@@ -14,6 +14,15 @@ category:           Development, Profiling, Debug
 build-type:         Simple
 extra-doc-files:    README.md
 
+-- The ghc-debug backend for the heap panel: live closure graphs and exact
+-- retainer paths from a program running ghc-debug-stub. The client builds on
+-- every platform ghc-debug-client does (Windows included); the stub, which
+-- the target links, needs Unix sockets and does not build on Windows.
+flag ghc-debug
+    description: Build the ghc-debug backend (live closure graphs, exact retainer paths)
+    default:     False
+    manual:      True
+
 common extensions
     default-language: GHC2024
     default-extensions:
@@ -49,6 +58,8 @@ library
         Stronghead.Ghci
         Stronghead.Live
         Stronghead.Format
+        Stronghead.Debug
+        Stronghead.Debug.Graph
     build-depends:
         base >=4.20 && <4.23,
         bytestring >=0.11 && <0.13,
@@ -60,6 +71,15 @@ library
         process ^>=1.6,
         text >=2.0 && <2.2,
         vector >=0.13 && <0.14
+    if flag(ghc-debug)
+        other-modules:  Stronghead.Debug.Client
+        cpp-options:    -DGHC_DEBUG
+        build-depends:
+            contra-tracer ^>=0.2,
+            ghc-debug-client ^>=0.8,
+            ghc-debug-common ^>=0.8,
+            ghc-debug-convention ^>=0.8,
+            time >=1.12 && <1.16
 
 -- The drop-in agent a target program links to publish live RTS stats.
 -- Deliberately tiny: base and network only.
@@ -112,6 +132,11 @@ executable stronghead-sample
         containers >=0.6 && <0.9,
         stronghead:agent
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4 -T"
+    -- With the flag, the sample also runs ghc-debug-stub so the heap panel's
+    -- live graph has something to connect to. The stub is Unix-only.
+    if flag(ghc-debug) && !os(windows)
+        cpp-options:   -DGHC_DEBUG_STUB
+        build-depends: ghc-debug-stub ^>=0.8
 
 test-suite stronghead-test
     import:           extensions, warnings

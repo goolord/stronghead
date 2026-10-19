@@ -9,6 +9,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+import Stronghead.Debug
 import Stronghead.Dump
 import Stronghead.Eventlog.Model
 import Stronghead.Ghci
@@ -99,6 +100,31 @@ main = do
   check "time in gc partial window" (timeIn tr 1 15 40 == 5)
   check "span at time" (spanIndexAt tr 35 == Just 2 && spanIndexAt tr 25 == Nothing)
   check "pick nearest span" (pickSpan tr 27 6 == Just 2)
+
+  putStrLn "ghc-debug graph"
+  check "host:port" (parseHostPort "localhost:1235" == Just ("localhost", 1235))
+  check "bare port" (parseHostPort " 1235 " == Just ("127.0.0.1", 1235))
+  check "ipv6 host" (parseHostPort "[::1]:9" == Just ("::1", 9))
+  check "bad port" (parseHostPort "host:abc" == Nothing && parseHostPort "host:70000" == Nothing)
+  check "closure kinds" (map kindOfClosureType ["THUNK_2_0", "AP", "IND_STATIC", "CONSTR_1_0", "MUT_VAR_DIRTY", "TSO"] == [NThunk, NThunk, NIndirection, NConstr, NMutable, NThread])
+  let snapA = leakSnapshot 2
+      snapB = leakSnapshot 5
+      path = map cnId (retainerPath snapA 8)
+  check "shortest retainer path" (path == [1, 2, 3, 4, 5, 6, 8])
+  check "unreachable closure has no path" (null (retainerPath snapA 99))
+  check "describe names holder thunk and CAF" $
+    let d = describePath (retainerPath snapA 8)
+     in "held by thunk plus" `T.isInfixOf` d && "rooted at CAF counter" `T.isInfixOf` d
+  check "held bytes cover the subtree" (M.lookup 5 (snapHeld snapA) == Just (4 * 16))
+  check "held never double counts shared children" (M.lookup 1 (snapHeld snapA) == Just (snapBytes snapA - 16))
+  check "thunks keyed by code and path" (M.size (snapThunks snapB) == 2 && sum (map tgCount (M.elems (snapThunks snapB))) == 5)
+  case survivingThunks [snapA, snapB] of
+    s : rest -> do
+      check "growing chain is the top survivor" (svGrowing s && svCounts s == [1, 4] && svSurvived s == 2)
+      check "chain head survives without growing" (map svGrowing rest == [False])
+      check "survivor ids cover the chain" (M.size (survivorIds snapB (s : rest)) == 5)
+    [] -> check "survivors found" False
+  check "one snapshot has no survivors" (null (survivingThunks [snapB]))
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
@@ -195,3 +221,24 @@ coreText =
     , "[GblId]"
     , "Main.main = System.IO.print @Int GHC.Show.$fShowInt (Main.go 10 0)"
     ]
+
+-- | A thread whose stack refers to a CAF holding an IORef with a chain of
+-- @n@ (+) thunks, the first of which also points at the boxed integer
+-- directly (so the graph is a DAG), plus one unreachable closure. Thunk
+-- addresses differ per call, as they would between real snapshots.
+leakSnapshot :: Int -> HeapSnapshot
+leakSnapshot n =
+  mkSnapshot "test" False [1] $
+    [ node 1 "TSO" "thread 1" [2]
+    , node 2 "STACK" "STACK" [3]
+    , node 3 "FUN_STATIC" "main" [4]
+    , node 4 "IND_STATIC" "counter" [5]
+    , node 5 "MUT_VAR_DIRTY" "IORef" [thunk 0]
+    , node 8 "CONSTR_1_0" "IS" []
+    , node 99 "CONSTR_0_1" "I#" []
+    ]
+      ++ [node (thunk i) "THUNK_2_0" "plus" ([thunk (i + 1) | i + 1 < n] ++ [8 | i == 0]) | i <- [0 .. n - 1]]
+  where
+    base = if n == 2 then 6 else 1000
+    thunk i = if n == 2 && i == 1 then 7 else base + fromIntegral i
+    node i ty name kids = ClosureNode i ty (kindOfClosureType ty) name Nothing 16 kids

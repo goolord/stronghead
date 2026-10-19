@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | A small program with the problems Stronghead is for:
 --
 -- * worker threads contending on one MVar (red blocked spans on the
@@ -13,6 +15,10 @@
 --
 -- then open stronghead-sample.eventlog (or .hp) in Stronghead, or connect
 -- the Live panel to 127.0.0.1:4777 while it runs.
+--
+-- Built with @-f ghc-debug@ (not on Windows), it also runs ghc-debug-stub,
+-- on the socket it prints, or on TCP when @GHC_DEBUG_TCP=host:port@ is set,
+-- for the heap panel's live graph.
 module Main (main) where
 
 import Control.Concurrent
@@ -25,10 +31,14 @@ import GHC.Clock (getMonotonicTime)
 import GHC.Conc (labelThread)
 import Stronghead.Agent
 import System.Environment (getArgs)
+#ifdef GHC_DEBUG_STUB
+import GHC.Debug.Stub (withGhcDebug, withGhcDebugTCP)
+import System.Environment (lookupEnv)
+#endif
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 main :: IO ()
-main = withAgent defaultAgentConfig $ do
+main = withDebugStub $ withAgent defaultAgentConfig $ do
   args <- getArgs
   let seconds = case args of
         s : _ | [(n, "")] <- reads s -> n
@@ -93,3 +103,13 @@ main = withAgent defaultAgentConfig $ do
   total <- readIORef leak
   size <- M.size <$> readIORef cache
   putStrLn ("leaked sum: " <> show total <> ", cache entries: " <> show size)
+
+withDebugStub :: IO a -> IO a
+#ifdef GHC_DEBUG_STUB
+withDebugStub body =
+  lookupEnv "GHC_DEBUG_TCP" >>= \case
+    Just hp | (host, ':' : port) <- break (== ':') hp, [(n, "")] <- reads port -> withGhcDebugTCP host n body
+    _ -> withGhcDebug body
+#else
+withDebugStub = id
+#endif
