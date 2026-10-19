@@ -18,6 +18,7 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Word (Word64)
 import Data.Vector qualified as V
 import NanoUI hiding (Binding)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
@@ -39,13 +40,23 @@ data CoreState = CoreState
     -- ^ Source, Core, STG.
   , csTasks :: !(Task FilePath (Either String CodeFile), Task FilePath (Either String CodeFile), Task FilePath (Either String CodeFile))
   , csHideUniques :: !(Var Bool)
+  , csColouring :: !(Var Colouring)
+  , csHovers :: !(Var (Maybe Text), Var (Maybe Text), Var (Maybe Text))
+    -- ^ The name under the pointer in each code pane: source, Core, STG.
   , csHideTypeable :: !(Var Bool)
   , csFilter :: !(Var Text)
   , csSelected :: !(Var (Maybe Text))
   , csHot :: !(Var (Maybe Text))
   , csViews :: !(CodeViewState, CodeViewState, CodeViewState)
-  , csShowSource :: !(Var Bool)
+  , csPanes :: !Workbench
   }
+
+paneBindings, paneNotes, paneSource, paneCore, paneStg :: Word64
+paneBindings = 1
+paneNotes = 2
+paneSource = 3
+paneCore = 4
+paneStg = 5
 
 newCoreState :: IO CoreState
 newCoreState = do
@@ -61,6 +72,11 @@ newCoreState = do
   stgTask <- newTask
   let csTasks = (srcTask, coreTask, stgTask)
   csHideUniques <- newVar True
+  csColouring <- newVar BoxingColours
+  hs <- newVar Nothing
+  hc <- newVar Nothing
+  hg <- newVar Nothing
+  let csHovers = (hs, hc, hg)
   csHideTypeable <- newVar True
   csFilter <- newVar ""
   csSelected <- newVar Nothing
@@ -69,7 +85,11 @@ newCoreState = do
   coreView' <- newCodeViewState
   stgView <- newCodeViewState
   let csViews = (srcView, coreView', stgView)
-  csShowSource <- newVar True
+  csPanes <-
+    newVar . Just $
+      Split 10 AxisV 0.17 (Pane paneBindings) $
+        Split 11 AxisH 0.2 (Pane paneNotes) $
+          Split 12 AxisV 0.3 (Pane paneSource) (Split 13 AxisV 0.5 (Pane paneCore) (Pane paneStg))
   pure CoreState {..}
 
 -- | Put a file in the pane its kind belongs to.
@@ -131,25 +151,25 @@ hasWorker :: Entry -> Bool
 hasWorker e = any (("$w" `T.isPrefixOf`) . stripQualifier . bdName) (enCore e ++ enStg e)
 
 coreView :: CoreState -> CoreLoaded -> NanoUI ()
-coreView st loaded = columnWith (gap 8 . grow . padAll 10) $ do
+coreView st loaded = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (csDirDialog st) $ \case
     p : _ -> openDumpDir st p
     [] -> pure ()
   useFileDialog (csFileDialog st) (mapM_ (openCodeFile st))
   let arts = fromMaybe [] (clArtifacts loaded)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    whenM (button "Open folder…") $
+  toolStrip $ do
+    whenM (toolButton "Open dump folder…") $
       writeVar (csDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
-    whenM (button "Open files…") $
+    whenM (toolButton "Open files…") $
       writeVar (csFileDialog st) . Just
         =<< askOpenFileDialog
           defaultFileDialogOptions
             { dialogAllowMany = True
             , dialogFilters = [FileFilter "Dumps and source" "dump-simpl;dump-stg-final;dump-stg;hs", FileFilter "All files" "*"]
             }
-    scope $ unless (null arts) $ do
-      label "Module"
-      selectWith (minW 220) (map maModule arts) (csModule st)
+    scope $ unless (null arts) $ toolGroup $ do
+      toolLabel "Module"
+      selectWith (alignMid . minW 220) (map maModule arts) (csModule st)
       i <- readVar (csModule st)
       current <- readVar (csLoadedModule st)
       -- Load whichever module the picker shows (the first one after a
@@ -160,13 +180,13 @@ coreView st loaded = columnWith (gap 8 . grow . padAll 10) $ do
           writeVar (csPaths st) (maSource a, maCore a, maStg a)
           writeVar (csSelected st) Nothing
     flex
-    checkboxWith alignMid "Hide uniques" (csHideUniques st)
-    checkboxWith alignMid "Hide Typeable" (csHideTypeable st)
-    checkboxWith alignMid "Source pane" (csShowSource st)
+    toolGroup $ do
+      toolLabel "Colour"
+      rowWith (alignMid . tight) $
+        boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring st)
+    toolGroup $ checkboxWith alignMid "Hide uniques" (csHideUniques st)
+    checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable st)
   root <- readVar (csRoot st)
-  scope $ when (isJust root && isNothing (clArtifacts loaded)) $ hint "Searching for dumps…"
-  scope $ when (isJust root && clArtifacts loaded == Just []) $
-    hint "No .dump-simpl or .dump-stg-final files found under that folder."
   let ok = \case
         Just (Right cf) -> Just cf
         _ -> Nothing
@@ -174,27 +194,38 @@ coreView st loaded = columnWith (gap 8 . grow . padAll 10) $ do
       core = ok (clCore loaded)
       stg = ok (clStg loaded)
       errors = [T.pack e | Just (Left e) <- [clSource loaded, clCore loaded, clStg loaded]]
-  forM_ errors (labelWith (fontTone Danger))
-  if isNothing core && isNothing stg && isNothing src
-    then scope intro
-    else scope (panes st src core stg)
+  scope $ unless (null errors) $
+    columnWith (padXY 20 0 . padBottom 8 . tight . gap 2 . fillW) $ forM_ errors (labelWith (fontTone Danger))
+  if
+    | isJust root && isNothing (clArtifacts loaded) -> scope $ emptyState "Searching for dumps…" [] []
+    | isJust root && clArtifacts loaded == Just [] && isNothing core && isNothing stg ->
+        scope $ emptyState "No dumps in that folder" ["No .dump-simpl or .dump-stg-final files were found under it. Build with -ddump-to-file, then open the folder again."] dumpCommands
+    | isNothing core && isNothing stg && isNothing src -> scope intro
+    | otherwise -> scope (panes st src core stg)
+
+dumpCommands :: [Text]
+dumpCommands =
+  [ "ghc -O2 -ddump-simpl -ddump-stg-final -ddump-to-file Main.hs"
+  , "cabal build --ghc-options=\"-ddump-simpl -ddump-stg-final -ddump-to-file\""
+  ]
 
 intro :: NanoUI ()
-intro = columnWith (gap 6 . padAll 24) $ do
-  sectionTitle "Core & STG pipeline viewer"
-  hint "Compile with dumps written to files, then open the folder (the dumps are found and paired with their sources):"
-  labelWith fontMono "  ghc -O2 -ddump-simpl -ddump-stg-final -ddump-to-file -dsuppress-module-prefixes Main.hs"
-  labelWith fontMono "  cabal build --ghc-options=\"-ddump-simpl -ddump-stg-final -ddump-to-file\""
-  hint "Cabal puts the dumps next to the object files under dist-newstyle/. Add -dsuppress-uniques for shorter names, or tick Hide uniques here."
+intro =
+  emptyState
+    "Open a folder of Core and STG dumps"
+    [ "Compile with the dumps written to files, then open the folder. Each module's source, Core and STG are found and paired."
+    , "Cabal puts the dumps next to the object files under dist-newstyle/."
+    ]
+    dumpCommands
 
 panes :: CoreState -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> NanoUI ()
 panes st src core stg = do
   hideU <- readVar (csHideUniques st)
   hideT <- readVar (csHideTypeable st)
+  colouring <- readVar (csColouring st)
   filt <- T.toLower <$> readVar (csFilter st)
   selected <- readVar (csSelected st)
   hot <- readVar (csHot st)
-  showSrc <- readVar (csShowSource st)
   mm <- monoMetrics 0.88
   th <- uiTheme
   let pal = palette th
@@ -208,67 +239,68 @@ panes st src core stg = do
           for_ (listToMaybe (enSrc e)) (scrollToLine vSrc . bdFirst)
           for_ (listToMaybe (enCore e)) (scrollToLine vCore . bdFirst)
           for_ (listToMaybe (enStg e)) (scrollToLine vStg . bdFirst)
-  rowWith (tight . gap 10 . grow) $ do
-    -- Binding list.
-    panelWith (fixedW 270 . fillH . padAll 6 . gap 4) $ do
-      searchInput "Filter bindings" (csFilter st)
-      labelWith (fontMuted . fontSizeScale 0.85) (tshow (length shown) <> " bindings")
-      scrollWith (grow . tight) $ columnWith (tight . fillW . gap 0) $
-        forM_ shown $ \e -> withKey (enKey e) $ do
-          picked <- selectableRow (selected == Just (enKey e)) id $ do
-            labelWith (fillW . fontMono . fontSizeScale 0.9) (T.take 34 (enKey e))
-            entryBadges e (isJust core)
-          when picked (select (enKey e))
-    columnWith (tight . gap 6 . grow) $ do
-      scope $ for_ selEntry $ \e -> notesBar st e core stg
-      rowWith (tight . gap 8 . grow) $ do
-        let pane title cv mcf kind = columnWith (tight . gap 4 . grow) $ do
-              rowWith (tight . gap 6 . alignMid . fillW) $ do
-                labelWith fontMedium title
-                labelWith (fontMuted . fontSizeScale 0.85) (maybe "not loaded" (T.pack . takeFileName . cfPath) mcf)
-              let ranges = case (selEntry, mcf) of
-                    (Just e, Just _) ->
-                      [ (bdFirst b, bdLast b, alpha 0.10 (pAccent pal))
-                      | b <- case kind of
-                          KindSource -> enSrc e
-                          KindCore -> enCore e
-                          KindStg -> enStg e
-                      ]
-                    _ -> []
-                  allocMarks = case (selEntry, kind) of
-                    (Just e, KindStg) -> concatMap (nAllocs . bdNotes) (enStg e)
-                    _ -> []
-                  boxMarks = case (selEntry, kind) of
-                    (Just e, KindCore) -> concatMap (nBoxing . bdNotes) (enCore e)
-                    _ -> []
-              codeView
-                cv
-                mm
-                defaultCodeConfig
-                  { ccLineCount = maybe 0 (V.length . cfLines) mcf
-                  , ccTokens = \l -> maybe [] (`lineTokens` l) mcf
-                  , ccHideUniques = hideU && kind /= KindSource
-                  , ccHot = hot
-                  , ccRanges = ranges
-                  , ccGutter = \l ->
-                      if
-                        | l `elem` allocMarks -> Just (MarkDot (pBlocked pal))
-                        | l `elem` boxMarks -> Just (MarkDot (pGCMajor pal))
-                        | otherwise -> Nothing
-                  , ccEmpty = "Open a " <> title <> " file"
-                  }
-        evSrc <-
-          if showSrc
-            then scope (Just <$> pane "Source" vSrc src KindSource)
-            else scope (pure Nothing)
-        evCore <- pane "Core" vCore core KindCore
-        evStg <- pane "STG" vStg stg KindStg
-        let events = maybe [] pure evSrc ++ [evCore, evStg]
-            hoverNow = listToMaybe (mapMaybe ceHoverKey events)
-        when (hoverNow /= hot) (writeVar (csHot st) hoverNow)
-        -- Clicking a name jumps to its binding, if it has one.
-        for_ (listToMaybe (mapMaybe ceClickedKey events)) $ \k ->
-          when (any ((== k) . enKey) es) (select k)
+      codePane ctx title cv mcf kind = paneWith tight ctx title (paneMeta (maybe "not loaded" (T.pack . takeFileName . cfPath) mcf)) $ do
+        let ranges = case (selEntry, mcf) of
+              (Just e, Just _) ->
+                [ (bdFirst b, bdLast b, alpha 0.10 (pAccent pal))
+                | b <- case kind of
+                    KindSource -> enSrc e
+                    KindCore -> enCore e
+                    KindStg -> enStg e
+                ]
+              _ -> []
+            allocMarks = case (selEntry, kind) of
+              (Just e, KindStg) -> concatMap (nAllocs . bdNotes) (enStg e)
+              _ -> []
+            boxMarks = case (selEntry, kind) of
+              (Just e, KindCore) -> concatMap (nBoxing . bdNotes) (enCore e)
+              _ -> []
+        ev <-
+          codeView
+            cv
+            mm
+            defaultCodeConfig
+              { ccLineCount = maybe 0 (V.length . cfLines) mcf
+              , ccTokens = \l -> maybe [] (`lineTokens` l) mcf
+              , ccHideUniques = hideU && kind /= KindSource
+              , ccHot = hot
+              , ccRanges = ranges
+              , ccGutter = \l ->
+                  if
+                    | l `elem` allocMarks -> Just (MarkDot (pBlocked pal))
+                    | l `elem` boxMarks -> Just (MarkDot (pGCMajor pal))
+                    | otherwise -> Nothing
+              , ccEmpty = "Open a " <> title <> " file"
+              , ccColouring = colouring
+              }
+        -- Hovering a name lights it up in every pane; clicking one jumps to
+        -- its binding, if it has one.
+        let (hs, hc, hg) = csHovers st
+        writeVar (case kind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
+        for_ (ceClickedKey ev) $ \k -> when (any ((== k) . enKey) es) (select k)
+  workbench (csPanes st) $ \pid ctx ->
+    if
+      | pid == paneBindings ->
+          pane ctx "Bindings" (paneMeta (tshow (length shown))) $ do
+            searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter bindings", sicLayout = fillW defaultLayout} (csFilter st)
+            paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
+              forM_ shown $ \e -> withKey (enKey e) $ do
+                picked <- selectableRow (selected == Just (enKey e)) id $ do
+                  cell (fillW . fontMono . fontSizeScale 0.9) (T.take 34 (enKey e))
+                  entryBadges e (isJust core)
+                when picked (select (enKey e))
+      | pid == paneNotes ->
+          pane ctx (maybe "What the optimiser did" enKey selEntry) (pure ()) $
+            paneScroll (grow . tight) $ columnWith (tight . gap 6 . fillW) $
+              case selEntry of
+                Nothing -> hint "Select a binding to see what the optimiser did to it: worker/wrapper, inlining, boxing, and the closures STG allocates."
+                Just e -> notesBar st e core stg
+      | pid == paneSource -> codePane ctx "Source" vSrc src KindSource
+      | pid == paneCore -> codePane ctx "Core" vCore core KindCore
+      | otherwise -> codePane ctx "STG" vStg stg KindStg
+  let (hs, hc, hg) = csHovers st
+  hoverNow <- listToMaybe . concatMap (maybe [] pure) <$> mapM readVar [hs, hc, hg]
+  when (hoverNow /= hot) (writeVar (csHot st) hoverNow)
 
 entryBadges :: Entry -> Bool -> NanoUI ()
 entryBadges e haveCore = do

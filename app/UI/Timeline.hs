@@ -15,7 +15,7 @@ import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust, listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -28,6 +28,7 @@ import NanoUI.Path qualified as P
 import Stronghead.Eventlog
 import Stronghead.Eventlog.Model
 import Stronghead.Format
+import System.FilePath (takeFileName)
 import UI.Common
 
 data TrackRef = OnCap !Int | OnThread !Word32
@@ -47,11 +48,16 @@ data TimelineState = TimelineState
   , tsSel :: !(Var (Maybe Sel))
   , tsThreadScroll :: !(Var Float)
   , tsThreadFilter :: !(Var Text)
-  , tsShowThreads :: !(Var Bool)
   , tsPressAt :: !(Var (Maybe V2))
   , tsDialog :: !(Var (Maybe FileDialogId))
   , tsFocusThread :: !(Var (Maybe Word32))
+  , tsPanes :: !Workbench
   }
+
+paneCaps, paneThreads, paneInspector :: Word64
+paneCaps = 1
+paneThreads = 2
+paneInspector = 3
 
 newTimelineState :: IO TimelineState
 newTimelineState = do
@@ -62,10 +68,10 @@ newTimelineState = do
   tsSel <- newVar Nothing
   tsThreadScroll <- newVar 0
   tsThreadFilter <- newVar ""
-  tsShowThreads <- newVar True
   tsPressAt <- newVar Nothing
   tsDialog <- newVar Nothing
   tsFocusThread <- newVar Nothing
+  tsPanes <- newVar (Just (Split 10 AxisV 0.74 (Split 11 AxisH 0.5 (Pane paneCaps) (Pane paneThreads)) (Pane paneInspector)))
   pure TimelineState {..}
 
 openEventlog :: TimelineState -> FilePath -> Bool -> NanoUI ()
@@ -89,14 +95,28 @@ timelineLoad st = do
 -- ---------------------------------------------------------------------------
 -- Geometry
 
-gutterW, rulerH, capH, capGap, gcH, memH, threadRowH :: Float
-gutterW = 150
-rulerH = 26
-capH = 24
+-- | The label gutter is the same width on every canvas, so the capability
+-- tracks and the thread rows share one time axis down the column.
+gutterW, plotMargin, rulerH, capGap, stripGap, gcH, memH, threadRowH :: Float
+gutterW = 172
+plotMargin = 12
+rulerH = 28
 capGap = 4
+stripGap = 14
 gcH = 54
 memH = 54
-threadRowH = 18
+threadRowH = 20
+
+-- | Capability tracks share whatever height the pane gives them, within
+-- reason.
+capHeight :: Float -> Int -> Float
+capHeight h nCaps =
+  let spare = h - rulerH - 2 * stripGap - gcH - memH - 8
+   in max 14 (min 40 (spare / fromIntegral (max 1 nCaps) - capGap))
+
+plotX, plotW :: Rect -> Float
+plotX r = rectX r + gutterW
+plotW r = max 10 (rectW r - gutterW - plotMargin)
 
 data Rows = Rows
   { rPlotX :: !Float
@@ -108,62 +128,60 @@ data Rows = Rows
   }
 
 mainHeight :: Int -> Float
-mainHeight nCaps = rulerH + fromIntegral nCaps * (capH + capGap) + 10 + gcH + 10 + memH
+mainHeight nCaps = rulerH + fromIntegral nCaps * (14 + capGap) + 2 * stripGap + gcH + memH + 8
 
 layoutRows :: Rect -> Int -> Rows
-layoutRows (Rect x y w _) nCaps =
-  let px = x + gutterW
-      pw = max 10 (w - gutterW - 4)
+layoutRows r@(Rect _ y _ h) nCaps =
+  let px = plotX r
+      pw = plotW r
+      capH = capHeight h nCaps
       capY i = y + rulerH + fromIntegral i * (capH + capGap)
-      gcY = capY nCaps + 10
+      gcY = capY nCaps + stripGap
    in Rows
         { rPlotX = px
         , rPlotW = pw
         , rRuler = Rect px y pw rulerH
         , rCaps = [Rect px (capY i) pw capH | i <- [0 .. nCaps - 1]]
         , rGC = Rect px gcY pw gcH
-        , rMem = Rect px (gcY + gcH + 10) pw memH
+        , rMem = Rect px (gcY + gcH + stripGap) pw memH
         }
 
 -- ---------------------------------------------------------------------------
 -- View
 
 timelineView :: TimelineState -> Maybe LoadProgress -> NanoUI ()
-timelineView st mprog = columnWith (gap 8 . grow . padAll 10) $ do
+timelineView st mprog = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (tsDialog st) $ \case
     p : _ -> openEventlog st p False
     [] -> pure ()
   path <- readVar (tsPath st)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    whenM (button "Open eventlog…") $
+  let loaded = mprog >>= lpTimeline
+  toolStrip $ do
+    whenM (toolButton "Open eventlog…") $
       writeVar (tsDialog st) . Just
         =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "GHC eventlog" "eventlog", FileFilter "All files" "*"]}
-    pathLabel path
-    checkboxWith alignMid "Follow live" (tsFollow st)
-    scope $ for_ mprog $ \p -> do
-      unless (lpDone p) $ do
-        let frac = if lpTotal p > 0 then fromIntegral (lpBytes p) / fromIntegral (lpTotal p) else 0 :: Double
-        progressBarWith (fixedW 160) 8 (realToFrac frac)
-        labelWith fontMuted ("reading " <> fmtBytes (fromIntegral (lpBytes p)))
-      when (lpFollowing p && lpDone p) $ badge Success "following"
-      for_ (lpError p) $ \e -> labelWith (fontTone Danger) ("decode stopped: " <> T.take 120 e)
+    checkboxWith alignMid "Follow as it is written" (tsFollow st)
     flex
-    whenM (button "Fit") (writeVar (tsView st) Nothing)
-  case mprog >>= lpTimeline of
-    Nothing -> scope $ emptyState path
+    scope $ for_ loaded $ \tl -> do
+      mv <- readVar (tsView st)
+      let lo = fromIntegral (tlStart tl)
+          hi = fromIntegral (tlEnd tl)
+          v = maybe (TimeView lo hi) (clampView lo hi) mv
+      toolLabel ("Showing " <> fmtNs (tvStart v - lo) <> " to " <> fmtNs (tvEnd v - lo))
+      disabledWhen (isNothing mv) $ whenM (toolButton "Fit to log") (writeVar (tsView st) Nothing)
+  case loaded of
+    Nothing -> scope $ case path of
+      Just p -> emptyState ("Reading " <> T.pack (takeFileName p)) ["The timeline appears as soon as the first scheduler events are decoded."] []
+      Nothing ->
+        emptyState
+          "Open an eventlog"
+          [ "Open a .eventlog file, drop one on the window, or pass it on the command line. Record one by running a -threaded program with +RTS -l:"
+          ]
+          ["ghc -threaded -rtsopts -eventlog Main.hs", "./Main +RTS -l -N4 -hT -RTS"]
     Just tl
-      | V.null (tlCaps tl) -> scope $ hint "This eventlog has no scheduler events yet. Was the program run with +RTS -l?"
+      | V.null (tlCaps tl) ->
+          scope $ emptyState "No scheduler events yet" ["This eventlog has no capability events. Was the program run with +RTS -l?"] []
       | otherwise -> scope (body st tl)
-
-emptyState :: Maybe FilePath -> NanoUI ()
-emptyState path = columnWith (gap 6 . padAll 24) $ case path of
-  Just _ -> hint "Loading…"
-  Nothing -> do
-    sectionTitle "No eventlog loaded"
-    hint "Open a .eventlog file, drop one on the window, or pass it on the command line."
-    hint "Record one with:  ghc -threaded -rtsopts Main.hs   then   ./Main +RTS -l -N4 -RTS"
-    hint "Add -hT (or -hi with -finfo-table-map) to get heap samples for the Heap tab, and use"
-    hint "Debug.Trace.traceMarkerIO to drop named markers on the timeline."
 
 body :: TimelineState -> Timeline -> NanoUI ()
 body st tl = do
@@ -175,26 +193,53 @@ body st tl = do
       summary = summarize tl
   mv <- readVar (tsView st)
   let v = maybe full (clampView lo hi) mv
-  rowWith (tight . gap 8 . wrap . lineGap 6 . fillW) $ do
-    statTile "Duration" (fmtSec (smDuration summary))
-    statTile "Mutator" (fmtPct (smMutatorFrac summary))
-    statTile "GC time" (fmtPct (smGCFrac summary))
-    statTile "GCs (major)" (fmtInt (smGCCount summary) <> " (" <> fmtInt (smMajorGCs summary) <> ")")
-    statTile "Longest pause" (fmtNs (smGCPauseMax summary))
-    statTile "Allocated" (fmtBytes (smAllocated summary))
-    statTile "Alloc rate" (fmtRate (fromIntegral (smAllocated summary) / max 1e-9 (smDuration summary)))
-    statTile "Peak live" (fmtBytes (smPeakLive summary))
-    statTile "Threads" (fmtInt (smThreads summary))
-    statTile "Events" (fmtInt (tlEventCount tl))
+  columnWith (padBottom 8 . tight . fillW) $
+    readout
+      [ ("duration", fmtSec (smDuration summary))
+      , ("mutator", fmtPct (smMutatorFrac summary))
+      , ("GC time", fmtPct (smGCFrac summary))
+      , ("collections, major", fmtInt (smGCCount summary) <> ", " <> fmtInt (smMajorGCs summary))
+      , ("longest pause", fmtNs (smGCPauseMax summary))
+      , ("allocated", fmtBytes (smAllocated summary))
+      , ("allocation rate", fmtRate (fromIntegral (smAllocated summary) / max 1e-9 (smDuration summary)))
+      , ("peak live", fmtBytes (smPeakLive summary))
+      , ("threads", fmtInt (smThreads summary))
+      , ("events", fmtInt (tlEventCount tl))
+      ]
   mm <- monoMetrics 0.85
   sel <- readVar (tsSel st)
-  rowWith (tight . gap 10 . grow) $ do
-    columnWith (tight . gap 6 . grow) $ do
-      mainCanvas st pal mm tl v sel
-      threadsSection st pal mm tl v sel
-    panelWith (fixedW 360 . fillH . padAll 10 . gap 6) $
-      scrollWith (grow . tight) $
-        columnWith (tight . gap 6 . fillW) (inspector st tl v sel)
+  workbench (tsPanes st) $ \pid ctx ->
+    if
+      | pid == paneCaps ->
+          paneWith tight ctx "Capabilities" (capsLegend pal) (mainCanvas st pal mm tl v sel)
+      | pid == paneThreads ->
+          paneWith tight ctx "Threads" (threadsHeader st pal tl) (threadsSection st pal mm tl v sel)
+      | otherwise -> do
+          let title = case sel of
+                Nothing -> "Overview"
+                Just (SelGC _) -> "Collection"
+                Just (SelSpan _ _) -> "Slice"
+          paneWith tight ctx title (inspectorActions st sel) $
+            paneScroll (grow . tight) $
+              columnWith (padAll 12 . gap 6 . fillW) (inspector st tl v sel)
+
+capsLegend :: Palette -> NanoUI ()
+capsLegend pal = do
+  flex
+  legendDot (pRun pal) "running"
+  legendDot (pGC pal) "minor GC"
+  legendDot (pGCMajor pal) "major GC"
+  legendDot (pBlocked pal) "stopped to block"
+  legendDot (pMarker pal) "marker"
+
+inspectorActions :: TimelineState -> Maybe Sel -> NanoUI ()
+inspectorActions st sel = do
+  flex
+  focus <- readVar (tsFocusThread st)
+  scope $ when (isJust focus) $
+    whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear highlight") (writeVar (tsFocusThread st) Nothing)
+  scope $ when (isJust sel) $
+    whenM (buttonWith (alignMid . padXY 8 2 . tight) "Back to overview") (writeVar (tsSel st) Nothing)
 
 -- | Apply wheel zoom, drag pan and double-click fit for a canvas whose plot
 -- area spans @[plotX, plotX + plotW]@.
@@ -243,7 +288,7 @@ mainCanvas st pal mm tl v sel = do
   resp <-
     canvasConfigured
       defaultCanvasConfig
-        { canvasLayout = (fillW . fixedH (mainHeight nCaps)) defaultLayout
+        { canvasLayout = (fillW . fillH . minH (mainHeight nCaps)) defaultLayout
         , canvasTrackPointer = True
         , canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)
         }
@@ -353,13 +398,15 @@ drawMain pal mm tl v sel hover r@(Rect x _ _ _) = do
       px = rPlotX rows
       pw = rPlotW rows
       font = mmFont mm
-      label' y txt = drawTextClipped font (mmCharW mm) (V2 (x + 6) y) (gutterW - 12) txt (pText pal)
+      label' y txt = drawTextClipped font (mmCharW mm) (V2 (x + 14) y) (gutterW - 26) txt (pText pal)
+      sub y txt = drawTextClipped font (mmCharW mm) (V2 (x + 14) y) (gutterW - 26) txt (pMuted pal)
       capsBottom = case reverse (rCaps rows) of
         Rect _ cy _ ch : _ -> cy + ch
         [] -> rectY (rRuler rows) + rulerH
+  drawGutter pal r
   drawRuler pal mm tl v (rRuler rows)
   forM_ (zip3 [0 :: Int ..] (rCaps rows) (V.toList (tlCaps tl))) $ \(i, cr@(Rect _ cy _ ch), tr) -> do
-    label' (cy + ch / 2) ("Cap " <> tshow i)
+    label' (cy + ch / 2) ("Capability " <> tshow i)
     drawTrack pal v cr tr [(kindRun, pRun pal), (kindGC, pGC pal)] True
     drawPoints pal v cr (tlCapPoints tl V.! i)
     case sel of
@@ -372,15 +419,14 @@ drawMain pal mm tl v sel hover r@(Rect x _ _ _) = do
       if mkIsMarker mk
         then drawStroke (V2 mx (rectY (rRuler rows) + 12)) (V2 mx capsBottom) 1 (alpha 0.55 (pMarker pal))
         else drawStroke (V2 mx (rectY (rRuler rows) + 18)) (V2 mx (rectY (rRuler rows) + rulerH)) 1 (alpha 0.6 (pMuted pal))
-  let Rect _ gy _ gh = rGC rows
-      Rect _ my' _ mh = rMem rows
+  let Rect _ gy _ _ = rGC rows
+      Rect _ my' _ _ = rMem rows
   label' (gy + 12) "GC pauses"
-  drawTextWith font (V2 (x + 6) (gy + 30)) AlignStart AlignMiddle "minor / major" (pMuted pal)
+  sub (gy + 30) "log scale"
   drawGCStrip pal v (rGC rows) tl sel
   label' (my' + 12) "Heap"
-  drawTextWith font (V2 (x + 6) (my' + 30)) AlignStart AlignMiddle "size / live" (pMuted pal)
+  sub (my' + 30) "size, live"
   drawMemStrip pal v (rMem rows) tl
-  let _ = (gh, mh)
   for_ hover $ \(hx, hy, ls) -> do
     drawStroke (V2 hx (rectY r)) (V2 hx (rectY r + rectH r)) 1 (pCursor pal)
     drawTooltip pal mm r hx hy ls
@@ -394,11 +440,20 @@ drawRuler pal mm tl v (Rect px py pw ph) = do
   drawRect (Rect px (py + ph - 1) pw 1) (pGrid pal)
   forM_ (take 200 ticks) $ \t -> do
     let tx = timeToX v px pw t
+        txt = fmtNs (t - origin)
     drawStroke (V2 tx (py + ph - 7)) (V2 tx (py + ph)) 1 (pMuted pal)
-    drawTextWith (mmFont mm) (V2 (tx + 3) (py + 8)) AlignStart AlignMiddle (fmtNs (t - origin)) (pMuted pal)
+    -- A label that would run past the plot is left off rather than cut.
+    when (tx + 4 + fromIntegral (T.length txt) * mmCharW mm <= px + pw) $
+      drawTextWith (mmFont mm) (V2 (tx + 4) (py + 11)) AlignStart AlignMiddle txt (pMuted pal)
   forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
     let mx = timeToX v px pw (fromIntegral (mkTime mk))
     drawPath (P.polygon [V2 mx (py + 12), V2 (mx + 6) (py + 16), V2 mx (py + 20)]) (pMarker pal)
+
+-- | The label gutter down the left of a canvas, ruled off from the plot.
+drawGutter :: Palette -> Rect -> CanvasM ()
+drawGutter pal (Rect x y _ h) = do
+  drawRect (Rect x y (gutterW - 8) h) (alpha 0.025 (pText pal))
+  drawRect (Rect (x + gutterW - 8) y 1 h) (pGrid pal)
 
 markersIn :: Timeline -> TimeView -> [Marker]
 markersIn tl v =
@@ -564,20 +619,20 @@ drawTooltip pal mm (Rect rx ry rw rh) hx hy ls = do
 -- ---------------------------------------------------------------------------
 -- Threads
 
+threadsHeader :: TimelineState -> Palette -> Timeline -> NanoUI ()
+threadsHeader st pal tl = do
+  paneMeta (fmtInt (M.size (tlThreads tl)))
+  searchInputConfigured
+    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW 220 . padXY 0 0) defaultLayout}
+    (tsThreadFilter st)
+  flex
+  legendDot (pRun pal) "running"
+  legendDot (pBlocked pal) "blocked"
+  legendDot (pRunnable pal) "runnable"
+
 threadsSection :: TimelineState -> Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> NanoUI ()
 threadsSection st pal mm tl v sel = do
-  showThreads <- readVar (tsShowThreads st)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    sectionTitle "Threads"
-    checkboxWith alignMid "Show" (tsShowThreads st)
-    searchInput "Filter by label or id" (tsThreadFilter st)
-    flex
-    legendDot (pRun pal) "running"
-    legendDot (pBlocked pal) "blocked"
-    legendDot (pRunnable pal) "runnable"
-    legendDot (pGC pal) "GC"
-    legendDot (pMarker pal) "marker"
-  scope $ when showThreads $ do
+  do
     filt <- T.toLower <$> readVar (tsThreadFilter st)
     focus <- readVar (tsFocusThread st)
     let threads =
@@ -586,7 +641,7 @@ threadsSection st pal mm tl v sel = do
           , T.null filt || filt `T.isInfixOf` T.toLower (threadName ti)
           ]
         nRows = length threads
-        contentH = fromIntegral nRows * threadRowH
+        contentH = fromIntegral nRows * threadRowH + 8
     scrollY0 <- readVar (tsThreadScroll st)
     mouse <- uiMousePos
     sid <- currentId
@@ -594,9 +649,7 @@ threadsSection st pal mm tl v sel = do
     let viewH = rectH prevRect
         maxScroll = max 0 (contentH - viewH)
         scrollY = max 0 (min maxScroll scrollY0)
-        rowAt (Rect _ ry _ _) my = floor ((my - ry + scrollY) / threadRowH) :: Int
-        plotX r = rectX r + gutterW
-        plotW r = max 10 (rectW r - gutterW - 4)
+        rowAt (Rect _ ry _ _) my = floor ((my - ry - 4 + scrollY) / threadRowH) :: Int
         hoverRow = if rectContains prevRect mouse then listToMaybe (drop (rowAt prevRect (v2Y mouse)) threads) else Nothing
         hoverText = do
           ti <- hoverRow
@@ -620,20 +673,22 @@ threadsSection st pal mm tl v sel = do
     resp <-
       canvasConfigured
         defaultCanvasConfig
-          { canvasLayout = (fillW . grow . minH 140) defaultLayout
+          { canvasLayout = (fillW . fillH . minH 80) defaultLayout
           , canvasTrackPointer = True
           }
         $ \r@(Rect x y w h) -> do
           let firstRow = max 0 (floor (scrollY / threadRowH))
               visible = take (ceiling (h / threadRowH) + 1) (drop firstRow (zip [firstRow ..] threads))
-              px = x + gutterW
-              pw = max 10 (w - gutterW - 4)
+              px = plotX r
+              pw = plotW r
+          drawGutter pal r
           withClip r $ forM_ visible $ \(i, ti) -> do
-            let ry = y + fromIntegral i * threadRowH - scrollY
-                rowRect = Rect px (ry + 2) pw (threadRowH - 4)
+            let ry = y + 4 + fromIntegral i * threadRowH - scrollY
+                rowRect = Rect px (ry + 3) pw (threadRowH - 6)
                 focused = focus == Just (tiId ti)
-            when focused $ drawRect (Rect x ry w threadRowH) (alpha 0.15 (pSelection pal))
-            drawTextClipped (mmFont mm) (mmCharW mm) (V2 (x + 6) (ry + threadRowH / 2)) (gutterW - 12) (threadName ti) (if focused then pAccent pal else pText pal)
+            when (even i) $ drawRect (Rect x ry w threadRowH) (alpha 0.022 (pText pal))
+            when focused $ drawRect (Rect x ry w threadRowH) (alpha 0.18 (pSelection pal))
+            drawTextClipped (mmFont mm) (mmCharW mm) (V2 (x + 14) (ry + threadRowH / 2)) (gutterW - 26) (threadName ti) (if focused then pAccent pal else pText pal)
             drawTrack pal v rowRect (tiTrack ti) [(kindRun, pRun pal), (kindBlocked, pBlocked pal), (kindRunnable, pRunnable pal)] False
             case sel of
               Just (SelSpan (OnThread tid) k) | tid == tiId ti -> outlineSpan pal v rowRect (tiTrack ti) k
@@ -673,9 +728,9 @@ ownerLine tl owner
   | otherwise = ["(black hole owned by " <> threadLabel tl owner <> ")"]
 
 legendDot :: Color -> Text -> NanoUI ()
-legendDot c txt = rowWith (tight . gap 4 . alignMid) $ do
-  _ <- canvas (fixedWH 10 10) (\r -> drawRoundedRect r 2 c)
-  labelWith (fontMuted . fontSizeScale 0.9) txt
+legendDot c txt = rowWith (tight . gap 5 . alignMid) $ do
+  _ <- canvas (fixedWH 9 9 . alignMid) (\r -> drawRoundedRect r 2 c)
+  labelWith (alignMid . fontMuted . fontSizeScale 0.85) txt
 
 -- ---------------------------------------------------------------------------
 -- Inspector
@@ -708,10 +763,7 @@ spanInspector st tl ref i = do
             | srKind s == kindGC = "Garbage collection"
             | srKind s == kindBlocked = "Blocked"
             | otherwise = "Runnable (waiting for a capability)"
-      rowWith (tight . gap 8 . alignMid . fillW) $ do
-        heading kindName
-        flex
-        whenM (buttonWith tight "Clear") (writeVar (tsSel st) Nothing)
+      labelWith (fontMedium . fontSizeScale 1.05 . padBottom 4) kindName
       case ref of
         OnCap c -> kv "Capability" (tshow c)
         OnThread _ -> pure ()
@@ -724,12 +776,14 @@ spanInspector st tl ref i = do
         whenM (button "Show owner thread") (writeVar (tsFocusThread st) (Just (srAux s)))
       scope $ for_ (seriesRateBetween (tlAlloc tl) (srStart s) (srEnd s)) $ \rate ->
         kv "Allocation rate" (fmtRate rate <> " (whole process)")
-      rowWith (tight . gap 6) $ do
+      rowWith (padTop 4 . tight . gap 6) $ do
         whenM (button "Zoom to slice") (zoomTo st tl (srStart s) (srEnd s))
-        scope $ unless (srKind s == kindGC) $ whenM (button "Show thread row") (writeVar (tsFocusThread st) (Just tid))
+        scope $ unless (srKind s == kindGC) $ whenM (button "Highlight thread") (writeVar (tsFocusThread st) (Just tid))
+      scope $ for_ (if srKind s == kindGC then Nothing else M.lookup tid (tlThreads tl)) $ \ti -> do
+        separator
+        threadStats tl ti
       separator
-      scope $ for_ (if srKind s == kindGC then Nothing else M.lookup tid (tlThreads tl)) (threadStats tl)
-      hint "Stack traces are not recorded in the eventlog. To see where a thread is, label it (GHC.Conc.labelThread), drop traceMarkerIO calls, or step it in the Debugger tab."
+      hint "The eventlog records no stack traces. To see where a thread is, label it (GHC.Conc.labelThread), drop traceMarkerIO calls, or step it in the Debugger."
     _ -> hint "The selection is no longer in the log."
 
 threadStats :: Timeline -> ThreadInfo -> NanoUI ()
@@ -748,16 +802,13 @@ threadStats tl ti = do
     sectionTitle "Time off-CPU by reason"
     forM_ off $ \(code, ns) ->
       rowWith (tight . gap 8 . fillW) $ do
-        labelWith (fillW . if stopIsBlocked code then fontTone Danger else fontMuted) (stopName code)
-        labelWith fontMono (fmtNs (fromIntegral ns))
-        labelWith (fontMuted . fixedW 52) (fmtPct (fromIntegral ns / life))
+        cell (fillW . if stopIsBlocked code then fontTone Danger else fontMuted) (stopName code)
+        numCell 84 id (fmtNs (fromIntegral ns))
+        numCell 52 fontMuted (fmtPct (fromIntegral ns / life))
 
 gcInspector :: TimelineState -> Timeline -> GCEvent -> NanoUI ()
 gcInspector st tl g = do
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    heading ("Garbage collection" <> genText (gcGen g))
-    flex
-    whenM (buttonWith tight "Clear") (writeVar (tsSel st) Nothing)
+  labelWith (fontMedium . fontSizeScale 1.05 . padBottom 4) ("Garbage collection" <> genText (gcGen g))
   let pause = fromIntegral (gcEnd g - gcStart g)
   kv "Starts at" (fmtNs (fromIntegral (gcStart g - tlStart tl)))
   kv "Pause" (fmtNs pause)
@@ -772,40 +823,38 @@ gcInspector st tl g = do
 
 overview :: TimelineState -> Timeline -> TimeView -> NanoUI ()
 overview st tl v = do
-  heading "Inspector"
-  hint "Click a slice on a capability, a thread row or the GC strip to inspect it. Wheel zooms, drag pans, double-click fits."
+  hint "Click a slice on a capability, a thread row or the GC strip to inspect it."
   kv "Window" (fmtNs (viewWidth v))
-  separator
   sectionTitle "Longest GC pauses"
   let gcs = take 8 (sortOn (\(_, g) -> Down (gcEnd g - gcStart g)) (zip [0 :: Int ..] (V.toList (tlGCs tl))))
+  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+    colHeader (fixedW 72 . alignEnd) "pause"
+    colHeader fillW "collection"
+    colHeader (fixedW 84 . alignEnd) "at"
   forM_ gcs $ \(i, g) -> withKey i $ do
     picked <- selectableRow False id $ do
-      labelWith (fillW . fontMono) (fmtNs (fromIntegral (gcEnd g - gcStart g)))
-      labelWith fontMuted (if gcGen g >= 1 then "major" else "minor")
-      labelWith (fontMuted . fixedW 80) ("@ " <> fmtNs (fromIntegral (gcStart g - tlStart tl)))
+      numCell 72 id (fmtNs (fromIntegral (gcEnd g - gcStart g)))
+      cell (fillW . fontMuted) (if gcGen g >= 1 then "major" else "minor")
+      numCell 84 fontMuted (fmtNs (fromIntegral (gcStart g - tlStart tl)))
     when picked $ do
       writeVar (tsSel st) (Just (SelGC i))
       zoomTo st tl (gcStart g) (gcEnd g)
-  separator
   sectionTitle "Most blocked threads"
   let blockedTime ti = sum [ns | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c]
       worst = take 8 (sortOn (Down . blockedTime) (filter ((> 0) . blockedTime) (M.elems (tlThreads tl))))
   forM_ worst $ \ti -> withKey (tiId ti) $ do
     let top = listToMaybe (sortOn (Down . snd) [(c, ns) | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c])
     picked <- selectableRow False id $ do
-      labelWith fillW (threadName ti)
-      labelWith fontMono (fmtNs (fromIntegral (blockedTime ti)))
-    scope $ for_ top $ \(c, _) -> labelWith (fontMuted . fontSizeScale 0.85 . padLeft 12) (stopName c)
+      columnWith (tight . gap 0 . fillW . alignMid) $ do
+        labelWith fillW (threadName ti)
+        scope $ for_ top $ \(c, _) -> labelWith (fillW . fontMuted . fontSizeScale 0.85) (stopName c)
+      numCell 72 id (fmtNs (fromIntegral (blockedTime ti)))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
-  separator
   sectionTitle "Busiest threads"
   forM_ (take 6 (sortOn (Down . tiRunTime) (M.elems (tlThreads tl)))) $ \ti -> withKey (tiId ti) $ do
     picked <- selectableRow False id $ do
-      labelWith fillW (threadName ti)
-      labelWith fontMono (fmtNs (fromIntegral (tiRunTime ti)))
+      cell fillW (threadName ti)
+      numCell 72 id (fmtNs (fromIntegral (tiRunTime ti)))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
-  separator
   sectionTitle "Program"
   forM_ (tlInfo tl) $ \(k, val) -> kv k (T.take 300 val)
-  focus <- readVar (tsFocusThread st)
-  scope $ when (isJust focus) $ whenM (button "Clear thread highlight") (writeVar (tsFocusThread st) Nothing)

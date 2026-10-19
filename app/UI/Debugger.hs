@@ -15,7 +15,7 @@ import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust, listToMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -23,7 +23,7 @@ import NanoUI
 import Stronghead.Dump (CodeFile (..), CodeKind (..), lineTokens, loadCodeFile)
 import Stronghead.Format (tshow)
 import Stronghead.Ghci
-import System.FilePath (isAbsolute, (</>))
+import System.FilePath (isAbsolute, takeFileName, (</>))
 import UI.Code
 import UI.Common
 
@@ -47,6 +47,7 @@ data DebugState = DebugState
   , dsSource :: !(Task FilePath (Either String CodeFile))
   , dsCode :: !CodeViewState
   , dsSeenLines :: !(Var Int)
+  , dsPanes :: !Workbench
   }
 
 newDebugState :: IO DebugState
@@ -68,6 +69,7 @@ newDebugState = do
   dsSource <- newTask
   dsCode <- newCodeViewState
   dsSeenLines <- newVar 0
+  dsPanes <- newVar (Just (Split 10 AxisH 0.7 (Split 11 AxisV 0.68 (Pane 1) (Pane 2)) (Pane 3)))
   pure DebugState {..}
 
 debugLoad :: DebugState -> NanoUI (Maybe (Either String CodeFile))
@@ -150,56 +152,56 @@ stopSession st wake = do
 -- View
 
 debugView :: DebugState -> Maybe (Either String CodeFile) -> NanoUI ()
-debugView st source = columnWith (gap 8 . grow . padAll 10) $ do
+debugView st source = columnWith (tight . gap 0 . grow) $ do
   wake <- askWake
   running <- readVar (dsRunning st)
   busy <- readVar (dsBusy st)
   stop <- readVar (dsStop st)
   let send cmds = liftIO (runCommands st wake cmds)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    label "Command"
-    textInputConfigured defaultTextInputConfig {ticPlaceholder = "ghci  or  cabal repl", ticLayout = minW 180 defaultLayout} (dsCommand st)
-    label "in"
-    textInputConfigured defaultTextInputConfig {ticPlaceholder = "working directory", ticLayout = (minW 240 . fillW) defaultLayout} (dsDir st)
-    label "load"
-    textInputConfigured defaultTextInputConfig {ticPlaceholder = "src/Main.hs", ticLayout = minW 200 defaultLayout} (dsFile st)
-    disabledWhen (busy || running) $ whenM (styled primary (button "Start")) (liftIO (startSession st wake))
-    disabledWhen (not running) $ whenM (button "Stop") (liftIO (stopSession st wake))
-    scope $ when busy spinner
-  rowWith (tight . gap 6 . alignMid . fillW . wrap . lineGap 6) $ disabledWhen (not running || busy) $ do
-    textInputConfigured defaultTextInputConfig {ticPlaceholder = "expression, e.g. main", ticLayout = minW 160 defaultLayout} (dsExpr st)
-    expr <- T.strip <$> readVar (dsExpr st)
-    whenM (button "Step into") (send [":step " <> expr])
-    whenM (button "Trace") (send [":trace " <> expr])
-    whenM (button "Run") (send [expr])
-    separator
-    disabledWhen (isNothing' stop) $ do
-      whenM (button "Step") (send [":step"])
-      whenM (button "Step over") (send [":steplocal"])
-      whenM (button "Step out") (send [":stepout"])
-      whenM (button "Step module") (send [":stepmodule"])
-      whenM (styled success (button "Continue")) (send [":continue"])
-      whenM (button "Back") (send [":back"])
-      whenM (button "Forward") (send [":forward"])
-      whenM (button "History") (send [":history"])
-      whenM (styled destructive (button "Abandon")) (send [":abandon"])
-  scope $ for_ stop $ \s ->
-    callout (colorRGB 240 192 48) $ rowWith (tight . gap 8 . alignMid . fillW) $ do
-      labelWith fontMedium ("Stopped in " <> stName s)
-      for_ (stSpan s) $ \sp -> labelWith (fontMono . fontMuted) (ssFile sp <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
-  rowWith (tight . gap 10 . grow) $ do
-    columnWith (tight . gap 4 . grow) $ do
-      sourcePane st source stop send
-    panelWith (fixedW 420 . fillH . padAll 8 . gap 6) $ do
-      sectionTitle "Local bindings"
-      bindingsPane st stop send
-  consolePane st send
+      input placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
+  toolStrip $ disabledWhen running $ do
+    toolLabel "Run"
+    input "ghci  or  cabal repl" (fixedW 160) (dsCommand st)
+    toolLabel "in"
+    input "working directory" (minW 240 . fillW) (dsDir st)
+    toolLabel "and load"
+    input "src/Main.hs" (fixedW 200) (dsFile st)
+  toolStrip $ do
+    scope $
+      if running
+        then whenM (toolButton "Stop session") (liftIO (stopSession st wake))
+        else disabledWhen busy $ whenM (styled primary (toolButton "Start session")) (liftIO (startSession st wake))
+    scope $ when busy (rowWith (alignMid . tight) spinner)
+    disabledWhen (not running || busy) $ toolGroup $ do
+      input "expression, e.g. main" (fixedW 170) (dsExpr st)
+      expr <- T.strip <$> readVar (dsExpr st)
+      whenM (toolButton "Step into") (send [":step " <> expr])
+      whenM (toolButton "Trace") (send [":trace " <> expr])
+      whenM (toolButton "Run") (send [expr])
+    disabledWhen (not running || busy || isNothing' stop) $ do
+      toolGroup $ do
+        whenM (toolButton "Step") (send [":step"])
+        whenM (toolButton "Step over") (send [":steplocal"])
+        whenM (toolButton "Step out") (send [":stepout"])
+        whenM (toolButton "Step module") (send [":stepmodule"])
+        whenM (styled success (toolButton "Continue")) (send [":continue"])
+      toolGroup $ do
+        whenM (toolButton "Back") (send [":back"])
+        whenM (toolButton "Forward") (send [":forward"])
+        whenM (toolButton "History") (send [":history"])
+      flex
+      whenM (styled destructive (toolButton "Abandon")) (send [":abandon"])
+  workbench (dsPanes st) $ \pid ctx ->
+    if
+      | pid == 1 -> sourcePane st ctx source stop send
+      | pid == 2 -> pane ctx "Local bindings" (pure ()) (bindingsPane st stop send)
+      | otherwise -> consolePane st ctx send
 
 isNothing' :: Maybe a -> Bool
 isNothing' = maybe True (const False)
 
-sourcePane :: DebugState -> Maybe (Either String CodeFile) -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
-sourcePane st source stop send = do
+sourcePane :: DebugState -> PaneGridCtx -> Maybe (Either String CodeFile) -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
+sourcePane st ctx source stop send = do
   path <- readVar (dsSourcePath st)
   breaks <- readVar (dsBreaks st)
   mm <- monoMetrics 0.9
@@ -211,15 +213,16 @@ sourcePane st source stop send = do
       here = stop >>= stSpan
       fileBreaks = M.fromList [(l, n) | ((f, l), n) <- M.toList breaks, Just f == path]
       candidates = maybe mempty (\c -> M.fromList [(l, ()) | l <- candidateLines (V.toList (cfLines c))]) cf
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    labelWith fontMedium "Source"
-    labelWith (fontMono . fontMuted) (maybe "no file loaded" T.pack path)
-    flex
-    hint "Click the gutter to toggle a breakpoint."
-  scope $ case source of
-    Just (Left e) -> labelWith (fontTone Danger) (T.pack e)
-    _ -> pure ()
-  ev <-
+  let header = do
+        paneMeta (maybe "no module loaded" (T.pack . takeFileName) path)
+        flex
+        scope $ for_ stop $ \s -> do
+          labelWith (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) ("Stopped in " <> stName s)
+          for_ (stSpan s) $ \sp -> labelWith (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (T.pack (takeFileName (T.unpack (ssFile sp))) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
+  ev <- paneWith tight ctx "Source" header $ do
+    scope $ case source of
+      Just (Left e) -> columnWith (padXY 12 6) $ labelWith (fontTone Danger) (T.pack e)
+      _ -> pure ()
     codeView
       (dsCode st)
       mm
@@ -238,6 +241,7 @@ sourcePane st source stop send = do
               | otherwise -> Nothing
         , ccEmpty = "Start a session and load a module to see its source."
         }
+
   -- Follow the stop location.
   let stopLine = maybe 0 ssLine here
   seen <- readVar (dsSeenLines st)
@@ -260,12 +264,12 @@ bindingsPane st stop send = do
     (Nothing, _) -> hint "Not stopped at a breakpoint. Set one in the gutter, then use Step into or Run."
     (Just _, []) -> hint "No local bindings at this location."
     _ -> pure ()
-  scrollWith (grow . tight) $ columnWith (tight . fillW . gap 4) $
+  paneScroll (grow . tight) $ columnWith (tight . fillW . gap 4) $
     forM_ bindings $ \b -> withKey (gbName b) $ panelWith (padXY 8 5 . gap 3 . fillW) $ do
       let thunk = valueIsThunk (gbValue b)
-      rowWith (tight . gap 6 . alignMid . fillW) $ do
-        labelWith (fontMono . fontMedium) (gbName b)
-        labelWith (fontMono . fontMuted . fillW . fontSizeScale 0.9) (":: " <> gbType b)
+      rowWith (tight . gap 6 . fillW) $ do
+        cell (fontMono . fontMedium) (gbName b)
+        cell (fontMono . fontMuted . fillW . fontSizeScale 0.9) (":: " <> gbType b)
         scope $ if thunk then badge Muted "_thunk" else badge Success "evaluated"
       scope $ for_ (gbValue b) $ \v ->
         unless (v == "_") $ labelWith (fontMono . fillW . (if thunk then fontMuted else id)) (T.take 400 v)
@@ -293,29 +297,33 @@ bindingsPane st stop send = do
             writeVarIO (dsBindings st) (parseBindings b)
             wake
 
-consolePane :: DebugState -> ([Text] -> NanoUI ()) -> NanoUI ()
-consolePane st send = panelWith (fillW . fixedH 210 . padAll 6 . gap 4) $ do
-  ls <- readVar (dsConsole st)
-  sid <- currentId
-  (_, ()) <- scrollArea (grow . tight) $ columnWith (tight . fillW . gap 0) $
-    forM_ (zip [0 :: Int ..] (drop (length ls - 400) ls)) $ \(i, l) -> withKey i $
-      labelWith (fontMono . fontSizeScale 0.85 . (if "λ>" `T.isPrefixOf` l then fontTone Accent else id)) (if T.null l then " " else l)
-  -- Keep the newest output in view.
-  seen <- useVar (0 :: Int)
-  n <- readVar seen
-  when (n /= length ls) $ do
-    writeVar seen (length ls)
-    scrollToUi sid (V2 0 (1 / 0)) ScrollInstant
-  running <- readVar (dsRunning st)
-  rowWith (tight . gap 6 . alignMid . fillW) $ do
-    labelWith fontMono "λ>"
-    resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "any GHCi command (:show breaks, :history, :sprint xs, ...)", ticLayout = fillW defaultLayout} (dsInput st)
-    go <- disabledWhen (not running) (button "Send")
-    when (respSubmitted resp || go) $ do
-      cmd <- readVar (dsInput st)
-      unless (T.null (T.strip cmd)) $ do
-        send [cmd]
-        writeVar (dsInput st) ""
-    whenM (buttonWith tight "Clear") (writeVar (dsConsole st) [])
-  let _ = listToMaybe ls
-  pure ()
+consolePane :: DebugState -> PaneGridCtx -> ([Text] -> NanoUI ()) -> NanoUI ()
+consolePane st ctx send = do
+  th <- uiTheme
+  let i = ink th
+      clear = do
+        flex
+        whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear") (writeVar (dsConsole st) [])
+  paneWith tight ctx "GHCi console" clear $ do
+    ls <- readVar (dsConsole st)
+    sid <- currentId
+    (_, ()) <- paneScrollArea (grow . tight) $ columnWith (padXY 12 8 . tight . fillW . gap 0) $
+      forM_ (zip [0 :: Int ..] (drop (length ls - 400) ls)) $ \(n, l) -> withKey n $
+        labelWith (fillW . fontMono . fontSizeScale 0.85 . (if "λ>" `T.isPrefixOf` l then fontTone Accent else id)) (if T.null l then " " else l)
+    -- Keep the newest output in view.
+    seen <- useVar (0 :: Int)
+    n <- readVar seen
+    when (n /= length ls) $ do
+      writeVar seen (length ls)
+      scrollToUi sid (V2 0 (1 / 0)) ScrollInstant
+    running <- readVar (dsRunning st)
+    styled (panelStyle (background (inkSunken i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
+      panelWith (asRow . fillW . padXY 12 6 . gap 8) $ themed th $ do
+        labelWith (alignMid . fontMono . fontTone Accent) "λ>"
+        resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "Any GHCi command, e.g. :show breaks, :history, :sprint xs", ticLayout = (alignMid . fillW) defaultLayout} (dsInput st)
+        go <- disabledWhen (not running) (toolButton "Send")
+        when (respSubmitted resp || go) $ do
+          cmd <- readVar (dsInput st)
+          unless (T.null (T.strip cmd)) $ do
+            send [cmd]
+            writeVar (dsInput st) ""

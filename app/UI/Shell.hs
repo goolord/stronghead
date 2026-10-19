@@ -12,14 +12,17 @@ module UI.Shell
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.List (isSuffixOf)
+import Data.Maybe (isNothing)
 import Data.Text qualified as T
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import Stronghead.Dump (kindForPath)
 import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Eventlog (LoadProgress (..))
+import Stronghead.Format (fmtBytes, tshow)
 import System.Directory (doesDirectoryExist, makeAbsolute)
 import System.FilePath (takeDirectory, takeFileName)
+import UI.Common
 import UI.Core
 import UI.Debugger
 import UI.Heap
@@ -33,9 +36,18 @@ panelTitle :: Panel -> T.Text
 panelTitle = \case
   PTimeline -> "Timeline"
   PHeap -> "Heap & leaks"
-  PCore -> "Core / STG"
+  PCore -> "Core & STG"
   PDebugger -> "Debugger"
   PLive -> "Live"
+
+-- | How to drive the panel, for the status bar.
+panelHint :: Panel -> T.Text
+panelHint = \case
+  PTimeline -> "Wheel to zoom, drag to pan, double-click to fit"
+  PHeap -> "Drag across the chart to move the census cursor"
+  PCore -> "Hover a name to find it in every pane, click it to jump to its binding"
+  PDebugger -> "Click the gutter to set or clear a breakpoint"
+  PLive -> "Samples arrive four times a second"
 
 tabNamed :: T.Text -> Panel
 tabNamed name = case [p | p <- [minBound .. maxBound], T.toLower (T.takeWhile (/= ' ') (panelTitle p)) == name] of
@@ -144,31 +156,27 @@ appView app = do
   live <- liveLoad (appLive app)
   let logProfile = timeline >>= lpTimeline >>= tlHeapProfile
 
+  th <- uiTheme
+  let i = ink th
+  active <- readVar (appTab app)
   columnWith (tight . grow . gap 0) $ do
-    rowWith (gap 10 . alignMid . fillW . padXY 12 8) $ do
-      labelWith (fontSizeScale 1.25 . fontSemiBold) "Stronghead"
-      labelWith (fontMuted . fontSizeScale 0.9) "GHC runtime debugger & profiler"
-      whenM (button "Open…") $
-        writeVar (appOpen app) . Just
-          =<< askOpenFileDialog
-            defaultFileDialogOptions
-              { dialogAllowMany = True
-              , dialogFilters =
-                  [ FileFilter "Stronghead inputs" "eventlog;hp;prof;dump-simpl;dump-stg-final;dump-stg;hs"
-                  , FileFilter "All files" "*"
-                  ]
-              }
-      msg <- readVar (appMessage app)
-      scope $ unless (T.null msg) $ do
-        labelWith (fontTone Warning) msg
-        whenM (buttonWith tight "×") (writeVar (appMessage app) "")
-      flex
-      labelWith (fontMuted . fontSizeScale 0.85) "Drop .eventlog / .hp / .prof / dump files anywhere"
-    -- Header only: 'tabs' would put the body in a column that does not
-    -- stretch vertically, and every panel wants the full height.
-    boundedTabBar panelTitle (appTab app)
-    active <- readVar (appTab app)
-    columnWith (tight . grow) . withKey (fromEnum active) $ case active of
+    styled (panelStyle (background (inkGround i) . borderWidth 0 . cornerRadius 0)) $
+      panelWith (asRow . fillW . fixedH 46 . padLeft 20 . padRight 8 . padTop 0 . padBottom 0 . gap 18) $ do
+        labelWith (alignMid . fontSemiBold . fontSizeScale 1.08) "Stronghead"
+        themed th $ navBar (appTab app)
+        flex
+        themed th $ document app active
+        themed th $ whenM (toolButton "Open…") $
+          writeVar (appOpen app) . Just
+            =<< askOpenFileDialog
+              defaultFileDialogOptions
+                { dialogAllowMany = True
+                , dialogFilters =
+                    [ FileFilter "Stronghead inputs" "eventlog;hp;prof;dump-simpl;dump-stg-final;dump-stg;hs"
+                    , FileFilter "All files" "*"
+                    ]
+                }
+    columnWith (tight . grow . gap 0) . withKey (fromEnum active) $ case active of
       PTimeline -> timelineView (appTimeline app) timeline
       PHeap -> heapView (appHeap app) heap logProfile
       PCore -> coreView (appCore app) core
@@ -176,3 +184,60 @@ appView app = do
       PLive -> liveView (appLive app) live $ \p -> do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
+    statusBar app active timeline live
+
+-- | The file the active panel is showing, in the title bar.
+document :: App -> Panel -> NanoUI ()
+document app active = scope $ case active of
+  PTimeline -> pathLabel =<< readVar (tsPath (appTimeline app))
+  PHeap -> do
+    source <- readVar (hsSource (appHeap app))
+    case source of
+      FromHpFile -> pathLabel =<< readVar (hsHpPath (appHeap app))
+      FromEventlog -> pathLabel =<< readVar (tsPath (appTimeline app))
+      FromGhcDebug -> labelWith (alignMid . fontMuted . fontSizeScale 0.92) "ghc-debug live graph"
+  PCore -> do
+    (s, c, g) <- readVar (csPaths (appCore app))
+    pathLabel (c `orElse` g `orElse` s)
+  PDebugger -> pathLabel =<< readVar (dsSourcePath (appDebug app))
+  PLive -> do
+    host <- readVar (lvHost (appLive app))
+    port <- readVar (lvPort (appLive app))
+    labelWith (alignMid . fontMono . fontSizeScale 0.92) (host <> ":" <> port)
+  where
+    orElse a b = maybe b Just a
+
+-- | Background work from every panel on the left, how to drive the active
+-- panel on the right.
+statusBar :: App -> Panel -> Maybe LoadProgress -> Maybe LiveData -> NanoUI ()
+statusBar app active timeline live = do
+  th <- uiTheme
+  let i = ink th
+      item = labelWith (alignMid . fontSizeScale 0.85)
+  busy <- readVar (dsBusy (appDebug app))
+  ghci <- readVar (dsRunning (appDebug app))
+  msg <- readVar (appMessage app)
+  styled (panelStyle (background (inkGround i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
+    panelWith (asRow . fillW . fixedH 28 . padXY 14 0 . gap 14) $ themed th $ do
+      scope $ for_ timeline $ \p -> do
+        unless (lpDone p) $ do
+          let frac = if lpTotal p > 0 then fromIntegral (lpBytes p) / fromIntegral (lpTotal p) else 0 :: Double
+          progressBarWith (fixedW 120 . alignMid) 6 (realToFrac frac)
+          item ("Reading eventlog, " <> fmtBytes (fromIntegral (lpBytes p)))
+        when (lpFollowing p && lpDone p) $ item "Following the eventlog as it is written"
+        for_ (lpError p) $ \e -> labelWith (alignMid . fontSizeScale 0.85 . fontTone Danger) ("Eventlog decoding stopped: " <> T.take 100 e)
+      scope $ for_ live $ \d -> do
+        for_ (ldHello d) $ \(p, pid, _) -> when (isNothing (ldClosed d)) $ item ("Live: " <> p <> ", pid " <> tshow pid)
+        for_ (ldClosed d) $ \why -> labelWith (alignMid . fontSizeScale 0.85 . fontTone Danger) ("Agent disconnected: " <> T.take 80 why)
+      scope $ when (ghci || busy) $ item (if busy then "GHCi is working…" else "GHCi session running")
+      scope $ unless (T.null msg) $ do
+        labelWith (alignMid . fontSizeScale 0.85 . fontTone Warning) msg
+        whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")
+      flex
+      labelWith (alignMid . fontMuted . fontSizeScale 0.85) (panelHint active)
+
+-- | The panels, as folder tabs along the bottom of the title bar.
+navBar :: Var Panel -> NanoUI ()
+navBar v =
+  rowWith (alignBottom . tight) $
+    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v

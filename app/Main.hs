@@ -18,9 +18,10 @@ module Main (main) where
 import Control.Monad (when)
 import Data.Text qualified as T
 import NanoUI
-import NanoUI.Backend.Sdl (SdlOptions (..), askSdlEnv, defaultSdlOptions, runSdlApp, saveScreenshot)
+import NanoUI.Backend.Sdl (NanoUIFont (..), SdlOptions (..), askSdlEnv, defaultSdlOptions, runSdlApp, saveScreenshot)
 import System.Environment (getArgs, lookupEnv)
 import Text.Read (readMaybe)
+import UI.Common (strongheadTheme)
 import UI.Shell
 
 main :: IO ()
@@ -38,7 +39,9 @@ main = do
             , wsSize = Size 1500 960
             , wsMinSize = Just (Size 960 640)
             }
-      , sdlAppThemeFor = Just (lightDark defaultLightTheme defaultTheme)
+      , sdlAppThemeFor = Just strongheadTheme
+      , sdlAppFontSize = 15
+      , sdlAppMonoFont = FontSearch ["JetBrains Mono", "Cascadia Mono", "Source Code Pro", "Consolas", "DejaVu Sans Mono", "monospace"]
       }
     (appView app >> maybe (pure ()) (captureAfter started delay) capture)
 

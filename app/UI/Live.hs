@@ -13,7 +13,8 @@ import Control.Monad (forM_, when)
 import Data.Foldable (for_, toList)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (isNothing)
+import Data.Word (Word64)
 import Data.Sequence (Seq, (|>))
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
@@ -32,6 +33,7 @@ data LiveState = LiveState
   , lvStream :: !(Stream (String, Int, Int) LiveData)
   , lvEventlog :: !(Var Text)
   , lvThreadFilter :: !(Var Text)
+  , lvPanes :: !Workbench
   }
 
 data LiveData = LiveData
@@ -49,6 +51,7 @@ newLiveState = do
   lvStream <- newStream
   lvEventlog <- newVar ""
   lvThreadFilter <- newVar ""
+  lvPanes <- newVar (Just (Split 10 AxisH 0.58 (Pane paneCharts) (Pane 2)))
   pure LiveState {..}
 
 keepFrames :: Int
@@ -106,34 +109,36 @@ rates fs =
             }
 
 liveView :: LiveState -> Maybe LiveData -> (FilePath -> NanoUI ()) -> NanoUI ()
-liveView st mdata followEventlog = columnWith (gap 8 . grow . padAll 10) $ do
+liveView st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
   want <- readVar (lvWant st)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    label "Agent"
-    textInputConfigured defaultTextInputConfig {ticLayout = fixedW 140 defaultLayout} (lvHost st)
-    textInputConfigured defaultTextInputConfig {ticLayout = fixedW 70 defaultLayout} (lvPort st)
+  toolStrip $ do
+    toolLabel "Agent"
+    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 150) defaultLayout} (lvHost st)
+    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 72) defaultLayout} (lvPort st)
     if want
-      then whenM (button "Disconnect") (writeVar (lvWant st) False)
-      else whenM (styled primary (button "Connect")) (writeVar (lvWant st) True >> modifyVar (lvAttempt st) (+ 1))
+      then whenM (toolButton "Disconnect") (writeVar (lvWant st) False)
+      else whenM (styled primary (toolButton "Connect")) (writeVar (lvWant st) True >> modifyVar (lvAttempt st) (+ 1))
     scope $ for_ mdata $ \d -> do
-      for_ (ldHello d) $ \(p, pid, caps) -> badge Success (p <> "  pid " <> tshow pid <> "  " <> tshow caps <> " caps")
-      for_ (ldClosed d) $ \why -> do
-        labelWith (fontTone Danger) (T.take 120 why)
-        whenM (button "Retry") (modifyVar (lvAttempt st) (+ 1))
+      for_ (ldHello d) $ \(p, pid, caps) -> when (isNothing (ldClosed d)) $
+        toolLabel (p <> ", pid " <> tshow pid <> ", " <> tshow caps <> " capabilities")
+      for_ (ldClosed d) $ \_ -> whenM (toolButton "Reconnect") (modifyVar (lvAttempt st) (+ 1))
     flex
-    label "Eventlog"
-    textInputConfigured defaultTextInputConfig {ticPlaceholder = "path of the program's .eventlog", ticLayout = minW 220 defaultLayout} (lvEventlog st)
-    path <- readVar (lvEventlog st)
-    whenM (button "Follow in Timeline") (when (not (T.null (T.strip path))) (followEventlog (T.unpack (T.strip path))))
+    toolGroup $ do
+      toolLabel "Eventlog"
+      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (alignMid . fixedW 240) defaultLayout} (lvEventlog st)
+      path <- readVar (lvEventlog st)
+      disabledWhen (T.null (T.strip path)) $
+        whenM (toolButton "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
   case mdata of
     Just d | not (Seq.null (ldFrames d)) -> scope (dashboard st d)
-    _ -> scope $ columnWith (gap 6 . padAll 24) $ do
-      sectionTitle "Live RTS dashboard"
-      hint "Link the target program with the stronghead:agent library and wrap main:"
-      labelWith fontMono "  import Stronghead.Agent"
-      labelWith fontMono "  main = withAgent defaultAgentConfig $ do ..."
-      hint "Build it with -threaded and run it with +RTS -T (for RTS statistics). Then press Connect."
-      hint "Run it with +RTS -l -ol<file>.eventlog as well and use Follow in Timeline: the agent flushes the eventlog every 250 ms so the timeline fills in as the program runs."
+    _ ->
+      scope $
+        emptyState
+          "Connect to a running program"
+          [ "Link the program with the stronghead:agent library and wrap main. Build it -threaded, run it with +RTS -T, then press Connect."
+          , "Add +RTS -l -ol<file>.eventlog and use Follow in Timeline: the agent flushes the eventlog every 250 ms, so the timeline fills in as the program runs."
+          ]
+          ["import Stronghead.Agent", " ", "main = withAgent defaultAgentConfig $ do", "  ..."]
 
 dashboard :: LiveState -> LiveData -> NanoUI ()
 dashboard st d = do
@@ -150,48 +155,65 @@ dashboard st d = do
         _ -> (0, 1)
       statsOn = stat "rts_stats" lastF > 0
   scope $ when (not statsOn) $
-    callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
-  rowWith (tight . gap 8 . wrap . lineGap 6 . fillW) $ do
-    for_ latest $ \r -> do
-      statTile "Allocation" (fmtRate (rAlloc r))
-      statTile "Live (last GC)" (fmtBytesD (rLive r))
-      statTile "Memory in use" (fmtBytesD (rMem r))
-      statTile "GCs / s" (fmtFixed 1 (rGCs r))
-      statTile "Productivity" (fmtPct (rProductivity r))
-    statTile "Last pause" (fmtNs (stat "gc_elapsed_ns" lastF))
-    statTile "Max live" (fmtBytesD (stat "max_live_bytes" lastF))
-    statTile "Major GCs" (fmtInt (round (stat "major_gcs" lastF) :: Int))
-    statTile "GC CPU" (fmtPct (stat "gc_cpu_ns" lastF / max 1 (stat "cpu_ns" lastF)))
-    statTile "Threads" (tshow (length (frThreads lastF)))
+    columnWith (padXY 8 0 . padBottom 8 . tight . fillW) $
+      callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
+  columnWith (padBottom 8 . tight . fillW) $
+    readout $
+      concat
+        [ [ ("allocation rate", fmtRate (rAlloc r))
+          , ("live after last GC", fmtBytesD (rLive r))
+          , ("memory in use", fmtBytesD (rMem r))
+          , ("collections per second", fmtFixed 1 (rGCs r))
+          , ("productivity", fmtPct (rProductivity r))
+          ]
+        | Just r <- [latest]
+        ]
+        ++ [ ("last pause", fmtNs (stat "gc_elapsed_ns" lastF))
+           , ("max live", fmtBytesD (stat "max_live_bytes" lastF))
+           , ("major GCs", fmtInt (round (stat "major_gcs" lastF) :: Int))
+           , ("GC CPU", fmtPct (stat "gc_cpu_ns" lastF / max 1 (stat "cpu_ns" lastF)))
+           , ("threads", tshow (length (frThreads lastF)))
+           ]
   mm <- monoMetrics 0.8
   let chart title color f fmtY fill' =
-        columnWith (tight . gap 2 . fillW) $ do
-          labelWith (fontMuted . fontSizeScale 0.9) title
-          _ <- canvas (fillW . fixedH 110) $ \r ->
+        columnWith (tight . gap 4 . fillW . fillH) $ do
+          labelWith (fontMuted . fontSizeScale 0.88) title
+          _ <- canvas (fillW . fillH . minH 60) $ \r ->
             drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color (series f) fill']
           pure ()
-  rowWith (tight . gap 8 . fillW) $ do
-    chart "Allocation rate" (pRun pal) rAlloc fmtRate True
-    chart "Live bytes after GC" (pLive pal) rLive fmtBytesD True
-  rowWith (tight . gap 8 . fillW) $ do
-    chart "GC pause (ms, at each collection)" (pGCMajor pal) rGCPauseMs (\v -> fmtFixed 1 v <> " ms") False
-    chart "Threads" (pWakeup pal) rThreads (fmtFixed 0) False
-  -- Thread table.
-  filt <- T.toLower <$> readVar (lvThreadFilter st)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    sectionTitle "Threads"
-    searchInput "Filter" (lvThreadFilter st)
-    flex
-    let counts = M.toList (M.fromListWith (+) [(statusGroup (ltStatus t), 1 :: Int) | t <- frThreads lastF])
-    forM_ counts $ \(g, n) -> badge (groupTone g) (g <> " " <> tshow n)
-  let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
-  scrollWith (grow . tight . minH 120) $ columnWith (tight . fillW . gap 0) $
-    forM_ threads $ \t -> withKey (ltId t) $ rowWith (gap 10 . fillW . padXY 8 2) $ do
-      labelWith (fontMono . fixedW 70) (tshow (ltId t))
-      labelWith fillW (if T.null (ltLabel t) then "(unlabelled)" else ltLabel t)
-      labelWith (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
-  let _ = isJust (ldHello d) || fromMaybe False Nothing
-  pure ()
+      counts = M.toList (M.fromListWith (+) [(statusGroup (ltStatus t), 1 :: Int) | t <- frThreads lastF])
+  workbench (lvPanes st) $ \pid ctx ->
+    if pid == paneCharts
+      then pane ctx "Runtime" (paneMeta ("last " <> fmtSec (snd span' - fst span'))) $ do
+        rowWith (tight . gap 16 . fillW . fillH) $ do
+          chart "Allocation rate" (pRun pal) rAlloc fmtRate True
+          chart "Live bytes after GC" (pLive pal) rLive fmtBytesD True
+        rowWith (padTop 6 . tight . gap 16 . fillW . fillH) $ do
+          chart "GC pause at each collection" (pGCMajor pal) rGCPauseMs (\v -> fmtFixed 1 v <> " ms") False
+          chart "Threads" (pWakeup pal) rThreads (fmtFixed 0) False
+      else pane ctx "Threads" (threadsHeader st counts) $ do
+        filt <- T.toLower <$> readVar (lvThreadFilter st)
+        let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
+        rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
+          colHeader (fixedW 56 . alignEnd) "id"
+          colHeader fillW "label"
+          colHeader (fixedW 240) "status"
+        paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
+          forM_ threads $ \t -> withKey (ltId t) $ rowWith (padXY 8 3 . tight . gap 12 . fillW) $ do
+            numCell 56 fontMuted (tshow (ltId t))
+            cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
+            cell (fixedW 240 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
+
+threadsHeader :: LiveState -> [(Text, Int)] -> NanoUI ()
+threadsHeader st counts = do
+  searchInputConfigured
+    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW 220) defaultLayout}
+    (lvThreadFilter st)
+  flex
+  forM_ counts $ \(g, n) -> withKey g $ badge (groupTone g) (g <> " " <> tshow n)
+
+paneCharts :: Word64
+paneCharts = 1
 
 statusGroup :: Text -> Text
 statusGroup s

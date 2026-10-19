@@ -1,7 +1,9 @@
 -- | The heap explorer and space-leak hunter: stacked residency bands over
 -- time with a scrub cursor, the breakdown at the cursor, ranked leak
 -- suspects (with the thunk sentinel), the retention tree, and the
--- cost-centre tree from a @.prof@ file.
+-- cost-centre tree from a @.prof@ file. With the @ghc-debug@ build flag it
+-- can also snapshot a running program's closure graph and show exact
+-- retainer paths and thunks that survive between snapshots.
 module UI.Heap
   ( HeapState (..)
   , HeapSource (..)
@@ -13,10 +15,12 @@ module UI.Heap
   , HeapLoaded (..)
   ) where
 
+import Control.Exception (displayException)
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.List (sortOn)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Map.Strict qualified as M
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as S
@@ -24,16 +28,41 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+import Data.Word (Word64)
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
+import Stronghead.Debug
 import Stronghead.Format
 import Stronghead.HeapProfile
 import Stronghead.Prof
+import System.FilePath (takeFileName)
 import UI.Common
 
-data HeapSource = FromEventlog | FromHpFile
+data HeapSource = FromEventlog | FromHpFile | FromGhcDebug
   deriving (Eq, Show, Enum, Bounded)
+
+-- | How to reach the program for a ghc-debug snapshot.
+data DbgConn = ConnSocket | ConnTcp | ConnFile
+  deriving (Eq, Show, Enum, Bounded)
+
+data DbgTab = DbgSurvivors | DbgGraph | DbgBiggest
+  deriving (Eq, Show, Enum, Bounded)
+
+-- | A snapshot to take: a counter (so the same target can be snapshotted
+-- again), the target and the options.
+type SnapRequest = (Int, DebugTarget, SnapshotOptions)
+
+-- | Snapshots taken, oldest first, stamped with the request that added the
+-- last one (-1 once cleared). Compared by stamp: comparing heaps is too slow.
+data History = History !Int ![HeapSnapshot]
+
+instance Eq History where
+  History a _ == History b _ = a == b
+
+-- | Snapshots kept for the survivor analysis.
+keepSnapshots :: Int
+keepSnapshots = 8
 
 data HeapTab = AtCursor | Leaks | Retention | CostCentres
   deriving (Eq, Show, Enum, Bounded)
@@ -43,7 +72,7 @@ tabName = \case
   AtCursor -> "At cursor"
   Leaks -> "Leak suspects"
   Retention -> "Retention tree"
-  CostCentres -> "Cost centres (.prof)"
+  CostCentres -> "Cost centres"
 
 data HeapState = HeapState
   { hsSource :: !(Var HeapSource)
@@ -62,6 +91,32 @@ data HeapState = HeapState
   , hsCCFilter :: !(Var Text)
   , hsCCOpen :: !(Var (Set Int))
   , hsRetOpen :: !(Var (Set Text))
+  , hsDbgConn :: !(Var DbgConn)
+  , hsDbgSocket :: !(Var Text)
+  , hsDbgHostPort :: !(Var Text)
+  , hsDbgFile :: !(Var (Maybe FilePath))
+  , hsDbgFileDialog :: !(Var (Maybe FileDialogId))
+  , hsDbgSockets :: !(Var [FilePath])
+  , hsDbgLimit :: !(Var Float)
+    -- ^ Closure limit, in thousands.
+  , hsDbgSrt :: !(Var Bool)
+  , hsDbgReq :: !(Var (Maybe SnapRequest))
+  , hsDbgTask :: !(Task SnapRequest (Either String HeapSnapshot))
+  , hsDbgStored :: !(Var Int)
+    -- ^ The request whose snapshot is already in the history.
+  , hsDbgHistory :: !(Var History)
+    -- ^ Oldest first.
+  , hsDbgSurvivors :: !(Var [Survivor])
+  , hsDbgMarked :: !(Var (M.Map ClosureId Int))
+    -- ^ Thunks of the latest snapshot in a surviving group, and for how many
+    -- snapshots it has survived.
+  , hsDbgTab :: !(Var DbgTab)
+  , hsDbgSel :: !(Var (Maybe ClosureId))
+  , hsDbgOpen :: !(Var (Set Text))
+  , hsPanes :: !Workbench
+  , hsDbgPanes :: !Workbench
+  , hsCCPanes :: !Workbench
+    -- ^ The cost-centre tree on its own, when there is no heap profile.
   }
 
 newHeapState :: IO HeapState
@@ -82,7 +137,32 @@ newHeapState = do
   hsCCFilter <- newVar ""
   hsCCOpen <- newVar (S.fromList [1])
   hsRetOpen <- newVar S.empty
+  hsDbgConn <- newVar ConnSocket
+  hsDbgSocket <- newVar ""
+  hsDbgHostPort <- newVar "127.0.0.1:1235"
+  hsDbgFile <- newVar Nothing
+  hsDbgFileDialog <- newVar Nothing
+  hsDbgSockets <- newVar []
+  hsDbgLimit <- newVar (fromIntegral (soMaxClosures defaultSnapshotOptions `div` 1000))
+  hsDbgSrt <- newVar (soFollowSrt defaultSnapshotOptions)
+  hsDbgReq <- newVar Nothing
+  hsDbgTask <- newTask
+  hsDbgStored <- newVar 0
+  hsDbgHistory <- newVar (History 0 [])
+  hsDbgSurvivors <- newVar []
+  hsDbgMarked <- newVar M.empty
+  hsDbgTab <- newVar DbgSurvivors
+  hsDbgSel <- newVar Nothing
+  hsDbgOpen <- newVar S.empty
+  hsPanes <- newVar (Just (Split 10 AxisH 0.46 (Split 11 AxisV 0.75 (Pane paneChart) (Pane paneLegend)) (Pane paneAnalysis)))
+  hsDbgPanes <- newVar (Just (Pane 1))
+  hsCCPanes <- newVar (Just (Pane 1))
   pure HeapState {..}
+
+paneChart, paneLegend, paneAnalysis :: Word64
+paneChart = 1
+paneLegend = 2
+paneAnalysis = 3
 
 openHp :: HeapState -> FilePath -> NanoUI ()
 openHp st p = do
@@ -100,16 +180,34 @@ openProf st p = do
 data HeapLoaded = HeapLoaded
   { hlHp :: !(Maybe (TaskStatus (Either String HeapProfile)))
   , hlProf :: !(Maybe (TaskStatus (Either String ProfFile)))
+  , hlSnap :: !(Maybe (TaskStatus (Either String HeapSnapshot)))
   }
 
--- | Run the file loaders; called every frame.
+-- | Run the file loaders and the ghc-debug snapshot; called every frame, so
+-- a snapshot keeps running when the panel is switched away from.
 heapLoad :: HeapState -> NanoUI HeapLoaded
 heapLoad st = do
   hp <- readVar (hsHpPath st)
   prof <- readVar (hsProfPath st)
-  a <- traverse (\p -> useTaskStatus (hsHpTask st) p (loadHp p)) hp
-  b <- traverse (\p -> useTaskStatus (hsProfTask st) p (loadProf p)) prof
-  pure (HeapLoaded a b)
+  req <- readVar (hsDbgReq st)
+  hlHp <- traverse (\p -> useTaskStatus (hsHpTask st) p (loadHp p)) hp
+  hlProf <- traverse (\p -> useTaskStatus (hsProfTask st) p (loadProf p)) prof
+  hlSnap <- traverse (\r@(_, target, opts) -> useTaskStatus (hsDbgTask st) r (takeSnapshot opts target)) req
+  case (req, hlSnap) of
+    (Just (n, _, _), Just (TaskDone (Right snap))) -> do
+      stored <- readVar (hsDbgStored st)
+      when (stored /= n) $ do
+        writeVar (hsDbgStored st) n
+        History _ old <- readVar (hsDbgHistory st)
+        let history = drop (length old + 1 - keepSnapshots) old ++ [snap]
+            survivors = survivingThunks history
+        writeVar (hsDbgHistory st) (History n history)
+        writeVar (hsDbgSurvivors st) survivors
+        writeVar (hsDbgMarked st) (survivorIds snap survivors)
+        writeVar (hsDbgOpen st) S.empty
+        writeVar (hsDbgSel st) Nothing
+    _ -> pure ()
+  pure HeapLoaded {..}
 
 done :: Maybe (TaskStatus (Either String a)) -> Maybe (Either String a)
 done = \case
@@ -119,7 +217,7 @@ done = \case
   _ -> Nothing
 
 heapView :: HeapState -> HeapLoaded -> Maybe HeapProfile -> NanoUI ()
-heapView st loaded fromLog = columnWith (gap 8 . grow . padAll 10) $ do
+heapView st loaded fromLog = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (hsHpDialog st) $ \case
     p : _ -> openHp st p
     [] -> pure ()
@@ -129,28 +227,37 @@ heapView st loaded fromLog = columnWith (gap 8 . grow . padAll 10) $ do
   source <- readVar (hsSource st)
   hpPath <- readVar (hsHpPath st)
   let hpResult = done (hlHp loaded)
-  rowWith (tight . gap 8 . alignMid . fillW) $ do
-    label "Source"
-    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} (\case FromEventlog -> "Eventlog samples"; FromHpFile -> ".hp file") (hsSource st)
-    whenM (button "Open .hp…") $
-      writeVar (hsHpDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Heap profile" "hp"]}
-    whenM (button "Open .prof…") $
-      writeVar (hsProfDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Cost-centre profile" "prof"]}
-    scope $ when (source == FromHpFile) (pathLabel hpPath)
+  toolStrip $ do
+    toolLabel "Source"
+    rowWith (alignMid . tight) $
+      boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} (\case FromEventlog -> "Eventlog samples"; FromHpFile -> ".hp file"; FromGhcDebug -> "Live graph (ghc-debug)") (hsSource st)
+    scope $ unless (source == FromGhcDebug) $ toolGroup $ do
+      whenM (toolButton "Open heap profile…") $
+        writeVar (hsHpDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Heap profile" "hp"]}
+      whenM (toolButton "Open cost-centre profile…") $
+        writeVar (hsProfDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Cost-centre profile" "prof"]}
     flex
   let profile = case source of
-        FromEventlog -> maybe (Left "The loaded eventlog has no heap samples. Run the program with +RTS -l -hT (or -hy, -hd, -hc with profiling, -hi with -finfo-table-map).") Right fromLog
+        FromGhcDebug -> Left ("", [], [])
+        FromEventlog ->
+          maybe
+            (Left ("No heap samples in the eventlog", ["Open an eventlog recorded with heap profiling on, or switch the source to a .hp file."], ["./Main +RTS -l -hT -i0.1 -RTS"]))
+            Right
+            fromLog
         FromHpFile -> case (hpPath, hpResult) of
-          (Nothing, _) -> Left "Open a .hp file (from +RTS -hT, -hc, -hy, -hd, -hr ...)."
-          (_, Nothing) -> Left "Loading…"
-          (_, Just r) -> r
+          (Nothing, _) -> Left ("Open a heap profile", ["Open the .hp file a program writes when run with heap profiling on, or drop one on the window."], ["./Main +RTS -hT -i0.1 -RTS", "./Main +RTS -hc -RTS      (profiled build: by cost centre)"])
+          (_, Nothing) -> Left ("Reading the heap profile…", [], [])
+          (_, Just (Left e)) -> Left ("Could not read the heap profile", [T.pack e], [])
+          (_, Just (Right hp)) -> Right hp
   case profile of
-    Left msg -> scope $ do
-      hint (T.pack msg)
+    _ | source == FromGhcDebug -> scope (ghcDebugView st loaded)
+    Left (title, body, commands) -> scope $
       -- The cost-centre tree does not need a heap profile.
-      scope $ when (isJust (hlProf loaded)) $ costCentreTree st (done (hlProf loaded))
+      if isJust (hlProf loaded)
+        then workbench (hsCCPanes st) $ \_ ctx -> pane ctx "Cost centres" (pure ()) (costCentreTree st (done (hlProf loaded)))
+        else emptyState title body commands
     Right hp
-      | VU.null (hpTimes hp) -> scope (hint "The heap profile has no samples.")
+      | VU.null (hpTimes hp) -> scope (emptyState "The heap profile has no samples" ["The program may have exited before the first census. Take censuses more often with -i0.05."] [])
       | otherwise -> scope (profileView st loaded hp)
 
 -- ---------------------------------------------------------------------------
@@ -187,47 +294,72 @@ profileView st loaded hp = do
       times = hpTimes hp
       n = VU.length times
       tEnd = VU.last times
-      cursorIx = maybe (n - 1) (sampleIndexAt hp) cursorT
-  rowWith (tight . gap 12 . alignMid . fillW) $ do
-    labelWith fontMuted ("Breakdown: " <> hpBreakdown hp)
-    labelWith fontMuted (tshow n <> " samples over " <> fmtSec tEnd)
-    labelWith fontMuted ("peak total " <> fmtBytesD (VU.maximum (hpTotals hp)))
-    flex
-    label "Bands"
-    sliderWith (fixedW 120) 3 30 (hsTopN st)
-    scope $ for_ solo $ \s -> whenM (button ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
-    scope $ unless (S.null hidden) $ whenM (button "Show all") (writeVar (hsHidden st) S.empty)
-  rowWith (tight . gap 10 . fillW . fixedH 300) $ do
-    mouse <- uiMousePos
-    sid <- currentId
-    prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
-    let geom = chartGeom prev
-        hoverT = if rectContains (cgPlot geom) mouse then Just (cgTime geom tEnd (v2X mouse)) else Nothing
-        hoverLines = do
-          t <- hoverT
-          let i = nearestSample times t
-              stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
-              ymax = maxStack ls
-              bytesAtMouse = (1 - (v2Y mouse - rectY (cgPlot geom)) / rectH (cgPlot geom)) * realToFrac ymax
-              under = [l | (l, lo', hi') <- zip3 ls stackAt (drop 1 stackAt), realToFrac bytesAtMouse >= lo', realToFrac bytesAtMouse < hi']
-          pure $
-            ("t = " <> fmtSec (times VU.! i) <> "   total " <> fmtBytesD (hpTotals hp VU.! i))
-              : [lyName l <> ": " <> fmtBytesD (lyValues l VU.! i) | l <- take 1 under]
-    resp <-
-      canvasConfigured
-        defaultCanvasConfig {canvasLayout = (fillW . grow) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
-        (\r -> drawChart pal mm hp ls cursorIx r (hoverT >> fmap (v2X mouse,v2Y mouse,) hoverLines))
-    drag <- useDrag2DOn resp
-    when (dragActive drag) $
-      writeVar (hsCursor st) (Just (cgTime (chartGeom (respRect resp)) tEnd (v2X (dragPosition drag))))
-    legend st hp hidden solo
+      -- Until the cursor is moved it sits on the peak census: the last one
+      -- is often taken as the program exits, with little left alive.
+      peakIx = VU.maxIndex (hpTotals hp)
+      cursorIx = maybe peakIx (sampleIndexAt hp) cursorT
+  columnWith (padBottom 8 . tight . fillW) $
+    readout
+      [ ("breakdown", hpBreakdown hp)
+      , ("censuses", tshow n)
+      , ("profiled", fmtSec tEnd)
+      , ("peak total", fmtBytesD (VU.maximum (hpTotals hp)))
+      , ("cursor at", fmtSec (times VU.! cursorIx))
+      , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx))
+      ]
   tab <- readVar (hsTab st)
-  boundedTabBar tabName (hsTab st)
-  scope $ case tab of
-    AtCursor -> atCursor st hp cursorIx
-    Leaks -> leakView st hp
-    Retention -> retentionView st hp cursorIx
-    CostCentres -> costCentreTree st (done (hlProf loaded))
+  workbench (hsPanes st) $ \pid ctx ->
+    if
+      | pid == paneChart -> do
+          let actions = do
+                paneMeta "Drag across to move the census cursor"
+                flex
+                scope $ for_ solo $ \s -> whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
+                scope $ unless (S.null hidden) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show all bands") (writeVar (hsHidden st) S.empty)
+                labelWith (alignMid . fontMuted . fontSizeScale 0.85) ("Top " <> tshow topN <> " bands")
+                sliderWith (alignMid . fixedW 110) 3 30 (hsTopN st)
+          paneWith (padAll 8) ctx "Residency" actions $ do
+            mouse <- uiMousePos
+            sid <- currentId
+            prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
+            let geom = chartGeom prev
+                hoverT = if rectContains (cgPlot geom) mouse then Just (cgTime geom tEnd (v2X mouse)) else Nothing
+                hoverLines = do
+                  t <- hoverT
+                  let i = nearestSample times t
+                      stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
+                      ymax = maxStack ls
+                      bytesAtMouse = (1 - (v2Y mouse - rectY (cgPlot geom)) / rectH (cgPlot geom)) * realToFrac ymax
+                      under = [l | (l, lo', hi') <- zip3 ls stackAt (drop 1 stackAt), realToFrac bytesAtMouse >= lo', realToFrac bytesAtMouse < hi']
+                  pure $
+                    ("t = " <> fmtSec (times VU.! i) <> ", total " <> fmtBytesD (hpTotals hp VU.! i))
+                      : [lyName l <> ": " <> fmtBytesD (lyValues l VU.! i) | l <- take 1 under]
+            resp <-
+              canvasConfigured
+                defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
+                (\r -> drawChart pal mm hp ls cursorIx r (hoverT >> fmap (v2X mouse,v2Y mouse,) hoverLines))
+            drag <- useDrag2DOn resp
+            when (dragActive drag) $
+              writeVar (hsCursor st) (Just (cgTime (chartGeom (respRect resp)) tEnd (v2X (dragPosition drag))))
+      | pid == paneLegend ->
+          paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)))) (legend st hp hidden solo)
+      | otherwise -> do
+          let actions = do
+                flex
+                rowWith (alignMid . tight) $
+                  boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabName (hsTab st)
+          pane ctx (analysisTitle tab) actions $ case tab of
+            AtCursor -> atCursor st hp cursorIx
+            Leaks -> leakView st hp
+            Retention -> retentionView st hp cursorIx
+            CostCentres -> costCentreTree st (done (hlProf loaded))
+
+analysisTitle :: HeapTab -> Text
+analysisTitle = \case
+  AtCursor -> "Census at the cursor"
+  Leaks -> "Leak suspects"
+  Retention -> "Retention tree"
+  CostCentres -> "Cost centres"
 
 data ChartGeom = ChartGeom {cgPlot :: !Rect, cgTime :: Double -> Float -> Double}
 
@@ -254,7 +386,6 @@ drawChart pal mm hp ls cursorIx r hover = do
       sx t = px + realToFrac (t / tEnd) * pw
       sy b = py + ph - realToFrac (b / ymax) * ph
       font = mmFont mm
-  drawRoundedRect r 6 (pTrackBg pal)
   -- Grid and axes.
   let ystep = niceStep (ymax / 4)
   forM_ (takeWhile (<= ymax) [ystep, 2 * ystep ..]) $ \b -> do
@@ -293,21 +424,20 @@ drawChart pal mm hp ls cursorIx r hover = do
       drawTextWith font (V2 (tx + 8) (ty + 5 + (fromIntegral i + 0.5) * (mmLineH mm + 2))) AlignStart AlignMiddle l (pText pal)
 
 legend :: HeapState -> HeapProfile -> Set Text -> Maybe Text -> NanoUI ()
-legend st hp hidden solo =
-  panelWith (fixedW 320 . fillH . padAll 6 . gap 2) $ do
-    labelWith (fontMuted . fontSizeScale 0.85) "Click a swatch to hide, a name to solo"
-    scrollWith (grow . tight) $ columnWith (tight . fillW . gap 1) $
+legend st hp hidden solo = do
+    labelWith (padXY 6 2 . fontMuted . fontSizeScale 0.85 . fillW) "Click a swatch to hide a band, a name to show it alone"
+    paneScroll (grow . tight) $ columnWith (tight . fillW . gap 1) $
       forM_ (zip [0 :: Int ..] (V.toList (hpBands hp))) $ \(i, b) -> withKey (bandName b) $ do
         let name = bandName b
             isHidden = S.member name hidden
             c = bandColor i name
-        rowWith (tight . gap 6 . alignMid . fillW) $ do
-          sw <- canvas (fixedWH 14 14) $ \r ->
+        rowWith (padLeft 6 . tight . gap 4 . fillW) $ do
+          sw <- canvas (fixedWH 12 12 . alignMid) $ \r ->
             if isHidden then drawStrokeRoundedRect r 3 1.5 c else drawRoundedRect r 3 c
           when (respClicked sw) $ writeVar (hsHidden st) (if isHidden then S.delete name hidden else S.insert name hidden)
           picked <- selectableRow (solo == Just name) id $ do
-            labelWith (fillW . fontSizeScale 0.9 . (if isHidden then fontMuted else id)) (T.take 60 name)
-            labelWith (fontMono . fontMuted . fontSizeScale 0.85) (fmtBytesD (bandPeak b))
+            cell (fillW . fontSizeScale 0.9 . (if isHidden then fontMuted else id)) (T.take 60 name)
+            numCell 72 (fontMuted . fontSizeScale 0.85) (fmtBytesD (bandPeak b))
           when picked $ writeVar (hsSolo st) (if solo == Just name then Nothing else Just name)
 
 -- ---------------------------------------------------------------------------
@@ -321,27 +451,28 @@ atCursor st hp i = do
         sortOn
           (\(_, b) -> Down (if byDelta then abs (bandDelta b i) else bandValues b VU.! i))
           [(k, b) | (k, b) <- zip [0 :: Int ..] (V.toList (hpBands hp)), bandValues b VU.! i > 0 || bandDelta b i /= 0]
-  rowWith (tight . gap 10 . alignMid . fillW) $ do
-    labelWith fontMedium ("Census at " <> fmtSec (hpTimes hp VU.! i) <> " — " <> fmtBytesD total)
+  rowWith (tight . gap 10 . fillW) $ do
+    labelWith (alignMid . fontMuted) (fmtSec (hpTimes hp VU.! i) <> ", " <> fmtBytesD total <> " live")
     flex
-    checkboxWith alignMid "Sort by change since previous census" (hsByDelta st)
-  rowWith (gap 8 . fillW . padXY 8 0) $ do
-    labelWith (fontMuted . fillW) "Closure / band"
-    labelWith (fontMuted . fixedW 90) "Kind"
-    labelWith (fontMuted . fixedW 100) "Residency"
-    labelWith (fontMuted . fixedW 100) "Δ previous"
-    labelWith (fontMuted . fixedW 60) "Share"
-  scrollWith (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
+    checkboxWith alignMid "Sort by change since the previous census" (hsByDelta st)
+  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+    colHeader (fixedW 10) ""
+    colHeader fillW "closure or band"
+    colHeader (fixedW 90) "kind"
+    colHeader (fixedW 100 . alignEnd) "residency"
+    colHeader (fixedW 100 . alignEnd) "since previous"
+    colHeader (fixedW 60 . alignEnd) "share"
+  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
     forM_ (take 300 rows) $ \(k, b) -> withKey (bandName b) $ do
       let val = bandValues b VU.! i
           d = bandDelta b i
       picked <- selectableRow False id $ do
-        _ <- canvas (fixedWH 10 10) (\r -> drawRoundedRect r 2 (bandColor k (bandName b)))
-        labelWith (fillW . fontSizeScale 0.92) (bandName b)
-        labelWith (fixedW 90 . kindTone (bandKind b)) (kindName (bandKind b))
-        labelWith (fixedW 100 . fontMono) (fmtBytesD val)
-        labelWith (fixedW 100 . fontMono . (if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted)) ((if d > 0 then "+" else "") <> fmtBytesD d)
-        labelWith (fixedW 60 . fontMuted) (fmtPct (val / max 1 total))
+        _ <- canvas (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 (bandColor k (bandName b)))
+        cell (fillW . fontSizeScale 0.92) (bandName b)
+        cell (fixedW 90 . kindTone (bandKind b)) (kindName (bandKind b))
+        numCell 100 id (fmtBytesD val)
+        numCell 100 (if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted) ((if d > 0 then "+" else "") <> fmtBytesD d)
+        numCell 60 fontMuted (fmtPct (val / max 1 total))
       when picked $ writeVar (hsSolo st) (Just (bandName b))
 
 kindName :: BandKind -> Text
@@ -361,7 +492,7 @@ leakView :: HeapState -> HeapProfile -> NanoUI ()
 leakView st hp = do
   let suspects = take 12 (leakSuspects hp)
       thunkBands = [b | b <- V.toList (hpBands hp), bandKind b == KindThunk]
-  scrollWith (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
+  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
     scope $
       if null suspects
         then hint "No band grows steadily across censuses. If memory still climbs, profile by retainer (-hr) or cost centre (-hc), or take censuses more often (-i0.05)."
@@ -432,17 +563,17 @@ retentionView st hp i
       openSet <- readVar (hsRetOpen st)
       let tree = retainTree hp i
           rows = flattenTree openSet "" 0 tree
-      hint ("Census at " <> fmtSec (hpTimes hp VU.! i) <> ". Read top-down: who holds (or allocated) the bytes, down to the closures.")
-      scrollWith (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
+      hint ("Census at " <> fmtSec (hpTimes hp VU.! i) <> ". Read top-down: who holds (or allocated) the bytes, down to the closures. For exact retainer paths, snapshot the running program with Source: Live graph (ghc-debug).")
+      paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
         forM_ rows $ \(path, depth, node, hasKids, isOpen) -> withKey path $ do
           picked <- selectableRow False id $ do
             spacer (Fixed (fromIntegral depth * 16)) Fit
-            labelWith (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
+            cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
             labelWith fillW (rtName node)
             _ <- canvas (fixedWH 120 8) $ \r@(Rect x y w h) -> do
               drawRoundedRect r 2 (alpha 0.15 (colorRGB 128 128 128))
               drawRoundedRect (Rect x y (w * realToFrac (rtBytes node / max 1 (rtBytes tree))) h) 2 (colorRGB 66 133 244)
-            labelWith (fontMono . fixedW 90) (fmtBytesD (rtBytes node))
+            cell (fontMono . fixedW 90) (fmtBytesD (rtBytes node))
           when (picked && hasKids) $
             writeVar (hsRetOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
 
@@ -461,34 +592,35 @@ costCentreTree st = \case
   Nothing -> hint "Open a .prof file (from a profiled build run with +RTS -p) to browse its cost-centre tree."
   Just (Left e) -> labelWith (fontTone Danger) (T.pack e)
   Just (Right pf) -> do
+    pal <- palette <$> uiTheme
     forM_ (take 4 (drop 1 (pfHeader pf))) (labelWith (fontMuted . fontSizeScale 0.9) . T.strip)
     filt <- T.toLower <$> readVar (hsCCFilter st)
     openSet <- readVar (hsCCOpen st)
-    rowWith (tight . gap 8 . alignMid . fillW) $ do
-      searchInput "Filter cost centres" (hsCCFilter st)
-      flex
-      labelWith (fontMuted . fixedW 70) "entries"
-      labelWith (fontMuted . fixedW 60) "%time"
-      labelWith (fontMuted . fixedW 60) "%alloc"
-      labelWith (fontMuted . fixedW 150) "inherited time / alloc"
+    searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter cost centres", sicLayout = (fixedW 280) defaultLayout} (hsCCFilter st)
+    rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+      colHeader fillW "cost centre"
+      colHeader (fixedW 70 . alignEnd) "entries"
+      colHeader (fixedW 60 . alignEnd) "time %"
+      colHeader (fixedW 60 . alignEnd) "alloc %"
+      colHeader (fixedW 150) "inherited time, alloc"
     let matches cc = filt `T.isInfixOf` T.toLower (ccName cc <> " " <> ccModule cc)
         rows
           | T.null filt = visibleCC openSet 0 (pfRoots pf)
           | otherwise = [(d, cc, False, False) | (d, cc) <- flattenCC (pfRoots pf), matches cc]
-    scrollWith (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
+    paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
       forM_ (take 2000 rows) $ \(depth, cc, hasKids, isOpen) -> withKey (ccNo cc) $ do
         picked <- selectableRow False id $ do
           spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
-          labelWith (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
-          labelWith fillW (ccName cc <> "  ")
-          labelWith (fontMuted . fontSizeScale 0.85) (ccModule cc)
-          labelWith (fontMono . fixedW 70) (fmtInt (ccEntries cc))
-          labelWith (fontMono . fixedW 60) (fmtFixed 1 (ccTime cc))
-          labelWith (fontMono . fixedW 60) (fmtFixed 1 (ccAlloc cc))
-          _ <- canvas (fixedWH 150 10) $ \(Rect x y w h) -> do
-            drawRoundedRect (Rect x y w (h / 2 - 1)) 1 (alpha 0.15 (colorRGB 128 128 128))
-            drawRoundedRect (Rect x y (w * realToFrac (ccInhTime cc / 100)) (h / 2 - 1)) 1 (colorRGB 76 175 80)
-            drawRoundedRect (Rect x (y + h / 2) (w * realToFrac (ccInhAlloc cc / 100)) (h / 2 - 1)) 1 (colorRGB 66 133 244)
+          cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
+          cell id (ccName cc)
+          cell (fillW . fontMuted . fontSizeScale 0.85) (ccModule cc)
+          numCell 70 id (fmtInt (ccEntries cc))
+          numCell 60 id (fmtFixed 1 (ccTime cc))
+          numCell 60 id (fmtFixed 1 (ccAlloc cc))
+          _ <- canvas (fixedWH 150 10 . alignMid) $ \(Rect x y w h) -> do
+            drawRoundedRect (Rect x y w (h / 2 - 1)) 1 (alpha 0.12 (pText pal))
+            drawRoundedRect (Rect x y (w * realToFrac (ccInhTime cc / 100)) (h / 2 - 1)) 1 (pRun pal)
+            drawRoundedRect (Rect x (y + h / 2) (w * realToFrac (ccInhAlloc cc / 100)) (h / 2 - 1)) 1 (pAccent pal)
           pure ()
         when (picked && hasKids) $
           writeVar (hsCCOpen st) (if isOpen then S.delete (ccNo cc) openSet else S.insert (ccNo cc) openSet)
@@ -501,3 +633,270 @@ visibleCC openSet depth ccs =
     | cc <- ccs
     , let isOpen = S.member (ccNo cc) openSet || depth < 1
     ]
+
+-- ---------------------------------------------------------------------------
+-- Live closure graph (ghc-debug)
+
+connName :: DbgConn -> Text
+connName = \case
+  ConnSocket -> "Unix socket"
+  ConnTcp -> "TCP"
+  ConnFile -> "Snapshot file"
+
+dbgTabName :: DbgTab -> Text
+dbgTabName = \case
+  DbgSurvivors -> "Surviving thunks"
+  DbgGraph -> "Closure graph"
+  DbgBiggest -> "Biggest retainers"
+
+ghcDebugView :: HeapState -> HeapLoaded -> NanoUI ()
+ghcDebugView st loaded
+  | not ghcDebugEnabled =
+      emptyState
+        "Built without ghc-debug"
+        [ "The live graph pauses a running program through ghc-debug, walks every closure reachable from its GC roots, and shows exact retainer paths. Rebuild Stronghead with the flag to turn it on."
+        , "The program being debugged links ghc-debug-stub and wraps main in withGhcDebug (Unix socket) or withGhcDebugTCP. The stub does not build on Windows; from Windows, connect over TCP to a program running on Linux, macOS or WSL, or open a snapshot file."
+        ]
+        ["cabal build -f ghc-debug"]
+  | otherwise = do
+      useFileDialog (hsDbgFileDialog st) $ \case
+        p : _ -> writeVar (hsDbgFile st) (Just p)
+        [] -> pure ()
+      conn <- readVar (hsDbgConn st)
+      socket <- T.strip <$> readVar (hsDbgSocket st)
+      hostPort <- readVar (hsDbgHostPort st)
+      file <- readVar (hsDbgFile st)
+      sockets <- readVar (hsDbgSockets st)
+      History _ history <- readVar (hsDbgHistory st)
+      limit <- readVar (hsDbgLimit st)
+      let target = case conn of
+            ConnSocket -> if T.null socket then Nothing else Just (DebugUnix (T.unpack socket))
+            ConnTcp -> uncurry DebugTCP <$> parseHostPort hostPort
+            ConnFile -> DebugSnapshotFile <$> file
+          running = case hlSnap loaded of
+            Just (TaskRunning _) -> True
+            _ -> False
+      toolStrip $ do
+        toolLabel "Target"
+        rowWith (alignMid . tight) $
+          boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} connName (hsDbgConn st)
+        scope $ case conn of
+          ConnSocket -> do
+            textInputConfigured defaultTextInputConfig {ticPlaceholder = "socket path, printed by withGhcDebug", ticLayout = (alignMid . minW 260 . fillW) defaultLayout} (hsDbgSocket st)
+            whenM (toolButton "Find sockets") (writeVar (hsDbgSockets st) =<< liftIO listSockets)
+          ConnTcp ->
+            textInputConfigured defaultTextInputConfig {ticPlaceholder = "host:port, as given to withGhcDebugTCP", ticLayout = (alignMid . minW 200 . fillW) defaultLayout} (hsDbgHostPort st)
+          ConnFile -> do
+            whenM (toolButton "Open snapshot…") $
+              writeVar (hsDbgFileDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions
+            pathLabel file
+            flex
+      scope $ when (conn == ConnSocket && not (null sockets)) $
+        toolStrip $ do
+          toolLabel "Sockets found"
+          forM_ sockets $ \p -> withKey (T.pack p) $
+            whenM (toolButton (T.pack (takeFileName p))) (writeVar (hsDbgSocket st) (T.pack p))
+      toolStrip $ do
+        disabledWhen (running || isNothing target) $ whenM (styled primary (toolButton "Take snapshot")) $ for_ target $ \t -> do
+          srt <- readVar (hsDbgSrt st)
+          n <- maybe 1 (\(k, _, _) -> k + 1) <$> readVar (hsDbgReq st)
+          writeVar (hsDbgReq st) (Just (n, t, SnapshotOptions {soMaxClosures = round limit * 1000, soFollowSrt = srt}))
+        toolGroup $ do
+          toolLabel "Closure limit"
+          sliderWith (alignMid . fixedW 120) 10 1000 (hsDbgLimit st)
+          numCell 52 id (fmtInt (round limit :: Int) <> "k")
+        toolGroup $ checkboxWith alignMid "Follow SRTs (CAFs)" (hsDbgSrt st)
+        disabledWhen (null history || running) $ whenM (toolButton "Clear snapshots") $ do
+          writeVar (hsDbgHistory st) (History (-1) [])
+          writeVar (hsDbgSurvivors st) []
+          writeVar (hsDbgMarked st) M.empty
+          writeVar (hsDbgSel st) Nothing
+          writeVar (hsDbgOpen st) S.empty
+        flex
+        scope $ case hlSnap loaded of
+          Just (TaskRunning _) -> labelWith (alignMid . fontTone Warning) "Target paused: walking its heap…"
+          Just (TaskDone (Left e)) -> labelWith (alignMid . fontTone Danger) (T.pack e)
+          Just (TaskFailed e _) -> labelWith (alignMid . fontTone Danger) (T.pack (displayException e))
+          _ -> pure ()
+      case reverse history of
+        [] ->
+          emptyState
+            "Take a snapshot"
+            [ "A snapshot pauses the program, walks every closure reachable from its GC roots, and resumes it."
+            , "Take another after the program has run for a while: thunks still unevaluated in both are what a lazy accumulator leaves behind."
+            ]
+            []
+        latest : _ -> scope $ do
+          survivors <- readVar (hsDbgSurvivors st)
+          marked <- readVar (hsDbgMarked st)
+          columnWith (padBottom 8 . tight . fillW) $
+            readout
+              [ ("closures", fmtInt (M.size (snapNodes latest)))
+              , ("thunks", fmtInt (M.size (snapThunkKeys latest)))
+              , ("bytes", fmtBytes (fromIntegral (snapBytes latest)))
+              , ("roots", fmtInt (length (snapRoots latest)))
+              , ("snapshots kept", tshow (length history))
+              ]
+          tab <- readVar (hsDbgTab st)
+          workbench (hsDbgPanes st) $ \_ ctx -> do
+            let actions = do
+                  paneMeta (dbgTabName tab)
+                  scope $ when (snapTruncated latest) $ badge Warning "stopped at the closure limit"
+                  flex
+                  rowWith (alignMid . tight) $
+                    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} dbgTabName (hsDbgTab st)
+            pane ctx (snapLabel latest) actions $ case tab of
+              DbgSurvivors -> dbgSurvivors st history latest survivors marked
+              DbgGraph -> dbgGraph st latest marked
+              DbgBiggest -> dbgBiggest st latest marked
+
+-- | Select a closure and open the tree down to it.
+reveal :: HeapState -> HeapSnapshot -> ClosureId -> NanoUI ()
+reveal st snap i = do
+  let ids = map cnId (retainerPath snap i)
+      keys = drop 1 (scanl (\acc c -> acc <> "/" <> fmtClosureId c) "" ids)
+  modifyVar (hsDbgOpen st) (S.union (S.fromList (take (length keys - 1) keys)))
+  writeVar (hsDbgSel st) (Just i)
+  writeVar (hsDbgTab st) DbgGraph
+
+nodeTone :: M.Map ClosureId Int -> ClosureNode -> Layout -> Layout
+nodeTone marked n
+  | M.member (cnId n) marked = fontTone Danger
+  | cnKind n == NThunk = fontTone Warning
+  | otherwise = id
+
+heldBar :: HeapSnapshot -> ClosureId -> NanoUI ()
+heldBar snap i = do
+  let h = M.findWithDefault 0 i (snapHeld snap)
+      share = fromIntegral h / max 1 (fromIntegral (snapBytes snap)) :: Double
+  th <- uiTheme
+  _ <- canvas (fixedWH 90 6 . alignMid) $ \r@(Rect x y w hh) -> do
+    drawRoundedRect r 2 (alpha 0.12 (inkText (ink th)))
+    drawRoundedRect (Rect x y (w * realToFrac share) hh) 2 (inkAccent (ink th))
+  numCell 90 id (fmtBytes (fromIntegral h))
+
+dbgSurvivors :: HeapState -> [HeapSnapshot] -> HeapSnapshot -> [Survivor] -> M.Map ClosureId Int -> NanoUI ()
+dbgSurvivors st history latest survivors marked =
+  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 6) $ do
+    scope $
+      if
+        | length history < 2 -> hint "One snapshot so far. Let the program run, then take another: thunk groups present in consecutive snapshots are listed here, growing ones first."
+        | null survivors -> hint "No thunk group survived from the previous snapshot. Thunks are grouped by their code and by the shape of the path that retains them, since objects move between snapshots."
+        | otherwise -> hint "Thunks still unevaluated after the program ran on between snapshots, grouped by code and retainer path. A growing group that never gets forced is a lazy accumulator."
+    forM_ (take 100 survivors) $ \s -> withKey (tshow (svKey s)) $ panelWith (padAll 8 . gap 3 . fillW) $ do
+      let k = svKey s
+      rowWith (tight . gap 8 . alignMid . fillW) $ do
+        labelWith (fontMedium . fillW) ("thunk " <> tkName k <> maybe "" ("  " <>) (tkSource k))
+        scope $ when (svGrowing s) $ badge Danger "growing"
+        badge Warning ("in " <> tshow (svSurvived s) <> " snapshots")
+        scope $ for_ (take 1 (svSample s)) $ \i ->
+          whenM (buttonWith tight "Show in graph") (reveal st latest i)
+      scope $ unless (null (tkPath k)) $
+        labelWith (fontMono . fontMuted . fontSizeScale 0.85 . fillW) ("held via " <> T.intercalate " → " (tkPath k))
+      rowWith (tight . gap 16 . wrap . fillW) $ do
+        fact "count" (T.intercalate " → " (map fmtInt (svCounts s)))
+        fact "bytes now" (fmtBytes (fromIntegral (sum (take 1 (reverse (svBytes s))))))
+    separator
+    sectionTitle "Thunks in the latest snapshot"
+    let groups = take 60 (sortOn (Down . tgBytes . snd) (M.toList (snapThunks latest)))
+    scope $ when (null groups) $ hint "No unevaluated thunks reachable."
+    forM_ groups $ \(k, g) -> withKey ("g:" <> tshow k) $ do
+      picked <- selectableRow False id $ do
+        cell (fillW . (if any (`M.member` marked) (tgSample g) then fontTone Danger else fontTone Warning)) (tkName k)
+        cell (fontMuted . fontSizeScale 0.85) (fromMaybe "" (tkSource k))
+        cell (fontMono . fixedW 80) (fmtInt (tgCount g))
+        cell (fontMono . fixedW 90) (fmtBytes (fromIntegral (tgBytes g)))
+      when picked $ for_ (take 1 (tgSample g)) (reveal st latest)
+
+-- | Rows of the expanded tree: path key, depth, closure, whether it can be
+-- expanded, whether it is, and whether it closes a cycle.
+flattenGraph :: HeapSnapshot -> Set Text -> [ClosureId] -> [(Text, Int, ClosureNode, Bool, Bool, Bool)]
+flattenGraph snap openSet = go "" 0 S.empty
+  where
+    nodes = snapNodes snap
+    heldOf i = M.findWithDefault 0 i (snapHeld snap)
+    go parent depth onPath ids =
+      concat
+        [ (path, depth, n, expandable, isOpen, cyclic)
+            : (if isOpen && expandable then go path (depth + 1) (S.insert i onPath) (kidsOf n) else [])
+        | i <- ids
+        , Just n <- [M.lookup i nodes]
+        , let path = parent <> "/" <> fmtClosureId i
+              cyclic = S.member i onPath
+              expandable = not cyclic && any (`M.member` nodes) (cnChildren n)
+              isOpen = S.member path openSet
+        ]
+    kidsOf n = take 200 (sortOn (Down . heldOf) (S.toList (S.fromList (filter (`M.member` nodes) (cnChildren n)))))
+
+dbgGraph :: HeapState -> HeapSnapshot -> M.Map ClosureId Int -> NanoUI ()
+dbgGraph st snap marked = do
+  sel <- readVar (hsDbgSel st)
+  openSet <- readVar (hsDbgOpen st)
+  let selPath = maybe [] (retainerPath snap) sel
+      shown = take 300 (snapRootsByHeld snap)
+      roots = shown ++ [cnId r | r <- take 1 selPath, cnId r `notElem` shown]
+      rows = take 3000 (flattenGraph snap openSet roots)
+  rowWith (grow . tight . gap 10 . fillW . minH 220) $ do
+    columnWith (grow . fillH . tight . gap 4) $ do
+      hint "GC roots (threads, stable pointers), biggest first. Expand to follow pointers. Held: bytes a closure keeps alive, each closure charged to its first retainer on a shortest path. Thunks are amber, surviving thunks red."
+      paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
+        forM_ rows $ \(path, depth, n, expandable, isOpen, cyclic) -> withKey path $ do
+          picked <- selectableRow (sel == Just (cnId n)) id $ do
+            spacer (Fixed (fromIntegral (min 40 depth) * 14)) Fit
+            cell (fixedW 14 . fontMuted) (if cyclic then "↺" else if expandable then (if isOpen then "▾" else "▸") else " ")
+            cell (fillW . nodeTone marked n) (cnName n)
+            scope $ for_ (M.lookup (cnId n) marked) $ \k -> badge Danger ("×" <> tshow k)
+            cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
+            cell (fontMono . fixedW 70) (fmtBytes (fromIntegral (cnSize n)))
+            heldBar snap (cnId n)
+          when picked $ do
+            writeVar (hsDbgSel st) (Just (cnId n))
+            when expandable $ writeVar (hsDbgOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
+    panelWith (fixedW 440 . fillH . padAll 10 . gap 6) $ dbgDetail st snap marked sel selPath
+
+dbgDetail :: HeapState -> HeapSnapshot -> M.Map ClosureId Int -> Maybe ClosureId -> [ClosureNode] -> NanoUI ()
+dbgDetail st snap marked sel selPath = case sel >>= (`M.lookup` snapNodes snap) of
+  Nothing -> hint "Select a closure to see what keeps it alive."
+  Just n -> paneScroll (grow . tight) $ columnWith (tight . fillW . gap 6) $ do
+    labelWith (fontMedium . fillW . nodeTone marked n) (nodeTitle n)
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      factMono "address" (fmtClosureId (cnId n))
+      fact "type" (cnType n)
+      fact "size" (fmtBytes (fromIntegral (cnSize n)))
+      fact "held" (fmtBytes (fromIntegral (M.findWithDefault 0 (cnId n) (snapHeld snap))))
+    scope $ for_ (M.lookup (cnId n) marked) $ \k ->
+      badge Danger ("its thunk group has survived " <> tshow k <> " snapshots")
+    sectionTitle "Retained by"
+    hint (describePath selPath)
+    forM_ (zip [0 :: Int ..] selPath) $ \(d, p) -> withKey ("p:" <> fmtClosureId (cnId p)) $ do
+      picked <- selectableRow (cnId p == cnId n) id $ do
+        spacer (Fixed (fromIntegral (min 12 d) * 8)) Fit
+        cell (fixedW 14 . fontMuted) (if d == 0 then "●" else "↳")
+        cell (fillW . fontSizeScale 0.9 . nodeTone marked p) (nodeTitle p)
+        cell (fontMuted . fontSizeScale 0.8) (cnType p)
+      when picked $ reveal st snap (cnId p)
+    let kids = [k | i <- take 60 (cnChildren n), Just k <- [M.lookup i (snapNodes snap)]]
+    scope $ unless (null kids) $ do
+      sectionTitle "Points to"
+      forM_ (zip [0 :: Int ..] kids) $ \(j, k) -> withKey ("k:" <> tshow j) $ do
+        picked <- selectableRow False id $ do
+          cell (fillW . fontSizeScale 0.9 . nodeTone marked k) (nodeTitle k)
+          cell (fontMono . fontSizeScale 0.85) (fmtBytes (fromIntegral (cnSize k)))
+        when picked $ reveal st snap (cnId k)
+
+dbgBiggest :: HeapState -> HeapSnapshot -> M.Map ClosureId Int -> NanoUI ()
+dbgBiggest st snap marked = do
+  hint "Closures holding the most bytes along shortest retainer paths (threads and roots left out). Select one to see its retainer path."
+  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+    colHeader fillW "closure"
+    colHeader (fixedW 120) "type"
+    colHeader (fixedW 70 . alignEnd) "size"
+    colHeader (fixedW 188) "held"
+  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
+    forM_ [n | i <- snapBiggest snap, Just n <- [M.lookup i (snapNodes snap)]] $ \n -> withKey (fmtClosureId (cnId n)) $ do
+      picked <- selectableRow False id $ do
+        cell (fillW . nodeTone marked n) (nodeTitle n)
+        cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
+        numCell 70 id (fmtBytes (fromIntegral (cnSize n)))
+        heldBar snap (cnId n)
+      when picked $ reveal st snap (cnId n)

@@ -8,6 +8,8 @@ module UI.Code
   , CodeConfig (..)
   , defaultCodeConfig
   , GutterMark (..)
+  , Colouring (..)
+  , colouringName
   , CodeEvent (..)
   , codeView
   , scrollToLine
@@ -61,10 +63,11 @@ data CodeConfig = CodeConfig
   , ccGutter :: Int -> Maybe GutterMark
   , ccLayout :: Layout -> Layout
   , ccEmpty :: !Text
+  , ccColouring :: !Colouring
   }
 
 defaultCodeConfig :: CodeConfig
-defaultCodeConfig = CodeConfig 0 (const []) False Nothing [] [] (const Nothing) (fillW . grow) ""
+defaultCodeConfig = CodeConfig 0 (const []) False Nothing [] [] (const Nothing) (fillW . grow) "" SyntaxColours
 
 data CodeEvent = CodeEvent
   { ceHoverKey :: !(Maybe Text)
@@ -125,13 +128,12 @@ codeView cv mm cfg = do
         , canvasCursor = Just (\_ (Rect x _ _ _) (V2 px _) -> if px > x + gutterW then UiCursorText else UiCursorDefault)
         }
       $ \r@(Rect x y w h) -> do
-        drawRoundedRect r 4 (pTrackBg pal)
         let count = ceiling (h / lh) + 1
             lines' = [l | l <- [first .. first + count], l < n]
             codeX = x + gutterW + 6
             colX c = codeX + (fromIntegral c - hscroll) * cw
             lineY l = y + 4 + fromIntegral (l - first) * lh
-        drawRect (Rect x y gutterW h) (alpha 0.04 (pText pal))
+        drawRect (Rect x y gutterW h) (alpha 0.025 (pText pal)) >> drawRect (Rect (x + gutterW) y 1 h) (pGrid pal)
         withClip r $ do
           -- Backgrounds first.
           forM_ (ccRanges cfg) $ \(a, b, c) ->
@@ -160,7 +162,7 @@ codeView cv mm cfg = do
                 when (tx + tw >= codeX && tx <= x + w && tkKind t /= TkSpace) $ do
                   let isHot = isNameTok t && Just (nameKey (tkText t)) == hot
                   when isHot $ drawRoundedRect (Rect (tx - 1) (ly + 1) (tw + 2) (lh - 2)) 3 (alpha 0.28 (pAccent pal))
-                  drawTextWith (mmFont mm) (V2 tx mid) AlignStart AlignMiddle (tkText t) (tokenColor th pal t)
+                  drawTextWith (mmFont mm) (V2 tx mid) AlignStart AlignMiddle (tkText t) (tokenColor (ccColouring cfg) th pal t)
                   when (fmap snd hovered == Just t && fmap fst hovered == Just l) $
                     drawRect (Rect tx (ly + lh - 2) tw 1) (pAccent pal)
           when (n == 0) $
@@ -186,22 +188,44 @@ codeView cv mm cfg = do
       , ceClickedLine = clickedLine
       }
 
-tokenColor :: Theme -> Palette -> Token -> Color
-tokenColor th pal t = case tkKind t of
-  TkKeyword -> themePurple th
-  TkCon
-    | T.last (tkText t) == '#' && isBoxCon (tkText t) -> themeOrange th
-    | otherwise -> themeYellow th
-  TkIdent
-    | T.last (tkText t) == '#' -> themeGreen th
-    | otherwise -> pText pal
-  TkOperator
-    | "#" `T.isSuffixOf` tkText t -> themeGreen th
-    | otherwise -> pMuted pal
-  TkNumber -> themeGreen th
-  TkString -> themeGreen th
-  TkComment -> alpha 0.7 (pMuted pal)
-  TkPragma -> alpha 0.8 (themeAccent th)
-  TkSpace -> pText pal
+-- | What the code panes colour.
+data Colouring
+  = SyntaxColours
+    -- ^ Ordinary syntax highlighting, kept quiet.
+  | BoxingColours
+    -- ^ Only what the optimiser did: boxing sites in orange, unboxed values
+    -- and primops in green, everything else plain.
+  deriving (Eq, Show, Enum, Bounded)
+
+colouringName :: Colouring -> Text
+colouringName = \case
+  SyntaxColours -> "Syntax"
+  BoxingColours -> "Boxing"
+
+tokenColor :: Colouring -> Theme -> Palette -> Token -> Color
+tokenColor colouring th pal t = case colouring of
+  SyntaxColours -> case tkKind t of
+    TkKeyword -> themeAccent th
+    TkCon -> themeYellow th
+    TkIdent -> pText pal
+    TkOperator -> pMuted pal
+    TkNumber -> themeOrange th
+    TkString -> themeGreen th
+    TkComment -> alpha 0.55 (pMuted pal)
+    TkPragma -> pMuted pal
+    TkSpace -> pText pal
+  BoxingColours
+    | boxing -> themeOrange th
+    | unboxed -> themeGreen th
+    | otherwise -> case tkKind t of
+        TkKeyword -> pMuted pal
+        TkOperator -> pMuted pal
+        TkString -> pMuted pal
+        TkComment -> alpha 0.55 (pMuted pal)
+        TkPragma -> pMuted pal
+        _ -> pText pal
   where
+    hashed = "#" `T.isSuffixOf` tkText t
+    boxing = tkKind t == TkCon && hashed && isBoxCon (tkText t)
+    unboxed = hashed && tkKind t `elem` [TkCon, TkIdent, TkOperator, TkNumber]
     isBoxCon c = any (`T.isSuffixOf` c) ["I#", "D#", "F#", "W#", "C#", "W8#", "W16#", "W32#", "W64#", "I8#", "I16#", "I32#", "I64#"]
