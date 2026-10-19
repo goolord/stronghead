@@ -1,0 +1,352 @@
+-- | Heap profiles: the band-per-sample residency matrix behind the heap
+-- explorer, whether it came from a @.hp@ file or from heap-sample events in
+-- an eventlog; plus the analyses run over it (leak suspects, thunk
+-- classification, and the cost-centre / retainer tree).
+module Stronghead.HeapProfile
+  ( HeapProfile (..)
+  , Band (..)
+  , BandKind (..)
+  , fromSamples
+  , emptyProfile
+  , parseHp
+  , loadHp
+  , classifyBand
+  , closureTypeKind
+    -- * Analysis
+  , Suspect (..)
+  , leakSuspects
+  , analysedSamples
+  , sampleIndexAt
+  , bandDelta
+  , RetainTree (..)
+  , retainTree
+  , looksStructured
+  ) where
+
+import Data.ByteString qualified as B
+import Data.List (sortOn)
+import Data.Map.Strict qualified as M
+import Data.Maybe (mapMaybe)
+import Data.Ord (Down (..))
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
+import Data.Text.Encoding.Error qualified as TE
+import Data.Text.Read qualified as TR
+import Data.Vector qualified as V
+import Data.Vector.Unboxed qualified as VU
+
+-- | What a band's closures are, as far as the breakdown lets us tell.
+data BandKind
+  = KindThunk
+  | KindFunction
+  | KindConstructor
+  | KindData
+    -- ^ Arrays, byte arrays, MUT_VARs and other primitive storage.
+  | KindUnknown
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+data Band = Band
+  { bandName :: !Text
+  , bandValues :: !(VU.Vector Double)
+    -- ^ Residency in bytes at each sample.
+  , bandPeak :: !Double
+  , bandKind :: !BandKind
+  , bandDetail :: !(Maybe Text)
+    -- ^ Extra provenance (info-table source location, type) when known.
+  }
+  deriving (Eq, Show)
+
+data HeapProfile = HeapProfile
+  { hpJob :: !Text
+  , hpBreakdown :: !Text
+  , hpTimes :: !(VU.Vector Double)
+    -- ^ Sample times in seconds.
+  , hpBands :: !(V.Vector Band)
+    -- ^ Sorted by peak residency, largest first.
+  , hpTotals :: !(VU.Vector Double)
+  }
+  deriving (Eq, Show)
+
+emptyProfile :: HeapProfile
+emptyProfile = HeapProfile "" "" VU.empty V.empty VU.empty
+
+-- | Build a profile from samples of @(time, [(band, bytes)])@. Bands missing
+-- from a sample are zero there. @detail@ supplies kind/provenance overrides
+-- (from IPE events) for band names it knows.
+fromSamples
+  :: Text
+  -> Text
+  -> (Text -> Maybe (BandKind, Text))
+  -> [(Double, [(Text, Double)])]
+  -> HeapProfile
+fromSamples job breakdown detail samples0 =
+  HeapProfile
+    { hpJob = job
+    , hpBreakdown = breakdown
+    , hpTimes = VU.fromList (map fst samples)
+    , hpBands = V.fromList (sortOn (Down . bandPeak) bands)
+    , hpTotals = VU.fromList [sum (map snd s) | (_, s) <- samples]
+    }
+  where
+    samples = sortOn fst samples0
+    n = length samples
+    names = M.keys (M.fromList [(b, ()) | (_, s) <- samples, (b, _) <- s])
+    columns :: M.Map Text (M.Map Int Double)
+    columns =
+      M.fromListWith
+        (M.unionWith (+))
+        [(b, M.singleton i v) | (i, (_, s)) <- zip [0 ..] samples, (b, v) <- s]
+    bands =
+      [ Band
+          { bandName = name
+          , bandValues = vals
+          , bandPeak = if VU.null vals then 0 else VU.maximum vals
+          , bandKind = maybe (classifyBand name) fst (detail name)
+          , bandDetail = snd <$> detail name
+          }
+      | name <- names
+      , let col = M.findWithDefault M.empty name columns
+            vals = VU.generate n (\i -> M.findWithDefault 0 i col)
+      ]
+
+-- | Guess a band's kind from its name. Exact for closure-type (@-hT@)
+-- breakdowns; a heuristic otherwise.
+classifyBand :: Text -> BandKind
+classifyBand name
+  | any (`T.isPrefixOf` name) ["THUNK", "AP", "BLACKHOLE", "IND"] = KindThunk
+  | any (`T.isPrefixOf` name) ["FUN", "PAP"] = KindFunction
+  | any (`T.isPrefixOf` name) ["CONSTR"] = KindConstructor
+  | any (`T.isPrefixOf` name) ["ARR_WORDS", "MUT_ARR", "SMALL_MUT_ARR", "MUT_VAR", "MVAR", "TVAR", "WEAK", "STACK", "TSO"] = KindData
+  | "(" `T.isPrefixOf` name && ")" `T.isSuffixOf` name = KindConstructor -- (:) (,)
+  -- GHC 9.10+ closure-type profiles name constructors pkg:Module.Con.
+  | (pkg, rest) <- T.breakOn ":" name
+  , not (T.null pkg)
+  , not (T.null rest)
+  , not (T.any (== ' ') name)
+  , con <- T.takeWhileEnd (/= '.') (T.drop 1 rest)
+  , maybe False (\(c, _) -> c >= 'A' && c <= 'Z') (T.uncons con) || con == ":" || T.null con =
+      KindConstructor
+  | T.any (== '#') name && T.length name < 6 = KindConstructor -- I# D#
+  | Just (c, _) <- T.uncons name, c >= 'A', c <= 'Z', T.all (\x -> x /= ' ' && x /= '/') name = KindConstructor
+  | otherwise = KindUnknown
+
+-- | Map a GHC closure type number (rts/include/rts/storage/ClosureTypes.h)
+-- to a band kind.
+closureTypeKind :: Int -> BandKind
+closureTypeKind t
+  | t >= 1 && t <= 7 = KindConstructor
+  | t >= 8 && t <= 14 = KindFunction
+  | t >= 15 && t <= 22 = KindThunk
+  | t == 24 || t == 26 = KindThunk -- AP, AP_STACK
+  | t == 25 = KindFunction -- PAP
+  | otherwise = KindData
+
+-- ---------------------------------------------------------------------------
+-- .hp files
+
+loadHp :: FilePath -> IO (Either String HeapProfile)
+loadHp path = parseHp . TE.decodeUtf8With TE.lenientDecode <$> B.readFile path
+
+data HpAcc = HpAcc
+  { accJob :: !Text
+  , accCur :: !(Maybe (Double, [(Text, Double)]))
+  , accDone :: ![(Double, [(Text, Double)])]
+  }
+
+-- | Parse the text of a @.hp@ heap profile.
+parseHp :: Text -> Either String HeapProfile
+parseHp src
+  | not (any ("BEGIN_SAMPLE" `T.isPrefixOf`) ls) = Left "not a heap profile: no BEGIN_SAMPLE lines"
+  | otherwise =
+      let acc = foldl' step (HpAcc "" Nothing []) ls
+          names = [n | (_, s) <- accDone acc, (n, _) <- s]
+          breakdown = guessBreakdown (accJob acc) names
+       in Right (fromSamples (accJob acc) breakdown (const Nothing) (reverse (accDone acc)))
+  where
+    ls = map (T.dropWhileEnd (== '\r')) (T.lines src)
+    step acc line
+      | Just rest <- T.stripPrefix "JOB " line = acc {accJob = unquote rest}
+      | Just rest <- T.stripPrefix "BEGIN_SAMPLE " line = acc {accCur = Just (readD rest, [])}
+      | "END_SAMPLE" `T.isPrefixOf` line = case accCur acc of
+          Just (t, bs) -> acc {accCur = Nothing, accDone = (t, bs) : accDone acc}
+          Nothing -> acc
+      | Just (t, bs) <- accCur acc
+      , Just band <- bandLine line =
+          acc {accCur = Just (t, band : bs)}
+      | otherwise = acc
+    bandLine line =
+      let (name, val) = T.breakOnEnd "\t" line
+       in if T.null name
+            then case T.words line of
+              ws@(_ : _ : _) -> Just (T.unwords (init ws), readD (last ws))
+              _ -> Nothing
+            else Just (T.dropEnd 1 name, readD val)
+    unquote = T.dropAround (== '"') . T.strip
+
+-- | The breakdown from the RTS flags in the JOB line or, when the program
+-- set its flags another way (-with-rtsopts, GHCRTS), from the band names.
+guessBreakdown :: Text -> [Text] -> Text
+guessBreakdown job names
+  | has "-hT" || closureTypes = "closure type"
+  | has "-hy" = "type"
+  | has "-hd" = "closure description"
+  | has "-hr" = "retainer set"
+  | has "-hm" = "module"
+  | has "-hb" = "biography"
+  | has "-hi" = "info table"
+  | has "-he" = "era"
+  | otherwise = "cost centre"
+  where
+    has f = f `T.isInfixOf` job
+    closureTypes = any (`elem` names) ["ARR_WORDS", "STACK", "TSO", "BLACKHOLE", "MUT_ARR_PTRS_CLEAN"] || any ("THUNK_" `T.isPrefixOf`) names
+
+readD :: Text -> Double
+readD t = case TR.double (T.strip t) of
+  Right (d, _) -> d
+  Left _ -> case TR.decimal (T.strip t) :: Either String (Integer, Text) of
+    Right (i, _) -> fromIntegral i
+    Left _ -> 0
+
+-- ---------------------------------------------------------------------------
+-- Analyses
+
+-- | The last sample at or before @t@ seconds.
+sampleIndexAt :: HeapProfile -> Double -> Int
+sampleIndexAt hp t =
+  let ts = hpTimes hp
+      go lo hi
+        | lo >= hi = lo
+        | otherwise =
+            let mid = (lo + hi + 1) `div` 2
+             in if ts VU.! mid <= t then go mid hi else go lo (mid - 1)
+   in if VU.null ts then 0 else go 0 (VU.length ts - 1)
+
+-- | Residency change of a band from the previous sample to sample @i@.
+bandDelta :: Band -> Int -> Double
+bandDelta b i
+  | i <= 0 || i >= VU.length (bandValues b) = 0
+  | otherwise = bandValues b VU.! i - bandValues b VU.! (i - 1)
+
+-- | A band whose residency keeps climbing: what a space leak looks like
+-- from outside.
+data Suspect = Suspect
+  { susBand :: !Int
+  , susScore :: !Double
+    -- ^ 0..1, higher is more leak-like.
+  , susGrowth :: !Double
+    -- ^ Last over first non-zero residency.
+  , susMonotone :: !Double
+    -- ^ Fraction of sample-to-sample steps that did not shrink.
+  , susSlope :: !Double
+    -- ^ Least-squares growth in bytes per second.
+  , susSurvived :: !Int
+    -- ^ Consecutive trailing samples it has been non-shrinking: each one is
+    -- a census taken after a major GC it survived.
+  }
+  deriving (Eq, Show)
+
+-- | How many samples the analyses look at: all of them, except a final
+-- census where the heap has collapsed to almost nothing, which is the RTS
+-- profiling the heap as the program exits rather than anything the program
+-- did.
+analysedSamples :: HeapProfile -> Int
+analysedSamples hp =
+  let tot = hpTotals hp
+      n = VU.length tot
+      peak = if n == 0 then 0 else VU.maximum tot
+   in if n >= 3 && VU.last tot < 0.05 * peak then n - 1 else n
+
+-- | Rank bands by how leak-like their residency curve is. A band qualifies
+-- when it grows over the run, rarely shrinks, and ends at least 1.5x where
+-- it started. Thunk bands get a boost: a thunk that keeps surviving
+-- censuses is never being forced.
+leakSuspects :: HeapProfile -> [Suspect]
+leakSuspects hp =
+  sortOn (Down . susScore) (mapMaybe judge (zip [0 ..] (V.toList (hpBands hp))))
+  where
+    n = analysedSamples hp
+    ts = VU.take n (hpTimes hp)
+    judge (i, b)
+      | VU.length vs < 3 = Nothing
+      | growth < 1.5 || slope <= 0 || mono < 0.6 = Nothing
+      | bandPeak b < 0.01 * maxTotal = Nothing
+      | otherwise = Just (Suspect i score growth mono slope trailing)
+      where
+        vs = VU.take n (bandValues b)
+        nz = VU.dropWhile (<= 0) vs
+        first = if VU.null nz then 0 else VU.head nz
+        lastV = VU.last vs
+        growth = if first <= 0 then 0 else lastV / first
+        steps = VU.zipWith (-) (VU.tail vs) vs
+        mono = fromIntegral (VU.length (VU.filter (>= 0) steps)) / fromIntegral (max 1 (VU.length steps))
+        slope = regressionSlope ts vs
+        trailing = VU.length (VU.takeWhile (>= 0) (VU.reverse steps))
+        thunkBoost = if bandKind b == KindThunk then 0.15 else 0
+        score =
+          min 1 $
+            0.45 * mono
+              + 0.25 * min 1 (logBase 10 growth / 2)
+              + 0.15 * min 1 (bandPeak b / max 1 maxTotal)
+              + thunkBoost
+    maxTotal = if VU.null (hpTotals hp) then 0 else VU.maximum (hpTotals hp)
+
+regressionSlope :: VU.Vector Double -> VU.Vector Double -> Double
+regressionSlope xs ys
+  | n < 2 || den == 0 = 0
+  | otherwise = num / den
+  where
+    n = fromIntegral (min (VU.length xs) (VU.length ys)) :: Double
+    mx = VU.sum xs / n
+    my = VU.sum ys / n
+    num = VU.sum (VU.zipWith (\x y -> (x - mx) * (y - my)) xs ys)
+    den = VU.sum (VU.map (\x -> (x - mx) ^ (2 :: Int)) xs)
+
+-- | A tree of who holds the heap: cost-centre stacks (@-hc@) are split at
+-- @/@ and rooted at their outermost frame, so a path reads from the
+-- top-level CAF or @main@ down to the allocation site. Retainer sets
+-- (@-hr@, labelled @(id)a,b@) attribute their bytes to each retainer.
+data RetainTree = RetainTree
+  { rtName :: !Text
+  , rtBytes :: !Double
+  , rtChildren :: ![RetainTree]
+  }
+  deriving (Eq, Show)
+
+-- | Whether the breakdown's band names carry structure 'retainTree' can use.
+looksStructured :: HeapProfile -> Bool
+looksStructured hp =
+  hpBreakdown hp == "retainer set" || V.any (T.any (== '/') . bandName) (hpBands hp)
+
+retainTree :: HeapProfile -> Int -> RetainTree
+retainTree hp i = toTree "heap" (foldl' insert M.empty paths)
+  where
+    paths =
+      [ (path, v)
+      | b <- V.toList (hpBands hp)
+      , let v = if i < VU.length (bandValues b) then bandValues b VU.! i else 0
+      , v > 0
+      , path <- bandPaths (hpBreakdown hp) (bandName b)
+      ]
+    insert m (path, v) = insertPath path v m
+    insertPath [] _ m = m
+    insertPath (p : ps) v m =
+      M.alter (Just . maybe (Node v (insertPath ps v M.empty)) (\(Node w kids) -> Node (w + v) (insertPath ps v kids))) p m
+    toTree name m =
+      RetainTree name (sum [w | Node w _ <- M.elems m]) $
+        sortOn (Down . rtBytes) [(toTree k kids) {rtBytes = w} | (k, Node w kids) <- M.toList m]
+
+data Node = Node !Double !(M.Map Text Node)
+
+-- | The root-to-leaf paths a band name stands for. Heap-profile labels
+-- carry a @(n)@ id prefix, which is dropped.
+bandPaths :: Text -> Text -> [[Text]]
+bandPaths breakdown name
+  | breakdown == "retainer set" =
+      [["retained by " <> m] | m <- T.splitOn "," stripped, not (T.null m)]
+  | T.any (== '/') stripped = [reverse (filter (not . T.null) (T.splitOn "/" stripped))]
+  | otherwise = [[stripped]]
+  where
+    stripped
+      | "(" `T.isPrefixOf` name, (_, rest) <- T.breakOn ")" name, not (T.null rest) = T.drop 1 rest
+      | otherwise = name

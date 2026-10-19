@@ -1,0 +1,18 @@
+packages: .
+
+-- nano-ui is not on Hackage; build it from GitHub. The tag pins the commit
+-- that was HEAD of goolord/nano-ui main when this was written. To move to a
+-- newer HEAD:  git ls-remote https://github.com/goolord/nano-ui HEAD
+source-repository-package
+  type: git
+  location: https://github.com/goolord/nano-ui.git
+  tag: 056d0932006b2955e179b7682878fc9c1f097397
+  subdir:
+    packages/nano-ui
+    packages/nano-ui-emit
+    packages/nano-ui-sdl
+
+package nano-ui-sdl
+  flags: +sdl
+
+tests: True
