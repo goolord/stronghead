@@ -800,9 +800,9 @@ coreLens st loaded spanOf anns = do
           Just sp -> [editAction (case r of RSource _ -> "Open in editor"; _ -> "Open its source in editor") sp]
           Nothing -> []
       , lensPeek = \case
-          RBinding m k -> entryPeek (isJust core) <$> entry m k
-          RSource sp | fmap Just (fileOf sp) == Just loadedFile -> entryPeek (isJust core) <$> entryAt (ssLine sp - 1)
-          r@(RBand _) | Just l <- stgLine r -> Just (fact "STG site" ("line " <> tshow (l + 1) <> " of " <> maybe "the STG dump" (T.pack . takeFileName . cfPath) stg))
+          RBinding m k -> (\e -> (entryPeek (isJust core) e) {peekExact = Just "by name: module and binding name"}) <$> entry m k
+          RSource sp | fmap Just (fileOf sp) == Just loadedFile -> (\e -> (entryPeek (isJust core) e) {peekExact = Just "exact: the line, once its path resolves"}) <$> entryAt (ssLine sp - 1)
+          r@(RBand _) | Just l <- stgLine r -> Just (peekOf [("STG site", "line " <> tshow (l + 1) <> " of " <> maybe "the STG dump" (T.pack . takeFileName . cfPath) stg)]) {peekExact = Just "exact: info-table name to STG binder"}
           _ -> Nothing
       , lensHits =
           [Hit "binding" (enKey e) modName (HitRef (RBinding modName (enKey e))) | e <- es, not (isTypeableBinding (enKey e)), not (T.null (enKey e))]
@@ -817,15 +817,18 @@ coreLens st loaded spanOf anns = do
       }
 
 -- | A binding's badges and what the optimiser recorded about it.
-entryPeek :: Bool -> Entry -> NanoUI ()
-entryPeek haveCore e = do
-  rowWith (tight . gap 6 . wrap . fillW) $ do
-    labelWith (fontMono . alignMid) (enKey e)
-    entryBadges e haveCore
-  scope $ forM_ (take 3 (enCore e)) $ \b -> withKey (bdName b) $ do
-    let n = bdNotes b
-    rowWith (tight . gap 12 . wrap . fillW) $ do
-      for_ (nArity n) $ \a -> fact "arity" (tshow a)
-      for_ (nStrictness n) $ \s -> factMono "Str" (T.take 40 s)
-  scope $ for_ (listToMaybe (enSrc e)) $ \b ->
-    labelWith (fontMuted . fontSizeScale 0.85) ("source lines " <> tshow (bdFirst b + 1) <> "–" <> tshow (bdLast b + 1))
+entryPeek :: Bool -> Entry -> Peek
+entryPeek haveCore e =
+  Peek
+    { peekFacts =
+        ("binding", enKey e)
+          : concat
+            [ [("arity", tshow a) | Just a <- [nArity n]] ++ [("Str", T.take 40 s) | Just s <- [nStrictness n]]
+            | b <- take 3 (enCore e)
+            , let n = bdNotes b
+            ]
+          ++ [("source lines", tshow (bdFirst b + 1) <> "–" <> tshow (bdLast b + 1)) | Just b <- [listToMaybe (enSrc e)]]
+    , peekNotes = []
+    , peekExact = Nothing
+    , peekExtra = Just (rowWith (tight . gap 6 . wrap . fillW) (entryBadges e haveCore))
+    }

@@ -606,9 +606,11 @@ debugLens st source ix spanOf = do
           _ -> []
       , lensPeek = \case
           RSource sp
-            | not (null (stopHere sp) && null (breakHere sp)) -> Just $ do
-                forM_ (stopHere sp) $ \s -> fact "stopped here" (renderSrcSpan s {ssFile = T.pack (takeFileName (resolve dir (ssFile s)))})
-                forM_ (breakHere sp) $ \n -> fact "breakpoint" (tshow n)
+            | not (null (stopHere sp) && null (breakHere sp)) ->
+                Just
+                  (peekOf ([("stopped here", renderSrcSpan s {ssFile = T.pack (takeFileName (resolve dir (ssFile s)))}) | s <- stopHere sp] ++ [("breakpoint", tshow n) | n <- breakHere sp]))
+                    { peekExact = Just "exact: file and line, as GHCi reports them"
+                    }
           _ -> Nothing
       , lensHits =
           if not running

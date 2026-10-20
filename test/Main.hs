@@ -35,6 +35,7 @@ import Stronghead.Live
 import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run
+import Stronghead.Session
 import Stronghead.Source
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
@@ -519,6 +520,76 @@ main = do
   check "render round trip" (all (\t -> renderValue (parseValue t) == t) ["Just (-3)", "1 : 2 : _t2", "(1, 'a')", "[Just 1, Nothing]", "P {px = 1, py = _}"])
   check ":print lines" (parsePrint "xs = 1 : (_t1::[Int])\nys = []\n" == [("xs", VList [VAtom "1"] (Just (VThunk "_t1" (Just "[Int]")))), ("ys", VList [] Nothing)])
   check "named thunks to force" (valueThunks (parseValue "(Just (_t1::Int), _, (_t2::Int))") == ["_t1", "_t2"] && valueHasThunks (parseValue "Just _") && not (valueHasThunks (parseValue "Just 1")))
+
+  putStrLn "sessions"
+  let sesRun = RunKey "stronghead-sample:4242"
+      session =
+        emptySession
+          { sesPanel = "heap"
+          , sesEventlog = Just "C:\\scratch dir\\stronghead-sample.eventlog"
+          , sesFollow = True
+          , sesHeapProfile = Just "scratch/stronghead-sample.hp"
+          , sesCostCentres = Nothing
+          , sesHeapSource = "hp"
+          , sesGhcDebug = "/tmp/ghc-debug/4242-stronghead-sample"
+          , sesDumps = Just "dist-newstyle/build/x/dumps"
+          , sesCodeFiles = ["sample/Main.hs"]
+          , sesAgentHost = "127.0.0.1"
+          , sesAgentPort = "4777"
+          , sesAgentConnected = True
+          , sesGhciCommand = "cabal repl stronghead-sample"
+          , sesGhciDir = "C:\\Users\\zach\\Dev\\stronghead"
+          , sesGhciFile = "sample/Main.hs"
+          , sesGhciRunning = False
+          , sesPins =
+              [ Pin (RThread sesRun 12) "the leaky accumulator\nholds 40 MB = too much"
+              , Pin (RBand "THUNK_2_0") ""
+              , Pin (RSource (SrcSpan "sample/Main.hs" 82 1 82 40)) "  100% of it, from here  "
+              ]
+          , sesCursor = Just (sesRun, 1500000000)
+          , sesRange = Just (sesRun, 1000, 2000)
+          , sesFocus = Just (RBinding "Main" "leak")
+          , sesLayouts = [("heap", "(h 0.500 heap.chart inspector)"), ("timeline", "tl.caps")]
+          , sesPresets = [("Leak hunt", "(v 0.500 heap.chart core.source)"), ("Mine = mine", "pinboard")]
+          , sesPopped = ["pinboard"]
+          }
+  check "a session round trips" (decodeSession (encodeSession session) == Right session)
+  check "the empty session round trips" (decodeSession (encodeSession emptySession) == Right emptySession)
+  check "notes keep their line breaks and spaces" $
+    T.isInfixOf "pin.1.note = the leaky accumulator%0aholds 40 MB = too much" (encodeSession session)
+      && T.isInfixOf "pin.3.note = %20%20100%25 of it, from here%20%20" (encodeSession session)
+  check "paths stay readable" (T.isInfixOf "eventlog = C:\\scratch dir\\stronghead-sample.eventlog" (encodeSession session))
+  check "a file without a version is not a session" (either (const True) (const False) (decodeSession "panel = heap\n"))
+  check "unknown keys and bad values are skipped" $
+    decodeSession "version = 1\nwhatever = 3\npin.1 = nope/1\npin.2 = band/x\nfollow = maybe\ncursor = band/y\n"
+      == Right emptySession {sesPins = [Pin (RBand "x") ""]}
+  check "pins keep their numbered order" $
+    fmap (map pinRef . sesPins) (decodeSession "version = 1\npin.10 = band/c\npin.2 = band/b\npin.1 = band/a\n") == Right [RBand "a", RBand "b", RBand "c"]
+  check "values escape and unescape" (all (\v -> unescapeValue (escapeValue v) == v) ["", " a ", "100%", "a\nb\r\n", "  ", "naïve λ", "%41"])
+
+  putStrLn "pins"
+  let pa = RBand "a"
+      pb = RBand "b"
+      pc = RBand "c"
+      board = [Pin pa "", Pin pb "note", Pin pc ""]
+  check "pinning adds at the end, once" (map pinRef (pinToggle pc [Pin pa ""]) == [pa, pc])
+  check "pinning a pinned entity unpins it" (pinToggle pb board == [Pin pa "", Pin pc ""])
+  check "a pin moves up and down" (map pinRef (pinMove 2 (-1) board) == [pa, pc, pb] && map pinRef (pinMove 0 1 board) == [pb, pa, pc])
+  check "and stops at either end" (pinMove 0 (-1) board == board && pinMove 2 1 board == board && pinMove 5 1 board == board)
+  let report =
+        pinsMarkdown
+          "Stronghead pins"
+          ["From stronghead-sample, pid 4242."]
+          [ PinReport "leaky-accumulator (12)" "thread/stronghead-sample:4242/12" [ReportSection "Timeline" (Just "exact: thread id in the same run") [("ran", "1.2 s, 41% of its life")] [], ReportSection "Live" Nothing [] []] "holds the thunks\nsee line 82"
+          , PinReport "THUNK_2_0 *x*" "band/THUNK_2_0" [ReportSection "Heap & leaks" Nothing [("peak", "40 MiB"), ("", "more")] ["retained by an IORef"]] ""
+          ]
+  check "the report has a heading per pin, its reference as code" $
+    all (`T.isInfixOf` report) ["# Stronghead pins", "## 1. leaky-accumulator (12)", "`thread/stronghead-sample:4242/12`", "## 2. THUNK\\_2\\_0 \\*x\\*", "`band/THUNK_2_0`"]
+  check "each panel's facts, with how it matched" $
+    all (`T.isInfixOf` report) ["- **Timeline** (exact: thread id in the same run)", "  - ran: 1.2 s, 41% of its life", "  - peak: 40 MiB", "  - more", "  - retained by an IORef"]
+  check "a panel with nothing to say is left out" (not ("**Live**" `T.isInfixOf` report))
+  check "the note as a quote" ("> holds the thunks\n> see line 82" `T.isInfixOf` report)
+  check "no pins says so" ("No pins." `T.isInfixOf` pinsMarkdown "Pins" [] [])
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

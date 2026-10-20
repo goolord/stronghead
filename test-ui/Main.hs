@@ -63,7 +63,7 @@ view w = do
           , lensReveal = \r -> record ("timeline " <> refTarget r)
           , lensTitle = \r -> if r == thread then Just "worker-7" else Nothing
           , lensRelated = \r -> [("Go to binding go", binding) | r == thread]
-          , lensPeek = \r -> if r == thread then Just (void (label "ran 41%")) else Nothing
+          , lensPeek = \r -> if r == thread then Just (peekOf [("ran", "41%")]) {peekExact = Just "exact: thread id in the same run"} else Nothing
           , lensHits = [Hit "thread" "worker-7" "ran 41%" (HitRef thread)]
           }
       live = (lens PLive) {lensShows = (== thread), lensReveal = \_ -> record "live"}
@@ -203,6 +203,7 @@ main = do
   check "offers what goes with it" (has "Go to binding go")
   check "lists actions, with reasons when disabled" (has "Do thing" && has "Disabled thing (no data)")
   check "can copy the reference" (has "Copy reference")
+  check "and pin it" (has "Pin")
   writeIORef (wLog w) []
   item <- at "Go to binding go" menu
   _ <- click inp0 item
@@ -229,7 +230,7 @@ main = do
   _ <- frame hover
   _ <- frame hover
   tip <- overlay
-  check "the peek shows each panel's facts" (hasText "ran 41%" tip && hasText "Timeline" tip)
+  check "the peek shows each panel's facts" (hasText "41%" tip && hasText "Timeline" tip && hasText "exact" tip)
   check "and how to act on it" (hasText "Ctrl+click to open" tip)
   _ <- frame inp0
   _ <- frame inp0

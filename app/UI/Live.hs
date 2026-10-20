@@ -767,7 +767,7 @@ liveLens st mdata moments remote = case mdata of
                   RThread r t -> (\lt -> if T.null (ltLabel lt) then "thread " <> tshow (ltId lt) else ltLabel lt <> " (" <> tshow (ltId lt) <> ")") <$> thread r t
                   _ -> Nothing
               , lensPeek = \case
-                  RThread r t -> (\lt -> threadPeek lt (M.findWithDefault [] (ltId lt) history) (historySpan (ldFrames d))) <$> thread r t
+                  RThread r t -> (\lt -> (threadPeek lt (M.findWithDefault [] (ltId lt) history) (historySpan (ldFrames d))) {peekExact = Just (runNote "thread id" r rk)}) <$> thread r t
                   RInstant r t -> momentPeek <$> moment r t
                   _ -> Nothing
               , lensHits =
@@ -794,23 +794,33 @@ momentKindName = \case
   MomentSnapshot -> "snapshot"
   MomentPause -> "pause"
 
-momentPeek :: Moment -> NanoUI ()
-momentPeek mo = do
-  fact (momentKindName (moKind mo)) (moLabel mo)
-  fact "stamped" $
-    if
-      | moInLog mo -> "by the eventlog's marker"
-      | moExact mo -> "by the program, through the agent"
-      | otherwise -> "estimated from the latest frame"
+momentPeek :: Moment -> Peek
+momentPeek mo =
+  (peekOf [(momentKindName (moKind mo), moLabel mo)])
+    { peekExact =
+        Just $
+          if
+            | moInLog mo -> "exact: stamped by the eventlog's marker"
+            | moExact mo -> "exact: stamped by the program, through the agent"
+            | otherwise -> "approximate: estimated from the latest frame"
+    }
 
-threadPeek :: LiveThread -> [Maybe Text] -> Double -> NanoUI ()
-threadPeek lt hist secs = do
-  fact "now" (ltStatus lt)
-  scope $ for_ (ltCap lt) $ \c -> fact "capability" (tshow c)
+threadPeek :: LiveThread -> [Maybe Text] -> Double -> Peek
+threadPeek lt hist secs =
   let seen = catMaybes hist
       share g = fromIntegral (length (filter (== g) seen)) / fromIntegral (max 1 (length seen)) :: Double
       groups = M.keys (M.fromList [(g, ()) | g <- seen])
-  scope $ unless (null seen) $
-    fact ("last " <> fmtSec secs) (T.intercalate ", " [g <> " " <> fmtPct (share g) | g <- sortOn (negate . share) groups])
-  th <- uiTheme
-  scope $ unless (null hist) $ void (canvas (fixedWH 300 12) (\r -> drawHistory (palette th) r hist))
+   in Peek
+        { peekFacts =
+            [("now", ltStatus lt)]
+              ++ [("capability", tshow c) | Just c <- [ltCap lt]]
+              ++ [("last " <> fmtSec secs, T.intercalate ", " [g <> " " <> fmtPct (share g) | g <- sortOn (negate . share) groups]) | not (null seen)]
+        , peekNotes = []
+        , peekExact = Nothing
+        , peekExtra =
+            if null hist
+              then Nothing
+              else Just $ do
+                th <- uiTheme
+                void (canvas (fixedWH 300 12) (\r -> drawHistory (palette th) r hist))
+        }

@@ -1443,16 +1443,18 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
               RRange r a b | mine r, inLog a, b > a -> [Action "Analyse range" (Right (writeVar (busRange bus) (Just (rk, a, b)) >> writeVar (tsSel st) (Just (SelRange a b)) >> switch))]
               _ -> []
           , lensPeek = \case
-              RThread r t -> threadPeek tl <$> thread r t
-              RCollection r i -> gcPeek tl <$> gc r i
-              RMarker r i -> (\mk -> fact "at" (offset (mkTime mk))) <$> marker r i
-              RCensus r j -> (\t -> fact "taken at" (offset t)) <$> census r j
-              RInstant r t | mine r, inLog t -> Just (instantPeek tl t)
-              RRange r a b | mine r, inLog a, b > a -> Just (rangePeek tl a b)
+              RThread r t -> (\ti -> (threadPeek tl ti) {peekExact = Just (runNote "thread id" r rk)}) <$> thread r t
+              RCollection r i -> (\g -> (gcPeek tl g) {peekExact = Just (runNote "collection" r rk)}) <$> gc r i
+              RMarker r i -> (\mk -> (peekOf [("at", offset (mkTime mk))]) {peekExact = Just (runNote "eventlog marker" r rk)}) <$> marker r i
+              RCensus r j -> (\t -> (peekOf [("taken at", offset t)]) {peekExact = Just "exact: this eventlog's census"}) <$> census r j
+              RInstant r t | mine r, inLog t -> Just (instantPeek tl t) {peekExact = Just (runNote "program time" r rk)}
+              RRange r a b | mine r, inLog a, b > a -> Just (rangePeek tl a b) {peekExact = Just (runNote "program time" r rk)}
               RCostCentre m l -> (\(c, n) -> codePeek tl c n totalSamples) <$> sampled m l
-              RBinding m k | xs@(_ : _) <- tickyOf m k -> Just $ do
-                fact "ticky" (tickyNote (sum [tcEntries c | (c, _, _) <- xs]) (sum [tcAlloc c | (c, _, _) <- xs]))
-                fact "counters" (fmtInt (length xs) <> ", joined by name")
+              RBinding m k | xs@(_ : _) <- tickyOf m k ->
+                Just
+                  (peekOf [("ticky", tickyNote (sum [tcEntries c | (c, _, _) <- xs]) (sum [tcAlloc c | (c, _, _) <- xs])), ("counters", fmtInt (length xs))])
+                    { peekExact = Just "by name: the counters' binder names"
+                    }
               _ -> Nothing
           , lensHits =
               [ Hit "thread" (threadName ti) ("ran " <> fmtNs (fromIntegral (tiRunTime ti))) (HitRef (RThread rk (tiId ti)))
@@ -1510,41 +1512,51 @@ centreOn st tl t = do
       c = fromIntegral t
   writeVar (tsView st) (Just (clampView lo hi (TimeView (c - w / 2) (c + w / 2))))
 
-threadPeek :: Timeline -> ThreadInfo -> NanoUI ()
-threadPeek tl ti = do
+threadPeek :: Timeline -> ThreadInfo -> Peek
+threadPeek tl ti =
   let created = fromMaybe (tlStart tl) (tiCreated ti)
       ended = fromMaybe (tlEnd tl) (tiFinished ti)
       life = fromIntegral (max 1 (ended - created)) :: Double
       offCpu = [(c, ns) | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c]
       blocked = sum (map snd offCpu)
       top = listToMaybe (sortOn (Down . snd) offCpu)
-  fact "ran" (fmtNs (fromIntegral (tiRunTime ti)) <> ", " <> fmtPct (fromIntegral (tiRunTime ti) / life) <> " of its life")
-  scope $ when (blocked > 0) $
-    fact "blocked" (fmtNs (fromIntegral blocked) <> maybe "" (\(c, _) -> ", mostly " <> stopName c) top)
-  fact "capabilities" (T.intercalate ", " (map tshow (tiCaps ti)))
+   in peekOf $
+        [("ran", fmtNs (fromIntegral (tiRunTime ti)) <> ", " <> fmtPct (fromIntegral (tiRunTime ti) / life) <> " of its life")]
+          ++ [("blocked", fmtNs (fromIntegral blocked) <> maybe "" (\(c, _) -> ", mostly " <> stopName c) top) | blocked > 0]
+          ++ [("capabilities", T.intercalate ", " (map tshow (tiCaps ti)))]
 
-gcPeek :: Timeline -> GCEvent -> NanoUI ()
-gcPeek tl g = do
-  fact "pause" (fmtNs (fromIntegral (gcEnd g - gcStart g)))
-  fact "at" (fmtNs (fromIntegral (gcStart g - min (gcStart g) (tlStart tl))))
-  fact "copied" (fmtBytes (gcCopied g))
-  for_ (seriesValueAt (tlLive tl) (gcEnd g)) $ \b -> fact "live after" (fmtBytes b)
+gcPeek :: Timeline -> GCEvent -> Peek
+gcPeek tl g =
+  peekOf $
+    [ ("pause", fmtNs (fromIntegral (gcEnd g - gcStart g)))
+    , ("at", fmtNs (fromIntegral (gcStart g - min (gcStart g) (tlStart tl))))
+    , ("copied", fmtBytes (gcCopied g))
+    ]
+      ++ [("live after", fmtBytes b) | Just b <- [seriesValueAt (tlLive tl) (gcEnd g)]]
 
-rangePeek :: Timeline -> Word64 -> Word64 -> NanoUI ()
-rangePeek tl a b = do
+rangePeek :: Timeline -> Word64 -> Word64 -> Peek
+rangePeek tl a b =
   let rs = rangeStats tl a b
-  fact "lasts" (fmtNs (fromIntegral (b - a)))
-  fact "collections" (fmtInt (length (rsCollections rs)) <> ", paused " <> fmtNs (fromIntegral (rsPauseTotal rs)))
-  for_ (rsAllocated rs) $ \n -> fact "allocated" (fmtBytes n)
-  fact "threads ran" (fmtInt (length (rsThreads rs)))
+   in peekOf $
+        [ ("lasts", fmtNs (fromIntegral (b - a)))
+        , ("collections", fmtInt (length (rsCollections rs)) <> ", paused " <> fmtNs (fromIntegral (rsPauseTotal rs)))
+        ]
+          ++ [("allocated", fmtBytes n) | Just n <- [rsAllocated rs]]
+          ++ [("threads ran", fmtInt (length (rsThreads rs)))]
 
-codePeek :: Timeline -> CostCentreInfo -> Int -> Int -> NanoUI ()
-codePeek tl c n total = do
-  fact "on top of the stack" (fmtInt n <> " of " <> fmtInt total <> " samples, one every " <> fmtNs (fromIntegral (tlSamplePeriod tl)))
-  scope $ for_ (srcLocSpan (cciSrc c)) $ \sp -> fact "source" (renderSrcSpan sp)
-  scope $ when (fewSamples n) $ labelWith (fontMuted . fontSizeScale 0.85 . fillW) "Few samples: a hint, not a measurement."
+codePeek :: Timeline -> CostCentreInfo -> Int -> Int -> Peek
+codePeek tl c n total =
+  Peek
+    { peekFacts =
+        ("on top of the stack", fmtInt n <> " of " <> fmtInt total <> " samples, one every " <> fmtNs (fromIntegral (tlSamplePeriod tl)))
+          : [("source", renderSrcSpan sp) | Just sp <- [srcLocSpan (cciSrc c)]]
+    , peekNotes = ["Few samples: a hint, not a measurement." | fewSamples n]
+    , peekExact = Just "by name: the eventlog's cost-centre module and label"
+    , peekExtra = Nothing
+    }
 
-instantPeek :: Timeline -> Word64 -> NanoUI ()
-instantPeek tl t = do
-  for_ (seriesValueAt (tlLive tl) t) $ \b -> fact "live" (fmtBytes b)
-  for_ (seriesValueAt (tlHeapSize tl) t) $ \b -> fact "heap" (fmtBytes b)
+instantPeek :: Timeline -> Word64 -> Peek
+instantPeek tl t =
+  peekOf $
+    [("live", fmtBytes b) | Just b <- [seriesValueAt (tlLive tl) t]]
+      ++ [("heap", fmtBytes b) | Just b <- [seriesValueAt (tlHeapSize tl) t]]

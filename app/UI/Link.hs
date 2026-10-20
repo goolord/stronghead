@@ -28,6 +28,10 @@ module UI.Link
     -- * Lenses
   , Lens (..)
   , lens
+  , Peek (..)
+  , peekOf
+  , drawPeek
+  , runNote
   , Action (..)
   , Hit (..)
   , HitTarget (..)
@@ -42,6 +46,8 @@ module UI.Link
   , goForward
   , setFocus
   , isFocusOrHover
+  , togglePin
+  , isPinned
     -- * Widgets
   , linked
   , linkRow
@@ -66,6 +72,7 @@ import Stronghead.Debug.Graph (ThunkKey (..), fmtClosureId)
 import Stronghead.Format (fmtNs, tshow)
 import Stronghead.Ref
 import Stronghead.Join (Annotation)
+import Stronghead.Session (Pin (..), pinToggle)
 import Stronghead.Source (SrcSpan, renderSrcSpan)
 import System.FilePath (takeFileName)
 import UI.Common
@@ -119,6 +126,8 @@ data Bus = Bus
     -- ^ Instants Stronghead put on the program's clock itself: the marks
     -- and actions it sent the agent, and the snapshots it took. Newest
     -- first.
+  , busPins :: !(Var [Pin])
+    -- ^ The pinboard, in the user's order.
   }
 
 -- | An instant Stronghead put on a run's clock: a mark or an action sent to
@@ -164,6 +173,7 @@ newBus = do
   busWindow <- newVar Nothing
   busBrush <- newIORef Nothing
   busMoments <- newVar []
+  busPins <- newVar []
   pure Bus {..}
 
 -- | Make this frame's hovered entity the one every panel highlights. Call
@@ -190,8 +200,9 @@ data Lens = Lens
     -- ^ Other entities this panel knows go with it: a band's allocation
     -- site, a closure's thread. The text is a menu item ("Go to ...").
   , lensActions :: Ref -> [Action]
-  , lensPeek :: Ref -> Maybe (NanoUI ())
-    -- ^ This panel's facts about it, for the peek.
+  , lensPeek :: Ref -> Maybe Peek
+    -- ^ This panel's facts about it, for the peek, the inspector and the
+    -- pinboard's report.
   , lensHits :: [Hit]
     -- ^ What the palette can find in this panel.
   , lensAnnotations :: [Annotation]
@@ -205,6 +216,39 @@ data Lens = Lens
 -- | A lens that shows nothing, to override field by field.
 lens :: Panel -> Lens
 lens p = Lens p (const False) (const (pure ())) (const Nothing) (const []) (const []) (const Nothing) [] [] (const Nothing)
+
+-- | One panel's facts about an entity. The facts and notes are text, so
+-- the pinboard's report can carry them; what only draws (a sparkline, a
+-- row of badges) goes in 'peekExtra'.
+data Peek = Peek
+  { peekFacts :: ![(Text, Text)]
+    -- ^ Name and value; an empty name continues the fact above.
+  , peekNotes :: ![Text]
+    -- ^ Lines of their own: a retainer path, a caveat.
+  , peekExact :: !(Maybe Text)
+    -- ^ How the panel matched the entity, in words: exact, by name, or
+    -- approximate (principle 4).
+  , peekExtra :: !(Maybe (NanoUI ()))
+  }
+
+peekOf :: [(Text, Text)] -> Peek
+peekOf fs = Peek fs [] Nothing Nothing
+
+-- | A peek's facts, notes and extra, as the peek and the inspector show
+-- them; @long@ also writes how the panel matched it.
+drawPeek :: Bool -> Peek -> NanoUI ()
+drawPeek long p = do
+  forM_ (zip [0 :: Int ..] (peekFacts p)) $ \(i, (k, v)) -> withKey i $ fact k v
+  forM_ (zip [0 :: Int ..] (peekNotes p)) $ \(i, n) -> withKey (1000 + i) $ labelWith (fontMuted . fontSizeScale 0.85 . fillW) n
+  scope $ for_ (peekExtra p) id
+  scope $ when long $ for_ (peekExact p) $ labelWith (fontMuted . fontSizeScale 0.8 . fillW . padTop 2)
+
+-- | How a time-keyed ref from run @r@ was matched to a panel's run @mine@:
+-- the same key is exact, anything 'runKeysMatch' lets through is a guess.
+runNote :: Text -> RunKey -> RunKey -> Text
+runNote what r mine
+  | r == mine = "exact: " <> what <> " in the same run"
+  | otherwise = "probable: " <> what <> ", the run matched by program name only"
 
 -- | Where any panel puts an entity in the source.
 refSpan :: Env -> Ref -> Maybe SrcSpan
@@ -337,6 +381,13 @@ setFocus env r = do
   cur <- readVar (busFocus (envBus env))
   when (cur /= r) (writeVar (busFocus (envBus env)) r)
 
+-- | Pin an entity, or unpin it.
+togglePin :: Bus -> Ref -> NanoUI ()
+togglePin bus r = modifyVar (busPins bus) (pinToggle r)
+
+isPinned :: Bus -> Ref -> NanoUI Bool
+isPinned bus r = any ((== r) . pinRef) <$> readVar (busPins bus)
+
 -- | Whether a ref is the focus, and whether the pointer is on it anywhere,
 -- for panels that highlight it themselves (canvases).
 isFocusOrHover :: Env -> NanoUI (Ref -> Bool, Ref -> Bool)
@@ -440,6 +491,8 @@ refMenu env ref = do
     Left why -> menuItemDisabled (actLabel a <> " (" <> why <> ")")
   menuSeparator
   whenM (menuItem "Focus everywhere") (setFocus env (Just ref))
+  pinned <- isPinned (envBus env) ref
+  whenM (menuItem (if pinned then "Unpin" else "Pin")) (togglePin (envBus env) ref)
   whenM (menuItem "Copy reference") (void (setClipboard (refTarget ref)))
 
 -- | What every panel knows about an entity, for its tooltip.
@@ -449,8 +502,10 @@ peek env ref =
     labelWith (fontMedium . fillW) (refTitle env ref)
     let ls = envLenses env
     forM_ [(lensPanel l, body) | l <- ls, Just body <- [lensPeek l ref]] $ \(p, body) -> withKey (fromEnum p) $ do
-      labelWith (fontMuted . fontSizeScale 0.8 . padTop 4) (panelTitle p)
-      columnWith (fillW . tight . gap 2) body
+      rowWith (fillW . tight . gap 6 . padTop 4) $ do
+        labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (panelTitle p)
+        for_ (peekExact body) $ labelWith (alignBaseline . fontMuted . fontSizeScale 0.75) . T.takeWhile (/= ':')
+      columnWith (fillW . tight . gap 2) (drawPeek False body)
     let related = nub [(lbl, r) | l <- ls, (lbl, r) <- lensRelated l ref]
     scope $ unless (null related) $
       columnWith (padTop 4 . fillW . tight . gap 2) $

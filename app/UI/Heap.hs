@@ -1444,11 +1444,19 @@ heapLens st loaded fromLog = do
           _ -> Nothing
       , lensPeek = \case
           RBand b -> (\bd -> bandPeek bd (profile >>= \hp -> Just (hp, cursorIx hp))) <$> band b
-          RCensus r i -> (\hp -> fact "live" (fmtBytesD (hpTotals hp VU.! i)) >> fact "taken at" (fmtSec (hpOffset hp i) <> if fromEventlog || logCensus r i then "" else " (the .hp file's clock)")) <$> census r i
+          RCensus r i ->
+            ( \hp ->
+                let own = fromEventlog || logCensus r i
+                 in (peekOf [("live", fmtBytesD (hpTotals hp VU.! i)), ("taken at", fmtSec (hpOffset hp i) <> if own then "" else " (the .hp file's clock)")])
+                      { peekExact = Just (if own then "exact: this profile's census, on the program clock" else "approximate: a .hp file keeps its own clock")
+                      }
+            )
+              <$> census r i
           RCostCentre m l -> ccPeek <$> costCentre m l
-          RClosure s a -> (\n -> closurePeek latest n) <$> closure s a
-          RThunkGroup k -> (\g -> fact "in the latest snapshot" (fmtInt (tgCount g) <> " thunks, " <> fmtBytes (fromIntegral (tgBytes g)))) <$> group k
-          RThread r t | runKeysMatch r snapRun -> (\n -> closurePeek latest n) <$> tso t
+          RClosure s a -> (\n -> (closurePeek latest n) {peekExact = Just ("exact: address in snapshot " <> tshow s)}) <$> closure s a
+          RThunkGroup k ->
+            (\g -> (peekOf [("in the latest snapshot", fmtInt (tgCount g) <> " thunks, " <> fmtBytes (fromIntegral (tgBytes g)))]) {peekExact = Just "by code and retainer shape"}) <$> group k
+          RThread r t | runKeysMatch r snapRun -> (\n -> (closurePeek latest n) {peekExact = Just (runNote "TSO thread id" r snapRun)}) <$> tso t
           _ -> Nothing
       , lensHits =
           [ Hit "band" (bandName b) (kindName (bandKind b) <> ", peak " <> fmtBytesD (bandPeak b)) (HitRef (RBand (bandName b)))
@@ -1468,34 +1476,49 @@ heapLens st loaded fromLog = do
                ]
       }
 
-bandPeek :: Band -> Maybe (HeapProfile, Int) -> NanoUI ()
-bandPeek b at = do
-  fact "kind" (kindName (bandKind b))
-  fact "peak" (fmtBytesD (bandPeak b))
-  scope $ for_ at $ \(hp, i) -> when (i < VU.length (bandValues b)) $
-    fact ("at " <> fmtSec (hpOffset hp i)) (fmtBytesD (bandValues b VU.! i))
-  scope $ for_ (bandDetail b) $ labelWith (fontMono . fontMuted . fontSizeScale 0.8 . fillW)
-  scope $ when (VU.length (bandValues b) >= 2) $ do
-    th <- uiTheme
-    _ <- canvas (fixedWH 300 28) $ \r -> sparkBand r (inkText (ink th)) (bandValues b)
-    pure ()
+bandPeek :: Band -> Maybe (HeapProfile, Int) -> Peek
+bandPeek b at =
+  Peek
+    { peekFacts =
+        [("kind", kindName (bandKind b)), ("peak", fmtBytesD (bandPeak b))]
+          ++ [("at " <> fmtSec (hpOffset hp i), fmtBytesD (bandValues b VU.! i)) | Just (hp, i) <- [at], i < VU.length (bandValues b)]
+    , peekNotes = maybe [] pure (bandDetail b)
+    , peekExact = Just (if isJust (bandProv b) then "exact: info table, through the IPE map" else "by name: the band in the profile on show")
+    , peekExtra =
+        if VU.length (bandValues b) >= 2
+          then Just $ do
+            th <- uiTheme
+            void (canvas (fixedWH 300 28) $ \r -> sparkBand r (inkText (ink th)) (bandValues b))
+          else Nothing
+    }
 
-ccPeek :: CostCentre -> NanoUI ()
-ccPeek c = do
-  fact "entries" (fmtInt (ccEntries c))
-  fact "time, alloc" (fmtFixed 1 (ccTime c) <> "%, " <> fmtFixed 1 (ccAlloc c) <> "%")
-  fact "inherited" (fmtFixed 1 (ccInhTime c) <> "%, " <> fmtFixed 1 (ccInhAlloc c) <> "%")
-  scope $ unless (T.null (ccSrc c)) $ fact "source" (ccSrc c)
+ccPeek :: CostCentre -> Peek
+ccPeek c =
+  ( peekOf $
+      [ ("entries", fmtInt (ccEntries c))
+      , ("time, alloc", fmtFixed 1 (ccTime c) <> "%, " <> fmtFixed 1 (ccAlloc c) <> "%")
+      , ("inherited", fmtFixed 1 (ccInhTime c) <> "%, " <> fmtFixed 1 (ccInhAlloc c) <> "%")
+      ]
+        ++ [("source", ccSrc c) | not (T.null (ccSrc c))]
+  )
+    { peekExact = Just "by name: the .prof's module and label"
+    }
 
-closurePeek :: Maybe HeapSnapshot -> ClosureNode -> NanoUI ()
-closurePeek latest n = do
-  fact "type" (cnType n)
-  fact "size" (fmtBytes (fromIntegral (cnSize n)))
-  scope $ for_ latest $ \snap -> do
-    fact "holds" (fmtBytes (fromIntegral (M.findWithDefault 0 (cnId n) (snapHeld snap))))
-    labelWith (fontMuted . fontSizeScale 0.85 . fillW) (describePath (retainerPath snap (cnId n)))
-    -- A thread's top frames at the snapshot.
-    let frames = threadStack snap (cnId n)
-    scope $ unless (null frames) $
-      forM_ (zip [0 :: Int ..] (take 4 frames)) $ \(i, f) -> withKey i $
-        fact (if i == 0 then "stack" else "") (frameTitle f <> maybe "" (\s -> "  " <> s) (sfSource f))
+closurePeek :: Maybe HeapSnapshot -> ClosureNode -> Peek
+closurePeek latest n =
+  let frames snap = threadStack snap (cnId n)
+   in Peek
+        { peekFacts =
+            [("type", cnType n), ("size", fmtBytes (fromIntegral (cnSize n)))]
+              ++ concat
+                [ ("holds", fmtBytes (fromIntegral (M.findWithDefault 0 (cnId n) (snapHeld snap))))
+                    -- A thread's top frames at the snapshot.
+                    : [ (if i == 0 then "stack" else "", frameTitle f <> maybe "" (\s -> "  " <> s) (sfSource f))
+                      | (i, f) <- zip [0 :: Int ..] (take 4 (frames snap))
+                      ]
+                | Just snap <- [latest]
+                ]
+        , peekNotes = [describePath (retainerPath snap (cnId n)) | Just snap <- [latest]]
+        , peekExact = Nothing
+        , peekExtra = Nothing
+        }
