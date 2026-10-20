@@ -32,6 +32,7 @@ import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
+import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
@@ -107,6 +108,12 @@ data Builder = Builder
   , bHeap :: !HeapB
   , bInfo :: ![(Text, Text)]
   , bRun :: !RunInfo
+  , bSamples :: ![(Word64, Int, VU.Vector Word32)]
+    -- ^ Cost-centre samples: time, capability, stack. Newest first.
+  , bTickyDefs :: !(M.Map Word64 (Text, Int, Text, Word64))
+    -- ^ Ticky counters by id: name, arity, argument kinds, info table.
+  , bTickySums :: !(M.Map Word64 (Word64, Word64, Word64, Int))
+    -- ^ Entries, allocation, allocated and samples, summed so far.
   , bCount :: !Int
   , bMin :: !Word64
   , bMax :: !Word64
@@ -114,7 +121,7 @@ data Builder = Builder
 
 emptyBuilder :: Builder
 emptyBuilder =
-  Builder IM.empty IM.empty [] [] [] [] [] (HeapB Nothing IM.empty Nothing [] M.empty) [] emptyRunInfo 0 maxBound 0
+  Builder IM.empty IM.empty [] [] [] [] [] (HeapB Nothing IM.empty Nothing [] M.empty) [] emptyRunInfo [] M.empty M.empty 0 maxBound 0
 
 -- ---------------------------------------------------------------------------
 -- Folding events
@@ -201,6 +208,14 @@ globalEvent b t = \case
   InfoTableProv {itInfo, itTableName, itClosureDesc, itTyDesc, itLabel, itModule, itSrcLoc} ->
     let prov = InfoProv itTableName itClosureDesc (closureTypeKind itClosureDesc) itTyDesc itLabel itModule (parseSrcLoc itSrcLoc)
      in heap (\h -> h {hbIPE = M.insert itInfo prov (hbIPE h)})
+  -- Every capability is sampled at each profiler tick; the event names
+  -- the capability rather than coming from its buffer.
+  ProfSampleCostCentre {profCap, profCcsStack} -> b {bSamples = (t, fromIntegral profCap, profCcsStack) : bSamples b}
+  TickyCounterDef {tickyCtrDefId, tickyCtrDefArity, tickyCtrDefKinds, tickyCtrDefName, tickyCtrInfoTbl} ->
+    b {bTickyDefs = M.insert tickyCtrDefId (tickyCtrDefName, fromIntegral tickyCtrDefArity, tickyCtrDefKinds, tickyCtrInfoTbl) (bTickyDefs b)}
+  TickyCounterSample {tickyCtrSampleId, tickyCtrSampleEntryCount, tickyCtrSampleAllocs, tickyCtrSampleAllocd} ->
+    let add (e, a, d, n) (e', a', d', n') = (e + e', a + a', d + d', n + n')
+     in b {bTickySums = M.insertWith add tickyCtrSampleId (tickyCtrSampleEntryCount, tickyCtrSampleAllocs, tickyCtrSampleAllocd, 1) (bTickySums b)}
   HeapProfSampleBegin {} -> heap (beginSample t)
   HeapBioProfSampleBegin {} -> heap (beginSample t)
   HeapProfSampleEnd {} -> heap endSample
@@ -246,7 +261,7 @@ snapshot b
       Timeline
         { tlStart = start
         , tlEnd = end
-        , tlCaps = V.fromList [mkTrack (sortOn srStart (reverse (cbSpans (closeOpen end 0 0 cb)))) | cb <- caps]
+        , tlCaps = tracks
         , tlCapPoints = V.fromList [VU.fromList (sortOn (\(x, _, _) -> x) (cbPoints cb)) | cb <- caps]
         , tlThreads = M.fromList [(fromIntegral tid, threadInfo end tid tb) | (tid, tb) <- IM.toList threads]
         , tlGCs = V.fromList (gcClusters (sortOn fst gcSpans) (sortOn (\(GCStat x _ _ _) -> x) (bGCStats b)))
@@ -257,7 +272,13 @@ snapshot b
         , tlHeapProfile = heapProfile b start
         , tlInfo = reverse (bInfo b)
         , tlRun = bRun b
-        , tlCostCentres = hbCostCentres (bHeap b)
+        , tlCostCentres = costCentres
+        , tlCostCentresByLabel = M.fromListWith (++) [(cciLabel c, [cciId c]) | c <- IM.elems costCentres]
+        , tlProfSamples = samples
+        , tlSamplePeriod = period
+        , tlCodeRuns = mkCodeRuns period nCaps samples
+        , tlSampleCounts = IM.fromListWith (+) [(fromIntegral i, 1) | s <- V.toList samples, Just i <- [psStack s VU.!? 0]]
+        , tlTicky = V.fromList (sortOn (Down . tcAlloc) ticky)
         , tlEventCount = bCount b
         }
   where
@@ -265,6 +286,23 @@ snapshot b
     end = bMax b
     nCaps = if IM.null (bCaps b) then 0 else fst (IM.findMax (bCaps b)) + 1
     caps = [IM.findWithDefault emptyCap i (bCaps b) | i <- [0 .. nCaps - 1]]
+    tracks = V.fromList [mkTrack (sortOn srStart (reverse (cbSpans (closeOpen end 0 0 cb)))) | cb <- caps]
+    costCentres = hbCostCentres (bHeap b)
+    -- A sample belongs to the thread running on its capability then.
+    samples =
+      V.fromList
+        [ ProfSample t c (runningOn c t) st
+        | (t, c, st) <- sortOn (\(x, _, _) -> x) (reverse (bSamples b))
+        ]
+    runningOn c t = case tracks V.!? c of
+      Just tr | Just i <- spanIndexAt tr t, trKind tr VU.! i == kindRun -> trThread tr VU.! i
+      _ -> 0
+    period = samplePeriod (V.toList samples)
+    ticky =
+      [ TickyCounter i name arity kinds info e a d n
+      | (i, (name, arity, kinds, info)) <- M.toList (bTickyDefs b)
+      , let (e, a, d, n) = M.findWithDefault (0, 0, 0, 0) i (bTickySums b)
+      ]
     gcSpans = [(srStart s, srEnd s) | cb <- caps, s <- cbSpans (closeOpen end 0 0 cb), srKind s == kindGC]
     series = VU.fromList . sortOn fst
     -- Runs still open at the snapshot appear in the capability tracks but
@@ -428,6 +466,8 @@ forceTimeline tl = do
   V.mapM_ evaluate (tlCapPoints tl)
   V.mapM_ evaluate (tlGCs tl)
   V.mapM_ evaluate (tlMarkers tl)
+  V.mapM_ evaluate (tlCodeRuns tl)
+  _ <- evaluate (IM.size (tlSampleCounts tl))
   mapM_ evaluate (tlThreads tl)
   case tlHeapProfile tl of
     Just hp -> evaluate hp >> V.mapM_ evaluate (hpBands hp)

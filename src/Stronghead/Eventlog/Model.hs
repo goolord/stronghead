@@ -55,6 +55,21 @@ module Stronghead.Eventlog.Model
   , collectionBeforeCensus
   , RangeStats (..)
   , rangeStats
+    -- * Code samples
+  , ProfSample (..)
+  , CodeRun (..)
+  , mkCodeRuns
+  , samplePeriod
+  , CodeProfile (..)
+  , codeProfile
+  , sliceProfile
+  , threadProfile
+  , costCentreName
+  , costCentreNamed
+  , isIdleCostCentre
+  , fewSamples
+    -- * Ticky
+  , TickyCounter (..)
   ) where
 
 import Data.IntMap.Strict (IntMap)
@@ -62,8 +77,10 @@ import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict (Map)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
+import Data.Maybe (listToMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word32, Word64, Word8)
@@ -377,12 +394,28 @@ data Timeline = Timeline
   , tlRun :: !RunInfo
   , tlCostCentres :: !(IntMap CostCentreInfo)
     -- ^ By id, from a profiled program's @HeapProfCostCentre@ events.
+  , tlCostCentresByLabel :: !(Map Text [Int])
+    -- ^ Cost-centre ids by label, for finding one another panel names.
+  , tlProfSamples :: !(V.Vector ProfSample)
+    -- ^ A profiled program's cost-centre samples (@+RTS -p -l@), every
+    -- capability's, sorted by time.
+  , tlSamplePeriod :: !Word64
+    -- ^ How far apart one capability's samples are, in ns, as the log
+    -- shows it (not as requested: on Windows the timer is coarser); 0 with
+    -- no samples.
+  , tlCodeRuns :: !(V.Vector (V.Vector CodeRun))
+    -- ^ Per capability, its samples merged into runs of one top frame.
+  , tlSampleCounts :: !(IntMap Int)
+    -- ^ Samples per top-frame cost centre, over the whole log.
+  , tlTicky :: !(V.Vector TickyCounter)
+    -- ^ A ticky build's counters (@-ticky@, @+RTS -lT@), most allocation
+    -- first.
   , tlEventCount :: !Int
   }
   deriving (Show)
 
 emptyTimeline :: Timeline
-emptyTimeline = Timeline 0 0 V.empty V.empty M.empty V.empty VU.empty VU.empty VU.empty V.empty Nothing [] emptyRunInfo IM.empty 0
+emptyTimeline = Timeline 0 0 V.empty V.empty M.empty V.empty VU.empty VU.empty VU.empty V.empty Nothing [] emptyRunInfo IM.empty M.empty V.empty 0 V.empty IM.empty V.empty 0
 
 -- | A cost centre as the eventlog defines it.
 data CostCentreInfo = CostCentreInfo
@@ -512,3 +545,145 @@ rangeStats tl a b =
     gcs = takeWhile ((<= b) . gcStart . snd) (zip [i0 ..] (V.toList (V.drop i0 (tlGCs tl))))
     pause (_, g) = gcEnd g - gcStart g
     lo = lowerBoundBy mkTime (tlMarkers tl) a
+
+-- ---------------------------------------------------------------------------
+-- Code samples
+
+-- | One cost-centre sample: what a capability was running at a profiler
+-- tick, from a profiled build run with @+RTS -p -l@.
+data ProfSample = ProfSample
+  { psTime :: !Word64
+  , psCap :: !Int
+  , psThread :: !Word32
+    -- ^ The thread running on the capability at the time (0 when none
+    -- was): the sample is part of that thread's CPU profile.
+  , psStack :: !(VU.Vector Word32)
+    -- ^ Cost-centre ids, innermost (the top frame) first.
+  }
+  deriving (Eq, Show)
+
+-- | The sample's top frame.
+psTop :: ProfSample -> Maybe Int
+psTop s = fromIntegral <$> psStack s VU.!? 0
+
+-- | Consecutive samples of one capability with the same top frame, as the
+-- code track draws them. A sample stands for the period before it.
+data CodeRun = CodeRun
+  { crStart :: !Word64
+  , crEnd :: !Word64
+  , crCostCentre :: !Int
+  , crSamples :: !Int
+  , crFirst :: !Int
+    -- ^ Index of its first sample in 'tlProfSamples', for the stack.
+  }
+  deriving (Eq, Show)
+
+-- | The median gap between one capability's consecutive samples, from
+-- samples sorted by time. The RTS samples every capability at each tick.
+samplePeriod :: [ProfSample] -> Word64
+samplePeriod samples =
+  let byCap = IM.fromListWith (++) [(psCap s, [psTime s]) | s <- reverse samples]
+      gaps = sortOn id [b - a | ts <- IM.elems byCap, (a, b) <- zip ts (drop 1 ts), b > a]
+   in case gaps of
+        [] -> 0
+        _ -> gaps !! (length gaps `div` 2)
+
+-- | Merge each capability's samples into runs of one top frame. A gap of
+-- more than a period and a half between samples ends a run; samples
+-- without a frame (at the stack's root) end one too.
+mkCodeRuns :: Word64 -> Int -> V.Vector ProfSample -> V.Vector (V.Vector CodeRun)
+mkCodeRuns period nCaps samples = V.generate nCaps (\c -> V.fromList (go Nothing (IM.findWithDefault [] c byCap)))
+  where
+    byCap = IM.fromListWith (++) [(psCap s, [(i, s)]) | (i, s) <- reverse (zip [0 ..] (V.toList samples))]
+    slack = period + period `div` 2
+    go acc [] = maybe [] pure acc
+    go acc ((i, s) : rest) = case psTop s of
+      Nothing -> maybe id (:) acc (go Nothing rest)
+      Just cc -> case acc of
+        Just r
+          | crCostCentre r == cc && psTime s <= crEnd r + slack ->
+              go (Just r {crEnd = psTime s, crSamples = crSamples r + 1}) rest
+        _ ->
+          let from = max (psTime s - min (psTime s) period) (maybe 0 crEnd acc)
+           in maybe id (:) acc (go (Just (CodeRun from (psTime s) cc 1 i)) rest)
+
+-- | The top frames of some samples, most sampled first.
+data CodeProfile = CodeProfile
+  { cpSamples :: !Int
+    -- ^ Samples taken, idle ones included.
+  , cpIdle :: !Int
+    -- ^ Samples of an idle capability (the @IDLE@ cost centre), which
+    -- 'cpTop' leaves out.
+  , cpTop :: ![(Int, Int)]
+    -- ^ Top-frame cost centre and its samples.
+  }
+  deriving (Eq, Show)
+
+-- | The top frames of the samples taken between two moments that @keep@
+-- keeps.
+codeProfile :: Timeline -> (ProfSample -> Bool) -> Word64 -> Word64 -> CodeProfile
+codeProfile tl keep a b =
+  CodeProfile (length ss) (length (filter idle ss)) (sortOn (Down . snd) (IM.toList counts))
+  where
+    everything = tlProfSamples tl
+    ss = filter keep (takeWhile ((<= b) . psTime) (V.toList (V.drop (lowerBoundBy psTime everything a) everything)))
+    idle s = maybe False isIdleCostCentre (psTop s >>= (`IM.lookup` tlCostCentres tl))
+    counts = IM.fromListWith (+) [(i, 1 :: Int) | s <- ss, not (idle s), Just i <- [psTop s]]
+
+-- | What ran during a slice: the samples on its capability (when it is a
+-- capability's slice) taken while its thread (when it has one) was
+-- running.
+sliceProfile :: Timeline -> Maybe Int -> Word32 -> Word64 -> Word64 -> CodeProfile
+sliceProfile tl cap tid = codeProfile tl (\s -> maybe True (== psCap s) cap && (tid == 0 || psThread s == tid))
+
+-- | A thread's CPU profile: the samples taken while it was running.
+threadProfile :: Timeline -> Word32 -> CodeProfile
+threadProfile tl tid = codeProfile tl ((== tid) . psThread) (tlStart tl) (tlEnd tl)
+
+-- | @Module.label@, from the log's cost-centre table.
+costCentreName :: Timeline -> Int -> Text
+costCentreName tl i = maybe ("cost centre " <> tshow i) (\c -> cciModule c <> "." <> cciLabel c) (IM.lookup i (tlCostCentres tl))
+
+-- | A cost centre by module (empty for any) and label.
+costCentreNamed :: Timeline -> Text -> Text -> Maybe CostCentreInfo
+costCentreNamed tl m l =
+  listToMaybe
+    [ c
+    | i <- M.findWithDefault [] l (tlCostCentresByLabel tl)
+    , Just c <- [IM.lookup i (tlCostCentres tl)]
+    , T.null m || cciModule c == m
+    ]
+
+-- | The cost centre an idle capability's samples are charged to.
+isIdleCostCentre :: CostCentreInfo -> Bool
+isIdleCostCentre c = cciLabel c == "IDLE" && cciModule c == "IDLE"
+
+-- | Too few samples to say much. The profiler samples each capability once
+-- a tick, and on Windows its tick is far coarser than asked for (V4).
+fewSamples :: Int -> Bool
+fewSamples n = n < 30
+
+-- ---------------------------------------------------------------------------
+-- Ticky
+
+-- | One ticky counter, from a ticky build (@-ticky@) run with @+RTS -lT@:
+-- a closure's entries and allocation, summed over the log's samples (the
+-- RTS resets the counters after each one).
+data TickyCounter = TickyCounter
+  { tcId :: !Word64
+  , tcName :: !Text
+    -- ^ As the RTS gives it: @main2_sat_s7qL{v} (Main) (fun) in s7qM@
+    -- ("Stronghead.Join.parseTickyName").
+  , tcArity :: !Int
+  , tcKinds :: !Text
+    -- ^ Argument kinds, one letter each.
+  , tcInfo :: !Word64
+    -- ^ Its info table's address.
+  , tcEntries :: !Word64
+  , tcAlloc :: !Word64
+    -- ^ Bytes its code allocated.
+  , tcAllocd :: !Word64
+    -- ^ Bytes of its own closures allocated (with @-ticky-allocd@).
+  , tcSamples :: !Int
+  }
+  deriving (Eq, Show)

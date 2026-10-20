@@ -35,9 +35,19 @@ module Stronghead.Join
   , StgSites (..)
   , stgSites
   , siteOfTable
+    -- * Ticky counters and STG
+  , TickyName (..)
+  , parseTickyName
+  , tickyBinder
+  , tickyUnique
+  , tickyTopLevel
     -- * Heap bands and closures
   , bandTitle
   , closureMatchesBand
+  , bandInfoTable
+  , BandMatch (..)
+  , bandMatchName
+  , matchBand
   , SourceGroup (..)
   , closuresBySource
   ) where
@@ -49,11 +59,13 @@ import Data.IntSet qualified as IS
 import Data.List (groupBy, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (listToMaybe)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
+import Data.Word (Word64)
 import Stronghead.Debug.Graph (ClosureId, ClosureNode (..), HeapSnapshot (..), NodeKind (..))
 import Stronghead.Dump (CodeFile (..), TokKind (..), Token (..), lineTokens)
 import Stronghead.HeapProfile (Band (..), BandKind (..), InfoProv (..))
@@ -103,6 +115,10 @@ data Lane
     -- ^ Bytes live at the heap cursor, from an info-table profile (@-hi@).
   | LaneLive
     -- ^ Bytes in the latest ghc-debug snapshot.
+  | LaneEntries
+    -- ^ Entries, from a ticky build's counters.
+  | LaneTicky
+    -- ^ Bytes allocated, from a ticky build's counters.
   | LaneNote
     -- ^ No bar: only the trailing note (a binding's badges).
   | LaneMark !Mark
@@ -115,6 +131,8 @@ laneName = \case
   LaneAlloc -> "alloc"
   LaneHeap -> "heap"
   LaneLive -> "live"
+  LaneEntries -> "entries"
+  LaneTicky -> "ticky alloc"
   LaneNote -> "note"
   LaneMark _ -> "mark"
 
@@ -299,6 +317,95 @@ siteOfTable sites table msp = case parseTableName table of
     listToMaybe [l | (s, l) <- sgNotes sites, sameFile (ssFile s) (ssFile sp), s {ssFile = ""} == sp {ssFile = ""}]
 
 -- ---------------------------------------------------------------------------
+-- Ticky counters and STG
+
+-- | What a ticky counter's name says (V5). The RTS names each counter
+-- after its closure's binder, as the STG dump prints it once the unique
+-- is put back:
+--
+-- * @main2_sat_s7qL{v} (Main) (fun) in s7qM@: the closure @main2_sat_s7qL@
+--   of @Main@, a function, defined inside the closure with unique @s7qM@;
+-- * @go3{v r9BH} (Stronghead.Agent) (fun)@: the top-level @go3_r9BH@;
+-- * @Main.main2{v r7mA} (fun,se)@: the exported @Main.main2@.
+data TickyName = TickyName
+  { tnName :: !Text
+    -- ^ As written before the braces.
+  , tnUnique :: !(Maybe Text)
+    -- ^ The unique in the braces, when the name does not carry its own.
+  , tnModule :: !Text
+  , tnFlags :: ![Text]
+    -- ^ @fun@, @thk@, @se@ (single entry) and the like.
+  , tnParent :: !(Maybe Text)
+    -- ^ The unique of the closure it is defined in.
+  }
+  deriving (Eq, Show)
+
+parseTickyName :: Text -> Maybe TickyName
+parseTickyName raw = do
+  let (name, open) = T.breakOn "{" (T.strip raw)
+      (braces, close) = T.breakOn "}" (T.drop 1 open)
+  if T.null name || T.null close then Nothing else Just ()
+  unique <- case T.words braces of
+    ["v"] -> Just Nothing
+    ["v", u] -> Just (Just u)
+    _ -> Nothing
+  let (groups, rest) = parenGroups (T.drop 1 close)
+      (mods, flagGroups) = span (maybe False (isUpper . fst) . T.uncons) groups
+      modName = case mods of
+        m : _ -> m
+        [] -> maybe "" fst (qualifierOf name)
+  pure
+    TickyName
+      { tnName = name
+      , tnUnique = unique
+      , tnModule = modName
+      , tnFlags = concatMap (map T.strip . T.splitOn ",") flagGroups
+      , tnParent = T.strip <$> T.stripPrefix "in " rest
+      }
+  where
+    parenGroups t = case T.stripPrefix "(" (T.stripStart t) of
+      Just r ->
+        let (g, r') = T.breakOn ")" r
+            (gs, rest) = parenGroups (T.drop 1 r')
+         in (g : gs, rest)
+      Nothing -> ([], T.strip t)
+
+-- | A qualified name's module and the rest: @Main.main2@ is @Main@ and
+-- @main2@. The top-level @:Main.main@ GHC adds counts too.
+qualifierOf :: Text -> Maybe (Text, Text)
+qualifierOf n =
+  let bare = T.dropWhile (== ':') n
+      (pre, base) = T.breakOnEnd "." bare
+   in case T.uncons pre of
+        Just (c, _) | isUpper c, not (T.null base) -> Just (T.dropEnd 1 pre, base)
+        _ -> Nothing
+
+-- | The STG binder a counter belongs to: the name with its unique put
+-- back, unless it is qualified (exported) or carries the unique already.
+tickyBinder :: TickyName -> Text
+tickyBinder tn = case tnUnique tn of
+  Just u | Nothing <- qualifierOf (tnName tn) -> tnName tn <> "_" <> u
+  _ -> tnName tn
+
+-- | The counter's own unique, which other counters name as their parent:
+-- the braces' one, or else the binder's suffix (@main2_sat_s7qL@ is
+-- @s7qL@).
+tickyUnique :: TickyName -> Maybe Text
+tickyUnique tn = case tnUnique tn of
+  Just u -> Just u
+  Nothing -> case T.breakOnEnd "_" (tnName tn) of
+    (pre, u) | not (T.null pre), not (T.null u) -> Just u
+    _ -> Nothing
+
+-- | The top-level closure a counter is nested in, following parents
+-- (looked up by unique) as far as they go.
+tickyTopLevel :: (Text -> Maybe TickyName) -> TickyName -> TickyName
+tickyTopLevel lookupUnique = go (64 :: Int)
+  where
+    go 0 tn = tn
+    go n tn = maybe tn (go (n - 1)) (tnParent tn >>= lookupUnique)
+
+-- ---------------------------------------------------------------------------
 -- Heap bands and closures
 
 -- | A band's name for display. An info-table band (@-hi@) is named by an
@@ -336,6 +443,31 @@ closureMatchesBand b n = case bandProv b of
   where
     -- -hd names a constructor with its module: "Main.Leaf" or "Leaf".
     stripped = snd (T.breakOnEnd "." (bandName b))
+
+-- | An info-table band's table: @-hi@ names its bands by the address.
+bandInfoTable :: Band -> Maybe Word64
+bandInfoTable b = case T.stripPrefix "0x" (bandName b) of
+  Just h | Right (n, "") <- TR.hexadecimal h -> Just n
+  _ -> Nothing
+
+-- | How a band was matched to closures.
+data BandMatch = ByInfoTable | BySource | ByName
+  deriving (Eq, Show)
+
+bandMatchName :: BandMatch -> Text
+bandMatchName = \case
+  ByInfoTable -> "exactly, by info table"
+  BySource -> "by source"
+  ByName -> "by closure type or name"
+
+-- | The closures a band stands for. Exactly, by info-table address, when
+-- the snapshot carries its closures' info pointers (D4) and the band's
+-- table is among them: addresses hold within one run, so a band from
+-- another run finds none and falls back. Otherwise 'closureMatchesBand'.
+matchBand :: Band -> [ClosureNode] -> (BandMatch, [ClosureNode])
+matchBand b ns = case bandInfoTable b of
+  Just a | exact@(_ : _) <- [n | n <- ns, cnInfo n == Just a] -> (ByInfoTable, exact)
+  _ -> (if isJust (bandProv b) then BySource else ByName, filter (closureMatchesBand b) ns)
 
 -- | The closures of a snapshot that share a source location.
 data SourceGroup = SourceGroup

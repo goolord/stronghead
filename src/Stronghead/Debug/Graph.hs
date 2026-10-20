@@ -1,7 +1,7 @@
 -- | The live closure graph a ghc-debug snapshot yields, and the analyses run
 -- over it: shortest retainer paths from the GC roots, the CAF or root each
--- closure hangs from, the bytes each closure holds, and thunks that survive
--- snapshot after snapshot.
+-- closure hangs from, the bytes each closure holds, thunks that survive
+-- snapshot after snapshot, and each thread's stack of frames.
 --
 -- Nothing here talks to ghc-debug, so it builds (and is tested) whether or
 -- not the @ghc-debug@ flag is on; "Stronghead.Debug" fills it in.
@@ -18,6 +18,10 @@ module Stronghead.Debug.Graph
   , NodeKind (..)
   , kindOfClosureType
   , ClosureNode (..)
+  , StackFrame (..)
+  , frameTitle
+  , threadStack
+  , threadOf
   , RootKind (..)
   , rootKindOf
   , HeapSnapshot (..)
@@ -39,7 +43,7 @@ module Stronghead.Debug.Graph
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
@@ -47,7 +51,7 @@ import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
-import Data.Word (Word16, Word64)
+import Data.Word (Word16, Word32, Word64)
 import Numeric (showHex)
 
 -- | A process to snapshot: one running ghc-debug-stub, listening on a Unix
@@ -144,8 +148,72 @@ data ClosureNode = ClosureNode
     -- ^ Bytes, header included.
   , cnChildren :: [ClosureId]
     -- ^ Pointer fields, SRT entries and stack-frame pointers, in order.
+  , cnInfo :: Maybe Word64
+    -- ^ Its info table's address, for the exact join to an info-table
+    -- heap band (@-hi@) of the same run.
+  , cnFrames :: [StackFrame]
+    -- ^ For a STACK, its frames, the top (most recent) first.
   }
   deriving (Eq, Show)
+
+-- | One frame of a thread's stack: the code it returns to.
+data StackFrame = StackFrame
+  { sfType :: Text
+    -- ^ The frame's closure type: @RET_SMALL@, @UPDATE_FRAME@,
+    -- @CATCH_FRAME@, @UNDERFLOW_FRAME@, @STOP_FRAME@ and so on.
+  , sfName :: Text
+    -- ^ The return point's name from the info-table map, if built with
+    -- @-finfo-table-map@.
+  , sfSource :: Maybe Text
+    -- ^ Its source span, from the same map.
+  , sfInfo :: Word64
+  , sfPointers :: [ClosureId]
+    -- ^ The closures the frame keeps alive.
+  }
+  deriving (Eq, Show)
+
+-- | What a frame is doing, in words.
+frameTitle :: StackFrame -> Text
+frameTitle f = case sfType f of
+  "UPDATE_FRAME" -> "evaluating a thunk" <> named
+  "CATCH_FRAME" -> "inside catch" <> named
+  "CATCH_RETRY_FRAME" -> "inside orElse" <> named
+  "CATCH_STM_FRAME" -> "inside catchSTM" <> named
+  "ATOMICALLY_FRAME" -> "inside atomically" <> named
+  "UNDERFLOW_FRAME" -> "continued in an older stack chunk"
+  "STOP_FRAME" -> "bottom of the stack"
+  _
+    | T.null (sfName f) -> "return frame (" <> sfType f <> ")"
+    | otherwise -> "returns to " <> sfName f
+  where
+    named = if T.null (sfName f) then "" else " (" <> sfName f <> ")"
+
+-- | A thread's stack at the snapshot, top frame first: the frames of the
+-- STACK its TSO points to, continued through underflow frames into older
+-- chunks. Empty when the closure is not a TSO or its stack was not
+-- reached.
+threadStack :: HeapSnapshot -> ClosureId -> [StackFrame]
+threadStack snap tso = case M.lookup tso nodes of
+  Just n | cnType n == "TSO" -> go S.empty (stackIn (cnChildren n))
+  _ -> []
+  where
+    nodes = snapNodes snap
+    stackIn ids = listToMaybe [i | i <- ids, Just c <- [M.lookup i nodes], cnType c == "STACK"]
+    go _ Nothing = []
+    go seen (Just s)
+      | S.member s seen = []
+      | otherwise = case M.lookup s nodes of
+          Nothing -> []
+          Just st ->
+            let fs = cnFrames st
+                older = stackIn [p | f <- fs, sfType f == "UNDERFLOW_FRAME", p <- sfPointers f]
+             in fs ++ go (S.insert s seen) older
+
+-- | The thread a TSO is: ghc-debug names it @thread N@.
+threadOf :: ClosureNode -> Maybe Word32
+threadOf n = case T.stripPrefix "thread " (cnName n) of
+  Just t | cnType n == "TSO", Right (tid, "") <- TR.decimal t -> Just tid
+  _ -> Nothing
 
 data RootKind
   = RootThread

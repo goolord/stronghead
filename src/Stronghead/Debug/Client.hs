@@ -1,6 +1,7 @@
 -- | The ghc-debug side of "Stronghead.Debug": connect to a ghc-debug-stub,
 -- pause the program, walk the closure graph breadth-first from the GC roots,
--- and resume. Only built with the @ghc-debug@ flag.
+-- and resume. Each closure keeps its info pointer, and each stack its
+-- frames with their sources. Only built with the @ghc-debug@ flag.
 module Stronghead.Debug.Client
   ( walkTarget
   , listSockets
@@ -18,7 +19,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Debug.Client
 import GHC.Debug.Client.Monad (debuggeeConnectWithTracer, debuggeeConnectWithTracerTCP, snapshotInitWithTracer)
-import GHC.Debug.Types.Ptr (ClosurePtr (..), mkClosurePtr)
+import Data.Word (Word64)
+import GHC.Debug.Types.Ptr (ClosurePtr (..), InfoTablePtr (..), mkClosurePtr)
 import Stronghead.Debug.Graph
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>))
@@ -67,6 +69,10 @@ decode followSrt p = do
       itb = info cl
       ty = T.pack (show (tipe (decodedTable itb)))
   src <- getSourceInfo (tableId itb)
+  -- A stack's frames, each with the source of the code it returns to.
+  stackFrames <- case cl of
+    StackClosure {frames = GenStackFrames fs} -> mapM frame fs
+    _ -> pure []
   let name = case cl of
         ConstrClosure {constrDesc = ConstrDesc {name = n}} -> T.pack n
         TSOClosure {threadId = t} -> "thread " <> T.pack (show t)
@@ -84,7 +90,24 @@ decode followSrt p = do
       , cnSource = sourceSpan =<< src
       , cnSize = getSize (dcSize c)
       , cnChildren = length kids `seq` kids
+      , cnInfo = Just (tablePtr (tableId itb))
+      , cnFrames = length stackFrames `seq` stackFrames
       }
+  where
+    frame (DebugStackFrame fi _ vals) = do
+      fsrc <- getSourceInfo (tableId fi)
+      let ptrs = [ptrId q | SPtr q <- vals]
+      pure
+        StackFrame
+          { sfType = T.pack (show (tipe (decodedTable fi)))
+          , sfName = maybe "" sourceName fsrc
+          , sfSource = sourceSpan =<< fsrc
+          , sfInfo = tablePtr (tableId fi)
+          , sfPointers = length ptrs `seq` ptrs
+          }
+
+tablePtr :: InfoTablePtr -> Word64
+tablePtr (InfoTablePtr w) = w
 
 sourceName :: SourceInformation -> Text
 sourceName si

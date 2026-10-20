@@ -7,7 +7,7 @@ import Data.IORef
 import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict qualified as M
 import Data.Text (Text)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, listToMaybe)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
@@ -360,13 +360,13 @@ main = do
   check "an info-table band is titled by its provenance" (bandTitle hiBand == "thunk in main2 (Main.hs:82)")
   check "a constructor band by its constructor" (bandTitle (band "0x5000" (Just (prov "I#_Main_3_con_info" KindConstructor))) == "I# in main2 (Main.hs:82)")
   check "other bands by name" (bandTitle (band "THUNK_2_0" Nothing) == "THUNK_2_0")
-  let srcNode i ty src size = ClosureNode i ty (kindOfClosureType ty) "x" src size []
+  let srcNode i ty src size = ClosureNode i ty (kindOfClosureType ty) "x" src size [] Nothing []
       thunkAt = srcNode 10 "THUNK_2_0" (Just "sample/Main.hs:82:59-63") 32
   check "a closure matches an info-table band by span" (closureMatchesBand hiBand thunkAt && not (closureMatchesBand hiBand (srcNode 11 "THUNK_2_0" (Just "sample/Main.hs:9:1-3") 32)))
   check "and a closure-type band by type" (closureMatchesBand (band "THUNK_2_0" Nothing) thunkAt && not (closureMatchesBand (band "ARR_WORDS" Nothing) thunkAt))
   let srcSnap =
         mkSnapshot "src" False [1] $
-          [ ClosureNode 1 "TSO" NThread "thread 1" Nothing 16 [10, 11, 12]
+          [ ClosureNode 1 "TSO" NThread "thread 1" Nothing 16 [10, 11, 12] Nothing []
           , thunkAt
           , srcNode 11 "THUNK_2_0" (Just "sample/Main.hs:82:59-63") 48
           , srcNode 12 "CONSTR_1_0" (Just "sample/Main.hs:93:1-4") 16
@@ -382,6 +382,85 @@ main = do
   check "history steps are spans" $
     parseHistory "-1  : go (Main.hs:5:8-21)\n-2  : main (Main.hs:(10,1)-(12,3))\n<end of history>"
       == [(-1, "go", SrcSpan "Main.hs" 5 8 5 21), (-2, "main", SrcSpan "Main.hs" 10 1 12 3)]
+
+  putStrLn "code samples"
+  let prof = snapshot (foldl feedEvent emptyBuilder [E.Event t e c | (t, c, e) <- profFixture])
+      samples = V.toList (tlProfSamples prof)
+  check "every sample is kept, in time order" (map psTime samples == [110, 110, 120, 120, 130, 130, 150, 170])
+  check "a sample belongs to the thread running on its capability" $
+    [(psCap s, psThread s) | s <- samples] == [(0, 1), (1, 2), (0, 1), (1, 2), (0, 1), (1, 2), (0, 0), (0, 1)]
+  check "the period is the usual gap" (tlSamplePeriod prof == 10)
+  check "samples merge into runs of one top frame" $
+    [(crStart r, crEnd r, crCostCentre r, crSamples r) | r <- V.toList (tlCodeRuns prof V.! 0)]
+      == [(100, 120, 2, 2), (120, 130, 3, 1), (140, 150, 1, 1), (160, 170, 2, 1)]
+  check "what ran during a slice" (sliceProfile prof (Just 0) 1 100 140 == CodeProfile 3 0 [(2, 2), (3, 1)])
+  check "a thread's CPU profile" (threadProfile prof 1 == CodeProfile 4 0 [(2, 3), (3, 1)])
+  check "idle samples are counted, not listed" (codeProfile prof (const True) 100 200 == CodeProfile 8 2 [(2, 3), (3, 3)])
+  check "top-frame counts for the whole log" (tlSampleCounts prof == IM.fromList [(1, 2), (2, 3), (3, 3)])
+  check "few samples are few" (fewSamples (length samples) && not (fewSamples 500))
+  check "cost centres by name" (fmap cciId (costCentreNamed prof "" "leak") == Just 2 && costCentreNamed prof "Other" "leak" == Nothing && costCentreName prof 3 == "Main.show")
+  check "no samples, no runs" (V.all V.null (tlCodeRuns sched) && tlSamplePeriod sched == 0)
+
+  putStrLn "ticky"
+  let ticky = snapshot (foldl feedEvent emptyBuilder [E.Event t e Nothing | (t, e) <- tickyFixture])
+  check "counters summed over samples, most allocation first" $
+    [(tcId c, tcEntries c, tcAlloc c, tcSamples c) | c <- V.toList (tlTicky ticky)] == [(3, 1, 828, 2), (1, 1, 496, 1), (2, 0, 0, 0)]
+  check "a local closure's counter" $
+    parseTickyName "main2_sat_s7qL{v} (Main) (fun) in s7qM" == Just (TickyName "main2_sat_s7qL" Nothing "Main" ["fun"] (Just "s7qM"))
+  let go3 = parseTickyName "go3{v r9BH} (Stronghead.Agent) (fun)"
+      exported = parseTickyName "Main.main2{v r7mA} (fun,se)"
+  check "a top-level binder gets its unique back" (fmap tickyBinder go3 == Just "go3_r9BH" && fmap tnModule go3 == Just "Stronghead.Agent")
+  check "an exported binder is qualified" (fmap tickyBinder exported == Just "Main.main2" && fmap tnModule exported == Just "Main" && fmap tnFlags exported == Just ["fun", "se"])
+  check "the root main counts as Main's" (fmap tnModule (parseTickyName ":Main.main{v 48_1D} (fun)") == Just "Main")
+  check "not a counter name" (parseTickyName "main2" == Nothing && parseTickyName "x{y} (M)" == Nothing)
+  let names = [tn | c <- V.toList (tlTicky ticky), Just tn <- [parseTickyName (tcName c)]]
+      byUnique u = listToMaybe [tn | tn <- names, tickyUnique tn == Just u]
+  check "uniques, given or carried" (map tickyUnique names == [Just "s7qL", Just "r7mA", Just "s7qM"])
+  check "a nested counter's top-level binding" (map (nameKey . tnName . tickyTopLevel byUnique) names == ["main2", "main2", "main2"])
+  check "a counter is its STG let" (siteOfTable sites (maybe "" tickyBinder (parseTickyName "main2_sat_s7qA{v} (Main) (fun) in s7qu") <> "_info") Nothing == lineOf "main2_sat_s7qA [Occ")
+  check "an exported counter is its top-level binding" (siteOfTable sites (maybe "" tickyBinder exported <> "_info") Nothing == Just 0)
+
+  putStrLn "thread stacks"
+  let frame ty name src ptrs = StackFrame ty name src 0 ptrs
+      bare i ty = ClosureNode i ty (kindOfClosureType ty) ty Nothing 16 [] Nothing []
+      stackSnap =
+        mkSnapshot "stacks" False [1, 30] $
+          [ (bare 1 "TSO") {cnName = "thread 7", cnChildren = [2]}
+          , (bare 2 "STACK") {cnChildren = [20, 3], cnFrames = [frame "RET_SMALL" "go" (Just "Main.hs:5:3-9") [20], frame "UPDATE_FRAME" "" Nothing [20], frame "UNDERFLOW_FRAME" "" Nothing [3]]}
+          , (bare 3 "STACK") {cnFrames = [frame "CATCH_FRAME" "" Nothing [], frame "STOP_FRAME" "" Nothing []]}
+          , bare 20 "THUNK_1_0"
+          , (bare 30 "TSO") {cnName = "thread 8", cnChildren = [31]}
+          , (bare 31 "STACK") {cnFrames = [frame "UNDERFLOW_FRAME" "" Nothing [31]]}
+          ]
+  check "a thread's stack runs on through older chunks" (map sfType (threadStack stackSnap 1) == ["RET_SMALL", "UPDATE_FRAME", "UNDERFLOW_FRAME", "CATCH_FRAME", "STOP_FRAME"])
+  check "a stack that loops ends" (length (threadStack stackSnap 30) == 1)
+  check "only a TSO has a stack" (null (threadStack stackSnap 20) && null (threadStack stackSnap 99))
+  check "frames in words" (map frameTitle (take 2 (threadStack stackSnap 1)) == ["returns to go", "evaluating a thunk"])
+  check "a TSO's thread" (fmap threadOf (M.lookup 1 (snapNodes stackSnap)) == Just (Just 7) && fmap threadOf (M.lookup 2 (snapNodes stackSnap)) == Just Nothing)
+
+  putStrLn "info-table pointers"
+  let withInfo n a = n {cnInfo = Just a}
+      exactNode = withInfo (srcNode 40 "THUNK_2_0" (Just "sample/Main.hs:9:1-3") 32) 0x4fe0
+      spanNode = withInfo thunkAt 0x9999
+  check "a band's table is its address" (bandInfoTable hiBand == Just 0x4fe0 && bandInfoTable (band "THUNK_2_0" Nothing) == Nothing)
+  check "pointers present: matched exactly" (matchBand hiBand [exactNode, spanNode] == (ByInfoTable, [exactNode]))
+  check "no closure has the table: by source, as before" (matchBand hiBand [spanNode] == (BySource, [spanNode]))
+  check "no pointers at all: as before" (matchBand hiBand [thunkAt] == (BySource, [thunkAt]) && fst (matchBand (band "THUNK_2_0" Nothing) [thunkAt]) == ByName)
+
+  putStrLn "ghci values"
+  check "a named thunk and its type" (parseValue "(_t1::[Int])" == VThunk "_t1" (Just "[Int]"))
+  check "a partial list" (parseValue "1 : 2 : (_t2::[Integer])" == VList [VAtom "1", VAtom "2"] (Just (VThunk "_t2" (Just "[Integer]"))))
+  check "a whole list" (parseValue "[Just 1,Nothing]" == VList [VCon "Just" [VAtom "1"], VAtom "Nothing"] Nothing)
+  check "a constructor with a thunk" (parseValue "Just (_t3::Int)" == VCon "Just" [VThunk "_t3" (Just "Int")])
+  check "a type with brackets inside" (parseValue "(_t4::Map.Map Int (Maybe [Int]))" == VThunk "_t4" (Just "Map.Map Int (Maybe [Int])"))
+  check "tuples, chars and strings" (parseValue "(1,'a',\"b, c\")" == VTuple [VAtom "1", VAtom "'a'", VAtom "\"b, c\""])
+  check "records and holes" (parseValue "P {px = 1.0e-2, py = _}" == VRecord "P" [("px", VAtom "1.0e-2"), ("py", VThunk "_" Nothing)])
+  check "negative numbers" (parseValue "Just (-3)" == VCon "Just" [VAtom "-3"])
+  check "infix constructors" (parseValue "1 :| [2]" == VCon ":|" [VAtom "1", VList [VAtom "2"] Nothing])
+  check "what doesn't parse is kept" (parseValue "(((" == VAtom "(((" && parseValue "<function>" == VAtom "<function>")
+  check "render round trip" (all (\t -> renderValue (parseValue t) == t) ["Just (-3)", "1 : 2 : _t2", "(1, 'a')", "[Just 1, Nothing]", "P {px = 1, py = _}"])
+  check ":print lines" (parsePrint "xs = 1 : (_t1::[Int])\nys = []\n" == [("xs", VList [VAtom "1"] (Just (VThunk "_t1" (Just "[Int]")))), ("ys", VList [] Nothing)])
+  check "named thunks to force" (valueThunks (parseValue "(Just (_t1::Int), _, (_t2::Int))") == ["_t1", "_t2"] && valueHasThunks (parseValue "Just _") && not (valueHasThunks (parseValue "Just 1")))
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
@@ -413,6 +492,47 @@ schedFixture =
   , (240, Nothing, HeapProfSampleEnd 0)
   , (250, Nothing, HeapLive 0 300)
   , (260, Just 0, EndGC)
+  ]
+
+-- | Cost-centre samples on two capabilities, each sampled every 10 ns.
+-- Thread 1 runs on capability 0 from 100 to 140 and again from 160;
+-- thread 2 on capability 1 from 100 to 140. Cost centre 1 is the idle one.
+profFixture :: [(Word64, Maybe Int, EventInfo)]
+profFixture =
+  [ (0, Nothing, HeapProfCostCentre 1 "IDLE" "IDLE" "<built-in>" (HeapProfFlags 0))
+  , (0, Nothing, HeapProfCostCentre 2 "leak" "Main" "sample/Main.hs:82:1-20" (HeapProfFlags 0))
+  , (0, Nothing, HeapProfCostCentre 3 "show" "Main" "sample/Main.hs:76:5-30" (HeapProfFlags 0))
+  , (0, Nothing, HeapProfCostCentre 4 "main" "Main" "sample/Main.hs:40:1-4" (HeapProfFlags 0))
+  , (100, Just 0, RunThread 1)
+  , (100, Just 1, RunThread 2)
+  , (110, Nothing, sample 0 1 [2, 4])
+  , (110, Nothing, sample 1 1 [1])
+  , (120, Nothing, sample 0 2 [2, 4])
+  , (120, Nothing, sample 1 2 [3, 4])
+  , (130, Nothing, sample 0 3 [3, 4])
+  , (130, Nothing, sample 1 3 [3, 4])
+  , (140, Just 0, StopThread 1 ThreadYielding)
+  , (140, Just 1, StopThread 2 ThreadFinished)
+  , (150, Nothing, sample 0 5 [1])
+  , (160, Just 0, RunThread 1)
+  , (170, Nothing, sample 0 7 [2])
+  , (180, Just 0, StopThread 1 ThreadFinished)
+  ]
+  where
+    sample cap tick stack = E.ProfSampleCostCentre cap tick (fromIntegral (length stack)) (VU.fromList stack)
+
+-- | Three ticky counters: @main2@ and two closures nested in it. The RTS
+-- resets the counters after each sample.
+tickyFixture :: [(Word64, EventInfo)]
+tickyFixture =
+  [ (10, E.TickyCounterDef 1 1 "L" "Main.main2{v r7mA} (fun,se)" 0x100 Nothing)
+  , (10, E.TickyCounterDef 2 0 "" "main2_sat_s7qM{v} (Main) (fun) in r7mA" 0x200 Nothing)
+  , (10, E.TickyCounterDef 3 0 "" "main2_sat_s7qL{v} (Main) (fun) in s7qM" 0x300 Nothing)
+  , (20, E.TickyBeginSample)
+  , (20, E.TickyCounterSample 3 1 128 0)
+  , (30, E.TickyBeginSample)
+  , (30, E.TickyCounterSample 3 0 700 0)
+  , (30, E.TickyCounterSample 1 1 496 0)
   ]
 
 -- | A slice of a @-hi@ eventlog: the run's identity, one cost centre, one
@@ -544,7 +664,7 @@ leakSnapshot n =
   where
     base = if n == 2 then 6 else 1000
     thunk i = if n == 2 && i == 1 then 7 else base + fromIntegral i
-    node i ty name kids = ClosureNode i ty (kindOfClosureType ty) name Nothing 16 kids
+    node i ty name kids = ClosureNode i ty (kindOfClosureType ty) name Nothing 16 kids Nothing []
 
 -- | A slice of an STG dump from an investigation build: a thunk bound by a
 -- @let@, a numbered constructor site, and the source notes
