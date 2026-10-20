@@ -20,11 +20,16 @@ module UI.Heap
   , openProf
   , HeapLoaded (..)
   , heapLens
+    -- * For attaching and remote actions
+  , debugTarget
+  , useDebugSocket
+  , requestSnapshot
+  , snapshotRunning
   ) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, displayException, try)
-import Control.Monad (forM_, join, unless, when)
+import Control.Monad (forM_, join, unless, void, when)
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
@@ -908,19 +913,12 @@ ghcDebugView env st loaded
         p : _ -> writeVar (hsDbgFile st) (Just p)
         [] -> pure ()
       conn <- readVar (hsDbgConn st)
-      socket <- T.strip <$> readVar (hsDbgSocket st)
-      hostPort <- readVar (hsDbgHostPort st)
       file <- readVar (hsDbgFile st)
       sockets <- readVar (hsDbgSockets st)
       History _ history <- readVar (hsDbgHistory st)
       limit <- readVar (hsDbgLimit st)
-      let target = case conn of
-            ConnSocket -> if T.null socket then Nothing else Just (DebugUnix (T.unpack socket))
-            ConnTcp -> uncurry DebugTCP <$> parseHostPort hostPort
-            ConnFile -> DebugSnapshotFile <$> file
-          running = case hlSnap loaded of
-            Just (TaskRunning _) -> True
-            _ -> False
+      target <- debugTarget st
+      let running = snapshotRunning loaded
       toolStrip $ do
         toolLabel "Target"
         rowWith (alignMid . tight) $
@@ -942,10 +940,7 @@ ghcDebugView env st loaded
           forM_ sockets $ \p -> withKey (T.pack p) $
             whenM (toolButton (T.pack (takeFileName p))) (writeVar (hsDbgSocket st) (T.pack p))
       toolStrip $ do
-        disabledWhen (running || isNothing target) $ whenM (styled primary (toolButton "Take snapshot")) $ for_ target $ \t -> do
-          srt <- readVar (hsDbgSrt st)
-          n <- maybe 1 (\(k, _, _) -> k + 1) <$> readVar (hsDbgReq st)
-          writeVar (hsDbgReq st) (Just (n, t, SnapshotOptions {soMaxClosures = round limit * 1000, soFollowSrt = srt}))
+        disabledWhen (running || isNothing target) $ whenM (styled primary (toolButton "Take snapshot")) (void (requestSnapshot st))
         toolGroup $ do
           toolLabel "Closure limit"
           sliderWith (alignMid . fixedW 120) 10 1000 (hsDbgLimit st)
@@ -995,6 +990,46 @@ ghcDebugView env st loaded
               DbgSurvivors -> dbgSurvivors env st history latest survivors marked
               DbgGraph -> dbgGraph env st sn latest marked
               DbgBiggest -> dbgBiggest env st sn latest marked
+
+-- | Where a snapshot would be taken from, as the live graph's toolbar has
+-- it.
+debugTarget :: HeapState -> NanoUI (Maybe DebugTarget)
+debugTarget st = do
+  conn <- readVar (hsDbgConn st)
+  socket <- T.strip <$> readVar (hsDbgSocket st)
+  hostPort <- readVar (hsDbgHostPort st)
+  file <- readVar (hsDbgFile st)
+  pure $ case conn of
+    ConnSocket -> if T.null socket then Nothing else Just (DebugUnix (T.unpack socket))
+    ConnTcp -> uncurry DebugTCP <$> parseHostPort hostPort
+    ConnFile -> DebugSnapshotFile <$> file
+
+-- | Take snapshots from a program's socket, as Connect found it.
+useDebugSocket :: HeapState -> FilePath -> NanoUI ()
+useDebugSocket st p = do
+  writeVar (hsDbgConn st) ConnSocket
+  writeVar (hsDbgSocket st) (T.pack p)
+
+-- | Ask for a snapshot of the target with the toolbar's options: its
+-- number, or why it can't be taken.
+requestSnapshot :: HeapState -> NanoUI (Either Text Int)
+requestSnapshot st = do
+  target <- debugTarget st
+  case target of
+    _ | not ghcDebugEnabled -> pure (Left "built without ghc-debug: cabal build -f ghc-debug")
+    Nothing -> pure (Left "no ghc-debug target: link ghc-debug-stub into the program (Unix only), or set one in Heap › Live graph")
+    Just t -> do
+      srt <- readVar (hsDbgSrt st)
+      limit <- readVar (hsDbgLimit st)
+      n <- maybe 1 (\(k, _, _) -> k + 1) <$> readVar (hsDbgReq st)
+      writeVar (hsDbgReq st) (Just (n, t, SnapshotOptions {soMaxClosures = round limit * 1000, soFollowSrt = srt}))
+      pure (Right n)
+
+-- | Whether a snapshot is being taken (the target is paused for it).
+snapshotRunning :: HeapLoaded -> Bool
+snapshotRunning loaded = case hlSnap loaded of
+  Just (TaskRunning _) -> True
+  _ -> False
 
 -- | Select a closure and open the tree down to it.
 reveal :: HeapState -> HeapSnapshot -> ClosureId -> NanoUI ()

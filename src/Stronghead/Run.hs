@@ -31,6 +31,7 @@ module Stronghead.Run
     -- * Matching
   , RunMatch (..)
   , matchRuns
+  , groupRuns
   ) where
 
 import Data.Char (isDigit, toLower)
@@ -212,3 +213,14 @@ matchRuns a b = case (riProgram a, riProgram b) of
           | Just da <- riStarted a, Just db <- riStarted b, da /= db -> DifferentRuns
           | otherwise -> ProbablySameRun
   _ -> DifferentRuns
+
+-- | Put sources into runs: each source joins the first run whose first
+-- source it matches, else starts its own. Each is given by its index,
+-- with how it matched the run's first ('SameRun' for that one itself).
+groupRuns :: [RunInfo] -> [[(Int, RunMatch)]]
+groupRuns ris = map snd (foldl add [] (zip [0 ..] ris))
+  where
+    -- Each group keeps its first source's run, and its members in order.
+    add groups (i, ri) = case break (\(first, _) -> matchRuns first ri /= DifferentRuns) groups of
+      (before, (first, members) : after) -> before ++ [(first, members ++ [(i, matchRuns first ri)])] ++ after
+      _ -> groups ++ [(ri, [(i, SameRun)])]

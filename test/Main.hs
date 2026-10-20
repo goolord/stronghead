@@ -2,18 +2,26 @@
 -- the run fails if any check failed.
 module Main (main) where
 
-import Control.Monad (unless)
+import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Exception (SomeException, bracket, try)
+import Control.Monad (forever, unless, void)
+import Data.ByteString qualified as B
+import Data.ByteString.Char8 qualified as BC
 import Data.IORef
 import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict qualified as M
 import Data.Text (Text)
-import Data.Maybe (isJust, listToMaybe)
+import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word64)
 import GHC.RTS.Events (EventInfo (..), HeapProfBreakdown (..), HeapProfFlags (..), ThreadStopStatus (..))
 import GHC.RTS.Events qualified as E
+import Network.Socket qualified as N
+import Network.Socket.ByteString qualified as NB
+import Stronghead.Agent (AgentConfig (..), defaultAgentConfig, startAgent)
+import Stronghead.Attach
 import Stronghead.Clock
 import Stronghead.Debug
 import Stronghead.Dump
@@ -28,6 +36,7 @@ import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run
 import Stronghead.Source
+import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath (pathSeparator, (</>))
 
@@ -144,10 +153,54 @@ main = do
   putStrLn "live protocol"
   check "hello" (parseLine "H prog 42 4" == LHello "prog" 42 4)
   check "stats" (parseLine "S gcs=3 allocated_bytes=1024" == LStats (M.fromList [("gcs", 3), ("allocated_bytes", 1024)]))
-  check "thread" (parseLine "T 7 BlockedOnMVar worker 1" == LThread (LiveThread 7 "BlockedOnMVar" "worker 1"))
+  check "thread" (parseLine "T 7 BlockedOnMVar worker 1" == LThread (LiveThread 7 "BlockedOnMVar" "worker 1" Nothing))
   check "program clock from elapsed_ns" (frameClock 9 (M.fromList [("rts_stats", 1), ("elapsed_ns", 1.5e9)]) == (1500000000, True))
   check "init time added" (frameClock 9 (M.fromList [("rts_stats", 1), ("elapsed_ns", 1.5e9), ("init_elapsed_ns", 1.3e6)]) == (1501300000, True))
   check "arrival time without +RTS -T" (frameClock 2.5 (M.fromList [("rts_stats", 0)]) == (2500000000, False))
+  -- v2 lines, which a v1 client reads as LUnknown and skips.
+  let infoText = "I version=2 cwd=C:\\work%20dir exe=C:\\bin\\prog.exe args=prog,%2BRTS,-l,-oltrace%2C1.eventlog,-RTS,a%20b heap-profile=hT heap-interval-ms=100 eventlog=1 commands=1"
+      info = AgentInfo 2 "C:\\work dir" "C:\\bin\\prog.exe" ["prog", "+RTS", "-l", "-oltrace,1.eventlog", "-RTS", "a b"] (Just "hT") 100 True True
+  check "info line" (parseLine infoText == LInfo info)
+  check "info line without a heap profile" (fmap aiHeapProfile (case parseLine "I version=2 heap-profile=none eventlog=0" of LInfo i -> Just i; _ -> Nothing) == Just Nothing)
+  check "capability line" (parseLine "C 7 2" == LCap 7 2)
+  check "reply with a stamp" (parseLine "A 3 ok t=1500000000" == LReply 3 (ReplyOk (Just 1500000000)))
+  check "reply without one" (parseLine "A 4 ok" == LReply 4 (ReplyOk Nothing))
+  check "error reply" (parseLine "A 5 error unknown command x" == LReply 5 (ReplyError "unknown command x"))
+  check "v1 lines unchanged" (parseLine "T 9 running" == LThread (LiveThread 9 "running" "" Nothing) && parseLine "E" == LEnd && parseLine "X whatever" == LUnknown)
+  check "percent encoding round trip" (all (\t -> percentDecode (percentEncode t) == t) ["C:\\a b,c=d%e", "/home/zoë/x", "", "plain-path_1.0"])
+  check "percent encoding keeps separators out" (not (T.any (`elem` (" ,=" :: String)) (percentEncode "a b,c=d")))
+  check "commands rendered" $
+    map (renderCommand 7) [CmdMark "two\nlines", CmdGC, CmdCensus, CmdHeapProfiling False, CmdFlush]
+      == ["7 mark two lines", "7 gc", "7 census", "7 heap-profiling off", "7 flush"]
+  check "the markers commands post" $
+    map commandMarker [CmdMark "  deploy ", CmdMark "", CmdGC, CmdHeapProfiling True, CmdFlush]
+      == [Just "deploy", Just "mark", Just "stronghead: major GC", Just "stronghead: heap profiling on", Nothing]
+  let frame t p = Frame t p True M.empty []
+  check "a pause leaves a gap" (frameGaps [frame (0.25 * fromIntegral i) (250000000 * i) | i <- [0 .. 9]] == [] && frameGaps ([frame (0.25 * fromIntegral i) (250000000 * i) | i <- [0 .. 9]] ++ [frame 6 6000000000]) == [(2250000000, 6000000000)])
+
+  putStrLn "attach"
+  let v2 = info {aiCwd = "/work", aiArgs = ["prog", "+RTS", "-l", "-RTS"]}
+  check "eventlog named after the program" (eventlogPathFor "prog" v2 == Just ("/work" </> "prog.eventlog"))
+  check "eventlog from -ol" (eventlogPathFor "prog" v2 {aiArgs = ["prog", "+RTS", "-olout/trace.eventlog", "-RTS"]} == Just ("/work" </> "out/trace.eventlog"))
+  check "an absolute -ol stays" (eventlogPathFor "prog" v2 {aiArgs = ["prog", "+RTS", "-ol/tmp/t.eventlog", "-RTS"]} == Just "/tmp/t.eventlog")
+  check "-ol after --RTS is the program's" (rtsOption "-ol" ["prog", "--RTS", "-olx"] == Nothing)
+  check "stem from -po" (eventlogPathFor "prog" v2 {aiArgs = ["prog", "+RTS", "-poall", "-RTS"]} == Just ("/work" </> "all.eventlog") && hpPathFor "prog" v2 {aiArgs = ["prog", "+RTS", "-poall", "-RTS"]} == Just ("/work" </> "all.hp"))
+  check "no eventlog without -l" (eventlogPathFor "prog" v2 {aiEventlog = False} == Nothing)
+  check "heap profile when profiling" (hpPathFor "prog" v2 == Just ("/work" </> "prog.hp") && hpPathFor "prog" v2 {aiHeapProfile = Nothing} == Nothing)
+  check "socket by pid" (socketFor "prog" 42 ["/tmp/ghc-debug/41-prog", "/tmp/ghc-debug/42-other", "/tmp/ghc-debug/42-prog"] == Just "/tmp/ghc-debug/42-prog")
+  tmp <- getTemporaryDirectory
+  let dir = tmp </> "stronghead-attach-test"
+  createDirectoryIfMissing True dir
+  writeFile (dir </> "prog.eventlog") ""
+  steps <- probeAttach "prog.exe" 42 v2 {aiCwd = T.pack dir} True (pure [dir </> "42-prog"])
+  check "probe finds the eventlog" (map asPath steps == [Just (dir </> "prog.eventlog"), Nothing, Just (dir </> "42-prog"), Just dir, Nothing])
+  check "probe says what it skipped" ("isn't there" `T.isInfixOf` asNote (steps !! 1) && "no dumps" `T.isInfixOf` asNote (steps !! 4))
+  away <- probeAttach "prog" 42 v2 {aiCwd = "/no/such/place"} False (pure [])
+  check "a directory elsewhere is skipped" (all (isNothing . asPath) away && "ghc-debug support" `T.isInfixOf` asNote (away !! 2))
+  removeDirectoryRecursive dir
+
+  putStrLn "agent"
+  agentChecks check
 
   putStrLn "eventlog provenance"
   let tl = snapshot (foldl feedEvent emptyBuilder [E.Event t e Nothing | (t, e) <- eventlogFixture])
@@ -242,6 +295,10 @@ main = do
   check "different start dates" (matchRuns hpRunInfo hpRunInfo {riStarted = Just "Tue Oct 20 09:00 2026"} == DifferentRuns)
   check "unknown program" (matchRuns emptyRunInfo {riPid = Just 4242} hello == DifferentRuns)
   check "merge prefers the first" (mergeRunInfo hpRunInfo hello == hpRunInfo {riPid = Just 4242})
+  check "runs grouped: same, probable, different" $
+    groupRuns [fromLog, hpRunInfo, runFromHello "other" 1, hello]
+      == [[(0, SameRun), (1, ProbablySameRun), (3, SameRun)], [(2, SameRun)]]
+  check "a source naming no program is a run of its own" (groupRuns [emptyRunInfo, emptyRunInfo] == [[(0, SameRun)], [(1, SameRun)]])
   check "run key" (runKey fromLog == RunKey "stronghead-sample:4242" && runKey hpRunInfo == RunKey "stronghead-sample:?")
   check "run keys match" $
     runKeysMatch (runKey fromLog) (runKey hello)
@@ -690,3 +747,114 @@ stgText =
     , "              3 GHC.Internal.Types.I#! [1#];"
     , "        } in  main2_sat_s7qB;"
     ]
+
+-- ---------------------------------------------------------------------------
+-- The agent and the client, in this process
+
+-- | A v2 agent and client together: the info line, capabilities, commands
+-- and their replies, and commands turned off. Then each side against the
+-- other version: a v1 agent (no info line, never reads) still streams
+-- frames to this client, and a v2 agent's lines leave everything a v1
+-- client reads as it was.
+agentChecks :: (String -> Bool -> IO ()) -> IO ()
+agentChecks check = do
+  let cfg port = defaultAgentConfig {agentPort = port, agentIntervalMs = 50, agentFlushEventlog = False}
+  agent <- startAgent (cfg 47771)
+  (events, client) <- listen 47771
+  box <- waitFor events (\case LiveConnected b -> Just b; _ -> Nothing)
+  hello <- waitFor events (\case LiveHello _ pid _ -> Just pid; _ -> Nothing)
+  info <- waitFor events (\case LiveInfo i -> Just i; _ -> Nothing)
+  frame <- waitFor events (\case LiveFrame f -> Just f; _ -> Nothing)
+  check "v2 agent: hello" (maybe False (> 0) hello)
+  check "v2 agent: info line" (fmap aiVersion info == Just 2 && fmap aiCommands info == Just True && maybe False (not . T.null . aiCwd) info && maybe False (not . null . aiArgs) info)
+  check "v2 agent: no heap profile or eventlog in this test" (fmap aiHeapProfile info == Just Nothing && fmap aiEventlog info == Just False)
+  check "v2 agent: threads carry capabilities" (maybe False (any (isJust . ltCap) . frThreads) frame)
+  for_' box $ \b -> do
+    sendCommand b 1 (CmdMark "test mark")
+    sendCommand b 2 CmdGC
+    sendCommand b 3 (CmdHeapProfiling False)
+    sendCommand b 4 CmdFlush
+  replies <- mapM (\i -> waitFor events (\case LiveReply j r | j == i -> Just r; _ -> Nothing)) [1, 2, 3, 4]
+  -- Without +RTS -T the agent can't say when.
+  check "v2 agent: commands answered, unstamped without +RTS -T" (all (== Just (ReplyOk Nothing)) replies)
+  stop client
+  -- Commands turned off.
+  closed <- startAgent (cfg 47772) {agentAcceptCommands = Just False}
+  (events2, client2) <- listen 47772
+  box2 <- waitFor events2 (\case LiveConnected b -> Just b; _ -> Nothing)
+  info2 <- waitFor events2 (\case LiveInfo i -> Just i; _ -> Nothing)
+  for_' box2 $ \b -> sendCommand b 9 CmdGC
+  refused <- waitFor events2 (\case LiveReply 9 r -> Just r; _ -> Nothing)
+  check "commands turned off: the info line says so" (fmap aiCommands info2 == Just False)
+  check "commands turned off: refused" (case refused of Just (ReplyError e) -> "turned off" `T.isInfixOf` e; _ -> False)
+  stop client2
+  -- A v1 client reading a v2 agent: the lines it knows are as they were,
+  -- and the rest start with a letter it skips.
+  raw <- rawLines 47771
+  let kinds = map (takeWhile (/= ' ')) raw
+  check "v1 client: hello first, as before" (case raw of h : _ -> length (words h) == 4 && take 2 h == "H "; [] -> False)
+  check "v1 client: only lines it knows or skips" (all (`elem` ["H", "I", "S", "T", "C", "E"]) kinds && "T" `elem` kinds && "E" `elem` kinds)
+  check "v1 client: thread lines unchanged" (and [length (words l) >= 3 | l <- raw, take 2 l == "T "])
+  -- A v2 client reading a v1 agent, which never reads what it is sent.
+  v1 <- forkIO (fakeV1Agent 47773)
+  threadDelay 100000
+  (events3, client3) <- listen 47773
+  box3 <- waitFor events3 (\case LiveConnected b -> Just b; _ -> Nothing)
+  for_' box3 $ \b -> sendCommand b 1 CmdGC
+  frames <- waitFor events3 (\case LiveFrame f -> Just f; _ -> Nothing)
+  threadDelay 300000
+  seen <- readIORef events3
+  check "v1 agent: frames still arrive" (isJust frames && not (null [() | LiveHello "prog" 7 1 <- seen]))
+  check "v1 agent: no info line, so no replies" (null [() | LiveInfo _ <- seen] && null [() | LiveReply _ _ <- seen])
+  stop client3
+  -- A synchronous kill would wait on a blocking accept (Windows).
+  mapM_ (forkIO . killThread) (v1 : agent ++ closed)
+  where
+    listen port = do
+      events <- newIORef []
+      t <- forkIO (connectLive "127.0.0.1" port (\e -> atomicModifyIORef' events (\es -> (es ++ [e], ()))))
+      pure (events, t)
+    stop t = void (forkIO (killThread t))
+    for_' m f = maybe (pure ()) f m
+
+-- | The first event that matches, waiting up to five seconds for it.
+waitFor :: IORef [LiveEvent] -> (LiveEvent -> Maybe a) -> IO (Maybe a)
+waitFor events pick = go (100 :: Int)
+  where
+    go 0 = pure Nothing
+    go n = do
+      es <- readIORef events
+      case mapMaybe pick es of
+        x : _ -> pure (Just x)
+        [] -> threadDelay 50000 >> go (n - 1)
+
+-- | A few frames' worth of an agent's lines, read as a v1 client would.
+rawLines :: Int -> IO [String]
+rawLines port = do
+  r <- try $ do
+    addr : _ <- N.getAddrInfo (Just N.defaultHints {N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
+    bracket (N.openSocket addr) N.close $ \sock -> do
+      N.connect sock (N.addrAddress addr)
+      let go acc n
+            | n <= (0 :: Int) = pure acc
+            | otherwise = do
+                chunk <- NB.recv sock 65536
+                if B.null chunk then pure acc else go (acc <> chunk) (n - BC.count '\n' chunk)
+      bytes <- go B.empty 60
+      pure [l | l <- lines (filter (/= '\r') (BC.unpack bytes)), not (null l)]
+  pure (either (\(_ :: SomeException) -> []) id r)
+
+-- | An agent from before protocol v2: hello and frames, and it never reads
+-- the socket.
+fakeV1Agent :: Int -> IO ()
+fakeV1Agent port = do
+  addr : _ <- N.getAddrInfo (Just N.defaultHints {N.addrFlags = [N.AI_PASSIVE], N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
+  bracket (N.openSocket addr) N.close $ \sock -> do
+    N.setSocketOption sock N.ReuseAddr 1
+    N.bind sock (N.addrAddress addr)
+    N.listen sock 1
+    (conn, _) <- N.accept sock
+    NB.sendAll conn "H prog 7 1\n"
+    forever $ do
+      NB.sendAll conn "S rts_stats=0\nT 1 running main\nE\n"
+      threadDelay 50000

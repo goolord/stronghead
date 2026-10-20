@@ -5,6 +5,10 @@
 -- scrubs moves the cursor with a plain drag. A view whose own cursor snaps
 -- to samples keeps it in step with the shared one through a 'Tether'.
 --
+-- Besides the eventlog's markers, every time view draws the bus's moments:
+-- the marks and actions Stronghead sent the agent, until their markers turn
+-- up in the followed eventlog ('confirmMoments'), and the snapshots it took.
+--
 -- Time links only join views of matching runs ('runKeysMatch').
 module UI.Clock
   ( -- * Axes
@@ -16,6 +20,8 @@ module UI.Clock
   , Marks (..)
   , marksFor
   , drawMarks
+  , momentAt
+  , confirmMoments
     -- * Gestures
   , Scrub (..)
   , timeGestures
@@ -26,13 +32,14 @@ module UI.Clock
   , tether
   ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.IORef
 import Data.Vector qualified as V
 import Data.Word (Word64)
 import NanoUI
 import NanoUI.Shortcut qualified as K
+import Data.List (sortOn)
 import Stronghead.Eventlog.Model (Marker (..), Timeline (..))
 import Stronghead.Ref
 import Stronghead.Run (runKey, runKeysMatch)
@@ -69,11 +76,13 @@ setRange bus rk a b = do
   when (cur /= new) (writeVar (busRange bus) new)
 
 -- | What a time view of a run marks: the cursor and range when they belong
--- to the run, and the eventlog's markers when the log is the run's.
+-- to the run, the eventlog's markers when the log is the run's, and the
+-- run's moments.
 data Marks = Marks
   { tmCursor :: !(Maybe Word64)
   , tmRange :: !(Maybe (Word64, Word64))
   , tmMarkers :: ![Word64]
+  , tmMoments :: ![Moment]
   }
 
 marksFor :: Env -> RunKey -> Maybe Timeline -> NanoUI Marks
@@ -81,6 +90,7 @@ marksFor env rk mlog = do
   let bus = envBus env
   cursor <- readVar (busCursor bus)
   range <- readVar (busRange bus)
+  moments <- readVar (busMoments bus)
   pure
     Marks
       { tmCursor = case cursor of
@@ -92,6 +102,7 @@ marksFor env rk mlog = do
       , tmMarkers = case mlog of
           Just tl | runKeysMatch (runKey (tlRun tl)) rk -> [mkTime mk | mk <- V.toList (tlMarkers tl), mkIsMarker mk]
           _ -> []
+      , tmMoments = [m | m <- moments, runKeysMatch (moRun m) rk]
       }
 
 -- | The range as a wash, markers as hairlines and the cursor as a line in
@@ -110,9 +121,73 @@ drawMarks pal ax r@(Rect x y w h) m = withClip r $ do
   forM_ (tmMarkers m) $ \t -> do
     let px = xOf t
     when (visible px) $ drawStroke (V2 px y) (V2 px (y + h)) 1 (alpha 0.55 (pMarker pal))
+  -- Stronghead's own moments carry a square cap. A mark's line is dashed
+  -- while its time is an estimate, and left to the eventlog's marker once
+  -- that is there. A snapshot or a pause is a line in ink.
+  forM_ (tmMoments m) $ \mo -> do
+    let px = xOf (moNs mo)
+        cap c = drawRect (Rect (px - 3) y 6 6) c
+    when (visible px) $ case moKind mo of
+      k | k `elem` [MomentSnapshot, MomentPause] -> do
+        let c = alpha (if k == MomentSnapshot then 0.75 else 0.5) (pText pal)
+        drawStroke (V2 px y) (V2 px (y + h)) 1 c
+        cap c
+      _
+        | moInLog mo -> cap (pMarker pal)
+        | moExact mo -> do
+            drawStroke (V2 px y) (V2 px (y + h)) 1 (alpha 0.75 (pMarker pal))
+            cap (pMarker pal)
+        | otherwise -> do
+            forM_ (takeWhile (< y + h) [y, y + 6 ..]) $ \dy ->
+              drawStroke (V2 px dy) (V2 px (min (y + h) (dy + 3))) 1 (alpha 0.75 (pMarker pal))
+            cap (alpha 0.6 (pMarker pal))
   for_ (tmCursor m) $ \t -> do
     let px = xOf t
     when (visible px) $ drawStroke (V2 px y) (V2 px (y + h)) 1.5 (pAccent pal)
+
+-- | The moment nearest @x@ on an axis, within a few pixels, as an instant.
+momentAt :: Axis -> Marks -> Float -> Maybe Ref
+momentAt ax m x =
+  case sortOn fst [(d, mo) | mo <- tmMoments m, let d = abs (axToX ax (fromIntegral (moNs mo)) - x), d <= 4] of
+    (_, mo) : _ -> Just (RInstant (moRun mo) (moNs mo))
+    [] -> Nothing
+
+-- | Note the marks whose markers have turned up in the followed eventlog,
+-- taking up the marker's time, which is exact. Called once a frame.
+confirmMoments :: Bus -> Maybe Timeline -> NanoUI ()
+confirmMoments bus = \case
+  Nothing -> pure ()
+  Just tl -> do
+    moments <- readVar (busMoments bus)
+    let rk = runKey (tlRun tl)
+        ms = tlMarkers tl
+        -- Markers are in time order; look only near the moment.
+        near mo =
+          let lo = if moNs mo > window then moNs mo - window else 0
+              start = lowerBound (\mk -> mkTime mk >= lo) ms
+           in [ mk
+              | mk <- V.toList (V.takeWhile (\mk -> mkTime mk <= moNs mo + window) (V.drop start ms))
+              , mkIsMarker mk
+              , mkText mk == moLabel mo
+              ]
+        confirm mo
+          | moInLog mo || not (runKeysMatch (moRun mo) rk) = mo
+          | mk : _ <- near mo = mo {moNs = mkTime mk, moExact = True, moInLog = True}
+          | otherwise = mo
+        moments' = map confirm moments
+    unless (moments' == moments) (writeVar (busMoments bus) moments')
+  where
+    window = 5000000000
+
+-- | The first index whose element satisfies a monotone predicate.
+lowerBound :: (a -> Bool) -> V.Vector a -> Int
+lowerBound p v = go 0 (V.length v)
+  where
+    go lo hi
+      | lo >= hi = lo
+      | otherwise =
+          let mid = (lo + hi) `div` 2
+           in if p (v V.! mid) then go lo mid else go (mid + 1) hi
 
 -- ---------------------------------------------------------------------------
 -- Gestures

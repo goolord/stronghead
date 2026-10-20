@@ -11,6 +11,7 @@ module Stronghead.Debug
   ( module Stronghead.Debug.Graph
   , ghcDebugEnabled
   , takeSnapshot
+  , pauseTarget
   , listSockets
   ) where
 
@@ -28,6 +29,10 @@ ghcDebugEnabled :: Bool
 -- | Pause the target, walk its closure graph, resume it, and index the
 -- result. Runs for as long as the walk takes: call it off the UI thread.
 takeSnapshot :: SnapshotOptions -> DebugTarget -> IO (Either String HeapSnapshot)
+
+-- | Pause a running target and hold it paused; the action returned
+-- resumes it. Blocks while connecting: call it off the UI thread.
+pauseTarget :: DebugTarget -> IO (Either String (IO ()))
 
 -- | Sockets in ghc-debug's default socket directory, where
 -- 'GHC.Debug.Stub.withGhcDebug' creates them.
@@ -48,11 +53,20 @@ takeSnapshot opts target = do
     Left (e :: SomeException) -> Left (displayException e)
     Right s -> Right s
 
+pauseTarget target = do
+  r <- try (Client.holdPaused target)
+  pure $ case r of
+    Left (e :: SomeException) -> Left (displayException e)
+    Right resume -> Right resume
+
 listSockets = Client.listSockets
 #else
 ghcDebugEnabled = False
 
 takeSnapshot _ _ =
+  pure (Left "This build of Stronghead has no ghc-debug support. Rebuild with: cabal build -f ghc-debug")
+
+pauseTarget _ =
   pure (Left "This build of Stronghead has no ghc-debug support. Rebuild with: cabal build -f ghc-debug")
 
 listSockets = pure []

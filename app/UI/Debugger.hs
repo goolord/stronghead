@@ -11,6 +11,7 @@
 module UI.Debugger
   ( DebugState (..)
   , startSession
+  , stopSession
   , newDebugState
   , debugLoad
   , debugView

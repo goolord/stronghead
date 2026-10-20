@@ -8,7 +8,7 @@ what is and isn't evaluated at a breakpoint.
 
 ```sh
 cabal run stronghead -- [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventlog]
-                        [--debug MODULE.hs] [--goto REF] [FILE|DIR ...]
+                        [--debug MODULE.hs] [--goto REF] [--mark TEXT] [FILE|DIR ...]
 ```
 
 Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`,
@@ -16,7 +16,8 @@ Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`,
 also be opened from the header or dropped on the window. `--goto` opens an
 entity by the reference **Copy reference** gives
 (`source/sample%2FMain.hs/82/1/82/1` is line 82 of the sample), once a panel
-has loaded it.
+has loaded it. `--mark` sends a connected program a mark once its agent
+has streamed a couple of seconds, for scripts and screenshots.
 
 **Settings** (the header button, or Ctrl+,) holds the theme (system, light,
 dark), the interface scale (follow the display's DPI scaling, or 75–300%;
@@ -67,7 +68,9 @@ range in program time, for every view of the same run.
   inspector, or on a range's right-click menu, lists the collections and
   pauses, allocation, the threads that ran, heap growth, censuses and
   markers inside it, all as links.
-- `traceMarkerIO` markers show on every time axis of the run.
+- `traceMarkerIO` markers show on every time axis of the run, and so do
+  the marks, actions and snapshots Stronghead sends a connected program
+  ([Live](#live)).
 - A `.hp` file keeps its own clock, which is not elapsed time. When an
   eventlog of the same run is loaded, its censuses are paired with the
   eventlog's by their totals and put on program time; otherwise the heap
@@ -309,9 +312,9 @@ that starts one).
 
 ### Live
 
-A "top" for a running Haskell service. Link the target with the
-`stronghead:agent` library (it depends only on `base`, `bytestring` and
-`network`):
+A "top" for a running Haskell service, and the way to attach to one. Link
+the target with the `stronghead:agent` library (it depends only on `base`,
+`bytestring` and `network`):
 
 ```haskell
 import Stronghead.Agent
@@ -322,14 +325,66 @@ main = withAgent defaultAgentConfig $ do
 ```
 
 Build it `-threaded` and run it with `+RTS -T`. The agent listens on
-`127.0.0.1:4777` and streams RTS statistics and the live thread list (labels
-and blocking status) four times a second. The panel charts allocation rate,
-live bytes, GC pauses and thread count on program time. If the program also
-writes an eventlog (`+RTS -l -ol<file>`), the agent flushes it on the same
-cadence, and **Follow in Timeline** (or `--follow`) tails it live. The
-charts then show the eventlog's markers and the shared cursor and range: a
-click or drag on a chart moves the cursor, and Shift+drag selects that range
-in the Timeline.
+`127.0.0.1:4777` and streams RTS statistics and the live thread list (labels,
+blocking status and capability) four times a second. The panel charts
+allocation rate, live bytes, GC pauses and thread count on program time, and
+each thread row has a strip of its status over the last half minute in the
+Timeline's colours.
+
+**One Connect wires the program.** The agent says where the program runs and
+how it was started, and Connect follows from there; the strip under the
+toolbar says what it found, and why it skipped the rest:
+
+- the eventlog (`+RTS -l`, at `-ol<file>` or `<program>.eventlog` in its
+  working directory), followed live in the Timeline; the agent flushes it
+  every 250 ms;
+- the heap profile (`-hT`, `-hi` ...), read as it grows, beside the
+  eventlog's own heap samples;
+- the ghc-debug socket of the same pid, for snapshots (with `-f ghc-debug`,
+  on a Unix target);
+- the working directory, searched for sources and for Core and STG dumps.
+
+So `stronghead-sample 60 +RTS -l -hT -i0.1 -T -RTS` and a Connect give the
+Timeline, the heap chart and Live all on one clock.
+
+**Acting on the program.** The **Program** toolbar, the palette (Ctrl+K) and
+the status bar's menu send the agent:
+
+- **Mark…** (**M** from any panel): an eventlog marker with your text;
+- **Major GC**, **Census now**, and **Start/Stop heap profiling**;
+
+and, through ghc-debug, **Snapshot**, **Census + snapshot**, **Snapshot
+twice, 2 s apart** and **Pause** / **Resume**. Each lands on every time axis
+of the run at once, as a mark with a square cap, dashed until the agent's
+reply stamps it in program time, and then drawn by the eventlog's own marker
+once it arrives. Snapshots are stamped the same way (through the agent, or
+from the eventlog's wall-clock anchor), in ink. Hovering a mark or a
+snapshot on a chart or the Timeline's ruler links to that instant. A
+stretch with no frames, while a snapshot or a pause holds the program, is
+shaded and labelled on Live's charts.
+
+Commands perturb the program but can't run code. The agent takes them only
+when it listens on a loopback address, unless `agentAcceptCommands` says
+otherwise. An agent built before protocol v2 still connects and streams;
+the panel says to rebuild against the current `stronghead:agent` to attach
+and act.
+
+The wire format (protocol v2, compatible with v1 both ways) is in
+`Stronghead.Live`'s header.
+
+## Data sources and connections
+
+**Sources** in the header lists each run Stronghead has something from (an
+eventlog, a heap or cost-centre profile, the agent, a ghc-debug target), by
+program and pid, with what each adds, what is missing, and the build and run
+flags that add it, ready to copy. Runs that should match but don't (a
+renamed binary, say) can be joined by hand there, and unlinked again.
+
+The **status bar** is the connection centre: the followed eventlog, the
+agent, the ghc-debug target and the GHCi session each open their panel on a
+click and have a menu on a right-click (stop following, disconnect,
+reconnect, take a snapshot, stop or restart the session). It also shows the
+shared cursor's time, which links to that instant.
 
 ## Try it
 
@@ -342,8 +397,10 @@ cabal run stronghead-sample -- 10 +RTS -l -hT -i0.1 -RTS
 cabal run stronghead -- stronghead-sample.eventlog
 ```
 
-While it runs, `cabal run stronghead -- --connect 127.0.0.1:4777` shows it
-live.
+While it runs, `cabal run stronghead -- --connect 127.0.0.1:4777` (or
+Connect in Live) attaches: the Timeline follows its eventlog, the heap panel
+its heap profile, and **M** marks all of them. Run it with `-T` for the
+charts: `+RTS -l -hT -i0.1 -T -RTS`.
 
 ## Building
 
@@ -371,7 +428,8 @@ backend; see [Live closure graph](#live-closure-graph-ghc-debug).
 | `src/Stronghead/Ghci.hs` | GHCi subprocess driver and output parsers |
 | `src/Stronghead/Source.hs` | Source spans, the source index, the editor command |
 | `src/Stronghead/Join.hs` | Joins between artifacts: spans, cost centres, info tables, ticky counters and STG binders, `-hc` stacks and `.prof` paths, bands and closures |
-| `src/Stronghead/Live.hs` | Client for the agent's protocol |
+| `src/Stronghead/Live.hs` | Client for the agent's protocol (v2: info line, capabilities, commands) |
+| `src/Stronghead/Attach.hs` | Where a connected program's eventlog, heap profile, socket and dumps are |
 | `src/Stronghead/Debug.hs` | ghc-debug snapshots (the backend behind the `ghc-debug` flag) |
 | `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots, thread stacks |
 | `src/Stronghead/Debug/Client.hs` | ghc-debug-client traversal (built only with the flag) |
