@@ -365,7 +365,10 @@ mainCanvas env st pal mm tl v sel marks = do
   when (scrubNow /= scrub) (writeVar (tsScrub st) scrubNow)
   when scrubNow $ setCursor (envBus env) rk (timeAt (v2X mouse))
   navigate st tl v resp (rPlotX rows) (rPlotW rows) True (not brushing && not scrubNow)
-  canvasLinks env resp (refAtMain tl v rows)
+  -- On the ruler, a moment Stronghead stamped (a mark, a snapshot) is an
+  -- instant to link to.
+  let momentHere (V2 mx my) = if my >= ry && my < ry + rh then momentAt axis marks mx else Nothing
+  canvasLinks env resp (\m -> maybe (refAtMain tl v rows m) Just (momentHere m))
   clicked <- isClick st resp
   when (clicked && not brushing && not (modCtrl mods)) $ do
     writeVar (tsSel st) (pickMain tl v rows mouse)

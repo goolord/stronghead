@@ -1,7 +1,7 @@
 -- | Stronghead: a live debugger and profiler for GHC programs.
 --
 -- > stronghead [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventlog]
--- >            [--debug MODULE.hs] [--goto REF] [FILE|DIR ...]
+-- >            [--debug MODULE.hs] [--goto REF] [--mark TEXT] [FILE|DIR ...]
 --
 -- Files are routed by extension: .eventlog to the timeline, .hp and .prof
 -- to the heap explorer, .dump-simpl / .dump-stg-final / .hs to the Core
@@ -12,7 +12,9 @@
 -- @--follow@ tails an eventlog the program is still writing, and @--debug@
 -- starts a GHCi session on a module. @--goto@ opens an entity by its
 -- reference, as "Copy reference" gives it (@source/sample%2FMain.hs/82/1/82/1@),
--- once a panel has loaded it. Preferences (theme, interface scale,
+-- once a panel has loaded it. @--mark@ sends the connected program a mark
+-- once its agent has streamed a couple of seconds (for scripts and
+-- screenshots). Preferences (theme, interface scale,
 -- window geometry, the panels' defaults) are loaded from and saved to the
 -- settings file ("UI.Settings"). For development, @STRONGHEAD_CAPTURE=out.bmp@ saves a screenshot
 -- once the window has been up for @STRONGHEAD_CAPTURE_DELAY@ seconds
@@ -69,6 +71,7 @@ parseArgs args o = case args of
   "--follow" : f : rest -> parseArgs rest o {optFollow = Just f}
   "--debug" : f : rest -> parseArgs rest o {optDebug = Just f}
   "--goto" : r : rest -> parseArgs rest o {optGoto = Just (T.pack r)}
+  "--mark" : m : rest -> parseArgs rest o {optMark = Just (T.pack m)}
   f : rest -> parseArgs rest o {optFiles = optFiles o ++ [f]}
   [] -> o
 

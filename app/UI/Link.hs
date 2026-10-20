@@ -22,6 +22,8 @@ module UI.Link
   , Bus (..)
   , newBus
   , Location (..)
+  , Moment (..)
+  , MomentKind (..)
   , publishHover
     -- * Lenses
   , Lens (..)
@@ -113,7 +115,34 @@ data Bus = Bus
     -- publishes it every frame and takes up a change another view writes.
   , busBrush :: !(IORef (Maybe V2))
     -- ^ Where a Shift+drag on a time view began.
+  , busMoments :: !(Var [Moment])
+    -- ^ Instants Stronghead put on the program's clock itself: the marks
+    -- and actions it sent the agent, and the snapshots it took. Newest
+    -- first.
   }
+
+-- | An instant Stronghead put on a run's clock: a mark or an action sent to
+-- the agent, or a ghc-debug snapshot.
+data Moment = Moment
+  { moId :: !Int
+  , moRun :: !RunKey
+  , moNs :: !Word64
+    -- ^ Program time.
+  , moLabel :: !Text
+    -- ^ For a mark or an action, the text of the eventlog marker the agent
+    -- posts for it.
+  , moKind :: !MomentKind
+  , moExact :: !Bool
+    -- ^ Stamped by the program, rather than estimated from the latest
+    -- frame while the reply is on its way.
+  , moInLog :: !Bool
+    -- ^ Its marker has turned up in the followed eventlog, which now draws
+    -- it.
+  }
+  deriving (Eq, Show)
+
+data MomentKind = MomentMark | MomentAction | MomentSnapshot | MomentPause
+  deriving (Eq, Show)
 
 -- | A place to come back to: a panel, and what was in focus there.
 data Location = Location
@@ -134,6 +163,7 @@ newBus = do
   busRange <- newVar Nothing
   busWindow <- newVar Nothing
   busBrush <- newIORef Nothing
+  busMoments <- newVar []
   pure Bus {..}
 
 -- | Make this frame's hovered entity the one every panel highlights. Call

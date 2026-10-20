@@ -3,6 +3,7 @@
 -- and resume. Only built with the @ghc-debug@ flag.
 module Stronghead.Debug.Client
   ( walkTarget
+  , holdPaused
   , listSockets
   ) where
 
@@ -38,6 +39,19 @@ walkTarget opts = \case
     live connect = bracket connect debuggeeClose $ \e -> do
       pause e
       run e (walk opts)
+
+-- | Pause a live target and keep it paused. The action returned resumes it
+-- and closes the connection.
+holdPaused :: DebugTarget -> IO (IO ())
+holdPaused = \case
+  DebugUnix path -> hold (debuggeeConnectWithTracer nullTracer path)
+  DebugTCP host port -> hold (debuggeeConnectWithTracerTCP nullTracer host port)
+  DebugSnapshotFile _ -> fail "a snapshot file is not a running program"
+  where
+    hold connect = do
+      e <- connect
+      pause e
+      pure (resume e >> debuggeeClose e)
 
 walk :: SnapshotOptions -> DebugM ([ClosureId], [ClosureNode], Bool)
 walk SnapshotOptions {..} = do

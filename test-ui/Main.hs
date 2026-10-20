@@ -3,29 +3,39 @@
 -- history, against stub lenses that record what they were asked to do;
 -- the shared clock ("UI.Clock"): the cursor and range a time view sets on
 -- the bus, and a snapping cursor kept in step with them; and the
--- annotated code view ("UI.Code"), whose heat bars are links.
+-- annotated code view ("UI.Code"), whose heat bars are links; and the
+-- Live panel's remote actions ("UI.Live"): a command lands on the clock at
+-- once, the agent's reply stamps it, the eventlog's marker takes over.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef
+import Data.Map.Strict qualified as M
+import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Vector qualified as V
 import NanoUI
 import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
 import Stronghead.Dump (CodeKind (..), tokenizeLine)
+import Stronghead.Eventlog.Model (Marker (..), Timeline (..), emptyTimeline)
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
+import Stronghead.Live
 import Stronghead.Ref
+import Stronghead.Run (RunInfo (..), emptyRunInfo, runFromHello, runKey)
 import Stronghead.Source (SrcSpan (..))
 import System.Exit (exitFailure)
 import UI.Clock
 import UI.Code
 import UI.Common (TimeView (..), monoMetrics)
 import UI.Link
+import UI.Live
 import UI.Palette
+import UI.Sources
 
 data World = World
   { wTab :: !(Var Panel)
@@ -294,6 +304,92 @@ main = do
   mapM_ codeFrame [bDown, bUp, inp0, inp0]
   barMenu <- collectOverlayTextSpans codeCtx inp0
   check "right-clicking a heat bar opens its entity's menu" (hasText "thunk in go" barMenu && hasText "Show in Heap & leaks" barMenu)
+
+  putStrLn "remote actions"
+  rctx <- newContext
+  rbus <- newBus
+  lv <- newLiveState
+  box <- newOutbox
+  let info = AgentInfo 2 "/w" "/w/prog" ["prog"] (Just "hT") 100 True True
+      frame0 = Frame 0 1000000000 True (M.fromList [("rts_stats", 1)]) []
+      d0 = LiveData (Just ("prog", 1, 4)) (Just info) (Just box) (Seq.fromList [frame0]) M.empty Nothing
+      hooks = DebugHooks (Left "built without ghc-debug") False Nothing
+      rk = RunKey "prog:1"
+      renv = Env rbus [] PLive (\_ -> pure ())
+      rframe d = evalUi rctx inp0 (liveTick rbus lv (Just d) Nothing hooks >> liveRemote rbus lv (Just d) Nothing hooks)
+      named t = filter ((== t) . raLabel)
+      enabled a = either (const False) (const True) (raRun a)
+      moments = readVarIO (busMoments rbus)
+      -- The harness may run a frame's view more than once; an action runs
+      -- in the first pass, as a click's does.
+      once act = do
+        first <- newIORef True
+        evalUi rctx inp0 (liftIO (atomicModifyIORef' first (False,)) >>= \go -> when go act)
+  actions <- rframe d0
+  check "agent actions are on" (all enabled (concatMap (`named` actions) ["Mark…", "Major GC", "Census now", "Stop heap profiling"]))
+  check "ghc-debug ones say why not" (all (either ("ghc-debug" `T.isInfixOf`) (const False) . raRun) (named "Snapshot" actions))
+  for_ (named "Major GC" actions) $ \a -> either (const (pure ())) once (raRun a)
+  sent <- readOutbox box
+  check "an action sends its command" (sent == "1 gc")
+  placed <- moments
+  check "and lands on the clock at once, estimated" (map (\m -> (moRun m, moKind m, moExact m, moLabel m)) placed == [(rk, MomentAction, False, "stronghead: major GC")])
+  _ <- rframe d0 {ldReplies = M.fromList [(1, ReplyOk (Just 5000000000))]}
+  check "the reply stamps it in program time" . (== [(5000000000, True)]) . map (\m -> (moNs m, moExact m)) =<< moments
+  for_ (named "Census now" actions) $ \a -> either (const (pure ())) once (raRun a)
+  _ <- readOutbox box
+  _ <- rframe d0 {ldReplies = M.fromList [(1, ReplyOk (Just 5000000000)), (2, ReplyError "no")]}
+  check "a refused command leaves the clock" . (== 1) . length =<< moments
+  check "and says so" . ("failed: no" `T.isInfixOf`) =<< readVarIO (lvMessage lv)
+  oldAgent <- rframe d0 {ldInfo = Nothing}
+  check "an old agent: no commands, and why" (and [either ("protocol v1" `T.isInfixOf`) (const False) (raRun a) | a <- named "Major GC" oldAgent])
+  marks <- evalUi rctx inp0 (marksFor renv rk Nothing)
+  others <- evalUi rctx inp0 (marksFor renv (RunKey "other:2") Nothing)
+  check "every time view of the run marks it" (length (tmMoments marks) == 1 && null (tmMoments others))
+  let ax = linearAxis rk (TimeView 0 1e10) 0 1000
+  check "a moment is an instant to link to" (momentAt ax marks 500 == Just (RInstant rk 5000000000) && momentAt ax marks 520 == Nothing)
+  let logged' = emptyTimeline {tlRun = runFromHello "prog" 1, tlMarkers = V.fromList [Marker 5000200000 "stronghead: major GC" Nothing True]}
+  evalUi rctx inp0 (confirmMoments rbus (Just logged'))
+  check "its marker in the eventlog takes over, exactly" . (== [(5000200000, True)]) . map (\m -> (moNs m, moInLog m)) =<< moments
+  pctx <- newContext
+  let prompt inp = evalUi pctx inp (markPrompt rbus lv (Just d0))
+  once (openMarkPrompt lv)
+  warmup pctx inp0 (markPrompt rbus lv (Just d0))
+  shown <- collectOverlayTextSpans pctx inp0
+  check "M opens a prompt with a default text" (hasText "Mark the program's timeline" shown)
+  check "named after the marks sent" . (== "mark 1") =<< readVarIO (lvMarkText lv)
+  markButton <- maybe (fail "no Mark button") pure (findExact "Mark" shown)
+  let (mp, mr) = clickPair inp0 markButton
+  mapM_ prompt [mp, mr, inp0]
+  marked <- readOutbox box
+  check "Mark sends it" (" mark mark 1" `T.isSuffixOf` marked)
+  check "and closes the prompt" . not =<< readVarIO (lvMarkOpen lv)
+  check "a mark lands on the clock" . any ((== ("mark 1", MomentMark)) . (\m -> (moLabel m, moKind m))) =<< moments
+
+  putStrLn "data sources"
+  sctx <- newContext
+  open <- newVar True
+  joined <- newIORef ([], Nothing)
+  -- Tall enough for the whole popover.
+  let sinp = withInput 1400 1400
+      logRun = (runFromHello "prog" 1) {riArgs = ["10"]}
+      src kind ri ds = Source kind (kind <> " detail") ri (runKey ri) False PTimeline ds
+      sources =
+        [ src "Eventlog" logRun [DTimeline, DHeapCensus]
+        , src "Heap profile" emptyRunInfo {riProgram = Just "prog"} [DHeapCensus]
+        , src "Agent" (runFromHello "prog" 1) [DLive, DLiveStats]
+        , src "Cost centres" (runFromHello "renamed" 9) [DCostCentres]
+        ]
+      senv = Env rbus [] PLive (\_ -> pure ())
+      popover inp = evalUi sctx inp (sourcesPopover senv open (Rect 10 10 80 20) sources (\ss ri -> liftIO (writeIORef joined (map srcKind ss, riProgram ri))) (\_ -> pure ()))
+  warmup sctx sinp (sourcesPopover senv open (Rect 10 10 80 20) sources (\_ _ -> pure ()) (\_ -> pure ()))
+  listed <- collectOverlayTextSpans sctx sinp
+  check "a run per program and pid" (hasText "prog, pid 1" listed && hasText "renamed, pid 9" listed)
+  check "a match without a pid says so" (hasText "matched by program name" listed)
+  check "what is missing, with how to add it" (hasText "Heap by source location" listed && hasText "-finfo-table-map" listed && hasText "Copy" listed)
+  sameRun <- maybe (fail "no Same run button") pure (findExact "Same run as prog, pid 1" listed)
+  let (sp', sr') = clickPair sinp sameRun
+  mapM_ popover [sp', sr', sinp]
+  check "an unmatched run can be joined by hand" . (== (["Cost centres"], Just "prog")) =<< readIORef joined
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
