@@ -1041,8 +1041,11 @@ how far C1 can trust each clock. Then P1a.
     **Leak hunt** arrangement (heap chart, bands, live graph, source and the
     inspector on `THUNK_2_0`); the same session with a pinboard of two pins
     with notes; a Timeline workbench with the heap chart under the
-    capabilities on the Timeline's axis and the pinboard popped out; and
-    Core & STG with the inspector under the bindings.
+    capabilities on the Timeline's axis and the pinboard popped out;
+    Core & STG with the inspector under the bindings; and, connected to the
+    sample running with `+RTS -l -hT -i0.1 -T` through a session with
+    `agent-connected = true`, Live's charts under the capabilities drawing
+    the followed Timeline's window, its markers lined up.
   - Found on the way: with a sixth header button the title bar overflowed
     at the default window width, so the active panel's file shows only when
     the window is at least 1640 wide.
