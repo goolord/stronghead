@@ -48,19 +48,28 @@ module Stronghead.Eventlog.Model
   , Summary (..)
   , summarize
   , threadName
+    -- * Joins
+  , wokenBy
+  , censusTimes
+  , censusAfterCollection
+  , collectionBeforeCensus
+  , RangeStats (..)
+  , rangeStats
   ) where
 
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict (Map)
+import Data.List (sortOn)
 import Data.Map.Strict qualified as M
+import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word32, Word64, Word8)
 import GHC.RTS.Events (ThreadStopStatus (..))
 import Stronghead.Format (tshow)
-import Stronghead.HeapProfile (HeapProfile)
+import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Run (RunInfo, emptyRunInfo)
 import Stronghead.Source (SrcLoc)
 
@@ -283,6 +292,9 @@ data ThreadInfo = ThreadInfo
     -- ^ Run, blocked and runnable spans of this thread.
   , tiCaps :: ![Int]
     -- ^ Capabilities it ran on.
+  , tiWakeups :: !(VU.Vector (Word64, Word32))
+    -- ^ When it was woken, and by which thread: the one running on the
+    -- capability that posted the wakeup (0 when none was).
   }
   deriving (Show)
 
@@ -422,3 +434,81 @@ summarize tl =
     frac k
       | capTime <= 0 = 0
       | otherwise = sum [timeIn c (fromIntegral k) (tlStart tl) (tlEnd tl) | c <- V.toList (tlCaps tl)] / capTime
+
+-- ---------------------------------------------------------------------------
+-- Joins
+
+-- | Who woke a thread out of a blocked span, and when: the first wakeup
+-- posted for it while it was blocked. The waker is 0 when no thread was
+-- running on the capability that posted it.
+wokenBy :: ThreadInfo -> SpanRec -> Maybe (Word64, Word32)
+wokenBy ti s
+  | srKind s /= kindBlocked = Nothing
+  | otherwise = VU.find (\(t, _) -> t >= srStart s && t <= srEnd s) (tiWakeups ti)
+
+-- | When each of the log's heap censuses was taken, in program time.
+censusTimes :: Timeline -> VU.Vector Word64
+censusTimes tl = maybe VU.empty (VU.map (\s -> round (s * 1e9)) . hpTimes) (tlHeapProfile tl)
+
+-- | The census that shows the heap after a collection: the first one taken
+-- after it began and before the next began. The RTS takes a census during a
+-- major collection, so that is where one is found.
+censusAfterCollection :: Timeline -> Int -> Maybe Int
+censusAfterCollection tl i = do
+  g <- tlGCs tl V.!? i
+  let next = maybe maxBound gcStart (tlGCs tl V.!? (i + 1))
+      cs = censusTimes tl
+  j <- VU.findIndex (>= gcStart g) cs
+  if cs VU.! j < next then Just j else Nothing
+
+-- | The collection a census followed: the last one to begin at or before
+-- it.
+collectionBeforeCensus :: Timeline -> Int -> Maybe Int
+collectionBeforeCensus tl j = do
+  t <- censusTimes tl VU.!? j
+  let i = lowerBoundBy gcStart (tlGCs tl) (t + 1) - 1
+  if i >= 0 then Just i else Nothing
+
+-- | What happened between two moments.
+data RangeStats = RangeStats
+  { rsCollections :: ![Int]
+    -- ^ Collections overlapping the range, by index.
+  , rsMajor :: !Int
+  , rsPauseTotal :: !Word64
+    -- ^ Nanoseconds, of the parts inside the range.
+  , rsLongest :: !(Maybe Int)
+  , rsAllocated :: !(Maybe Word64)
+  , rsThreads :: ![(Word32, Word64)]
+    -- ^ Threads that ran, with their running time in the range, busiest
+    -- first.
+  , rsLive :: !(Maybe Word64, Maybe Word64)
+    -- ^ Live bytes at the start and the end.
+  , rsHeap :: !(Maybe Word64, Maybe Word64)
+  , rsCensuses :: ![Int]
+  , rsMarkers :: ![Int]
+  }
+  deriving (Eq, Show)
+
+rangeStats :: Timeline -> Word64 -> Word64 -> RangeStats
+rangeStats tl a b =
+  RangeStats
+    { rsCollections = map fst gcs
+    , rsMajor = length [() | (_, g) <- gcs, gcGen g >= 1]
+    , rsPauseTotal = sum [min b (gcEnd g) - max a (gcStart g) | (_, g) <- gcs]
+    , rsLongest = fst <$> foldr (\x m -> Just (maybe x (\y -> if pause x >= pause y then x else y) m)) Nothing gcs
+    , rsAllocated = do
+        va <- seriesValueAt (tlAlloc tl) a
+        vb <- seriesValueAt (tlAlloc tl) b
+        if vb >= va then Just (vb - va) else Nothing
+    , rsThreads =
+        sortOn (Down . snd) [(tiId ti, ns) | ti <- M.elems (tlThreads tl), let ns = round (timeIn (tiTrack ti) (fromIntegral kindRun) a b), ns > 0]
+    , rsLive = (seriesValueAt (tlLive tl) a, seriesValueAt (tlLive tl) b)
+    , rsHeap = (seriesValueAt (tlHeapSize tl) a, seriesValueAt (tlHeapSize tl) b)
+    , rsCensuses = [j | (j, t) <- zip [0 ..] (VU.toList (censusTimes tl)), t >= a, t <= b]
+    , rsMarkers = map fst (takeWhile ((<= b) . mkTime . snd) (zip [lo ..] (V.toList (V.drop lo (tlMarkers tl)))))
+    }
+  where
+    i0 = lowerBoundBy gcEnd (tlGCs tl) a
+    gcs = takeWhile ((<= b) . gcStart . snd) (zip [i0 ..] (V.toList (V.drop i0 (tlGCs tl))))
+    pause (_, g) = gcEnd g - gcStart g
+    lo = lowerBoundBy mkTime (tlMarkers tl) a

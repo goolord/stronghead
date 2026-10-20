@@ -12,8 +12,9 @@ import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word64)
-import GHC.RTS.Events (EventInfo (..), HeapProfBreakdown (..), HeapProfFlags (..))
+import GHC.RTS.Events (EventInfo (..), HeapProfBreakdown (..), HeapProfFlags (..), ThreadStopStatus (..))
 import GHC.RTS.Events qualified as E
+import Stronghead.Clock
 import Stronghead.Debug
 import Stronghead.Dump
 import Stronghead.Eventlog (emptyBuilder, feedEvent, snapshot)
@@ -177,6 +178,51 @@ main = do
       Just a -> wallToProgram a (programToWall a 7) == Just 7 && wallToProgram a 0 == Nothing
       Nothing -> False
 
+  putStrLn "wakeups"
+  let sched = snapshot (foldl feedEvent emptyBuilder [E.Event t e c | (t, c, e) <- schedFixture])
+      blockedSpans tid =
+        [ s
+        | Just ti <- [M.lookup tid (tlThreads sched)]
+        , s <- map (trackSpan (tiTrack ti)) [0 .. trackLength (tiTrack ti) - 1]
+        , srKind s == kindBlocked
+        ]
+      woken tid = [M.lookup tid (tlThreads sched) >>= (`wokenBy` s) | s <- blockedSpans tid]
+  check "every wakeup is recorded" (fmap (VU.length . tiWakeups) (M.lookup 2 (tlThreads sched)) == Just 2)
+  check "the waker runs on the posting capability" (woken 2 == [Just (150, 1), Just (180, 3)])
+  check "a wakeup on the same capability names its waker too" (woken 2 !! 1 == Just (180, 3))
+  check "only cross-capability wakeups are track points" $
+    map (VU.toList . VU.map (\(t, _, _) -> t)) (V.toList (tlCapPoints sched)) == [[150], []]
+  check "a running span has no waker" $
+    case M.lookup 2 (tlThreads sched) of
+      Just ti -> wokenBy ti (trackSpan (tiTrack ti) 0) == Nothing
+      Nothing -> False
+
+  putStrLn "time"
+  let rs = rangeStats sched 100 255
+  check "range: collections and pauses" (rsCollections rs == [0] && rsPauseTotal rs == 35 && rsLongest rs == Just 0 && rsMajor rs == 0)
+  check "range: allocation from the counter" (rsAllocated rs == Just 5000)
+  check "range: threads busiest first" (rsThreads rs == [(1, 110), (2, 30), (3, 10)])
+  check "range: heap growth" (rsLive rs == (Just 100, Just 300))
+  check "range: censuses and markers" (rsCensuses rs == [0] && rsMarkers rs == [0])
+  check "range: a pause cut by its edge" (rsPauseTotal (rangeStats sched 100 230) == 10)
+  check "census after a collection" (censusAfterCollection sched 0 == Just 0)
+  check "collection before a census" (collectionBeforeCensus sched 0 == Just 0)
+  check "census times in program time" (censusTimes sched == VU.fromList [240])
+  check "nearest sample" (map (nearestIndex (VU.fromList [1, 2, 4])) [-5, 1.4, 2.9, 3.1, 10] == [0, 0, 1, 2, 2])
+  check "nearest of nothing" (nearestIndex VU.empty 3 == 0)
+  check "step forward and back" $
+    let ts = VU.fromList [10, 20, 30]
+     in map (\(d, t) -> stepTime d ts t) [(1, 20), (-1, 20), (1, 30), (-1, 10), (1, 0)] == [Just 30, Just 10, Nothing, Nothing, Just 10]
+  check "pair censuses by total" (pairByTotals (VU.fromList [0, 100, 250, 400, 90]) (VU.fromList [100, 250, 400]) == [(1, 0), (2, 1), (3, 2)])
+  check "a census on one side only is skipped" (pairByTotals (VU.fromList [100, 120, 250]) (VU.fromList [100, 250]) == [(0, 0), (2, 1)])
+  let paired = pairedClock [(0.1, 1.5e8), (0.2, 3e8)]
+      near a b = abs (a - b) < 1e-3
+  check "seconds clock" (toProgramNs (secondsClock False) 1.5 == 1.5e9 && fromProgramNs (secondsClock True) 2e9 == 2)
+  check "paired clock is exact at its points" (toProgramNs paired 0.1 == 1.5e8 && toProgramNs paired 0.2 == 3e8)
+  check "paired clock interpolates and extrapolates" (near (toProgramNs paired 0.15) 2.25e8 && near (toProgramNs paired 0.3) 4.5e8)
+  check "paired clock inverts" (all (\x -> near (fromProgramNs paired (toProgramNs paired x)) x) [0, 0.12, 0.2, 0.5])
+  check "exactness" (cmExact paired && not (cmExact (secondsClock False)) && not (cmExact (pairedClock [])))
+
   putStrLn "runs"
   let fromLog = (runFromArgs ["C:\\bin\\stronghead-sample.exe", "+RTS", "-l", "-RTS"]) {riPid = Just 4242}
       hello = runFromHello "stronghead-sample.exe" 4242
@@ -275,6 +321,35 @@ main = do
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
+
+-- | Scheduling on two capabilities. Thread 2 blocks twice: thread 1 wakes
+-- it from capability 0, then thread 3 from its own capability 1. One
+-- collection, one census during it, and a marker.
+schedFixture :: [(Word64, Maybe Int, EventInfo)]
+schedFixture =
+  [ (50, Nothing, HeapAllocated 0 0)
+  , (100, Just 0, RunThread 1)
+  , (100, Nothing, HeapLive 0 100)
+  , (110, Just 1, RunThread 2)
+  , (120, Just 1, StopThread 2 BlockedOnMVar)
+  , (150, Just 0, WakeupThread 2 1)
+  , (155, Nothing, UserMarker "mid")
+  , (160, Just 1, RunThread 2)
+  , (170, Just 1, StopThread 2 BlockedOnMVar)
+  , (175, Just 1, RunThread 3)
+  , (180, Just 1, WakeupThread 2 1)
+  , (185, Just 1, StopThread 3 ThreadFinished)
+  , (190, Just 1, RunThread 2)
+  , (200, Just 1, StopThread 2 ThreadFinished)
+  , (210, Just 0, StopThread 1 ThreadFinished)
+  , (220, Just 0, StartGC)
+  , (230, Nothing, HeapAllocated 0 5000)
+  , (240, Nothing, HeapProfSampleBegin 0)
+  , (240, Nothing, HeapProfSampleString 0 300 "THUNK")
+  , (240, Nothing, HeapProfSampleEnd 0)
+  , (250, Nothing, HeapLive 0 300)
+  , (260, Just 0, EndGC)
+  ]
 
 -- | A slice of a @-hi@ eventlog: the run's identity, one cost centre, one
 -- info table and one census. The first event is at 1 s.

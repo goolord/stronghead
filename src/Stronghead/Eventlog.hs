@@ -79,10 +79,12 @@ data ThreadB = ThreadB
   , tbCreated :: !(Maybe Word64)
   , tbFinished :: !(Maybe Word64)
   , tbRuns :: ![RunRec]
+  , tbWakeups :: ![(Word64, Word32)]
+    -- ^ Newest first.
   }
 
 emptyThread :: ThreadB
-emptyThread = ThreadB Nothing Nothing Nothing []
+emptyThread = ThreadB Nothing Nothing Nothing [] []
 
 data GCStat = GCStat !Word64 !Int !Word64 !Int
 
@@ -147,14 +149,21 @@ capEvent b c t = \case
   ThreadLabel tid lbl -> onThread tid (\tb -> tb {tbLabel = Just lbl}) b
   MigrateThread tid _ -> addPoint pointMigrate tid
   SparkSteal victim -> addPoint pointSteal (fromIntegral victim)
-  WakeupThread tid other
-    | other /= c -> addPoint pointWakeup tid
+  -- Every wakeup names its waker for the woken thread; one that crosses
+  -- capabilities is also a point on the posting capability's track.
+  WakeupThread tid other ->
+    let waker = case cbOpen (IM.findWithDefault emptyCap c (bCaps b)) of
+          OpenRun _ w -> w
+          _ -> 0
+        b' = onThread tid (\tb -> tb {tbWakeups = (t, waker) : tbWakeups tb}) b
+     in if other /= c then addPointTo b' pointWakeup tid else b'
   UserMarker name -> b {bMarkers = Marker t name (Just c) True : bMarkers b}
   UserMessage m -> b {bMarkers = Marker t m (Just c) False : bMarkers b}
   other -> globalEvent b t other
   where
     onCap f bb = bb {bCaps = IM.alter (Just . f . fromMaybe emptyCap) c (bCaps bb)}
-    addPoint k x = onCap (\cb -> cb {cbPoints = (t, k, x) : cbPoints cb}) b
+    addPoint = addPointTo b
+    addPointTo bb k x = onCap (\cb -> cb {cbPoints = (t, k, x) : cbPoints cb}) bb
 
 -- | End whatever span is open on a capability at time @t@; a run span cut
 -- short this way gets @stop@ as its end reason.
@@ -281,6 +290,7 @@ threadInfo end tid tb =
     , tiBlocked = M.fromListWith (+) [(srStop g, srEnd g - srStart g) | g <- gaps]
     , tiTrack = mkTrack (sortOn srStart (gaps ++ [SpanRec (rrStart r) (rrEnd r) kindRun (fromIntegral tid) (rrStop r) (rrAux r) | r <- runs]))
     , tiCaps = IM.keys (IM.fromList [(rrCap r, ()) | r <- runs])
+    , tiWakeups = VU.fromList (sortOn fst (tbWakeups tb))
     }
   where
     runs = sortOn rrStart (tbRuns tb)

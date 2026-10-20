@@ -59,6 +59,7 @@ library
         Stronghead.Live
         Stronghead.Source
         Stronghead.Run
+        Stronghead.Clock
         Stronghead.Ref
         Stronghead.Fuzzy
         Stronghead.Format
