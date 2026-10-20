@@ -1,8 +1,9 @@
 -- | The links between panels ("UI.Link"), driven headlessly through
 -- nano-ui's test harness: clicks, Ctrl+clicks, right-click menus, peeks and
--- history, against stub lenses that record what they were asked to do; and
+-- history, against stub lenses that record what they were asked to do;
 -- the shared clock ("UI.Clock"): the cursor and range a time view sets on
--- the bus, and a snapping cursor kept in step with them.
+-- the bus, and a snapping cursor kept in step with them; and the
+-- annotated code view ("UI.Code"), whose heat bars are links.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
@@ -15,10 +16,14 @@ import NanoUI
 import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
+import Stronghead.Dump (CodeKind (..), tokenizeLine)
+import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
 import Stronghead.Ref
+import Stronghead.Source (SrcSpan (..))
 import System.Exit (exitFailure)
 import UI.Clock
-import UI.Common (TimeView (..))
+import UI.Code
+import UI.Common (TimeView (..), monoMetrics)
 import UI.Link
 import UI.Palette
 
@@ -97,6 +102,31 @@ clockView c = do
   tether (cBus c) (cTether c) run (cCensus c) (\t -> Just (round (fromIntegral t / 1e8 :: Double))) (\i -> Just (fromIntegral i * 100000000))
   (dir, _) <- stepKeys
   when (dir /= 0) (liftIO (modifyIORef' (cSteps c) (dir :)))
+
+band :: Ref
+band = RBand "0x4fe0"
+
+-- | A three-line file whose second line holds a thunk band's bytes. The
+-- point of its heat bar is written out for the test to click.
+codeScene :: World -> CodeViewState -> IORef V2 -> NanoUI ()
+codeScene w cv point = do
+  tab <- readVar (wTab w)
+  mm <- monoMetrics 0.88
+  let record t = liftIO (modifyIORef' (wLog w) (t :))
+      heap = (lens PHeap) {lensShows = (== band), lensReveal = \r -> record ("heap " <> refTarget r), lensTitle = \r -> if r == band then Just "thunk in go" else Nothing}
+      env = Env (wBus w) [heap] tab (writeVar (wTab w))
+      src = ["module M where", "go = 1 + 2", ""]
+      ann = (annotationAt (SrcSpan "M.hs" 2 6 2 10) LaneHeap 2048 "2 KiB live" (Just band)) {anShade = ShadeThunk}
+      cfg =
+        withNotes
+          (placedNotes [(1, 1, ann)])
+          defaultCodeConfig
+            { ccLineCount = length src
+            , ccTokens = \l -> fst (tokenizeLine KindSource False (src !! l))
+            }
+  ev <- annotatedCode env cv mm cfg (const Nothing)
+  liftIO (writeIORef point (lanePoint mm cfg (respRect (ceResp ev)) 1 0))
+  publishHover (wBus w)
 
 main :: IO ()
 main = do
@@ -240,6 +270,30 @@ main = do
   _ <- cframe (keyInp (KeyChar ']') inp0)
   _ <- cframe (keyInp (KeyChar '[') inp0)
   check "[ and ] step" . (== [-1, 1]) =<< readIORef (cSteps c)
+
+  putStrLn "annotated code"
+  codeCtx <- newContext
+  cv <- newCodeViewState
+  point <- newIORef (V2 0 0)
+  writeVarIO (wTab w) PCore
+  writeIORef (wLog w) []
+  let codeFrame inp = evalUi codeCtx inp (codeScene w cv point)
+      codeClick inp pos = do
+        let (press, release) = clickPair inp pos
+        mapM_ codeFrame [press, release, inp0]
+  _ <- warmup2 codeCtx inp0 (codeScene w cv point)
+  bar <- readIORef point
+  _ <- codeFrame inp0 {inputMousePos = bar}
+  _ <- codeFrame inp0 {inputMousePos = bar}
+  check "the pointer on a heat bar is on its entity" . (== Just band) =<< readVarIO (busHover (wBus w))
+  codeClick inp0 bar
+  check "clicking a heat bar goes to its entity" . (== ["heap band/0x4fe0"]) =<< logged
+  check "in its panel" . (== PHeap) =<< tab
+  writeVarIO (wTab w) PCore
+  let (bDown, bUp) = rightClickPair inp0 bar
+  mapM_ codeFrame [bDown, bUp, inp0, inp0]
+  barMenu <- collectOverlayTextSpans codeCtx inp0
+  check "right-clicking a heat bar opens its entity's menu" (hasText "thunk in go" barMenu && hasText "Show in Heap & leaks" barMenu)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

@@ -31,6 +31,7 @@ module UI.Link
   , HitTarget (..)
   , Env (..)
   , refTitle
+  , refSpan
   , describeRef
     -- * Navigation
   , goTo
@@ -62,7 +63,8 @@ import NanoUI
 import Stronghead.Debug.Graph (ThunkKey (..), fmtClosureId)
 import Stronghead.Format (fmtNs, tshow)
 import Stronghead.Ref
-import Stronghead.Source (renderSrcSpan)
+import Stronghead.Join (Annotation)
+import Stronghead.Source (SrcSpan, renderSrcSpan)
 import System.FilePath (takeFileName)
 import UI.Common
 
@@ -162,11 +164,23 @@ data Lens = Lens
     -- ^ This panel's facts about it, for the peek.
   , lensHits :: [Hit]
     -- ^ What the palette can find in this panel.
+  , lensAnnotations :: [Annotation]
+    -- ^ What this panel says about lines of source, for the annotated code
+    -- views: heat bars, gutter marks and notes, each with its entity.
+  , lensSpan :: Ref -> Maybe SrcSpan
+    -- ^ Where in the source an entity is, as far as this panel knows: a
+    -- band's allocation site, a closure's info table, a binding's lines.
   }
 
 -- | A lens that shows nothing, to override field by field.
 lens :: Panel -> Lens
-lens p = Lens p (const False) (const (pure ())) (const Nothing) (const []) (const []) (const Nothing) []
+lens p = Lens p (const False) (const (pure ())) (const Nothing) (const []) (const []) (const Nothing) [] [] (const Nothing)
+
+-- | Where any panel puts an entity in the source.
+refSpan :: Env -> Ref -> Maybe SrcSpan
+refSpan env = \case
+  RSource sp -> Just sp
+  r -> listToMaybe (mapMaybe (`lensSpan` r) (envLenses env))
 
 data Action = Action
   { actLabel :: !Text

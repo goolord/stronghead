@@ -26,6 +26,7 @@ import Stronghead.Dump (kindForPath)
 import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Eventlog (LoadProgress (..))
 import Stronghead.Format (fmtBytes, tshow)
+import Stronghead.Ref (Ref, parseRefTarget)
 import System.Directory (doesDirectoryExist, makeAbsolute)
 import System.FilePath (takeDirectory, takeFileName)
 import UI.Code (colouringName)
@@ -44,7 +45,7 @@ panelHint :: Panel -> T.Text
 panelHint = \case
   PTimeline -> "Wheel to zoom, drag to pan, click or drag the ruler for the cursor, Shift+drag for a range, [ ] step collections"
   PHeap -> "Drag the chart to move the cursor, wheel to zoom, drag the time axis to pan, Shift+drag for a range, [ ] step censuses"
-  PCore -> "Hover a name to find it in every pane, click it to jump to its binding"
+  PCore -> "Hover a name to find it in every pane, click it to jump to its binding; click a bar or a note to go to what it measures"
   PDebugger -> "Click the gutter to set or clear a breakpoint"
   PLive -> "Click or drag a chart to move the cursor, Shift+drag for a range; samples arrive four times a second"
 
@@ -80,6 +81,8 @@ data App = App
     -- ^ What the settings file holds, so it is written only on a change.
   , appBus :: !Bus
   , appPalette :: !CommandPalette
+  , appGoto :: !(Var (Maybe Ref))
+    -- ^ From the command line: opened once a panel can show it.
   }
 
 -- | What the command line asked for.
@@ -92,10 +95,12 @@ data Options = Options
     -- ^ An eventlog to follow as it is written.
   , optDebug :: !(Maybe FilePath)
     -- ^ A module to start a GHCi session on.
+  , optGoto :: !(Maybe T.Text)
+    -- ^ An entity to open, by its reference.
   }
 
 defaultOptions :: Options
-defaultOptions = Options [] Nothing Nothing Nothing Nothing
+defaultOptions = Options [] Nothing Nothing Nothing Nothing Nothing
 
 -- | The app, starting from saved settings; the command line wins over them.
 newApp :: Settings -> Options -> IO App
@@ -112,6 +117,8 @@ newApp settings Options {..} = do
   writeVarIO (csColouring appCore) (cfgColouring settings)
   writeVarIO (csHideUniques appCore) (cfgHideUniques settings)
   writeVarIO (csHideTypeable appCore) (cfgHideTypeable settings)
+  writeVarIO (csProjectRoot appCore) (cfgProjectRoot settings)
+  writeVarIO (csEditor appCore) (cfgEditorCommand settings)
   appDebug <- newDebugState
   writeVarIO (dsCommand appDebug) (cfgGhciCommand settings)
   appStartDebug <- newVar False
@@ -142,6 +149,7 @@ newApp settings Options {..} = do
   appSaved <- newIORef settings
   appBus <- newBus
   appPalette <- newPalette
+  appGoto <- newVar (optGoto >>= parseRefTarget)
   pure App {..}
 
 -- | The settings as they stand: the dialog's, the panels' defaults as last
@@ -160,6 +168,8 @@ currentSettings app = do
   cfgColouring <- readVarIO (csColouring (appCore app))
   cfgHideUniques <- readVarIO (csHideUniques (appCore app))
   cfgHideTypeable <- readVarIO (csHideTypeable (appCore app))
+  cfgProjectRoot <- readVarIO (csProjectRoot (appCore app))
+  cfgEditorCommand <- readVarIO (csEditor (appCore app))
   pure Settings {..}
 
 -- | Save the settings with the window's final geometry; call once the
@@ -241,7 +251,8 @@ appView app = do
   -- Loaders run every frame so background work survives tab switches.
   timeline <- timelineLoad (appTimeline app)
   heap <- heapLoad (appHeap app)
-  core <- coreLoad (appCore app)
+  debugDir <- T.unpack <$> readVar (dsDir (appDebug app))
+  core <- coreLoad (appCore app) [debugDir]
   debugSrc <- debugLoad (appDebug app)
   live <- liveLoad (appLive app)
   let logTl = timeline >>= lpTimeline
@@ -251,8 +262,10 @@ appView app = do
 
   active <- readVar (appTab app)
   heapL <- heapLens (appHeap app) heap logProfile
-  coreL <- coreLens (appCore app) core
-  debugL <- debugLens (appDebug app) debugSrc
+  -- Each lens may ask the ones built before it where an entity is in the
+  -- source: Core opens it in an editor, the Debugger breaks on it.
+  coreL <- coreLens (appCore app) core (lensSpan heapL) (lensAnnotations heapL)
+  debugL <- debugLens (appDebug app) debugSrc (clIndex core) (\r -> maybe (lensSpan coreL r) Just (lensSpan heapL r))
   let env =
         Env
           { envBus = appBus app
@@ -261,6 +274,10 @@ appView app = do
           , envSwitch = writeVar (appTab app)
           }
   navShortcuts app env
+  goto <- readVar (appGoto app)
+  for_ goto $ \r -> when (any (`lensShows` r) (envLenses env)) $ do
+    writeVar (appGoto app) Nothing
+    goTo env r
 
   th <- uiTheme
   let i = ink th
@@ -279,7 +296,7 @@ appView app = do
       PTimeline -> timelineView env (appTimeline app) timeline
       PHeap -> heapView env (appHeap app) heap logTl
       PCore -> coreView env (appCore app) core
-      PDebugger -> debugView env (appDebug app) debugSrc
+      PDebugger -> debugView env (appDebug app) (clIndex core) debugSrc
       PLive -> liveView env (appLive app) live logTl $ \p -> do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
@@ -435,6 +452,7 @@ settingsModal app = do
       chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
       headOr = \case k : _ -> k; [] -> mempty
       input f v = textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . f) defaultLayout} v
+      inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
       core = appCore app
   modalWith (fixedW 620) (appSettingsOpen app) "Settings" $
     columnWith (fillW . tight . gap 8) $ do
@@ -465,6 +483,11 @@ settingsModal app = do
         checkboxWith alignMid "Hide uniques" (csHideUniques core)
         checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable core)
       settingNote "The Core & STG toolbar changes these too; the last choice is kept."
+      sectionTitle "Source"
+      settingRow "Project root" $ inputHint "folder whose sources the panels link to" fillW (csProjectRoot core)
+      settingNote "Sources are also found beside the dumps, in the project the dump folder is in, and under the debugger's directory."
+      settingRow "Editor command" $ inputHint "code -g {file}:{line}:{col}" fillW (csEditor core)
+      settingNote "Run by \"Open in editor\" on any source line; {file}, {line} and {col} are filled in."
       columnWith (padTop 12 . fillW . tight . gap 8) $ do
         labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack path)
         fillRow $ do
@@ -488,6 +511,8 @@ resetSettings app = do
   writeVar (csColouring core) (cfgColouring d)
   writeVar (csHideUniques core) (cfgHideUniques d)
   writeVar (csHideTypeable core) (cfgHideTypeable d)
+  writeVar (csProjectRoot core) (cfgProjectRoot d)
+  writeVar (csEditor core) (cfgEditorCommand d)
 
 -- | A setting: its name in a column of names, then its controls.
 settingRow :: T.Text -> NanoUI () -> NanoUI ()

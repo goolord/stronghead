@@ -15,6 +15,8 @@ module Stronghead.Ghci
   , StopInfo (..)
   , parseStop
   , parseBreakpointSet
+  , parseHistory
+  , historyLine
   , GhciBinding (..)
   , parseBindings
   , valueIsThunk
@@ -156,6 +158,20 @@ parseStop out =
          | l <- T.lines out
          , "Stopped at <exception thrown>" `T.isInfixOf` l
          ]
+
+-- | One step of @:history@: @-1  : go (Main.hs:5:8-21)@ is step -1, in
+-- @go@, at that span.
+parseHistory :: Text -> [(Int, Text, SrcSpan)]
+parseHistory out = mapMaybe historyLine (T.lines out)
+
+historyLine :: Text -> Maybe (Int, Text, SrcSpan)
+historyLine l = do
+  rest <- T.stripPrefix "-" (T.strip l)
+  (n, after) <- either (const Nothing) Just (TR.decimal rest)
+  body <- T.stripPrefix ":" (T.stripStart after)
+  let (name, loc) = T.breakOn " (" (T.strip body)
+  sp <- parseSrcSpan =<< T.stripSuffix ")" (T.drop 2 loc)
+  pure (negate n, T.strip name, sp)
 
 -- | "Breakpoint 3 activated at file:12:3-20" lines.
 parseBreakpointSet :: Text -> [(Int, Maybe SrcSpan)]

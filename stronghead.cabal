@@ -61,6 +61,7 @@ library
         Stronghead.Run
         Stronghead.Clock
         Stronghead.Ref
+        Stronghead.Join
         Stronghead.Fuzzy
         Stronghead.Format
         Stronghead.Debug
@@ -122,6 +123,7 @@ executable stronghead
         filepath >=1.4 && <1.6,
         nano-ui ^>=0.2,
         nano-ui-sdl ^>=0.2,
+        process ^>=1.6,
         stronghead,
         text >=2.0 && <2.2,
         vector >=0.13 && <0.14
@@ -156,11 +158,13 @@ test-suite stronghead-ui-test
     main-is:          Main.hs
     other-modules:
         UI.Clock
+        UI.Code
         UI.Common
         UI.Link
         UI.Palette
     build-depends:
         base >=4.20 && <4.23,
+        containers >=0.6 && <0.9,
         filepath >=1.4 && <1.6,
         nano-ui ^>=0.2,
         stronghead,

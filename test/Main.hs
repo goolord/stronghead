@@ -22,6 +22,7 @@ import Stronghead.Eventlog.Model
 import Stronghead.Fuzzy
 import Stronghead.Ghci
 import Stronghead.HeapProfile
+import Stronghead.Join
 import Stronghead.Live
 import Stronghead.Prof
 import Stronghead.Ref
@@ -64,12 +65,13 @@ main = do
     Left e -> check ("parseProf: " <> e) False
     Right pf -> do
       let flat = flattenCC (pfRoots pf)
-      check "four cost centres" (length flat == 4)
-      check "nesting from indentation" (map fst flat == [0, 1, 2, 1])
+      check "five cost centres" (length flat == 5)
+      check "nesting from indentation" (map fst flat == [0, 1, 2, 1, 1])
+      check "a source with spaces keeps the columns after it" (ccTime (snd (flat !! 4)) == 0.2 && ccNo (snd (flat !! 4)) == 5)
       check "inherited time parsed" (ccInhTime (snd (flat !! 2)) == 60.5)
       check "cost-centre spans parsed" $
         map (ccLoc . snd) flat
-          == [SrcBuiltIn, SrcAt (SrcSpan "Main.hs" 9 1 9 20), SrcAt (SrcSpan "Main.hs" 5 1 5 20), SrcEntireModule]
+          == [SrcBuiltIn, SrcAt (SrcSpan "Main.hs" 9 1 9 20), SrcAt (SrcSpan "Main.hs" 5 1 5 20), SrcEntireModule, SrcNoLocation]
       check "run from the header" $
         runFromProfHeader (pfHeader pf) == (runFromArgs ["prog", "+RTS", "-p", "-RTS"]) {riStarted = Just "Fri Oct 16 21:49 2026"}
 
@@ -319,6 +321,68 @@ main = do
     [] -> check "survivors found" False
   check "one snapshot has no survivors" (null (survivingThunks [snapB]))
 
+  putStrLn "joins"
+  check "same file across tools" (sameFile "sample\\Main.hs" "C:\\x\\sample\\Main.hs" && sameFile "/p/sample/Main.hs" "sample/Main.hs")
+  check "different directories are different files" (not (sameFile "app/Main.hs" "sample/Main.hs"))
+  check "span within" (spanWithin (SrcSpan "" 82 42 82 63) (SrcSpan "" 81 37 83 20) && not (spanWithin (SrcSpan "" 81 1 83 20) (SrcSpan "" 81 37 83 20)))
+  check "spans overlap" (spanOverlaps (SrcSpan "" 5 1 6 9) (SrcSpan "" 6 3 8 1) && not (spanOverlaps (SrcSpan "" 5 1 5 9) (SrcSpan "" 5 10 5 12)))
+  check "the smallest range owns a line" (lineValues [(80, 82, 5.2), (81, 81, 4.9)] == IM.fromList [(80, 5.2), (81, 4.9), (82, 5.2)])
+  check "equal ranges add up" (lineValues [(1, 1, 1), (1, 1, 2), (0, 3, 9)] == IM.fromList [(0, 9), (1, 3), (2, 9), (3, 9)])
+  case parseProf profText of
+    Left e -> check ("parseProf for joins: " <> e) False
+    Right pf -> do
+      check "a cost-centre stack finds its .prof path" (fmap (map ccName) (profPath ["go", "main", "MAIN"] (pfRoots pf)) == Just ["MAIN", "main", "go"])
+      check "a truncated stack matches its prefix" (fmap (map ccName) (profPath ["main", "MAIN"] (pfRoots pf)) == Just ["MAIN", "main"])
+      check "a stack the tree lacks does not" (profPath ["nope", "MAIN"] (pfRoots pf) == Nothing && profPath [] (pfRoots pf) == Nothing)
+      case costTotals (pfRoots pf) of
+        t : _ -> check "cost totals, dearest first" (ctName t == "go" && ctTime t == 60 && ctEntries t == 1000 && ctLoc t == SrcAt (SrcSpan "Main.hs" 5 1 5 20))
+        [] -> check "cost totals found" False
+  let cc name time inh kids = CostCentre name "Main" "Main.hs:5:1-20" (parseSrcLoc "Main.hs:5:1-20") 0 10 time time inh inh kids
+      recursive = costTotals [cc "go" 10 50 [cc "go" 20 40 [cc "go" 20 20 []]]]
+  check "recursion sums individual costs, inherited once" (map (\t -> (ctTime t, ctInhTime t, ctEntries t)) recursive == [(50, 50, 30)])
+  check "frames of a cost-centre band" (ccsFrames "(12)leaf/go/MAIN" == ["leaf", "go", "MAIN"])
+  check "binder table names" (parseTableName "main2_sat_s7qA_info" == Just (TableOfBinder "main2_sat_s7qA"))
+  check "constructor table names" (parseTableName "I#_Main_3_con_info" == Just (TableOfCon "I#" "Main" 3) && parseTableName "Bin_Data.Map_8_con_info" == Just (TableOfCon "Bin" "Data.Map" 8))
+  check "other symbols are not tables" (parseTableName "main2" == Nothing && parseTableName "_info" == Nothing)
+  let stg = parseCodeFile KindStg "dumps/Main.thr.dump-stg-final" stgText
+      sites = stgSites stg
+      lineOf needle = V.findIndex (needle `T.isInfixOf`) (cfLines stg)
+      thunkSpan = SrcSpan "sample/Main.hs" 82 59 82 63
+  check "a way-suffixed dump is of its module" (cfModule stg == "Main")
+  check "an IPE binder is its STG let" (siteOfTable sites "main2_sat_s7qA_info" Nothing == lineOf "main2_sat_s7qA [Occ")
+  check "a constructor table is its numbered site" (siteOfTable sites "I#_Main_3_con_info" Nothing == lineOf "3 GHC.Internal.Types.I#!")
+  check "a table without a site falls back to its span" (siteOfTable sites "I#_Main_9_con_info" (Just thunkSpan) == lineOf "src<sample")
+  check "another module's constructor is not here" (siteOfTable sites "I#_Other_3_con_info" Nothing == Nothing)
+  check "a dump names its source" (dumpSourcePath stg == Just "sample\\Main.hs")
+  let prov table kind = InfoProv table 15 kind "Integer" "main2" "Main" (SrcAt (SrcSpan "sample\\Main.hs" 82 59 82 63))
+      band name p = Band name (VU.fromList [10, 20]) 20 KindThunk p Nothing
+      hiBand = band "0x4fe0" (Just (prov "main2_sat_s7qA_info" KindThunk))
+  check "an info-table band is titled by its provenance" (bandTitle hiBand == "thunk in main2 (Main.hs:82)")
+  check "a constructor band by its constructor" (bandTitle (band "0x5000" (Just (prov "I#_Main_3_con_info" KindConstructor))) == "I# in main2 (Main.hs:82)")
+  check "other bands by name" (bandTitle (band "THUNK_2_0" Nothing) == "THUNK_2_0")
+  let srcNode i ty src size = ClosureNode i ty (kindOfClosureType ty) "x" src size []
+      thunkAt = srcNode 10 "THUNK_2_0" (Just "sample/Main.hs:82:59-63") 32
+  check "a closure matches an info-table band by span" (closureMatchesBand hiBand thunkAt && not (closureMatchesBand hiBand (srcNode 11 "THUNK_2_0" (Just "sample/Main.hs:9:1-3") 32)))
+  check "and a closure-type band by type" (closureMatchesBand (band "THUNK_2_0" Nothing) thunkAt && not (closureMatchesBand (band "ARR_WORDS" Nothing) thunkAt))
+  let srcSnap =
+        mkSnapshot "src" False [1] $
+          [ ClosureNode 1 "TSO" NThread "thread 1" Nothing 16 [10, 11, 12]
+          , thunkAt
+          , srcNode 11 "THUNK_2_0" (Just "sample/Main.hs:82:59-63") 48
+          , srcNode 12 "CONSTR_1_0" (Just "sample/Main.hs:93:1-4") 16
+          ]
+  case closuresBySource srcSnap (M.fromList [(11, 2)]) of
+    [g, h] -> do
+      check "closures grouped by source, biggest first" (sgSpan g == SrcSpan "sample/Main.hs" 82 59 82 63 && sgClosures g == 2 && sgThunks g == 2 && sgBytes g == 80 && sgClosures h == 1)
+      check "survivors counted, the biggest kept to reveal" (sgSurvivors g == 1 && sgSample g == 11 && sgSurvivors h == 0)
+    gs -> check ("two source groups, not " <> show (length gs)) False
+  check "way suffixes dropped from dump names" (map dumpModuleName ["d/Main.thr.dump-stg-final", "Data.Map.dump-simpl", "Foo.p_dyn.dump-simpl", "Main.dump-stg"] == ["Main", "Data.Map", "Foo", "Main"])
+  check "editor command template" (editorCommand "code -g {file}:{line}:{col}" "C:\\My Files\\M.hs" 3 0 == "code -g \"C:\\My Files\\M.hs\":3:1")
+  check "overlapping roots are not a tie" (fmap rsHow (resolveSource (mkSourceIndex [] ["/p/sample/Main.hs", "/p/sample/Main.hs"]) Nothing "sample/Main.hs") == Just (BySuffix 2))
+  check "history steps are spans" $
+    parseHistory "-1  : go (Main.hs:5:8-21)\n-2  : main (Main.hs:(10,1)-(12,3))\n<end of history>"
+      == [(-1, "go", SrcSpan "Main.hs" 5 8 5 21), (-2, "main", SrcSpan "Main.hs" 10 1 12 3)]
+
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
 
@@ -420,6 +484,7 @@ profText =
     , " main        Main      Main.hs:9:1-20    2          1    1.0    1.0    80.0   90.0"
     , "  go         Main      Main.hs:5:1-20    3       1000   60.0   70.0    60.5   70.0"
     , " CAF         GHC.IO    <entire-module>   4          0    0.5    0.1     0.5    0.1"
+    , " CAF         GHC.Conc  <no location info> 5         0    0.2    0.0     0.2    0.0"
     ]
 
 coreText :: Text
@@ -480,3 +545,27 @@ leakSnapshot n =
     base = if n == 2 then 6 else 1000
     thunk i = if n == 2 && i == 1 then 7 else base + fromIntegral i
     node i ty name kids = ClosureNode i ty (kindOfClosureType ty) name Nothing 16 kids
+
+-- | A slice of an STG dump from an investigation build: a thunk bound by a
+-- @let@, a numbered constructor site, and the source notes
+-- @-finfo-table-map@ adds.
+stgText :: Text
+stgText =
+  T.unlines
+    [ "Main.main2 [GblId, Arity=1] :: GHC.Internal.Bignum.Integer.Integer -> GHC.Internal.Types.Int"
+    , "[GblId, Arity=1, Unf=OtherCon []] ="
+    , "    \\r [x1_s7qu]"
+    , "        let {"
+    , "          main2_sat_s7qA [Occ=Once1]"
+    , "            :: GHC.Internal.Bignum.Integer.Integer"
+    , "          [LclId] ="
+    , "              {x1_s7qu} \\u []"
+    , "                  src<sample\\Main.hs:82:59-63>"
+    , "                  GHC.Internal.Bignum.Integer.integerAdd x1_s7qu x1_s7qu;"
+    , "        } in"
+    , "        let {"
+    , "          main2_sat_s7qB [Occ=Once1] :: GHC.Internal.Types.Int"
+    , "          [LclId] ="
+    , "              3 GHC.Internal.Types.I#! [1#];"
+    , "        } in  main2_sat_s7qB;"
+    ]

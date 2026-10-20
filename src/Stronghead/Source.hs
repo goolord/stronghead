@@ -27,13 +27,19 @@ module Stronghead.Source
   , Resolved (..)
   , resolveSource
   , resolveModule
+  , resolvesTo
   , locateSource
   , pathComponents
+  , findProjectRoot
+  , sourceRoots
+    -- * Editors
+  , editorCommand
   ) where
 
 import Control.Exception (IOException, try)
+import Control.Monad (filterM)
 import Data.Char (isSpace)
-import Data.List (sortOn)
+import Data.List (isPrefixOf, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (listToMaybe)
@@ -43,7 +49,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
-import System.FilePath (isAbsolute, normalise, takeExtension, (</>))
+import System.FilePath (isAbsolute, normalise, takeDirectory, takeExtension, (</>))
 
 -- ---------------------------------------------------------------------------
 -- Spans
@@ -162,16 +168,19 @@ mkSourceIndex :: [FilePath] -> [FilePath] -> SourceIndex
 mkSourceIndex roots files =
   SourceIndex
     { siRoots = roots
-    , siFiles = S.fromList (map normalise files)
-    , siByName = M.fromListWith (++) [(last cs, [normalise f]) | f <- files, let cs = pathComponents f, not (null cs)]
+    , siFiles = unique
+    , siByName = M.fromListWith (++) [(last cs, [f]) | f <- S.toList unique, let cs = pathComponents f, not (null cs)]
     }
+  where
+    -- Overlapping roots find a file twice; once is not a tie.
+    unique = S.fromList (map normalise files)
 
 -- | Walk the roots for Haskell sources, skipping build output and hidden
 -- directories. Stops after 20000 files so a root set to a home directory
 -- does not hang the caller.
 buildSourceIndex :: [FilePath] -> IO SourceIndex
 buildSourceIndex roots = do
-  files <- go 20000 roots
+  files <- go 20000 (outermost roots)
   pure (mkSourceIndex roots files)
   where
     go :: Int -> [FilePath] -> IO [FilePath]
@@ -186,6 +195,11 @@ buildSourceIndex roots = do
           more <- go (budget - length here) (rest ++ dirs)
           pure (here ++ more)
     skipDir e = take 1 e == "." || take 4 e == "dist" || e `elem` ["node_modules", "_build"]
+    -- A root inside another is walked with it.
+    outermost rs =
+      let ns = S.toList (S.fromList (map normalise rs))
+       in [r | r <- ns, not (any (\o -> o /= r && pathComponents o `isPrefixOf` pathComponents r && sameDrive o r) ns)]
+    sameDrive a b = take 2 a == take 2 b || not (isAbsolute a && isAbsolute b)
 
 sourceExtensions :: [String]
 sourceExtensions = [".hs", ".lhs", ".hsc", ".hs-boot", ".chs"]
@@ -260,6 +274,15 @@ best candidates comps how =
       _ -> 1
     commonTail a b = length (takeWhile id (zipWith (==) (reverse a) (reverse b)))
 
+-- | Whether a reported path is this file. When the index does not hold the
+-- file (it is still being built, or the file is outside its roots), the
+-- file alone is the index: a reported path matching its tail is it.
+resolvesTo :: SourceIndex -> FilePath -> Text -> Bool
+resolvesTo ix path reported =
+  let file = normalise path
+      ix' = if S.member file (siFiles ix) then ix else mkSourceIndex [] [file]
+   in fmap rsPath (resolveSource ix' Nothing reported) == Just file
+
 -- | 'resolveSource', but an absolute path outside the roots is accepted if
 -- the file exists.
 locateSource :: SourceIndex -> Maybe Text -> Text -> IO (Maybe Resolved)
@@ -287,6 +310,43 @@ pathComponents p =
     dropDrive s = case s of
       d : ':' : more | not (isSep d), not (isSpace d) -> more
       _ -> s
+
+-- | The nearest directory at or above a path that holds a @.cabal@ file or
+-- a @cabal.project@: where a build of it ran. Gives up after eight levels.
+findProjectRoot :: FilePath -> IO (Maybe FilePath)
+findProjectRoot start = do
+  isDir <- doesDirectoryExist start
+  go (8 :: Int) (normalise (if isDir then start else takeDirectory start))
+  where
+    go 0 _ = pure Nothing
+    go n d = do
+      entries <- either (\(_ :: IOException) -> []) id <$> try (listDirectory d)
+      if any (\e -> takeExtension e == ".cabal" || e == "cabal.project" || e == "stack.yaml") entries
+        then pure (Just d)
+        else
+          let up = takeDirectory d
+           in if up == d then pure Nothing else go (n - 1) up
+
+-- | The roots to index for a set of starting points (the project root
+-- setting, the dump folder, the debugger's directory): each one, and the
+-- project it is in when there is one.
+sourceRoots :: [FilePath] -> IO [FilePath]
+sourceRoots starts = do
+  existing <- filterM doesDirectoryExist [normalise s | s <- starts, not (null s)]
+  projects <- mapM findProjectRoot existing
+  pure (S.toList (S.fromList (existing ++ [p | Just p <- projects])))
+
+-- ---------------------------------------------------------------------------
+-- Editors
+
+-- | Fill an editor command template: @{file}@, @{line}@ and @{col}@ are
+-- replaced, the file quoted when it holds a space
+-- (@code -g {file}:{line}:{col}@).
+editorCommand :: Text -> FilePath -> Int -> Int -> Text
+editorCommand template file line col =
+  T.replace "{file}" quoted . T.replace "{line}" (showT line) . T.replace "{col}" (showT (max 1 col)) $ template
+  where
+    quoted = if any isSpace file then "\"" <> T.pack file <> "\"" else T.pack file
 
 firstJust :: [Maybe a] -> Maybe a
 firstJust = listToMaybe . concatMap (maybe [] pure)
