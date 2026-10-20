@@ -50,6 +50,10 @@ data Settings = Settings
   , cfgColouring :: !Colouring
   , cfgHideUniques :: !Bool
   , cfgHideTypeable :: !Bool
+  , cfgProjectRoot :: !Text
+    -- ^ Where to look for sources; empty for only the dump folder's project.
+  , cfgEditorCommand :: !Text
+    -- ^ A template with @{file}@, @{line}@ and @{col}@; empty for none.
   }
   deriving (Eq, Show)
 
@@ -76,6 +80,8 @@ defaultSettings =
     , cfgColouring = BoxingColours
     , cfgHideUniques = True
     , cfgHideTypeable = True
+    , cfgProjectRoot = ""
+    , cfgEditorCommand = ""
     }
 
 -- ---------------------------------------------------------------------------
@@ -197,6 +203,8 @@ encode Settings {..} =
            , ("code-colouring", case cfgColouring of BoxingColours -> "boxing"; SyntaxColours -> "syntax")
            , ("hide-uniques", bool cfgHideUniques)
            , ("hide-typeable", bool cfgHideTypeable)
+           , ("project-root", cfgProjectRoot)
+           , ("editor-command", cfgEditorCommand)
            ]
     windowPairs SavedWindow {..} =
       let Size w h = swSize
@@ -238,6 +246,8 @@ decode file =
         _ -> Nothing
     , cfgHideUniques = field "hide-uniques" (cfgHideUniques d) readBool
     , cfgHideTypeable = field "hide-typeable" (cfgHideTypeable d) readBool
+    , cfgProjectRoot = field "project-root" (cfgProjectRoot d) Just
+    , cfgEditorCommand = field "editor-command" (cfgEditorCommand d) Just
     }
   where
     d = defaultSettings

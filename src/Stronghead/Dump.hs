@@ -20,6 +20,9 @@ module Stronghead.Dump
   , lineTokens
   , ModuleArtifacts (..)
   , discoverArtifacts
+  , dumpModuleName
+  , sourceModuleName
+  , dumpSourcePath
   , kindForPath
   , isTypeableBinding
   , occurrences
@@ -39,6 +42,7 @@ import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import System.Directory (doesDirectoryExist, listDirectory)
+import Stronghead.Source (SrcSpan (..), parseSrcLoc, srcLocSpan)
 import System.FilePath (takeBaseName, takeExtension, takeFileName, (</>))
 
 data CodeKind = KindSource | KindCore | KindStg
@@ -134,7 +138,8 @@ parseCodeFile kind path src =
   where
     lines' = V.fromList (map (T.replace "\t" "        " . T.dropWhileEnd (== '\r')) (T.lines src))
     tokens = V.fromList (tokenizeLines kind (V.toList lines'))
-    modName = fromMaybe (T.pack (takeBaseName path)) $ listToMaybe
+    fallbackName = if kind == KindSource then T.pack (takeBaseName path) else dumpModuleName path
+    modName = fromMaybe fallbackName $ listToMaybe
       [ T.takeWhile (\c -> not (isSpace c) && c /= '(') (T.strip rest)
       | l <- take 400 (V.toList lines')
       , Just rest <- [T.stripPrefix "module " l]
@@ -465,11 +470,11 @@ data ModuleArtifacts = ModuleArtifacts
 discoverArtifacts :: FilePath -> IO [ModuleArtifacts]
 discoverArtifacts root = do
   files <- walk (10 :: Int) root
-  let dumps k = [(dumpModule f, f) | f <- files, kindForPath f == Just k]
+  let dumps k = [(dumpModuleName f, f) | f <- files, kindForPath f == Just k]
       cores = M.fromList (dumps KindCore)
       stgs = M.fromList (dumps KindStg)
   sources <- fmap catMaybes . forM [f | f <- files, kindForPath f == Just KindSource] $ \f -> do
-    m <- sourceModule f
+    m <- sourceModuleName f
     pure ((,f) <$> m)
   let srcMap = M.fromList sources
       -- A hierarchical -dumpdir names Foo/Bar.dump-simpl just "Bar".
@@ -494,18 +499,46 @@ discoverArtifacts root = do
           let files = [p | p <- paths, p `notElem` dirs]
           deeper <- concat <$> mapM (walk (d - 1)) dirs
           pure (files ++ deeper)
-    dumpModule f =
-      let b = takeFileName f
-       in T.pack (fromMaybe b (listToMaybe (mapMaybe (\ext -> stripSuffix ext b) [".dump-simpl", ".dump-stg-final", ".dump-stg"])))
+
+-- | The module a dump is of, from its file name: @Foo.Bar.dump-simpl@ is
+-- @Foo.Bar@. A build in another way puts the way in the name
+-- (@Main.thr.dump-stg-final@, @Main.p_dyn.dump-simpl@), which is dropped.
+dumpModuleName :: FilePath -> Text
+dumpModuleName f =
+  let b = takeFileName f
+      stem = fromMaybe b (listToMaybe (mapMaybe (\ext -> stripSuffix ext b) [".dump-simpl", ".dump-stg-final", ".dump-stg"]))
+      parts = T.splitOn "." (T.pack stem)
+   in case parts of
+        _ : _ : _ | isWay (last parts) -> T.intercalate "." (init parts)
+        _ -> T.pack stem
+  where
     stripSuffix suf str
       | suf `isSuffixOf` str = Just (take (length str - length suf) str)
       | otherwise = Nothing
-    sourceModule f = do
-      r <- try (B.readFile f)
-      pure $ case r of
-        Left (_ :: IOException) -> Nothing
-        Right bs ->
-          let ls = T.lines (TE.decodeUtf8With TE.lenientDecode (B.take 20000 bs))
-           in case [T.takeWhile (\c -> not (isSpace c) && c /= '(') (T.strip rest) | l <- ls, Just rest <- [T.stripPrefix "module " l]] of
-                m : _ -> Just m
-                [] -> Just (T.pack (takeBaseName f))
+    isWay w = not (T.null w) && all (`elem` ["thr", "p", "dyn", "debug", "l"]) (T.splitOn "_" w)
+
+-- | The module a Haskell source file declares, or its base name for a
+-- @Main@ module without a header. 'Nothing' when it can't be read.
+sourceModuleName :: FilePath -> IO (Maybe Text)
+sourceModuleName f = do
+  r <- try (B.readFile f)
+  pure $ case r of
+    Left (_ :: IOException) -> Nothing
+    Right bs ->
+      let ls = T.lines (TE.decodeUtf8With TE.lenientDecode (B.take 20000 bs))
+       in case [T.takeWhile (\c -> not (isSpace c) && c /= '(') (T.strip rest) | l <- ls, Just rest <- [T.stripPrefix "module " l]] of
+            m : _ -> Just m
+            [] -> Just (T.pack (takeBaseName f))
+
+-- | The source file a dump was compiled from, as the compiler reported it
+-- in the first @src<file:...>@ note (STG built with @-finfo-table-map@ has
+-- them). For dumps whose source is not beside them.
+dumpSourcePath :: CodeFile -> Maybe Text
+dumpSourcePath cf =
+  listToMaybe
+    [ ssFile sp
+    | l <- V.toList (cfLines cf)
+    , let (_, rest) = T.breakOn "src<" l
+    , not (T.null rest)
+    , Just sp <- [srcLocSpan (parseSrcLoc (T.takeWhile (/= '>') (T.drop 4 rest)))]
+    ]

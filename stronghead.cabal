@@ -60,6 +60,7 @@ library
         Stronghead.Source
         Stronghead.Run
         Stronghead.Ref
+        Stronghead.Join
         Stronghead.Fuzzy
         Stronghead.Format
         Stronghead.Debug
@@ -120,6 +121,7 @@ executable stronghead
         filepath >=1.4 && <1.6,
         nano-ui ^>=0.2,
         nano-ui-sdl ^>=0.2,
+        process ^>=1.6,
         stronghead,
         text >=2.0 && <2.2,
         vector >=0.13 && <0.14
