@@ -12,8 +12,9 @@ cabal run stronghead -- [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventl
 ```
 
 Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`,
-`.dump-stg-final`, `.hs`); a directory is searched for Core/STG dumps. Files can
-also be opened from the header or dropped on the window. `--goto` opens an
+`.dump-stg-final`, `.hs`, and `.stronghead` for a [session](#sessions)); a
+directory is searched for Core/STG dumps. Files can also be opened from the
+header or dropped on the window. `--goto` opens an
 entity by the reference **Copy reference** gives
 (`source/sample%2FMain.hs/82/1/82/1` is line 82 of the sample), once a panel
 has loaded it. `--mark` sends a connected program a mark once its agent
@@ -28,7 +29,8 @@ and the **editor command** that "Open in editor" runs
 (`code -g {file}:{line}:{col}`, say). They are saved as they change, with the window's
 size and position on quit, to `settings.conf` in the user config directory
 (`%APPDATA%\stronghead` on Windows, `~/.config/stronghead` elsewhere). The
-command line wins over them.
+command line wins over them. **Reopen the last session on start** (off by
+default) brings back the session saved on quit; see [Sessions](#sessions).
 
 ## Links between panels
 
@@ -48,6 +50,10 @@ the same entity in every panel.
   bands, closures, markers, and commands.
 - **Ctrl+1** to **Ctrl+5** switch panels. A click focuses an entity, and the
   status bar shows the focus; **Esc** clears it.
+- Each panel's facts in a peek say how that panel matched the entity:
+  **exact** (the same thread id in the same run, an info table through the
+  IPE map), **by name** (a binding by module and name, a `-hT` band by its
+  closure type) or **approximate** (a `.hp` file's clock).
 
 Time-keyed links (a thread, a census, an instant) join artifacts from the
 same run, matched by program name and pid. Code-keyed links (a binding, a
@@ -75,6 +81,86 @@ range in program time, for every view of the same run.
   eventlog of the same run is loaded, its censuses are paired with the
   eventlog's by their totals and put on program time; otherwise the heap
   chart says its times are approximate.
+
+## Inspector
+
+The **Inspector** pane shows everything Stronghead knows about the focus:
+the long form of a peek. Its name and reference, where it is in the source,
+and then a section for each panel that knows it: how that panel matched it,
+its facts, what goes with it (as links) and the panel's actions (as
+buttons, disabled with the reason when they can't run). **Pin**, **Go to**
+and **Copy reference** sit under the name.
+
+It follows the focus as it changes. Its **←** and **→** step through what it
+has shown, apart from the window's history, and focus the entity again; with
+**Follow** off it holds on to what it shows. It sits beside the heap's
+analysis and under Core & STG's bindings by default, and can be added to any
+panel.
+
+## Pinboard
+
+**Pin** is on every entity's right-click menu and in the inspector. The
+**Pinboard** pane lists the pins by name, each with a note; the arrows
+reorder them, **×** unpins, and a click on a pin's name goes to it.
+
+**Copy report** puts the board on the clipboard as Markdown, and
+**Export…** saves it: a heading per pin, its reference as code (paste it
+into Go to… or `--goto` to open it again), every panel's facts about it as
+text, with how each matched, and the note as a quote. Pins are saved with
+the session.
+
+## Sessions
+
+A session is where an investigation stands: the eventlog (and whether it
+is followed), the heap and cost-centre profiles and what the heap panel
+charts, the ghc-debug socket, the dump folder and module or the files open
+in Core & STG, the agent's address and whether it is connected, the GHCi
+command, directory and file and whether a session runs, the pins and their
+notes, the shared cursor and range, the focus, every panel's arrangement of
+panes, the presets, the panes popped out, and the panel in front.
+
+**Save session…** and **Open session…** are in the header's **Workspace**
+popover and in Go to… (Ctrl+K). A `.stronghead` file also opens from the
+command line or by dropping it on the window. Stronghead saves the session
+on quit to `last.stronghead` beside `settings.conf`, and reopens it on
+start when Settings says to (unless the command line opens something).
+
+The file is `key = value` lines like `settings.conf`, written whole or not
+at all. Lists are numbered (`pin.1`, `pin.1.note`); arrangements are trees
+of pane names (`layout.heap = (h 0.5 heap.chart inspector)`, where `v` puts
+two panes side by side and `h` stacks them). Only line breaks, spaces at
+either end and a `%` that would read as an escape are escaped, so paths
+and references stay readable and the file can be written by hand.
+Unknown keys are skipped, and an arrangement that doesn't read is left as
+it was, with a message.
+
+## Workspaces
+
+Every pane of every panel is registered by kind, and any panel can hold any
+of them: the Timeline's capabilities, threads, overview and markers; the
+heap chart, bands, analysis, live graph and cost centres; Core & STG's
+bindings, notes, source, Core and STG; the Debugger's source, locals,
+console and breakpoints; Live's charts and threads; and the inspector and
+the pinboard.
+
+- **Workspace** in the header adds a pane to the panel in front, beside the
+  others. Drag a pane by its header to place it: the middle of another pane
+  swaps them, an edge splits it. Double-click a header to maximise.
+- Each pane's **⋯** menu moves it to another panel, pops it out into a
+  floating window (closing the window puts it back), or closes it. A pane
+  is drawn once: a panel that still holds a popped-out pane says where it
+  went.
+- A pane draws from its panel's loaded data whichever panel it is in, so a
+  heap chart under the Timeline, or Core's source pane beside the leak
+  suspects, is live.
+- Time panes placed with the Timeline's capabilities or threads take the
+  Timeline's window: the heap chart (as **Lock to Timeline** does) and
+  Live's charts, when they are on the program clock.
+- **Arrangements** in the popover put back any panel's own panes, or a
+  preset across panels: **Leak hunt** (heap chart, bands, live graph,
+  source and inspector) and **Latency** (capabilities with their code
+  tracks, threads and inspector). **Save as a preset** names the current
+  arrangement; presets are saved with the session.
 
 ## Panels
 
@@ -433,8 +519,9 @@ backend; see [Live closure graph](#live-closure-graph-ghc-debug).
 | `src/Stronghead/Debug.hs` | ghc-debug snapshots (the backend behind the `ghc-debug` flag) |
 | `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots, thread stacks |
 | `src/Stronghead/Debug/Client.hs` | ghc-debug-client traversal (built only with the flag) |
+| `src/Stronghead/Session.hs` | Pins, the session file, the pinboard's Markdown report |
 | `agent/Stronghead/Agent.hs` | The drop-in agent |
-| `app/UI/*.hs` | The nano-ui panels |
+| `app/UI/*.hs` | The nano-ui panels; `UI.Workspace` is the pane registry, `UI.Inspector` and `UI.Pinboard` the shell's own panes |
 | `sample/Main.hs` | The deliberately leaky sample program |
 
 ## Limits

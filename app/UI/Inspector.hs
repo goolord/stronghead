@@ -93,7 +93,7 @@ inspectorPane env ins ctx = do
         step "←" back (stepInspector env ins inBack inForward)
         step "→" forward (stepInspector env ins inForward inBack)
         flex
-        checkboxWith alignMid "Follow the focus" (inFollow ins)
+        checkboxWith alignMid "Follow" (inFollow ins)
   paneWith tight ctx "Inspector" header $
     paneScroll (grow . tight) $
       columnWith (padAll 12 . gap 6 . fillW) $ case shown of

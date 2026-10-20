@@ -559,6 +559,15 @@ main = do
   check "each pane draws with its title" (hasText "Heap residency" ws && hasText "Inspector" ws)
   let menus = [r | (r, t, _, _, _) <- ws, t == "⋯"]
   check "and a menu" (length menus == 2)
+  title <- findSpan "Heap residency" ws
+  let dbl = do
+        let (dp, dr) = clickPair iinp title
+        mapM_ mframe [dp {inputMouseClicks = 2}, dr {inputMouseClicks = 2}, iinp, iinp]
+  dbl
+  maxed <- collectTextSpans mctx
+  check "double-clicking a header maximises its pane" (hasText "Heap residency" maxed && not (hasText "Inspector" maxed))
+  dbl
+  check "and again restores it" . hasText "Inspector" =<< collectTextSpans mctx
   for_ (take 1 menus) $ \(Rect x y bw bh) -> mclick (V2 (x + bw / 2) (y + bh / 2))
   opened <- collectOverlayTextSpans mctx iinp
   check "the menu moves, pops out and closes" (hasText "Move to Bench B" opened && hasText "Pop out" opened && hasText "Close pane" opened && not (hasText "Move to Bench A" opened))

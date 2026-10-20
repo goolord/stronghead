@@ -321,6 +321,9 @@ Core & STG's source pane and the Debugger's.
 | `app/UI/Palette.hs` | Ctrl+K |
 | `app/UI/Sources.hs` | the data sources popover (A6) |
 | `app/UI/Inspector.hs` | the entity inspector (W1) |
+| `app/UI/Pinboard.hs` | the pinboard and its report (W2) |
+| `app/UI/Workspace.hs` | the pane registry, workbench trees and presets (W4) |
+| `src/Stronghead/Session.hs` | pins, the session file, the report's Markdown (W2, W3) |
 | `agent/Stronghead/Agent.hs` | protocol v2, still on `base`, `bytestring` and `network` only |
 
 The `src/` modules stay free of the GUI and are tested headlessly, as the
@@ -947,6 +950,131 @@ how far C1 can trust each clock. Then P1a.
     on this machine is skipped, and said to be.
   - **Statuses between frames.** A thread's strip samples its status four
     times a second; the Timeline has the exact spans.
+- **P5** is in place, W1–W4:
+  - **Peeks are data.** `lensPeek` returns a `Peek`: facts and notes as
+    text, an exactness note ("exact: thread id in the same run", "by name:
+    module and binding name", "approximate: a .hp file keeps its own
+    clock"), and an optional drawing (a sparkline, badges). The hover peek
+    names each panel's kind of match beside its title; the inspector and
+    the report write it out. `runNote` words a time-keyed match: the same
+    run key is exact, a match `runKeysMatch` lets through is "probable".
+  - **Inspector** (W1). `UI.Inspector` shows the focus: its title and
+    reference, **Pin**, **Focus everywhere**, **Go to** and **Copy
+    reference**, the source span any lens gives it, then a section per lens
+    that shows, peeks, relates or acts on it: the exactness note, the facts
+    and notes, related refs as links, **Show in …** and the lens's actions
+    as buttons (disabled ones with their reason as a tooltip). It takes up
+    the focus every frame (`inspectorSync`), and keeps its own back and
+    forward, which refocus the entity; **Follow** off holds it. It is in the
+    Heap layout beside the analysis and in Core & STG's under the bindings,
+    and any panel can add it.
+  - **Pinboard** (W2). Pins live on the bus (`busPins`); every ref menu has
+    **Pin** / **Unpin**, and so does the inspector. The pane lists them by
+    `refTitle`, with a note each (a text input over the pin), up, down and
+    unpin, and a click on the title goes to it. **Copy report** and
+    **Export…** (a save dialog; `.md` is added when there is no extension)
+    give the Markdown from `Stronghead.Session.pinsMarkdown`: a heading per
+    pin, its `refTarget` as code, the source span, each lens's facts and
+    notes as text with its exactness note, and the note as a quote.
+  - **Sessions** (W3). `Stronghead.Session` holds `Session` and its
+    `key = value` codec: the eventlog and following, the `.hp` and `.prof`,
+    the heap source, the ghc-debug socket, the dump folder and module or
+    the files opened alone, the agent's address and whether it is
+    connected, the GHCi command, directory, file and whether it runs, the
+    pins with notes, the cursor, the range, the focus, every workbench's
+    tree, the user's presets, the popped-out panes and the panel in front.
+    Lists are numbered keys; values escape only what a line would lose
+    (line breaks, spaces at the ends, and a `%` that would read as one of
+    the five escapes), so references (`source/sample%2FMain.hs/82/…`) and
+    paths are written as they are. Files are written to a `.tmp` and
+    renamed. **Save session…** and **Open session…** are in the header's
+    Workspace popover and the palette; `.stronghead` opens from the command
+    line and by drag and drop (`openAny`). Settings gained **Reopen the last
+    session on start** (`reopen-last-session`, off); the session is saved to
+    `last.stronghead` beside `settings.conf` on quit, except in a screenshot
+    run, and reopened only when the command line opens nothing.
+  - **Mixed workspaces** (W4). `UI.Workspace` registers 22 pane kinds by id
+    and session name, and a workbench's pane ids are those kind ids, so a
+    tree says what is in it and a kind is in a workbench at most once;
+    split ids are 1000 and up. `Workbench` is now a named tree. Each panel
+    exports its panes (`timelinePanes`, `heapPanes`, `corePanes`,
+    `debugPanes`, `livePanes`): a function from what the frame's loaders
+    returned and the panel's state to a `PaneDraw`, with an in-pane empty
+    state when its data isn't loaded. The panel views draw their toolbars
+    and readouts and hand their workbench to the shell's `Bench`, which
+    draws the grid with the panel's own panes, any other panel's from the
+    same loader output, and the inspector and pinboard. No pane draws from
+    its panel being on screen.
+    - **Add** in the header's **Workspace** popover puts any kind beside the
+      arrangement (`addPane`); the pane header is a `paneDragHandle`, so a
+      drag swaps or splits within the workbench; each pane's **⋯** menu has
+      **Move to …** (any other panel's workbench), **Pop out** and **Close
+      pane**. Double-clicking a header still maximises.
+    - The five panels' layouts are `panelPreset`s; **Leak hunt** (heap
+      chart, bands, live graph, source, inspector) and **Latency**
+      (capabilities with their code tracks, threads, inspector) are the
+      seeded `userPresets`, and **Save as a preset** adds the current
+      arrangement. Presets are saved with sessions.
+    - A time pane placed with `tl.caps` or `tl.threads` takes the
+      Timeline's window: the heap chart through the Lock to Timeline path
+      (`chartWindow`, reading and writing `busWindow`), and Live's charts
+      by drawing the window's span when the run matches and frames are on
+      the program clock.
+    - **Pop out** moves a pane into a nano-ui `window`; closing the window
+      puts it back in the workbench it came from. A workbench that still
+      holds a popped-out kind draws a placeholder with **Bring it back
+      here**, so a pane is never drawn twice.
+    - Trees are written as `(v 0.740 (h 0.500 tl.caps tl.threads)
+      inspector)`; `decodeTree` refuses unknown names, repeats, ratios
+      outside (0, 1) and junk, and checks `validateGridTree`.
+  - Tests: `stronghead-test` round-trips a full session and the empty one,
+    escapes and unescapes values, keeps hand-written references and
+    numbered pin order, skips bad keys, and covers pinning, moving pins and
+    the report text. `stronghead-ui-test` drives the inspector (content,
+    pinning, following, its own back and forward, holding), the pinboard
+    (titles, reorder, click to go, report text from the lenses' peeks), the
+    registry (unique kinds, valid presets, tree text round trips, refused
+    trees, add and remove) and a workbench's pane menu (move to another
+    workbench, pop out, the placeholder).
+  - Checked by hand with screenshots on the sample's `-l -hT` eventlog:
+    the Heap layout with the inspector; a hand-written session opening the
+    **Leak hunt** arrangement (heap chart, bands, live graph, source and the
+    inspector on `THUNK_2_0`); the same session with a pinboard of two pins
+    with notes; a Timeline workbench with the heap chart under the
+    capabilities on the Timeline's axis and the pinboard popped out; and
+    Core & STG with the inspector under the bindings.
+  - Found on the way: with a sixth header button the title bar overflowed
+    at the default window width, so the active panel's file shows only when
+    the window is at least 1640 wide.
+- **Deferred from P5:**
+  - **`commitPaneDrop`.** Panes are added from the Workspace popover, beside
+    the arrangement, and placed by dragging their header, which nano-ui
+    commits itself. Dropping a new pane straight onto a spot would need a
+    drag source that lives on after the popover closes and feeds
+    `pgrDropTarget`; that wasn't attempted.
+  - **Dragging a pane between panels.** Each workbench is its own pane grid
+    and only one panel is on screen, so there is nothing to drop onto;
+    **Move to …** does it.
+  - **Pop-out size.** nano-ui's `window` takes no layout, and a pane needs a
+    bounded box, so a popped-out pane is a fixed 720 × 460: resizing the
+    window scrolls it rather than growing it. Sessions keep which panes are
+    out, not where their windows were.
+  - **Keys follow the panel, not the pane.** A panel's keys (`[` and `]`
+    stepping collections on the Timeline, censuses on the heap chart) belong
+    to the panel in front, so a Timeline pane in the heap panel steps
+    censuses.
+  - **Big empty states.** A panel with nothing loaded still shows its own
+    empty state unless its workbench holds another panel's panes (the
+    inspector and pinboard don't count), so the default Heap layout's
+    inspector appears once a profile is loaded.
+  - **Moments and run links in sessions.** The marks and snapshots sent to
+    a program, and runs joined by hand, belong to a run that is over once
+    the program exits; the followed eventlog keeps the marks themselves.
+  - **The Workspace popover headlessly.** It lives in `UI.Shell`, which
+    needs nano-ui-sdl's dialogs, so the UI tests drive the registry, the
+    pane menu and the panes, not the popover. Screenshot runs can't click,
+    so the menus are checked by the tests only.
+  - **Notes** are one-line inputs; a long note scrolls.
 
 ## Verification spikes
 
@@ -1105,7 +1233,7 @@ What this changes in the plan:
    from any link, which is simpler to learn but yanks you between tabs.
 2. **Agent control by default.** I recommend on for loopback and off
    otherwise.
-3. **Mixed workspaces (W4)** are the largest refactor, because panes would
+3. *(Done in P5.)* **Mixed workspaces (W4)** are the largest refactor, because panes would
    stop owning their panel's state. I recommend deciding after P1–P3. Peeks,
    the inspector and the cross-panel strips may make it unnecessary.
 4. **nano-ui upstream.** The link widget, the palette list and the annotated
