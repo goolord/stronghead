@@ -113,12 +113,15 @@ executable stronghead
         UI.Heap
         UI.Core
         UI.Debugger
+        UI.Inspector
         UI.Link
         UI.Live
         UI.Palette
+        UI.Pinboard
         UI.Settings
         UI.Shell
         UI.Sources
+        UI.Workspace
     build-depends:
         base >=4.20 && <4.23,
         containers >=0.6 && <0.9,
@@ -165,10 +168,13 @@ test-suite stronghead-ui-test
         UI.Code
         UI.Common
         UI.Debugger
+        UI.Inspector
         UI.Link
         UI.Live
         UI.Palette
+        UI.Pinboard
         UI.Sources
+        UI.Workspace
     build-depends:
         base >=4.20 && <4.23,
         containers >=0.6 && <0.9,

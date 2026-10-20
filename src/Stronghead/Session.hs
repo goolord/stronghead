@@ -9,6 +9,8 @@
 -- percent-encoded where they would otherwise be lost: a @%@, a line break,
 -- and spaces at either end. Unknown keys and unreadable values are skipped,
 -- so an older or hand-edited file still opens as far as it can be read.
+-- Only the escapes the file needs are decoded (@%25@, @%0a@, @%0d@, @%20@
+-- and @%09@), so a reference's own @%2F@ is written and read as it is.
 --
 -- Pane arrangements are opaque text here: the GUI writes and validates
 -- them, so this module stays free of it.
@@ -33,7 +35,7 @@ module Stronghead.Session
   , parseKeyValues
   ) where
 
-import Data.Char (chr, digitToInt, isHexDigit, isSpace, ord)
+import Data.Char (chr, digitToInt, isSpace, ord)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -41,7 +43,6 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
 import Data.Word (Word64)
-import Numeric (showHex)
 import Stronghead.Ref (Ref (..), RunKey, parseRefTarget, refTarget)
 
 -- ---------------------------------------------------------------------------
@@ -90,6 +91,8 @@ data Session = Session
     -- ^ The ghc-debug socket, empty for none.
   , sesDumps :: !(Maybe FilePath)
     -- ^ The dump folder Core & STG reads.
+  , sesModule :: !Text
+    -- ^ The module picked from it, empty for the first.
   , sesCodeFiles :: ![FilePath]
     -- ^ Files opened in Core & STG on their own: source, Core, STG.
   , sesAgentHost :: !Text
@@ -123,6 +126,7 @@ emptySession =
     , sesHeapSource = "eventlog"
     , sesGhcDebug = ""
     , sesDumps = Nothing
+    , sesModule = ""
     , sesCodeFiles = []
     , sesAgentHost = "127.0.0.1"
     , sesAgentPort = "4777"
@@ -162,6 +166,7 @@ encodeSession Session {..} =
         ++ [("heap-source", sesHeapSource)]
         ++ [("ghc-debug", sesGhcDebug) | not (T.null sesGhcDebug)]
         ++ opt "dumps" sesDumps
+        ++ [("module", sesModule) | not (T.null sesModule)]
         ++ numbered "code-file" (map T.pack sesCodeFiles)
         ++ [ ("agent-host", sesAgentHost)
            , ("agent-port", sesAgentPort)
@@ -198,6 +203,7 @@ decodeSession file
           , sesHeapSource = text "heap-source" (sesHeapSource d)
           , sesGhcDebug = text "ghc-debug" ""
           , sesDumps = path "dumps"
+          , sesModule = text "module" ""
           , sesCodeFiles = map T.unpack (numbered "code-file")
           , sesAgentHost = text "agent-host" (sesAgentHost d)
           , sesAgentPort = text "agent-port" (sesAgentPort d)
@@ -251,28 +257,43 @@ parseKeyValues = mapMaybe line . T.lines
         | T.null k || "#" `T.isPrefixOf` k || T.null v -> Nothing
         | otherwise -> Just (T.strip k, unescapeValue (T.strip (T.drop 1 v)))
 
--- | Percent-encode what a @key = value@ line would lose: @%@, line breaks
--- and spaces at either end. Paths and most text stay readable.
+-- | Percent-encode what a @key = value@ line would lose: line breaks and
+-- spaces at either end, and a @%@ that would otherwise read as one of
+-- those escapes. Paths, references and most text stay as they are.
 escapeValue :: Text -> Text
 escapeValue v =
   let (lead, rest) = T.span isSpace v
       body = T.dropWhileEnd isSpace rest
       trail = T.drop (T.length body) rest
-   in T.concatMap enc lead <> T.concatMap inner body <> T.concatMap enc trail
+   in T.pack (concatMap edge (T.unpack lead) ++ inner (T.unpack body) ++ concatMap edge (T.unpack trail))
   where
-    inner c = if c == '%' || c == '\n' || c == '\r' then enc c else T.singleton c
-    enc c
-      | ord c < 256 = T.pack ('%' : pad (showHex (ord c) ""))
-      | otherwise = T.singleton c
-    pad s = replicate (2 - length s) '0' ++ s
+    inner = \case
+      '%' : rest@(a : b : _) | decodes a b -> "%25" ++ inner rest
+      '\n' : rest -> "%0a" ++ inner rest
+      '\r' : rest -> "%0d" ++ inner rest
+      c : rest -> c : inner rest
+      [] -> []
+    edge = \case
+      ' ' -> "%20"
+      '\t' -> "%09"
+      '\n' -> "%0a"
+      '\r' -> "%0d"
+      c -> [c]
 
+-- | Read back what 'escapeValue' wrote; any other @%@ is kept.
 unescapeValue :: Text -> Text
 unescapeValue = T.pack . go . T.unpack
   where
     go = \case
-      '%' : a : b : rest | isHexDigit a, isHexDigit b -> chr (digitToInt a * 16 + digitToInt b) : go rest
+      '%' : a : b : rest | decodes a b -> chr (digitToInt a * 16 + digitToInt b) : go rest
       c : rest -> c : go rest
       [] -> []
+
+-- | The escapes a session file uses: @%25@, @%0a@, @%0d@, @%20@, @%09@.
+decodes :: Char -> Char -> Bool
+decodes a b = (a, toLowerHex b) `elem` [('2', '5'), ('0', 'a'), ('0', 'd'), ('2', '0'), ('0', '9')]
+  where
+    toLowerHex c = if c >= 'A' && c <= 'F' then chr (ord c + 32) else c
 
 tshow' :: Int -> Text
 tshow' = T.pack . show

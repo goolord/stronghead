@@ -14,6 +14,7 @@ module UI.Timeline
   , newTimelineState
   , timelineLoad
   , timelineView
+  , timelinePanes
   , openEventlog
   , timelineLens
   , timelineSync
@@ -49,6 +50,7 @@ import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
 import UI.Link
+import UI.Workspace
 
 data TrackRef = OnCap !Int | OnThread !Word32
   deriving (Eq, Show)
@@ -84,12 +86,6 @@ data TimelineState = TimelineState
     -- cost-centre samples.
   }
 
-paneCaps, paneThreads, paneInspector, paneMarkers :: Word64
-paneCaps = 1
-paneThreads = 2
-paneInspector = 3
-paneMarkers = 4
-
 newTimelineState :: IO TimelineState
 newTimelineState = do
   tsPath <- newVar Nothing
@@ -102,7 +98,7 @@ newTimelineState = do
   tsPressAt <- newVar Nothing
   tsDialog <- newVar Nothing
   tsFocusThread <- newVar Nothing
-  tsPanes <- newVar (Just (Split 10 AxisV 0.74 (Split 11 AxisH 0.5 (Pane paneCaps) (Pane paneThreads)) (Split 12 AxisH 0.64 (Pane paneInspector) (Pane paneMarkers))))
+  tsPanes <- newWorkbench "timeline" (panelPreset PTimeline)
   tsScrub <- newVar False
   tsMarkerFilter <- newVar ""
   tsMarkerEvents <- newVar False
@@ -240,8 +236,8 @@ costCentreRef tl i = (\c -> RCostCentre (cciModule c) (cciLabel c)) <$> IM.looku
 -- ---------------------------------------------------------------------------
 -- View
 
-timelineView :: Env -> TimelineState -> Maybe LoadProgress -> NanoUI ()
-timelineView env st mprog = columnWith (tight . gap 0 . grow) $ do
+timelineView :: Env -> Bench -> TimelineState -> Maybe LoadProgress -> NanoUI ()
+timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (tsDialog st) $ \case
     p : _ -> openEventlog st p False
     [] -> pure ()
@@ -260,7 +256,10 @@ timelineView env st mprog = columnWith (tight . gap 0 . grow) $ do
           v = maybe (TimeView lo hi) (clampView lo hi) mv
       toolLabel ("Showing " <> fmtNs (tvStart v - lo) <> " to " <> fmtNs (tvEnd v - lo))
       disabledWhen (isNothing mv) $ whenM (toolButton "Fit to log") (writeVar (tsView st) Nothing)
+  mixed <- bnMixed bench (tsPanes st)
+  let drawn = scope (bnDraw bench (tsPanes st) (timelinePanes env st mprog))
   case loaded of
+    _ | mixed && maybe True (V.null . tlCaps) loaded -> drawn
     Nothing -> scope $ case path of
       Just p -> emptyState ("Reading " <> T.pack (takeFileName p)) ["The timeline appears as soon as the first scheduler events are decoded."] []
       Nothing ->
@@ -272,19 +271,16 @@ timelineView env st mprog = columnWith (tight . gap 0 . grow) $ do
     Just tl
       | V.null (tlCaps tl) ->
           scope $ emptyState "No scheduler events yet" ["This eventlog has no capability events. Was the program run with +RTS -l?"] []
-      | otherwise -> scope (body env st tl)
+      | otherwise -> scope (body env bench st tl mprog)
 
-body :: Env -> TimelineState -> Timeline -> NanoUI ()
-body env st tl = do
-  th <- uiTheme
-  let pal = palette th
-      lo = fromIntegral (tlStart tl)
+body :: Env -> Bench -> TimelineState -> Timeline -> Maybe LoadProgress -> NanoUI ()
+body env bench st tl mprog = do
+  let lo = fromIntegral (tlStart tl)
       hi = fromIntegral (tlEnd tl) :: Double
       full = TimeView lo hi
       summary = summarize tl
   mv <- readVar (tsView st)
   let v = maybe full (clampView lo hi) mv
-  marks <- marksFor env (runKey (tlRun tl)) (Just tl)
   stepCursor env st tl v
   columnWith (padBottom 8 . tight . fillW) $
     readout
@@ -299,25 +295,45 @@ body env st tl = do
       , ("threads", fmtInt (smThreads summary))
       , ("events", fmtInt (tlEventCount tl))
       ]
-  mm <- monoMetrics 0.85
-  sel <- readVar (tsSel st)
-  workbench (tsPanes st) $ \pid ctx ->
-    if
-      | pid == paneCaps ->
-          paneWith tight ctx "Capabilities" (capsLegend st pal tl) (mainCanvas env st pal mm tl v sel marks)
-      | pid == paneThreads ->
-          paneWith tight ctx "Threads" (threadsHeader st pal tl) (threadsSection env st pal mm tl v sel marks)
-      | pid == paneMarkers ->
-          paneWith tight ctx "Markers" (markersHeader st tl) (markersList env st tl)
-      | otherwise -> do
-          let title = case sel of
-                Nothing -> "Overview"
-                Just (SelGC _) -> "Collection"
-                Just (SelSpan _ _) -> "Slice"
-                Just (SelRange _ _) -> "Range"
-          paneWith tight ctx title (inspectorActions env st tl sel marks) $
-            paneScroll (grow . tight) $
-              columnWith (padAll 12 . gap 6 . fillW) (inspector env st tl v sel)
+  bnDraw bench (tsPanes st) (timelinePanes env st mprog)
+
+-- | The Timeline's panes, for whichever workbench holds them: the
+-- capability tracks, the thread rows, the overview of the selection and
+-- the markers. Without a log each says how to get one.
+timelinePanes :: Env -> TimelineState -> Maybe LoadProgress -> [Word64] -> NanoUI PaneDraw
+timelinePanes env st mprog _ = case mprog >>= lpTimeline of
+  Just tl | not (V.null (tlCaps tl)) -> do
+    th <- uiTheme
+    let pal = palette th
+        lo = fromIntegral (tlStart tl)
+        hi = fromIntegral (tlEnd tl) :: Double
+    mv <- readVar (tsView st)
+    let v = maybe (TimeView lo hi) (clampView lo hi) mv
+    marks <- marksFor env (runKey (tlRun tl)) (Just tl)
+    mm <- monoMetrics 0.85
+    sel <- readVar (tsSel st)
+    pure $ \pid ctx ->
+      if
+        | pid == paneTlCaps ->
+            Just (paneWith tight ctx "Capabilities" (capsLegend st pal tl) (mainCanvas env st pal mm tl v sel marks))
+        | pid == paneTlThreads ->
+            Just (paneWith tight ctx "Threads" (threadsHeader st pal tl) (threadsSection env st pal mm tl v sel marks))
+        | pid == paneTlMarkers ->
+            Just (paneWith tight ctx "Markers" (markersHeader st tl) (markersList env st tl))
+        | pid == paneTlOverview -> Just $ do
+            let title = case sel of
+                  Nothing -> "Overview"
+                  Just (SelGC _) -> "Collection"
+                  Just (SelSpan _ _) -> "Slice"
+                  Just (SelRange _ _) -> "Range"
+            paneWith tight ctx title (inspectorActions env st tl sel marks) $
+              paneScroll (grow . tight) $
+                columnWith (padAll 12 . gap 6 . fillW) (inspector env st tl v sel)
+        | otherwise -> Nothing
+  _ -> pure $ \pid ctx ->
+    if pid `elem` [paneTlCaps, paneTlThreads, paneTlOverview, paneTlMarkers]
+      then Just (paneEmpty ctx (paneTitle pid) "No eventlog with scheduler events is open. Open one in the Timeline, or connect to a program run with +RTS -l." [])
+      else Nothing
 
 capsLegend :: TimelineState -> Palette -> Timeline -> NanoUI ()
 capsLegend st pal tl = do

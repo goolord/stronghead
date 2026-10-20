@@ -58,9 +58,11 @@ main = do
       , sdlAppMonoFont = FontSearch ["JetBrains Mono", "Cascadia Mono", "Source Code Pro", "Consolas", "DejaVu Sans Mono", "monospace"]
       }
     (appView app >> maybe (pure ()) (captureAfter started delay) capture)
-  -- A screenshot run leaves the user's settings as they were.
-  when (isNothing capture) $
+  -- A screenshot run leaves the user's settings and last session as they
+  -- were.
+  when (isNothing capture) $ do
     saveAppSettings app >>= either (T.hPutStrLn stderr) pure
+    saveLastSession app >>= either (T.hPutStrLn stderr) pure
 
 parseArgs :: [String] -> Options -> Options
 parseArgs args o = case args of

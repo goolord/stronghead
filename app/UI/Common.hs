@@ -24,8 +24,10 @@ module UI.Common
   , toolLabel
   , toolButton
   , toolGroup
-  , Workbench
-  , workbench
+  , Workbench (..)
+  , newWorkbench
+  , PaneCtx (..)
+  , floatingPane
   , pane
   , paneWith
   , paneMeta
@@ -61,9 +63,9 @@ module UI.Common
 import Control.Monad (forM_, void, when)
 import Data.Bits (xor)
 import Data.Char (ord)
+import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word64)
 import NanoUI
 import NanoUI.Path qualified as P
 import System.FilePath (takeFileName)
@@ -354,50 +356,72 @@ toolGroup body = do
   rowWith (tight . gap 6 . alignMid) body
 
 -- | The split tree of a panel's panes, kept in the panel's state so the
--- arrangement survives switching panels.
-type Workbench = Var (Maybe GridNode)
+-- arrangement survives switching panels. Pane ids name pane kinds
+-- ("UI.Workspace"); split ids are 1000 and up. The name keys it in
+-- session files and in the panes' menus.
+data Workbench = Workbench
+  { wbName :: !Text
+  , wbTree :: !(Var (Maybe GridNode))
+  }
 
--- | Resizable panes filling the rest of the panel. @view@ draws one pane
--- by id; wrap its content in 'pane'.
-workbench :: Workbench -> (Word64 -> PaneGridCtx -> NanoUI ()) -> NanoUI ()
-workbench tree view = do
-  th <- uiTheme
-  columnWith (fillW . grow . padXY 8 0 . padTop 8 . padBottom 8) $
-    void $
-      paneGrid
-        defaultPaneGridConfig
-          { pgLayout = fillW . fillH
-          , pgSpacing = 6
-          , pgMinSize = 120
-          , pgLeeway = 4
-          , pgFocusable = False
-          , pgTree = ControlledTree tree
-          , pgDividerColor = Just (inkGround (ink th))
-          , pgViewPane = \pid ctx -> view pid ctx >> pure (PaneView "" False)
-          }
+newWorkbench :: Text -> GridNode -> IO Workbench
+newWorkbench name tree = Workbench name <$> newVar (Just tree)
+
+-- | Where a pane is drawn: in a workbench's grid, or on its own in a
+-- floating window. 'pcMenu' draws the pane's menu (move, pop out, close)
+-- and says whether one of its items was picked.
+data PaneCtx = PaneCtx
+  { pcGrid :: !(Maybe PaneGridCtx)
+  , pcMenu :: !(Maybe (NanoUI Bool))
+  }
+
+-- | A pane in a floating window: no grid, no menu.
+floatingPane :: PaneCtx
+floatingPane = PaneCtx Nothing Nothing
 
 -- | A pane: a header with its title and @trailing@ (meta text, actions),
--- and a padded body. Double-click the header to maximize the pane.
-pane :: PaneGridCtx -> Text -> NanoUI () -> NanoUI a -> NanoUI a
+-- and a padded body. Drag the header to move the pane, double-click it to
+-- maximize; the header's last button opens the pane's menu.
+pane :: PaneCtx -> Text -> NanoUI () -> NanoUI a -> NanoUI a
 pane = paneWith (padAll 10 . gap 6)
 
 -- | 'pane' with the body's layout, e.g. @tight@ for a canvas that fills it.
-paneWith :: (Layout -> Layout) -> PaneGridCtx -> Text -> NanoUI () -> NanoUI a -> NanoUI a
+paneWith :: (Layout -> Layout) -> PaneCtx -> Text -> NanoUI () -> NanoUI a -> NanoUI a
 paneWith bodyLayout ctx title trailing body = do
   th <- uiTheme
   let i = ink th
+      headerRow = asRow . fillW . fixedH 34 . padXY 12 0 . gap 8
+      contents = do
+        labelWith (alignMid . fontMedium . fontSizeScale 0.92) title
+        themed th trailing
+        for_ (pcMenu ctx) (themed th . paneMenu)
   styled (panelStyle (background (inkPane i) . borderColor (inkRule i) . borderWidth 1 . cornerRadius 6)) $
     panelWith (tight . gap 0 . fillW . fillH) $ do
-      (_, header) <-
-        styled (panelStyle (background colorTransparent . borderBottom 1 (inkRule i) . cornerRadius 0)) $
-          mouseArea (fillW . tight) $
-            panelWith (asRow . fillW . fixedH 34 . padXY 12 0 . gap 8) $ do
-              labelWith (alignMid . fontMedium . fontSizeScale 0.92) title
-              themed th trailing
-      inp <- askInput
-      when (respHovered header && pressedIn MouseLeft inp && inputMouseClicks inp >= 2) $
-        if pgcMaximized ctx then pgcRestore ctx else pgcMaximize ctx
+      styled (panelStyle (background colorTransparent . borderBottom 1 (inkRule i) . cornerRadius 0)) $
+        case pcGrid ctx of
+          -- The header drags the pane; a press on a control in it does not.
+          Just g -> paneDragHandle g headerRow contents
+          Nothing -> panelWith headerRow contents
+      for_ (pcGrid ctx) $ \g -> do
+        inp <- askInput
+        let Rect x y w _ = pgcRect g
+        when (rectContains (Rect x y w 34) (inputMousePos inp) && pressedIn MouseLeft inp && inputMouseClicks inp >= 2) $
+          if pgcMaximized g then pgcRestore g else pgcMaximize g
       themed th $ columnWith (fillW . fillH . bodyLayout) body
+
+-- | The pane menu's button, a popover of the menu's items that closes once
+-- one is picked.
+paneMenu :: NanoUI Bool -> NanoUI ()
+paneMenu items = do
+  open <- useVar False
+  resp <- buttonWith' (alignMid . padXY 6 0 . tight) "⋯"
+  tooltip resp "Move, pop out or close this pane; drag the header to rearrange"
+  when (respClicked resp) (modifyVar open not)
+  _ <- popupWith open (defaultPopupConfig (AnchorRect (respRect resp))) (fixedW 240) $
+    columnWith (fillW . padAll 6 . tight . gap 0) $ do
+      picked <- items
+      when picked (writeVar open False)
+  pure ()
 
 -- | Muted text in a pane header, after the title.
 paneMeta :: Text -> NanoUI ()

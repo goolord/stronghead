@@ -5,13 +5,17 @@
 -- the bus, and a snapping cursor kept in step with them; and the
 -- annotated code view ("UI.Code"), whose heat bars are links; and the
 -- Live panel's remote actions ("UI.Live"): a command lands on the clock at
--- once, the agent's reply stamps it, the eventlog's marker takes over.
+-- once, the agent's reply stamps it, the eventlog's marker takes over;
+-- the entity inspector ("UI.Inspector") and the pinboard ("UI.Pinboard");
+-- and the pane registry ("UI.Workspace"): trees, presets, and moving a
+-- pane through its menu.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef
+import Data.List (nub)
 import Data.Map.Strict qualified as M
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
@@ -28,16 +32,40 @@ import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
 import Stronghead.Live
 import Stronghead.Ref
 import Stronghead.Run (RunInfo (..), emptyRunInfo, runFromHello, runKey)
+import Stronghead.Session (Pin (..))
 import Stronghead.Source (SrcSpan (..))
 import System.Exit (exitFailure)
 import UI.Clock
 import UI.Code
-import UI.Common (TimeView (..), monoMetrics)
+import UI.Common (TimeView (..), Workbench (..), floatingPane, monoMetrics, newWorkbench, pane)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
+import UI.Inspector
 import UI.Link
 import UI.Live
 import UI.Palette
+import UI.Pinboard
 import UI.Sources
+import UI.Workspace
+
+-- | The world's lenses, for scenes that draw something other than 'view'.
+worldEnv :: World -> Panel -> Env
+worldEnv w tab =
+  let record t = liftIO (modifyIORef' (wLog w) (t :))
+      timeline =
+        (lens PTimeline)
+          { lensShows = (== thread)
+          , lensReveal = \r -> record ("timeline " <> refTarget r)
+          , lensTitle = \r -> if r == thread then Just "worker-7" else Nothing
+          , lensRelated = \r -> [("Go to binding go", binding) | r == thread]
+          , lensPeek = \r -> if r == thread then Just (peekOf [("ran", "41%")]) {peekExact = Just "exact: thread id in the same run", peekNotes = ["mostly blocked on an MVar"]} else Nothing
+          }
+      core = (lens PCore) {lensShows = (== binding), lensReveal = \_ -> record "core go"}
+      debugger =
+        (lens PDebugger)
+          { lensActions = \r ->
+              if r == thread then [Action "Do thing" (Right (record "acted")), Action "Disabled thing" (Left "no data")] else []
+          }
+   in Env (wBus w) [timeline, core, debugger] tab (writeVar (wTab w))
 
 data World = World
   { wTab :: !(Var Panel)
@@ -425,6 +453,129 @@ main = do
   let (sp', sr') = clickPair sinp sameRun
   mapM_ popover [sp', sr', sinp]
   check "an unmatched run can be joined by hand" . (== (["Cost centres"], Just "prog")) =<< readIORef joined
+
+  putStrLn "inspector"
+  let findSpan name = maybe (fail ("no span " <> T.unpack name)) pure . findExact name
+  ictx <- newContext
+  ins <- newInspector
+  writeVarIO (busFocus (wBus w)) Nothing
+  writeIORef (wLog w) []
+  let iinp = withInput 900 900
+      iscene = do
+        tab <- readVar (wTab w)
+        let env = worldEnv w tab
+        inspectorSync env ins
+        void (columnWith (fixedWH 600 800) (inspectorPane env ins floatingPane))
+      iframe inp = evalUi ictx inp iscene
+      iclick pos = let (p, r) = clickPair iinp pos in mapM_ iframe [p, r, iinp]
+      ispans = collectTextSpans ictx
+  warmup2 ictx iinp iscene >>= \_ -> pure ()
+  empty' <- ispans
+  check "with nothing in focus it says what it is for" (any (\(_, t, _, _, _) -> "Click a thread" `T.isInfixOf` t) empty')
+  writeVarIO (busFocus (wBus w)) (Just thread)
+  _ <- iframe iinp
+  _ <- iframe iinp
+  shownI <- ispans
+  check "it shows the focus: its title and reference" (hasText "worker-7" shownI && hasText "thread/prog:1/7" shownI)
+  check "a section per panel, with how it matched" (hasText "Timeline" shownI && hasText "exact: thread id in the same run" shownI)
+  check "the long form of the peek: facts and notes" (hasText "41%" shownI && hasText "mostly blocked on an MVar" shownI)
+  check "what goes with it, as links" (hasText "Go to binding go" shownI)
+  check "every panel's actions, as buttons" (hasText "Do thing" shownI && hasText "Disabled thing" shownI && hasText "Show in Timeline" shownI)
+  check "and a pin button" (hasText "Pin" shownI)
+  pinB <- findSpan "Pin" shownI
+  iclick pinB
+  check "pinning from the inspector" . (== [thread]) . map pinRef =<< readVarIO (busPins (wBus w))
+  check "which then offers to unpin" . hasText "Unpin" =<< ispans
+  writeVarIO (busFocus (wBus w)) (Just binding)
+  _ <- iframe iinp
+  _ <- iframe iinp
+  check "it follows the focus" . (== Just binding) =<< readVarIO (inShown ins)
+  check "remembering what it showed" . (== [thread]) =<< readVarIO (inBack ins)
+  backB <- findSpan "←" =<< ispans
+  iclick backB
+  check "its own back returns to it" . (== Just thread) =<< readVarIO (inShown ins)
+  check "and focuses it everywhere" . (== Just thread) =<< readVarIO (busFocus (wBus w))
+  check "with forward to come back" . (== [binding]) =<< readVarIO (inForward ins)
+  writeVarIO (inFollow ins) False
+  writeVarIO (busFocus (wBus w)) (Just binding)
+  _ <- iframe iinp
+  check "not following, it holds on" . (== Just thread) =<< readVarIO (inShown ins)
+
+  putStrLn "pinboard"
+  pctx' <- newContext
+  writeVarIO (busPins (wBus w)) [Pin thread "", Pin binding "the hot loop"]
+  let pscene = do
+        tab <- readVar (wTab w)
+        void (columnWith (fixedWH 600 500) (pinboardPane (worldEnv w tab) (pure ()) floatingPane))
+      pframe inp = evalUi pctx' inp pscene
+      pclick pos = let (p, r) = clickPair iinp pos in mapM_ pframe [p, r, iinp]
+  warmup2 pctx' iinp pscene >>= \_ -> pure ()
+  board <- collectTextSpans pctx'
+  check "pins are listed by title" (hasText "worker-7" board && hasText "M.go" board)
+  downs <- pure [r | (r, t, _, _, _) <- board, t == "↓"]
+  for_ (take 1 downs) $ \(Rect x y bw bh) -> pclick (V2 (x + bw / 2) (y + bh / 2))
+  check "a pin moves down the board" . (== [binding, thread]) . map pinRef =<< readVarIO (busPins (wBus w))
+  let report = pinsReport (worldEnv w PHeap) [] [Pin thread "slow", Pin binding "the hot loop"]
+  check "the report carries each panel's facts as text" ("ran: 41%" `T.isInfixOf` report && "exact: thread id in the same run" `T.isInfixOf` report)
+  check "with titles, references and notes" ("## 1. worker-7" `T.isInfixOf` report && "`thread/prog:1/7`" `T.isInfixOf` report && "> the hot loop" `T.isInfixOf` report)
+  goB <- findSpan "M.go" board
+  writeIORef (wLog w) []
+  writeVarIO (busPins (wBus w)) [Pin binding ""]
+  _ <- pframe iinp
+  goB' <- findSpan "M.go" =<< collectTextSpans pctx'
+  pclick goB'
+  check "a click on a pin goes to it" . (== ["core go"]) =<< logged
+  let _ = goB
+
+  putStrLn "pane registry"
+  check "pane kinds are unique" (length (nub (map pkId paneKinds)) == length paneKinds && length (nub (map pkKey paneKinds)) == length paneKinds)
+  let presets = map panelPreset [minBound .. maxBound] ++ [heapGraphPreset, heapCostsPreset] ++ map prTree userPresets
+  check "every preset is a valid tree of known panes" (all (\t -> validateGridTree t == Right () && all (maybe False (const True) . paneKind) (treeKinds t)) presets)
+  check "presets read back as written" (all (\t -> decodeTree (encodeTree t) == Right t) presets)
+  check "a tree's text form" (encodeTree (Split 1000 AxisV 0.5 (Pane paneHeapChart) (Pane paneInspector)) == "(v 0.500 heap.chart inspector)")
+  check "Leak hunt has the chart, the source and the inspector" (and [all (`elem` treeKinds (prTree p)) [paneHeapChart, paneCoreSource, paneInspector] | p <- userPresets, prName p == "Leak hunt"])
+  check "unknown panes, repeats, bad ratios and junk are refused" $
+    all (either (const True) (const False) . decodeTree) ["(v 0.5 heap.chart nope)", "(v 0.5 inspector inspector)", "(h 1.5 inspector pinboard)", "(v 0.5 inspector", "inspector pinboard", ""]
+  let one = Pane paneTlCaps
+      two = addPane paneInspector (Just one)
+  check "adding a pane puts it beside the rest" (treeKinds two == [paneTlCaps, paneInspector] && validateGridTree two == Right ())
+  check "adding one already there leaves the tree" (addPane paneTlCaps (Just two) == two)
+  check "adding to an empty workbench" (addPane panePinboard Nothing == Pane panePinboard)
+  check "new splits get fresh ids" (validateGridTree (addPane panePinboard (Just (addPane paneHeapChart (Just two)))) == Right ())
+  check "removing a pane closes the gap" (removePane paneInspector two == Just one && removePane paneTlCaps one == Nothing)
+
+  putStrLn "moving panes"
+  mctx <- newContext
+  benchA <- newWorkbench "a" (Split 1000 AxisV 0.5 (Pane paneHeapChart) (Pane paneInspector))
+  benchB <- newWorkbench "b" (Pane paneTlCaps)
+  popped <- newVar []
+  let places = [BenchPlace "Bench A" benchA, BenchPlace "Bench B" benchB]
+      draw pid ctx = Just (pane ctx (paneTitle pid) (pure ()) (void (label "body")))
+      mscene = void (columnWith (fixedWH 800 500) (workspace places popped benchA draw))
+      mframe inp = evalUi mctx inp mscene
+      mclick pos = let (p, r) = clickPair iinp pos in mapM_ mframe [p, r, iinp, iinp]
+  warmup2 mctx iinp mscene >>= \_ -> pure ()
+  ws <- collectTextSpans mctx
+  check "each pane draws with its title" (hasText "Heap residency" ws && hasText "Inspector" ws)
+  let menus = [r | (r, t, _, _, _) <- ws, t == "⋯"]
+  check "and a menu" (length menus == 2)
+  for_ (take 1 menus) $ \(Rect x y bw bh) -> mclick (V2 (x + bw / 2) (y + bh / 2))
+  opened <- collectOverlayTextSpans mctx iinp
+  check "the menu moves, pops out and closes" (hasText "Move to Bench B" opened && hasText "Pop out" opened && hasText "Close pane" opened && not (hasText "Move to Bench A" opened))
+  moveB <- findSpan "Move to Bench B" opened
+  mclick moveB
+  check "a pane moves to another workbench" . (== Just [paneInspector]) . fmap treeKinds =<< readVarIO (wbTree benchA)
+  check "beside what is there" . (== Just [paneTlCaps, paneHeapChart]) . fmap treeKinds =<< readVarIO (wbTree benchB)
+  ws2 <- collectTextSpans mctx
+  for_ (take 1 [r | (r, t, _, _, _) <- ws2, t == "⋯"]) $ \(Rect x y bw bh) -> mclick (V2 (x + bw / 2) (y + bh / 2))
+  popB <- findSpan "Pop out" =<< collectOverlayTextSpans mctx iinp
+  mclick popB
+  check "popping out takes it from the workbench" . (== Nothing) =<< readVarIO (wbTree benchA)
+  check "into a floating window, remembering where from" . (== [Popped paneInspector "a"]) =<< readVarIO popped
+  writeVarIO (wbTree benchA) (Just (Pane paneInspector))
+  _ <- mframe iinp
+  _ <- mframe iinp
+  check "a workbench that still holds it says where it went" . hasText "In a floating window." =<< collectTextSpans mctx
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

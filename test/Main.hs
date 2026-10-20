@@ -533,6 +533,7 @@ main = do
           , sesHeapSource = "hp"
           , sesGhcDebug = "/tmp/ghc-debug/4242-stronghead-sample"
           , sesDumps = Just "dist-newstyle/build/x/dumps"
+          , sesModule = "Main"
           , sesCodeFiles = ["sample/Main.hs"]
           , sesAgentHost = "127.0.0.1"
           , sesAgentPort = "4777"
@@ -557,15 +558,19 @@ main = do
   check "the empty session round trips" (decodeSession (encodeSession emptySession) == Right emptySession)
   check "notes keep their line breaks and spaces" $
     T.isInfixOf "pin.1.note = the leaky accumulator%0aholds 40 MB = too much" (encodeSession session)
-      && T.isInfixOf "pin.3.note = %20%20100%25 of it, from here%20%20" (encodeSession session)
-  check "paths stay readable" (T.isInfixOf "eventlog = C:\\scratch dir\\stronghead-sample.eventlog" (encodeSession session))
+      && T.isInfixOf "pin.3.note = %20%20100% of it, from here%20%20" (encodeSession session)
+  check "paths and references stay readable" $
+    T.isInfixOf "eventlog = C:\\scratch dir\\stronghead-sample.eventlog" (encodeSession session)
+      && T.isInfixOf "pin.3 = source/sample%2FMain.hs/82/1/82/40" (encodeSession session)
+  check "a reference written by hand reads as it is" $
+    fmap (map pinRef . sesPins) (decodeSession "version = 1\npin.1 = source/sample%2FMain.hs/82/1/82/1\n") == Right [RSource (SrcSpan "sample/Main.hs" 82 1 82 1)]
   check "a file without a version is not a session" (either (const True) (const False) (decodeSession "panel = heap\n"))
   check "unknown keys and bad values are skipped" $
     decodeSession "version = 1\nwhatever = 3\npin.1 = nope/1\npin.2 = band/x\nfollow = maybe\ncursor = band/y\n"
       == Right emptySession {sesPins = [Pin (RBand "x") ""]}
   check "pins keep their numbered order" $
     fmap (map pinRef . sesPins) (decodeSession "version = 1\npin.10 = band/c\npin.2 = band/b\npin.1 = band/a\n") == Right [RBand "a", RBand "b", RBand "c"]
-  check "values escape and unescape" (all (\v -> unescapeValue (escapeValue v) == v) ["", " a ", "100%", "a\nb\r\n", "  ", "naïve λ", "%41"])
+  check "values escape and unescape" (all (\v -> unescapeValue (escapeValue v) == v) ["", " a ", "100%", "a\nb\r\n", "  ", "naïve λ", "%41", "%25", "%2", "a%", "%%0a", "%0A x", "\t%20\t", "%2\n"])
 
   putStrLn "pins"
   let pa = RBand "a"

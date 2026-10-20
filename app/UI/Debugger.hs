@@ -15,6 +15,7 @@ module UI.Debugger
   , newDebugState
   , debugLoad
   , debugView
+  , debugPanes
   , debugLens
   , valueTree
   ) where
@@ -43,6 +44,7 @@ import System.FilePath (isAbsolute, makeRelative, normalise, takeDirectory, take
 import UI.Code
 import UI.Common
 import UI.Link
+import UI.Workspace
 
 data DebugState = DebugState
   { dsCommand :: !(Var Text)
@@ -90,14 +92,8 @@ newDebugState = do
   dsSource <- newTask
   dsCode <- newCodeViewState
   dsSeenLines <- newVar 0
-  dsPanes <- newVar (Just (Split 10 AxisH 0.7 (Split 11 AxisV 0.68 (Pane paneSource) (Split 12 AxisH 0.62 (Pane paneLocals) (Pane paneBreaks))) (Pane paneConsole)))
+  dsPanes <- newWorkbench "debugger" (panelPreset PDebugger)
   pure DebugState {..}
-
-paneSource, paneLocals, paneConsole, paneBreaks :: Word64
-paneSource = 1
-paneLocals = 2
-paneConsole = 3
-paneBreaks = 4
 
 debugLoad :: DebugState -> NanoUI (Maybe (Either String CodeFile))
 debugLoad st = do
@@ -236,8 +232,8 @@ stopSession st wake = do
 -- ---------------------------------------------------------------------------
 -- View
 
-debugView :: Env -> DebugState -> SourceIndex -> Maybe (Either String CodeFile) -> NanoUI ()
-debugView env st ix source = columnWith (tight . gap 0 . grow) $ do
+debugView :: Env -> Bench -> DebugState -> SourceIndex -> Maybe (Either String CodeFile) -> NanoUI ()
+debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
   wake <- askWake
   running <- readVar (dsRunning st)
   busy <- readVar (dsBusy st)
@@ -276,12 +272,23 @@ debugView env st ix source = columnWith (tight . gap 0 . grow) $ do
         whenM (toolButton "History") (send [":history"])
       flex
       whenM (styled destructive (toolButton "Abandon")) (send [":abandon"])
-  workbench (dsPanes st) $ \pid ctx ->
+  bnDraw bench (dsPanes st) (debugPanes env st ix source)
+
+-- | The Debugger's panes, for whichever workbench holds them: the source
+-- with the stop and breakpoints, the local bindings, the breakpoints and
+-- the GHCi console.
+debugPanes :: Env -> DebugState -> SourceIndex -> Maybe (Either String CodeFile) -> [Word64] -> NanoUI PaneDraw
+debugPanes env st ix source _ = do
+  wake <- askWake
+  stop <- readVar (dsStop st)
+  let send cmds = liftIO (runCommands st wake cmds)
+  pure $ \pid ctx ->
     if
-      | pid == paneSource -> sourcePane env st ix ctx source stop send
-      | pid == paneLocals -> pane ctx "Local bindings" (pure ()) (bindingsPane st stop)
-      | pid == paneBreaks -> breaksPane env st ctx send
-      | otherwise -> consolePane env st ctx send
+      | pid == paneDbgSource -> Just (sourcePane env st ix ctx source stop send)
+      | pid == paneDbgLocals -> Just (pane ctx "Local bindings" (pure ()) (bindingsPane st stop))
+      | pid == paneDbgBreaks -> Just (breaksPane env st ctx send)
+      | pid == paneDbgConsole -> Just (consolePane env st ctx send)
+      | otherwise -> Nothing
 
 isNothing' :: Maybe a -> Bool
 isNothing' = maybe True (const False)
@@ -292,7 +299,7 @@ stopBinding name =
   let (m, k) = T.breakOnEnd "." name
    in if T.null m || T.null k then RBinding "" (nameKey name) else RBinding (T.dropEnd 1 m) (nameKey k)
 
-sourcePane :: Env -> DebugState -> SourceIndex -> PaneGridCtx -> Maybe (Either String CodeFile) -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
+sourcePane :: Env -> DebugState -> SourceIndex -> PaneCtx -> Maybe (Either String CodeFile) -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
 sourcePane env st ix ctx source stop send = do
   dir <- readVar (dsDir st)
   path <- readVar (dsSourcePath st)
@@ -368,7 +375,7 @@ deleteBreak st send (path, line) n = do
   for_ path $ \p -> modifyVar (dsBreaks st) (M.delete (p, line))
 
 -- | Every breakpoint, across files, as links.
-breaksPane :: Env -> DebugState -> PaneGridCtx -> ([Text] -> NanoUI ()) -> NanoUI ()
+breaksPane :: Env -> DebugState -> PaneCtx -> ([Text] -> NanoUI ()) -> NanoUI ()
 breaksPane env st ctx send = do
   breaks <- readVar (dsBreaks st)
   running <- readVar (dsRunning st)
@@ -464,7 +471,7 @@ nodeText open v = case v of
   VTuple _ | open -> "tuple"
   _ -> renderValue v
 
-consolePane :: Env -> DebugState -> PaneGridCtx -> ([Text] -> NanoUI ()) -> NanoUI ()
+consolePane :: Env -> DebugState -> PaneCtx -> ([Text] -> NanoUI ()) -> NanoUI ()
 consolePane env st ctx send = do
   th <- uiTheme
   dir <- readVar (dsDir st)

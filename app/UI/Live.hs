@@ -22,6 +22,7 @@ module UI.Live
   , liveTick
   , liveAttach
   , liveView
+  , livePanes
   , LiveData (..)
   , liveRun
   , liveLens
@@ -62,6 +63,7 @@ import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
 import UI.Link
+import UI.Workspace
 
 data LiveState = LiveState
   { lvHost :: !(Var Text)
@@ -135,7 +137,7 @@ newLiveState = do
   lvEventlog <- newVar ""
   lvThreadFilter <- newVar ""
   lvFocus <- newVar Nothing
-  lvPanes <- newVar (Just (Split 10 AxisH 0.58 (Pane paneCharts) (Pane 2)))
+  lvPanes <- newWorkbench "live" (panelPreset PLive)
   lvNextId <- newVar 1
   lvSent <- newVar M.empty
   lvMessage <- newVar ""
@@ -265,8 +267,8 @@ rates fs =
             , rThreads = fromIntegral (length (frThreads b))
             }
 
-liveView :: Env -> LiveState -> Maybe LiveData -> Maybe Timeline -> [RemoteAction] -> (FilePath -> NanoUI ()) -> NanoUI ()
-liveView env st mdata logTl remote followEventlog = columnWith (tight . gap 0 . grow) $ do
+liveView :: Env -> Bench -> LiveState -> Maybe LiveData -> Maybe Timeline -> [RemoteAction] -> (FilePath -> NanoUI ()) -> NanoUI ()
+liveView env bench st mdata logTl remote followEventlog = columnWith (tight . gap 0 . grow) $ do
   want <- readVar (lvWant st)
   toolStrip $ do
     toolLabel "Agent"
@@ -289,8 +291,10 @@ liveView env st mdata logTl remote followEventlog = columnWith (tight . gap 0 . 
   scope $ for_ mdata $ \d -> when (isNothing (ldClosed d) && not (Seq.null (ldFrames d))) $
     actionStrip st remote
   scope $ for_ mdata $ \d -> when (isNothing (ldClosed d)) (attachReport st d)
+  mixed <- bnMixed bench (lvPanes st)
   case mdata of
-    Just d | not (Seq.null (ldFrames d)) -> scope (dashboard env st d logTl)
+    Just d | not (Seq.null (ldFrames d)) -> scope (dashboard env bench st d logTl)
+    _ | mixed -> scope (bnDraw bench (lvPanes st) (livePanes env st mdata logTl))
     _ ->
       scope $
         emptyState
@@ -354,24 +358,14 @@ attachReport st d = do
               tooltip area (asNote s)
     | otherwise -> pure ()
 
-dashboard :: Env -> LiveState -> LiveData -> Maybe Timeline -> NanoUI ()
-dashboard env st d logTl = do
+dashboard :: Env -> Bench -> LiveState -> LiveData -> Maybe Timeline -> NanoUI ()
+dashboard env bench st d logTl = do
   th <- uiTheme
-  let pal = palette th
-      frames = ldFrames d
+  let frames = ldFrames d
       rs = rates frames
       lastF = Seq.index frames (Seq.length frames - 1)
       latest = if null rs then Nothing else Just (last rs)
-      series f = [(rTime r, f r) | r <- rs]
-      span' = case (rs, reverse rs) of
-        (r0 : _, rN : _) -> (rTime r0, max (rTime r0 + 1e-3) (rTime rN))
-        _ -> (0, 1)
       statsOn = stat "rts_stats" lastF > 0
-      -- Without +RTS -T a frame's time is when it arrived, which links to
-      -- nothing.
-      onClock = frProgramExact lastF
-      rk = liveRun d
-      holes = frameGaps (toList frames)
   scope $ when (not statsOn) $
     columnWith (padXY 8 0 . padBottom 8 . tight . fillW) $
       callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
@@ -392,66 +386,105 @@ dashboard env st d logTl = do
            , ("GC CPU", fmtPct (stat "gc_cpu_ns" lastF / max 1 (stat "cpu_ns" lastF)))
            , ("threads", tshow (length (frThreads lastF)))
            ]
-  mm <- monoMetrics 0.8
-  marks <- if onClock then marksFor env rk logTl else pure (Marks Nothing Nothing [] [])
-  let axisOf r = Axis rk (\ns -> chartTimeX r span' (ns / 1e9)) (\x -> chartXTime r span' x * 1e9)
-      inner (Rect x y w h) = Rect (x + 4) (y + 2) (max 1 (w - 8)) (max 1 (h - 6))
-      -- A gap is "paused" when Stronghead paused the program in it.
-      gapLabel (a, b) =
-        let ours = any (\mo -> moKind mo `elem` [MomentPause, MomentSnapshot] && moNs mo + 500000000 >= a && moNs mo <= b) (tmMoments marks)
-         in (if ours then "paused " else "no samples ") <> fmtSec (fromIntegral (b - a) / 1e9)
-      drawGaps ax r@(Rect _ y _ h) = withClip r $ forM_ holes $ \g@(a, b) -> do
-        let xa = axToX ax (fromIntegral a)
-            xb = axToX ax (fromIntegral b)
-        when (xb - xa >= 2) $ do
-          drawRect (Rect xa y (xb - xa) h) (alpha 0.06 (pText pal))
-          drawTextWith (mmFont mm) (V2 (xa + 4) (y + 22)) AlignStart AlignMiddle (gapLabel g) (pMuted pal)
-      chart title color f fmtY fill' =
-        columnWith (tight . gap 4 . fillW . fillH) $ do
-          labelWith (fontMuted . fontSizeScale 0.88) title
-          resp <-
-            canvasConfigured
-              defaultCanvasConfig
-                { canvasLayout = (fillW . fillH . minH 60) defaultLayout
-                , canvasTrackPointer = True
-                , canvasCursor = if onClock then Just (\_ _ _ -> UiCursorCrosshair) else Nothing
-                }
-              $ \r -> do
-                drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color (series f) fill']
-                when onClock (drawGaps (axisOf r) (inner r))
-                drawMarks pal (axisOf r) (inner r) marks
-          when onClock $ do
-            void (timeGestures env (axisOf (respRect resp)) resp ScrubDrag)
-            canvasLinks env resp (momentAt (axisOf (respRect resp)) marks . v2X)
-      counts = M.toList (M.fromListWith (+) [(statusGroup (ltStatus t), 1 :: Int) | t <- frThreads lastF])
-  workbench (lvPanes st) $ \pid ctx ->
-    if pid == paneCharts
-      then pane ctx "Runtime" (paneMeta ("last " <> fmtSec (snd span' - fst span') <> if onClock then ", program time" else ", times approximate: run with +RTS -T")) $ do
-        rowWith (tight . gap 16 . fillW . fillH) $ do
-          chart "Allocation rate" (pRun pal) rAlloc fmtRate True
-          chart "Live bytes after GC" (pLive pal) rLive fmtBytesD True
-        rowWith (padTop 6 . tight . gap 16 . fillW . fillH) $ do
-          chart "GC pause at each collection" (pGCMajor pal) rGCPauseMs (\v -> fmtFixed 1 v <> " ms") False
-          chart "Threads" (pWakeup pal) rThreads (fmtFixed 0) False
-      else pane ctx "Threads" (threadsHeader st counts) $ do
-        filt <- T.toLower <$> readVar (lvThreadFilter st)
-        focus <- readVar (lvFocus st)
-        let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
-            history = statusHistory frames
-            span'' = historySpan frames
-        rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
-          colHeader (fixedW 56 . alignEnd) "id"
-          colHeader fillW "label"
-          colHeader (fixedW 36 . alignEnd) "cap"
-          colHeader (fixedW historyW) ("last " <> fmtSec span'')
-          colHeader (fixedW 220) "status"
-        paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
-          forM_ threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
-            numCell 56 fontMuted (tshow (ltId t))
-            cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
-            numCell 36 fontMuted (maybe "" tshow (ltCap t))
-            _ <- canvas (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r (M.findWithDefault [] (ltId t) history))
-            cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
+  bnDraw bench (lvPanes st) (livePanes env st (Just d) logTl)
+
+-- | Live's panes, for whichever workbench holds them: the runtime charts
+-- and the thread list. The charts show the last five minutes, or, placed
+-- with the Timeline's time panes and on the program clock, the Timeline's
+-- window (@site@ is every pane in the same workbench).
+livePanes :: Env -> LiveState -> Maybe LiveData -> Maybe Timeline -> [Word64] -> NanoUI PaneDraw
+livePanes env st mdata logTl site = case mdata of
+  Just d | not (Seq.null (ldFrames d)) -> do
+    th <- uiTheme
+    window <- readVar (busWindow (envBus env))
+    let pal = palette th
+        frames = ldFrames d
+        rs = rates frames
+        lastF = Seq.index frames (Seq.length frames - 1)
+        series f = [(rTime r, f r) | r <- rs]
+        recent = case (rs, reverse rs) of
+          (r0 : _, rN : _) -> (rTime r0, max (rTime r0 + 1e-3) (rTime rN))
+          _ -> (0, 1)
+        -- Without +RTS -T a frame's time is when it arrived, which links to
+        -- nothing.
+        onClock = frProgramExact lastF
+        rk = liveRun d
+        placed = any (`elem` site) timelineTimePanes
+        shared = case window of
+          Just (r, w) | placed, onClock, runKeysMatch r rk -> Just (tvStart w / 1e9, max (tvStart w / 1e9 + 1e-3) (tvEnd w / 1e9))
+          _ -> Nothing
+        span' = maybe recent id shared
+        holes = frameGaps (toList frames)
+    mm <- monoMetrics 0.8
+    marks <- if onClock then marksFor env rk logTl else pure (Marks Nothing Nothing [] [])
+    let axisOf r = Axis rk (\ns -> chartTimeX r span' (ns / 1e9)) (\x -> chartXTime r span' x * 1e9)
+        inner (Rect x y w h) = Rect (x + 4) (y + 2) (max 1 (w - 8)) (max 1 (h - 6))
+        -- A gap is "paused" when Stronghead paused the program in it.
+        gapLabel (a, b) =
+          let ours = any (\mo -> moKind mo `elem` [MomentPause, MomentSnapshot] && moNs mo + 500000000 >= a && moNs mo <= b) (tmMoments marks)
+           in (if ours then "paused " else "no samples ") <> fmtSec (fromIntegral (b - a) / 1e9)
+        drawGaps ax r@(Rect _ y _ h) = withClip r $ forM_ holes $ \g@(a, b) -> do
+          let xa = axToX ax (fromIntegral a)
+              xb = axToX ax (fromIntegral b)
+          when (xb - xa >= 2) $ do
+            drawRect (Rect xa y (xb - xa) h) (alpha 0.06 (pText pal))
+            drawTextWith (mmFont mm) (V2 (xa + 4) (y + 22)) AlignStart AlignMiddle (gapLabel g) (pMuted pal)
+        chart title color f fmtY fill' =
+          columnWith (tight . gap 4 . fillW . fillH) $ do
+            labelWith (fontMuted . fontSizeScale 0.88) title
+            resp <-
+              canvasConfigured
+                defaultCanvasConfig
+                  { canvasLayout = (fillW . fillH . minH 60) defaultLayout
+                  , canvasTrackPointer = True
+                  , canvasCursor = if onClock then Just (\_ _ _ -> UiCursorCrosshair) else Nothing
+                  }
+                $ \r -> do
+                  drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color (series f) fill']
+                  when onClock (drawGaps (axisOf r) (inner r))
+                  drawMarks pal (axisOf r) (inner r) marks
+            when onClock $ do
+              void (timeGestures env (axisOf (respRect resp)) resp ScrubDrag)
+              canvasLinks env resp (momentAt (axisOf (respRect resp)) marks . v2X)
+        counts = M.toList (M.fromListWith (+) [(statusGroup (ltStatus t), 1 :: Int) | t <- frThreads lastF])
+        meta
+          | isJust shared = "the Timeline's window, program time"
+          | otherwise = "last " <> fmtSec (snd span' - fst span') <> if onClock then ", program time" else ", times approximate: run with +RTS -T"
+    pure $ \pid ctx ->
+      if
+        | pid == paneLiveCharts -> Just $
+            pane ctx "Runtime" (paneMeta meta) $ do
+              rowWith (tight . gap 16 . fillW . fillH) $ do
+                chart "Allocation rate" (pRun pal) rAlloc fmtRate True
+                chart "Live bytes after GC" (pLive pal) rLive fmtBytesD True
+              rowWith (padTop 6 . tight . gap 16 . fillW . fillH) $ do
+                chart "GC pause at each collection" (pGCMajor pal) rGCPauseMs (\v -> fmtFixed 1 v <> " ms") False
+                chart "Threads" (pWakeup pal) rThreads (fmtFixed 0) False
+        | pid == paneLiveThreads -> Just $
+            pane ctx "Threads" (threadsHeader st counts) $ do
+              filt <- T.toLower <$> readVar (lvThreadFilter st)
+              focus <- readVar (lvFocus st)
+              let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
+                  history = statusHistory frames
+                  span'' = historySpan frames
+              rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
+                colHeader (fixedW 56 . alignEnd) "id"
+                colHeader fillW "label"
+                colHeader (fixedW 36 . alignEnd) "cap"
+                colHeader (fixedW historyW) ("last " <> fmtSec span'')
+                colHeader (fixedW 220) "status"
+              paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
+                forM_ threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
+                  numCell 56 fontMuted (tshow (ltId t))
+                  cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
+                  numCell 36 fontMuted (maybe "" tshow (ltCap t))
+                  _ <- canvas (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r (M.findWithDefault [] (ltId t) history))
+                  cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
+        | otherwise -> Nothing
+  _ -> pure $ \pid ctx ->
+    if pid `elem` [paneLiveCharts, paneLiveThreads]
+      then Just (paneEmpty ctx (paneTitle pid) "Not connected to a program. Connect to its agent in Live." [])
+      else Nothing
 
 historyW :: Float
 historyW = 160
@@ -504,9 +537,6 @@ threadsHeader st counts = do
     (lvThreadFilter st)
   flex
   forM_ counts $ \(g, n) -> withKey g $ badge (groupTone g) (g <> " " <> tshow n)
-
-paneCharts :: Word64
-paneCharts = 1
 
 statusGroup :: Text -> Text
 statusGroup s

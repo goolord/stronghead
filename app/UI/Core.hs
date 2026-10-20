@@ -13,6 +13,7 @@ module UI.Core
   , newCoreState
   , coreLoad
   , coreView
+  , corePanes
   , openCodeFile
   , openDumpDir
   , CoreLoaded (..)
@@ -45,6 +46,7 @@ import System.Process (spawnCommand)
 import UI.Code
 import UI.Common
 import UI.Link
+import UI.Workspace
 
 data CoreState = CoreState
   { csRoot :: !(Var (Maybe FilePath))
@@ -88,13 +90,6 @@ data CoreState = CoreState
 data BindingSort = InFileOrder | ByTime | ByAlloc | ByHeap | ByEntries | ByTicky
   deriving (Eq, Show)
 
-paneBindings, paneNotes, paneSource, paneCore, paneStg :: Word64
-paneBindings = 1
-paneNotes = 2
-paneSource = 3
-paneCore = 4
-paneStg = 5
-
 newCoreState :: IO CoreState
 newCoreState = do
   csRoot <- newVar Nothing
@@ -123,11 +118,7 @@ newCoreState = do
   stgView <- newCodeViewState
   let csViews = (srcView, coreView', stgView)
   csPending <- newVar Nothing
-  csPanes <-
-    newVar . Just $
-      Split 10 AxisV 0.22 (Pane paneBindings) $
-        Split 11 AxisH 0.2 (Pane paneNotes) $
-          Split 12 AxisV 0.44 (Pane paneSource) (Split 13 AxisV 0.45 (Pane paneCore) (Pane paneStg))
+  csPanes <- newWorkbench "core" (panelPreset PCore)
   csProjectRoot <- newVar ""
   csEditor <- newVar ""
   csIndex <- newTask
@@ -311,8 +302,8 @@ badgeText e haveCore =
     boxes = sum (map (length . nBoxing . bdNotes) (enCore e))
     allocs = sum (map (length . nAllocs . bdNotes) (enStg e))
 
-coreView :: Env -> CoreState -> CoreLoaded -> NanoUI ()
-coreView env st loaded = columnWith (tight . gap 0 . grow) $ do
+coreView :: Env -> Bench -> CoreState -> CoreLoaded -> NanoUI ()
+coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (csDirDialog st) $ \case
     p : _ -> openDumpDir st p
     [] -> pure ()
@@ -361,12 +352,14 @@ coreView env st loaded = columnWith (tight . gap 0 . grow) $ do
       errors = [T.pack e | Just (Left e) <- [clSource loaded, clCore loaded, clStg loaded]]
   scope $ unless (null errors) $
     columnWith (padXY 20 0 . padBottom 8 . tight . gap 2 . fillW) $ forM_ errors (labelWith (fontTone Danger))
+  mixed <- bnMixed bench (csPanes st)
   if
+    | mixed -> scope (bnDraw bench (csPanes st) (corePanes env st loaded))
     | isJust root && isNothing (clArtifacts loaded) -> scope $ emptyState "Searching for dumps…" [] []
     | isJust root && clArtifacts loaded == Just [] && isNothing core && isNothing stg && isNothing src ->
         scope $ emptyState "No dumps in that folder" ["No .dump-simpl or .dump-stg-final files were found under it. Build with -ddump-to-file, then open the folder again."] dumpCommands
     | isNothing core && isNothing stg && isNothing src -> scope intro
-    | otherwise -> scope (panes env st loaded src core stg)
+    | otherwise -> scope (bnDraw bench (csPanes st) (corePanes env st loaded))
 
 dumpCommands :: [Text]
 dumpCommands =
@@ -384,8 +377,17 @@ intro =
     ]
     dumpCommands
 
-panes :: Env -> CoreState -> CoreLoaded -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> NanoUI ()
-panes env st loaded src core stg = do
+-- | Core & STG's panes, for whichever workbench holds them: the binding
+-- list, the optimiser's notes, and the source, Core and STG of the module
+-- open. Without files each code pane says what to open.
+corePanes :: Env -> CoreState -> CoreLoaded -> [Word64] -> NanoUI PaneDraw
+corePanes env st loaded _ = do
+  let ok = \case
+        Just (Right cf) -> Just cf
+        _ -> Nothing
+      src = ok (clSource loaded)
+      core = ok (clCore loaded)
+      stg = ok (clStg loaded)
   hideU <- readVar (csHideUniques st)
   hideT <- readVar (csHideTypeable st)
   colouring <- readVar (csColouring st)
@@ -564,9 +566,14 @@ panes env st loaded src core stg = do
           let (hs, hc, hg) = csHovers st
           writeVar (case kind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
           for_ (ceClickedKey ev) $ \k -> when (any ((== k) . enKey) es) (select k)
-  workbench (csPanes st) $ \pid ctx ->
+  -- The name under the pointer in any code pane last frame lights it up
+  -- in all of them.
+  let (hs0, hc0, hg0) = csHovers st
+  hoverNow <- listToMaybe . concatMap (maybe [] pure) <$> mapM readVar [hs0, hc0, hg0]
+  when (hoverNow /= hot) (writeVar (csHot st) hoverNow)
+  pure $ \pid ctx ->
     if
-      | pid == paneBindings ->
+      | pid == paneCoreBindings -> Just $
           pane ctx "Bindings" (paneMeta (tshow (length shown))) $ do
             searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter bindings", sicLayout = fillW defaultLayout} (csFilter st)
             scope $ unless (null lanes) $ do
@@ -599,18 +606,16 @@ panes env st loaded src core stg = do
                     LaneTicky -> numCell 46 (if rtTicky r > 0 then id else fontMuted) (if rtTicky r > 0 then fmtBytesShort (rtTicky r) else "·")
                     _ -> numCell 52 (if rtHeap r > 0 then id else fontMuted) (if rtHeap r > 0 then fmtBytesD (rtHeap r) else "·")
                 when picked (select (enKey e))
-      | pid == paneNotes ->
+      | pid == paneCoreNotes -> Just $
           pane ctx (maybe "What the optimiser did" enKey selEntry) (pure ()) $
             paneScroll (grow . tight) $ columnWith (tight . gap 6 . fillW) $
               case selEntry of
                 Nothing -> hint "Select a binding to see what the optimiser did to it: worker/wrapper, inlining, boxing, and the closures STG allocates."
                 Just e -> notesBar st e core (rt e) (not (null lanes))
-      | pid == paneSource -> codePane ctx "Source" vSrc src KindSource
-      | pid == paneCore -> codePane ctx "Core" vCore core KindCore
-      | otherwise -> codePane ctx "STG" vStg stg KindStg
-  let (hs, hc, hg) = csHovers st
-  hoverNow <- listToMaybe . concatMap (maybe [] pure) <$> mapM readVar [hs, hc, hg]
-  when (hoverNow /= hot) (writeVar (csHot st) hoverNow)
+      | pid == paneCoreSource -> Just (codePane ctx "Source" vSrc src KindSource)
+      | pid == paneCoreCore -> Just (codePane ctx "Core" vCore core KindCore)
+      | pid == paneCoreStg -> Just (codePane ctx "STG" vStg stg KindStg)
+      | otherwise -> Nothing
   where
     pct v = if v > 0 then fmtFixed 1 v else "·"
     costTone v = if v >= 1 then id else fontMuted

@@ -16,6 +16,7 @@ module UI.Heap
   , heapLoad
   , heapSync
   , heapView
+  , heapPanes
   , openHp
   , openProf
   , HeapLoaded (..)
@@ -62,6 +63,7 @@ import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
 import UI.Link
+import UI.Workspace
 
 data HeapSource = FromEventlog | FromHpFile | FromGhcDebug
   deriving (Eq, Show, Enum, Bounded)
@@ -214,15 +216,10 @@ newHeapState = do
   hsDbgFind <- newVar Nothing
   hsCCSel <- newVar Nothing
   hsCostTotals <- newVar Nothing
-  hsPanes <- newVar (Just (Split 10 AxisH 0.46 (Split 11 AxisV 0.75 (Pane paneChart) (Pane paneLegend)) (Pane paneAnalysis)))
-  hsDbgPanes <- newVar (Just (Pane 1))
-  hsCCPanes <- newVar (Just (Pane 1))
+  hsPanes <- newWorkbench "heap" (panelPreset PHeap)
+  hsDbgPanes <- newWorkbench "heap-graph" heapGraphPreset
+  hsCCPanes <- newWorkbench "heap-costs" heapCostsPreset
   pure HeapState {..}
-
-paneChart, paneLegend, paneAnalysis :: Word64
-paneChart = 1
-paneLegend = 2
-paneAnalysis = 3
 
 openHp :: HeapState -> FilePath -> NanoUI ()
 openHp st p = do
@@ -298,8 +295,8 @@ done = \case
   Just (TaskFailed e _) -> Just (Left (show e))
   _ -> Nothing
 
-heapView :: Env -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
-heapView env st loaded logTl = columnWith (tight . gap 0 . grow) $ do
+heapView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
+heapView env bench st loaded logTl = columnWith (tight . gap 0 . grow) $ do
   let fromLog = logTl >>= tlHeapProfile
   useFileDialog (hsHpDialog st) $ \case
     p : _ -> openHp st p
@@ -332,16 +329,19 @@ heapView env st loaded logTl = columnWith (tight . gap 0 . grow) $ do
           (_, Nothing) -> Left ("Reading the heap profile…", [], [])
           (_, Just (Left e)) -> Left ("Could not read the heap profile", [T.pack e], [])
           (_, Just (Right hp)) -> Right hp
+  mixed <- bnMixed bench (hsPanes st)
+  let panes = heapPanes env st loaded logTl
   case profile of
-    _ | source == FromGhcDebug -> scope (ghcDebugView env st loaded)
+    _ | source == FromGhcDebug -> scope (ghcDebugView env bench st loaded logTl)
+    _ | mixed && either (const True) (VU.null . hpTimes) profile -> scope (bnDraw bench (hsPanes st) panes)
     Left (title, body, commands) -> scope $
       -- The cost-centre tree does not need a heap profile.
       if isJust (hlProf loaded)
-        then workbench (hsCCPanes st) $ \_ ctx -> pane ctx "Cost centres" (pure ()) (costCentreTree env st (done (hlProf loaded)))
+        then bnDraw bench (hsCCPanes st) panes
         else emptyState title body commands
     Right hp
       | VU.null (hpTimes hp) -> scope (emptyState "The heap profile has no samples" ["The program may have exited before the first census. Take censuses more often with -i0.05."] [])
-      | otherwise -> scope (profileView env st loaded logTl hp)
+      | otherwise -> scope (profileView env bench st loaded logTl hp)
 
 -- ---------------------------------------------------------------------------
 -- The stacked chart
@@ -421,36 +421,25 @@ heapSync bus st loaded logTl following = do
     after <- readVar (hsCursor st)
     when (tracks && tracking && after /= Just newest) (writeVar (hsTracking st) False)
 
-profileView :: Env -> HeapState -> HeapLoaded -> Maybe Timeline -> HeapProfile -> NanoUI ()
-profileView env st loaded logTl hp = do
-  th <- uiTheme
-  let pal = palette th
-      bus = envBus env
-  hidden <- readVar (hsHidden st)
-  solo <- readVar (hsSolo st)
-  topN <- round <$> readVar (hsTopN st)
-  cursorT <- readVar (hsCursor st)
-  source <- readVar (hsSource st)
-  following <- readVar (hsFollowing st)
-  tracking <- readVar (hsTracking st)
-  locked <- readVar (hsLock st)
+-- | The chart's window on the profile's clock, in ns, and how to move it:
+-- its own, or the Timeline's when locked to it or placed with one of the
+-- Timeline's time panes (@placed@).
+data ChartWindow = ChartWindow
+  { cwView :: !TimeView
+  , cwSet :: TimeView -> NanoUI ()
+  , cwFit :: NanoUI ()
+  , cwOwn :: !Bool
+    -- ^ The chart has a window of its own, not the whole profile.
+  , cwLocked :: !Bool
+  , cwLockable :: !Bool
+  }
+
+chartWindow :: Bus -> HeapState -> HeapProfile -> ClockMap -> RunKey -> Bool -> NanoUI ChartWindow
+chartWindow bus st hp clock rk placed = do
+  locked <- (|| placed) <$> readVar (hsLock st)
   own <- readVar (hsView st)
   window <- readVar (busWindow bus)
-  mm <- monoMetrics 0.85
-  let ls = stackLayers hp hidden solo topN
-      times = hpOffsets hp
-      n = VU.length times
-      tEnd = VU.last times
-      fromLog = logTl >>= tlHeapProfile
-      clock = profileClock source hp fromLog
-      rk = profileRun source hp fromLog clock
-      -- Until the cursor is moved it sits on the peak census: the last one
-      -- is often taken as the program exits, with little left alive.
-      peakIx = VU.maxIndex (hpTotals hp)
-      cursorIx = maybe peakIx (nearestIndex times) cursorT
-      approx = if cmExact clock then "" else " (approx.)"
-      -- The chart's window, on the profile's clock in ns.
-      -- A little room after the last census, so a cursor on it shows.
+  let -- A little room after the last census, so a cursor on it shows.
       lo = hpStart hp * 1e9
       hi = let end = VU.last (hpTimes hp) * 1e9 in max (lo + 1e6) (end + 0.015 * (end - lo))
       fromProg p = fromProgramNs clock p * 1e9
@@ -459,27 +448,102 @@ profileView env st loaded logTl hp = do
       lockedTo = case window of
         Just (r, w) | locked, runKeysMatch r rk -> Just (r, TimeView (fromProg (tvStart w)) (fromProg (tvEnd w)))
         _ -> Nothing
-      v = maybe (maybe (TimeView lo hi) (clampView lo hi) own) snd lockedTo
-      setView v' = case lockedTo of
-        Just (r, _) -> writeVar (busWindow bus) (Just (r, TimeView (toProg (tvStart v')) (toProg (tvEnd v'))))
-        Nothing -> writeVar (hsView st) (Just (clampView lo hi v'))
-      fitView = case lockedTo of
-        Just (r, _) -> writeVar (busWindow bus) (Just (r, TimeView (toProg lo) (toProg hi)))
-        Nothing -> writeVar (hsView st) Nothing
-  stepCensus st hp v cursorIx
+  pure
+    ChartWindow
+      { cwView = maybe (maybe (TimeView lo hi) (clampView lo hi) own) snd lockedTo
+      , cwSet = \v' -> case lockedTo of
+          Just (r, _) -> writeVar (busWindow bus) (Just (r, TimeView (toProg (tvStart v')) (toProg (tvEnd v'))))
+          Nothing -> writeVar (hsView st) (Just (clampView lo hi v'))
+      , cwFit = case lockedTo of
+          Just (r, _) -> writeVar (busWindow bus) (Just (r, TimeView (toProg lo) (toProg hi)))
+          Nothing -> writeVar (hsView st) Nothing
+      , cwOwn = isJust own
+      , cwLocked = isJust lockedTo
+      , cwLockable = lockable
+      }
+
+-- | The census the cursor is on: the one it was moved to, or else the
+-- peak, since the last census is often taken as the program exits with
+-- little left alive.
+cursorIndex :: HeapProfile -> Maybe Double -> Int
+cursorIndex hp cursorT = maybe (VU.maxIndex (hpTotals hp)) (nearestIndex (hpOffsets hp)) cursorT
+
+-- | The profile's readout over its panes, and the census keys. The panes
+-- themselves come from 'heapPanes'.
+profileView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> HeapProfile -> NanoUI ()
+profileView env bench st loaded logTl hp = do
+  cursorT <- readVar (hsCursor st)
+  source <- readVar (hsSource st)
+  tree <- readVar (wbTree (hsPanes st))
+  let times = hpOffsets hp
+      fromLog = logTl >>= tlHeapProfile
+      clock = profileClock source hp fromLog
+      rk = profileRun source hp fromLog clock
+      cursorIx = cursorIndex hp cursorT
+      approx = if cmExact clock then "" else " (approx.)"
+  cw <- chartWindow (envBus env) st hp clock rk (any (`hasPane` tree) timelineTimePanes)
+  stepCensus st hp (cwView cw) cursorIx
   columnWith (padBottom 8 . tight . fillW) $
     readout
       [ ("breakdown", hpBreakdown hp)
-      , ("censuses", tshow n)
-      , ("profiled", fmtSec tEnd)
+      , ("censuses", tshow (VU.length times))
+      , ("profiled", fmtSec (VU.last times))
       , ("peak total", fmtBytesD (VU.maximum (hpTotals hp)))
       , ("cursor at" <> approx, fmtSec (times VU.! cursorIx))
       , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx))
       ]
+  bnDraw bench (hsPanes st) (heapPanes env st loaded logTl)
+
+-- | The heap panel's panes, for whichever workbench holds them: the
+-- residency chart, its bands and the analysis of the profile on show, the
+-- live graph of the latest snapshot, and the cost-centre tree. @site@ is
+-- every pane in the same workbench: placed with the Timeline's time panes,
+-- the chart takes the Timeline's window.
+heapPanes :: Env -> HeapState -> HeapLoaded -> Maybe Timeline -> [Word64] -> NanoUI PaneDraw
+heapPanes env st loaded logTl site = do
+  source <- readVar (hsSource st)
+  let fromLog = logTl >>= tlHeapProfile
+      costs pid ctx
+        | pid == paneHeapCosts = Just (pane ctx "Cost centres" (pure ()) (costCentreTree env st (done (hlProf loaded))))
+        | otherwise = Nothing
+  profileDraw <- case shownProfile source loaded fromLog of
+    Just hp | not (VU.null (hpTimes hp)) -> profilePanes env st loaded logTl hp site
+    _ -> pure $ \pid ctx ->
+      if pid `elem` [paneHeapChart, paneHeapBands, paneHeapAnalysis]
+        then Just (paneEmpty ctx (paneTitle pid) "No heap profile is on show. Open an eventlog recorded with heap profiling, or a .hp file, in Heap & leaks." ["./Main +RTS -l -hT -i0.1 -RTS"])
+        else Nothing
+  graphDraw <- graphPanes env st
+  pure (profileDraw `orPanes` graphDraw `orPanes` costs)
+
+profilePanes :: Env -> HeapState -> HeapLoaded -> Maybe Timeline -> HeapProfile -> [Word64] -> NanoUI PaneDraw
+profilePanes env st loaded logTl hp site = do
+  th <- uiTheme
+  let pal = palette th
+  hidden <- readVar (hsHidden st)
+  solo <- readVar (hsSolo st)
+  topN <- round <$> readVar (hsTopN st)
+  cursorT <- readVar (hsCursor st)
+  source <- readVar (hsSource st)
+  following <- readVar (hsFollowing st)
+  tracking <- readVar (hsTracking st)
   tab <- readVar (hsTab st)
-  workbench (hsPanes st) $ \pid ctx ->
+  mm <- monoMetrics 0.85
+  let ls = stackLayers hp hidden solo topN
+      times = hpOffsets hp
+      fromLog = logTl >>= tlHeapProfile
+      clock = profileClock source hp fromLog
+      rk = profileRun source hp fromLog clock
+      cursorIx = cursorIndex hp cursorT
+      approx = if cmExact clock then "" else " (approx.)"
+      placed = any (`elem` site) timelineTimePanes
+  cw <- chartWindow (envBus env) st hp clock rk placed
+  marks <- marksFor env rk logTl
+  let v = cwView cw
+      setView = cwSet cw
+      fitView = cwFit cw
+  pure $ \pid ctx ->
     if
-      | pid == paneChart -> do
+      | pid == paneHeapChart -> Just $ do
           let actions = do
                 paneMeta $
                   if
@@ -493,8 +557,11 @@ profileView env st loaded logTl hp = do
                 flex
                 scope $ for_ solo $ \s -> whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
                 scope $ unless (S.null hidden) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show all bands") (writeVar (hsHidden st) S.empty)
-                scope $ when (isJust own && isNothing lockedTo) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Fit") fitView
-                disabledWhen (not lockable) $ checkboxWith alignMid "Lock to Timeline" (hsLock st)
+                scope $ when (cwOwn cw && not (cwLocked cw)) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Fit") fitView
+                scope $
+                  if placed && cwLocked cw
+                    then paneMeta "On the Timeline's axis"
+                    else disabledWhen (not (cwLockable cw)) $ checkboxWith alignMid "Lock to Timeline" (hsLock st)
                 labelWith (alignMid . fontMuted . fontSizeScale 0.85) ("Top " <> tshow topN <> " bands")
                 sliderWith (alignMid . fixedW 110) 3 30 (hsTopN st)
           paneWith (padAll 8) ctx "Residency" actions $ do
@@ -514,7 +581,6 @@ profileView env st loaded logTl hp = do
                   pure $
                     ("t = " <> fmtSec (times VU.! i) <> approx <> ", total " <> fmtBytesD (hpTotals hp VU.! i))
                       : [lyName l <> ": " <> fmtBytesD (lyValues l VU.! i) | l <- take 1 under]
-            marks <- marksFor env rk logTl
             resp <-
               canvasConfigured
                 defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
@@ -541,9 +607,9 @@ profileView env st loaded logTl hp = do
             when (dragActive drag && not panNow && not brushing && not (modCtrl mods) && not (modShift mods)) $ do
               let i = nearestIndex (hpTimes hp) (xToTime v px pw (v2X (dragPosition drag)) / 1e9)
               when (cursorT /= Just (times VU.! i)) $ writeVar (hsCursor st) (Just (times VU.! i))
-      | pid == paneLegend ->
-          paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)))) (legend env st hp hidden solo)
-      | otherwise -> do
+      | pid == paneHeapBands ->
+          Just (paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)))) (legend env st hp hidden solo))
+      | pid == paneHeapAnalysis -> Just $ do
           let actions = do
                 flex
                 rowWith (alignMid . tight) $
@@ -553,6 +619,7 @@ profileView env st loaded logTl hp = do
             Leaks -> leakView env st hp
             Retention -> retentionView env st hp cursorIx
             CostCentres -> costCentreTree env st (done (hlProf loaded))
+      | otherwise -> Nothing
   where
     guard' c = if c then Just () else Nothing
 
@@ -899,8 +966,8 @@ dbgTabName = \case
   DbgGraph -> "Closure graph"
   DbgBiggest -> "Biggest retainers"
 
-ghcDebugView :: Env -> HeapState -> HeapLoaded -> NanoUI ()
-ghcDebugView env st loaded
+ghcDebugView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
+ghcDebugView env bench st loaded logTl
   | not ghcDebugEnabled =
       emptyState
         "Built without ghc-debug"
@@ -958,18 +1025,17 @@ ghcDebugView env st loaded
           Just (TaskDone (Left e)) -> labelWith (alignMid . fontTone Danger) (T.pack e)
           Just (TaskFailed e _) -> labelWith (alignMid . fontTone Danger) (T.pack (displayException e))
           _ -> pure ()
+      mixed <- bnMixed bench (hsDbgPanes st)
       case reverse history of
-        [] ->
+        [] | not mixed ->
           emptyState
             "Take a snapshot"
             [ "A snapshot pauses the program, walks every closure reachable from its GC roots, and resumes it."
             , "Take another after the program has run for a while: thunks still unevaluated in both are what a lazy accumulator leaves behind."
             ]
             []
+        [] -> scope (bnDraw bench (hsDbgPanes st) (heapPanes env st loaded logTl))
         latest : _ -> scope $ do
-          survivors <- readVar (hsDbgSurvivors st)
-          marked <- readVar (hsDbgMarked st)
-          sn <- readVar (hsDbgStored st)
           columnWith (padBottom 8 . tight . fillW) $
             readout
               [ ("closures", fmtInt (M.size (snapNodes latest)))
@@ -978,8 +1044,32 @@ ghcDebugView env st loaded
               , ("roots", fmtInt (length (snapRoots latest)))
               , ("snapshots kept", tshow (length history))
               ]
-          tab <- readVar (hsDbgTab st)
-          workbench (hsDbgPanes st) $ \_ ctx -> do
+          bnDraw bench (hsDbgPanes st) (heapPanes env st loaded logTl)
+
+-- | The live graph's pane: the latest snapshot's survivors, graph and
+-- biggest retainers, or how to take a snapshot.
+graphPanes :: Env -> HeapState -> NanoUI PaneDraw
+graphPanes env st = do
+  History _ history <- readVar (hsDbgHistory st)
+  case reverse history of
+    [] ->
+      pure $ \pid ctx ->
+        if pid /= paneHeapGraph
+          then Nothing
+          else
+            Just $
+              if ghcDebugEnabled
+                then paneEmpty ctx "Live graph" "No snapshot yet. In Heap & leaks, switch the source to Live graph (ghc-debug) and take one, or snapshot from Live." []
+                else paneEmpty ctx "Live graph" "Built without ghc-debug: rebuild with the flag to snapshot a running program." ["cabal build -f ghc-debug"]
+    latest : _ -> do
+      survivors <- readVar (hsDbgSurvivors st)
+      marked <- readVar (hsDbgMarked st)
+      sn <- readVar (hsDbgStored st)
+      tab <- readVar (hsDbgTab st)
+      pure $ \pid ctx ->
+        if pid /= paneHeapGraph
+          then Nothing
+          else Just $ do
             let actions = do
                   paneMeta (dbgTabName tab)
                   scope $ when (snapTruncated latest) $ badge Warning "stopped at the closure limit"

@@ -54,6 +54,8 @@ data Settings = Settings
     -- ^ Where to look for sources; empty for only the dump folder's project.
   , cfgEditorCommand :: !Text
     -- ^ A template with @{file}@, @{line}@ and @{col}@; empty for none.
+  , cfgReopenSession :: !Bool
+    -- ^ Reopen the session saved on quit.
   }
   deriving (Eq, Show)
 
@@ -82,6 +84,7 @@ defaultSettings =
     , cfgHideTypeable = True
     , cfgProjectRoot = ""
     , cfgEditorCommand = ""
+    , cfgReopenSession = False
     }
 
 -- ---------------------------------------------------------------------------
@@ -205,6 +208,7 @@ encode Settings {..} =
            , ("hide-typeable", bool cfgHideTypeable)
            , ("project-root", cfgProjectRoot)
            , ("editor-command", cfgEditorCommand)
+           , ("reopen-last-session", bool cfgReopenSession)
            ]
     windowPairs SavedWindow {..} =
       let Size w h = swSize
@@ -248,6 +252,7 @@ decode file =
     , cfgHideTypeable = field "hide-typeable" (cfgHideTypeable d) readBool
     , cfgProjectRoot = field "project-root" (cfgProjectRoot d) Just
     , cfgEditorCommand = field "editor-command" (cfgEditorCommand d) Just
+    , cfgReopenSession = field "reopen-last-session" (cfgReopenSession d) readBool
     }
   where
     d = defaultSettings
