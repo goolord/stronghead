@@ -24,6 +24,7 @@ module Stronghead.Eventlog
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, evaluate, try)
+import Data.Bits (testBit)
 import Data.ByteString qualified as B
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
@@ -42,7 +43,9 @@ import GHC.RTS.Events
 import GHC.RTS.Events.Incremental (Decoder (..), decodeEventLog)
 import Stronghead.Eventlog.Model
 import Stronghead.Format (tshow)
-import Stronghead.HeapProfile (BandKind, HeapProfile (..), closureTypeKind, fromSamples)
+import Stronghead.HeapProfile (HeapProfile (..), InfoProv (..), closureTypeKind, fromSamples)
+import Stronghead.Run
+import Stronghead.Source (parseSrcLoc)
 import System.IO
 
 -- ---------------------------------------------------------------------------
@@ -85,10 +88,10 @@ data GCStat = GCStat !Word64 !Int !Word64 !Int
 
 data HeapB = HeapB
   { hbBreakdown :: !(Maybe Text)
-  , hbCostCentres :: !(IntMap Text)
+  , hbCostCentres :: !(IntMap CostCentreInfo)
   , hbCur :: !(Maybe (Word64, [(Text, Double)]))
   , hbDone :: ![(Word64, [(Text, Double)])]
-  , hbIPE :: !(M.Map Word64 (BandKind, Text))
+  , hbIPE :: !(M.Map Word64 InfoProv)
   }
 
 data Builder = Builder
@@ -101,6 +104,7 @@ data Builder = Builder
   , bMarkers :: ![Marker]
   , bHeap :: !HeapB
   , bInfo :: ![(Text, Text)]
+  , bRun :: !RunInfo
   , bCount :: !Int
   , bMin :: !Word64
   , bMax :: !Word64
@@ -108,7 +112,7 @@ data Builder = Builder
 
 emptyBuilder :: Builder
 emptyBuilder =
-  Builder IM.empty IM.empty [] [] [] [] [] (HeapB Nothing IM.empty Nothing [] M.empty) [] 0 maxBound 0
+  Builder IM.empty IM.empty [] [] [] [] [] (HeapB Nothing IM.empty Nothing [] M.empty) [] emptyRunInfo 0 maxBound 0
 
 -- ---------------------------------------------------------------------------
 -- Folding events
@@ -173,26 +177,32 @@ globalEvent b t = \case
   ThreadLabel tid lbl -> onThread tid (\tb -> tb {tbLabel = Just lbl}) b
   UserMarker name -> b {bMarkers = Marker t name Nothing True : bMarkers b}
   UserMessage m -> b {bMarkers = Marker t m Nothing False : bMarkers b}
-  RtsIdentifier _ ident -> info "RTS" ident
-  ProgramArgs _ as -> info "Arguments" (T.unwords as)
-  OsProcessPid _ p -> info "PID" (tshow p)
+  RtsIdentifier _ ident -> run (\r -> r {riRts = Just ident}) (info "RTS" ident)
+  ProgramArgs _ as -> run (mergeRunInfo (runFromArgs as)) (info "Arguments" (T.unwords as))
+  OsProcessPid _ p -> run (\r -> r {riPid = Just (fromIntegral p)}) (info "PID" (tshow p))
+  -- Posted once at startup: the moment's Unix time, at program time t.
+  WallClockTime {sec, nsec} ->
+    run (\r -> r {riWallClock = Just (fromMaybe (WallAnchor t (sec * 1000000000 + fromIntegral nsec)) (riWallClock r))}) b
   Startup n -> info "Capabilities" (tshow n)
   HeapProfBegin {heapProfBreakdown} -> heap (\h -> h {hbBreakdown = Just (breakdownName heapProfBreakdown)})
-  HeapProfCostCentre {heapProfCostCentreId, heapProfLabel, heapProfModule} ->
-    heap (\h -> h {hbCostCentres = IM.insert (fromIntegral heapProfCostCentreId) (heapProfModule <> "." <> heapProfLabel) (hbCostCentres h)})
+  HeapProfCostCentre {heapProfCostCentreId, heapProfLabel, heapProfModule, heapProfSrcLoc, heapProfFlags} ->
+    let i = fromIntegral heapProfCostCentreId
+        cc = CostCentreInfo i heapProfLabel heapProfModule (parseSrcLoc heapProfSrcLoc) (let HeapProfFlags w = heapProfFlags in testBit w 0)
+     in heap (\h -> h {hbCostCentres = IM.insert i cc (hbCostCentres h)})
   InfoTableProv {itInfo, itTableName, itClosureDesc, itTyDesc, itLabel, itModule, itSrcLoc} ->
-    let detail = itTableName <> " :: " <> itTyDesc <> "  (" <> itLabel <> ", " <> itModule <> " " <> itSrcLoc <> ")"
-     in heap (\h -> h {hbIPE = M.insert itInfo (closureTypeKind itClosureDesc, detail) (hbIPE h)})
+    let prov = InfoProv itTableName itClosureDesc (closureTypeKind itClosureDesc) itTyDesc itLabel itModule (parseSrcLoc itSrcLoc)
+     in heap (\h -> h {hbIPE = M.insert itInfo prov (hbIPE h)})
   HeapProfSampleBegin {} -> heap (beginSample t)
   HeapBioProfSampleBegin {} -> heap (beginSample t)
   HeapProfSampleEnd {} -> heap endSample
   HeapProfSampleString {heapProfResidency, heapProfLabel} -> heap (addBand heapProfLabel heapProfResidency)
   HeapProfSampleCostCentre {heapProfResidency, heapProfStack} -> heap $ \h ->
-    let names = [IM.findWithDefault ("cc" <> tshow i) (fromIntegral i) (hbCostCentres h) | i <- VU.toList heapProfStack]
+    let names = [maybe ("cc" <> tshow i) (\cc -> cciModule cc <> "." <> cciLabel cc) (IM.lookup (fromIntegral i) (hbCostCentres h)) | i <- VU.toList heapProfStack]
      in addBand (T.intercalate "/" names) heapProfResidency h
   _ -> b
   where
     info k v = b {bInfo = (k, v) : filter ((/= k) . fst) (bInfo b)}
+    run f bb = bb {bRun = f (bRun bb)}
     heap f = b {bHeap = f (bHeap b)}
     beginSample time h = (endSample h) {hbCur = Just (time, [])}
     endSample h = case hbCur h of
@@ -237,6 +247,8 @@ snapshot b
         , tlMarkers = V.fromList (sortOn mkTime (bMarkers b))
         , tlHeapProfile = heapProfile b start
         , tlInfo = reverse (bInfo b)
+        , tlRun = bRun b
+        , tlCostCentres = hbCostCentres (bHeap b)
         , tlEventCount = bCount b
         }
   where
@@ -300,16 +312,21 @@ gcClusters spans stats = go (merge spans) stats
           par = foldl' (\p (GCStat _ _ _ n) -> max p n) 0 mine
        in GCEvent s e 0 gen cop par : go rest later
 
+-- | Sample times are program time, in seconds; displays count from the
+-- first event, as the timeline's do.
 heapProfile :: Builder -> Word64 -> Maybe HeapProfile
 heapProfile b start = case hbDone h of
   [] -> Nothing
   samples ->
     Just $
-      fromSamples
-        (fromMaybe "" (lookup "Arguments" (bInfo b)))
-        (fromMaybe "unknown" (hbBreakdown h))
-        ipe
-        [(fromIntegral (t - min t start) / 1e9, bands) | (t, bands) <- samples]
+      ( fromSamples
+          (fromMaybe "" (lookup "Arguments" (bInfo b)))
+          (fromMaybe "unknown" (hbBreakdown h))
+          (fromIntegral start / 1e9)
+          ipe
+          [(fromIntegral t / 1e9, bands) | (t, bands) <- samples]
+      )
+        {hpRun = bRun b}
   where
     h = bHeap b
     ipe label = do

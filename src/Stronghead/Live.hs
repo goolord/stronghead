@@ -14,6 +14,7 @@ module Stronghead.Live
   , LiveThread (..)
   , LiveEvent (..)
   , connectLive
+  , frameClock
   , parseLine
   , Line (..)
   , stat
@@ -29,6 +30,7 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
+import Data.Word (Word64)
 import GHC.Clock (getMonotonicTime)
 import Network.Socket
 import Network.Socket.ByteString (recv)
@@ -43,6 +45,11 @@ data LiveThread = LiveThread
 data Frame = Frame
   { frTime :: !Double
     -- ^ Seconds on our clock when the frame arrived.
+  , frProgramNs :: !Word64
+    -- ^ Program time, as eventlog timestamps count it (see 'frameClock').
+  , frProgramExact :: !Bool
+    -- ^ Whether 'frProgramNs' came from the program's statistics rather
+    -- than our clock.
   , frStats :: !(Map Text Double)
   , frThreads :: ![LiveThread]
   }
@@ -88,6 +95,7 @@ connectLive host port emit = do
       addr : _ ->
         bracket (openSocket addr) close $ \sock -> do
           connect sock (addrAddress addr)
+          connected <- getMonotonicTime
           let loop buf stats threads = do
                 chunk <- recv sock 65536
                 if B.null chunk
@@ -103,13 +111,27 @@ connectLive host port emit = do
                 LThread t -> handle more s (t : ts)
                 LEnd -> do
                   now <- getMonotonicTime
-                  emit (LiveFrame (Frame now s (reverse ts)))
+                  let (prog, exact) = frameClock (now - connected) s
+                  emit (LiveFrame (Frame now prog exact s (reverse ts)))
                   handle more M.empty []
                 LUnknown -> handle more s ts
           loop B.empty M.empty []
   emit . LiveClosed $ case r of
     Left (e :: SomeException) -> T.pack (show e)
     Right () -> "connection closed by the program"
+
+-- | A frame's program time from its statistics, or, without them (no
+-- @+RTS -T@), the seconds since the connection opened, which is only a
+-- guess.
+--
+-- @elapsed_ns@ counts from the end of RTS initialisation and eventlog
+-- timestamps from its start, so the agent also sends @init_elapsed_ns@ and
+-- the two are added. An older agent doesn't, and its times are early by the
+-- RTS's start-up time, about a millisecond.
+frameClock :: Double -> Map Text Double -> (Word64, Bool)
+frameClock sinceConnect stats = case M.lookup "elapsed_ns" stats of
+  Just ns | M.findWithDefault 0 "rts_stats" stats > 0 -> (round (ns + M.findWithDefault 0 "init_elapsed_ns" stats), True)
+  _ -> (round (max 0 sinceConnect * 1e9), False)
 
 splitLines :: B.ByteString -> ([B.ByteString], B.ByteString)
 splitLines bs =

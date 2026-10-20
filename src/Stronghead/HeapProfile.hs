@@ -6,8 +6,12 @@ module Stronghead.HeapProfile
   ( HeapProfile (..)
   , Band (..)
   , BandKind (..)
+  , InfoProv (..)
+  , infoProvDetail
   , fromSamples
   , emptyProfile
+  , hpOffset
+  , hpOffsets
   , parseHp
   , loadHp
   , classifyBand
@@ -35,6 +39,8 @@ import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+import Stronghead.Run (RunInfo, emptyRunInfo, runFromHp)
+import Stronghead.Source (SrcLoc, renderSrcLoc)
 
 -- | What a band's closures are, as far as the breakdown lets us tell.
 data BandKind
@@ -52,41 +58,85 @@ data Band = Band
     -- ^ Residency in bytes at each sample.
   , bandPeak :: !Double
   , bandKind :: !BandKind
+  , bandProv :: !(Maybe InfoProv)
+    -- ^ Where the band's closures were defined, when an info-table
+    -- breakdown (@-hi@) names them.
   , bandDetail :: !(Maybe Text)
-    -- ^ Extra provenance (info-table source location, type) when known.
+    -- ^ 'bandProv' as one line of text.
   }
   deriving (Eq, Show)
+
+-- | An info table's provenance, from the eventlog's IPE events (built with
+-- @-finfo-table-map@).
+data InfoProv = InfoProv
+  { ipTableName :: !Text
+    -- ^ The info table's symbol: an STG binder plus @_info@
+    -- (@main2_sat_s7qA_info@), or a constructor allocation site
+    -- (@I#_Main_3_con_info@) with @-fdistinct-constructor-tables@.
+  , ipClosureType :: !Int
+    -- ^ The closure type number (rts/include/rts/storage/ClosureTypes.h).
+  , ipKind :: !BandKind
+  , ipType :: !Text
+  , ipLabel :: !Text
+    -- ^ The binding the closure was allocated in.
+  , ipModule :: !Text
+  , ipSrc :: !SrcLoc
+  }
+  deriving (Eq, Show)
+
+-- | @table :: type  (label, Module file:line:col)@.
+infoProvDetail :: InfoProv -> Text
+infoProvDetail ip =
+  ipTableName ip <> " :: " <> ipType ip <> "  (" <> ipLabel ip <> ", " <> ipModule ip <> " " <> renderSrcLoc (ipSrc ip) <> ")"
 
 data HeapProfile = HeapProfile
   { hpJob :: !Text
   , hpBreakdown :: !Text
   , hpTimes :: !(VU.Vector Double)
-    -- ^ Sample times in seconds.
+    -- ^ Sample times in seconds. From an eventlog, program time (since the
+    -- RTS started). A @.hp@ file's own times are not elapsed time (most
+    -- likely mutator CPU time) and only approximate it.
+  , hpStart :: !Double
+    -- ^ The program time displays count from: the eventlog's first event,
+    -- or 0 for a @.hp@ file.
   , hpBands :: !(V.Vector Band)
     -- ^ Sorted by peak residency, largest first.
   , hpTotals :: !(VU.Vector Double)
+  , hpRun :: !RunInfo
+    -- ^ From a @.hp@ file's @JOB@ and @DATE@, or the eventlog's run.
   }
   deriving (Eq, Show)
 
 emptyProfile :: HeapProfile
-emptyProfile = HeapProfile "" "" VU.empty V.empty VU.empty
+emptyProfile = HeapProfile "" "" VU.empty 0 V.empty VU.empty emptyRunInfo
 
--- | Build a profile from samples of @(time, [(band, bytes)])@. Bands missing
--- from a sample are zero there. @detail@ supplies kind/provenance overrides
--- (from IPE events) for band names it knows.
+-- | Sample @i@'s time from the start of the run, as displays show it.
+hpOffset :: HeapProfile -> Int -> Double
+hpOffset hp i = hpTimes hp VU.! i - hpStart hp
+
+hpOffsets :: HeapProfile -> VU.Vector Double
+hpOffsets hp = VU.map (subtract (hpStart hp)) (hpTimes hp)
+
+-- | Build a profile from samples of @(time, [(band, bytes)])@, with times
+-- counted from @start@ in displays. Bands missing from a sample are zero
+-- there. @prov@ supplies provenance (from IPE events) for band names it
+-- knows, which also fixes their kind.
 fromSamples
   :: Text
   -> Text
-  -> (Text -> Maybe (BandKind, Text))
+  -> Double
+  -> (Text -> Maybe InfoProv)
   -> [(Double, [(Text, Double)])]
   -> HeapProfile
-fromSamples job breakdown detail samples0 =
+fromSamples job breakdown start prov samples0 =
   HeapProfile
     { hpJob = job
     , hpBreakdown = breakdown
     , hpTimes = VU.fromList (map fst samples)
+    , hpStart = start
     , hpBands = V.fromList (sortOn (Down . bandPeak) bands)
     , hpTotals = VU.fromList [sum (map snd s) | (_, s) <- samples]
+    , hpRun = emptyRunInfo
     }
   where
     samples = sortOn fst samples0
@@ -102,12 +152,14 @@ fromSamples job breakdown detail samples0 =
           { bandName = name
           , bandValues = vals
           , bandPeak = if VU.null vals then 0 else VU.maximum vals
-          , bandKind = maybe (classifyBand name) fst (detail name)
-          , bandDetail = snd <$> detail name
+          , bandKind = maybe (classifyBand name) ipKind p
+          , bandProv = p
+          , bandDetail = infoProvDetail <$> p
           }
       | name <- names
       , let col = M.findWithDefault M.empty name columns
             vals = VU.generate n (\i -> M.findWithDefault 0 i col)
+            p = prov name
       ]
 
 -- | Guess a band's kind from its name. Exact for closure-type (@-hT@)
@@ -150,6 +202,7 @@ loadHp path = parseHp . TE.decodeUtf8With TE.lenientDecode <$> B.readFile path
 
 data HpAcc = HpAcc
   { accJob :: !Text
+  , accDate :: !Text
   , accCur :: !(Maybe (Double, [(Text, Double)]))
   , accDone :: ![(Double, [(Text, Double)])]
   }
@@ -159,14 +212,15 @@ parseHp :: Text -> Either String HeapProfile
 parseHp src
   | not (any ("BEGIN_SAMPLE" `T.isPrefixOf`) ls) = Left "not a heap profile: no BEGIN_SAMPLE lines"
   | otherwise =
-      let acc = foldl' step (HpAcc "" Nothing []) ls
+      let acc = foldl' step (HpAcc "" "" Nothing []) ls
           names = [n | (_, s) <- accDone acc, (n, _) <- s]
           breakdown = guessBreakdown (accJob acc) names
-       in Right (fromSamples (accJob acc) breakdown (const Nothing) (reverse (accDone acc)))
+       in Right (fromSamples (accJob acc) breakdown 0 (const Nothing) (reverse (accDone acc))) {hpRun = runFromHp (accJob acc) (accDate acc)}
   where
     ls = map (T.dropWhileEnd (== '\r')) (T.lines src)
     step acc line
       | Just rest <- T.stripPrefix "JOB " line = acc {accJob = unquote rest}
+      | Just rest <- T.stripPrefix "DATE " line = acc {accDate = unquote rest}
       | Just rest <- T.stripPrefix "BEGIN_SAMPLE " line = acc {accCur = Just (readD rest, [])}
       | "END_SAMPLE" `T.isPrefixOf` line = case accCur acc of
           Just (t, bs) -> acc {accCur = Nothing, accDone = (t, bs) : accDone acc}

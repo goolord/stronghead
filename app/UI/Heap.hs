@@ -291,13 +291,13 @@ profileView st loaded hp = do
   cursorT <- readVar (hsCursor st)
   mm <- monoMetrics 0.85
   let ls = stackLayers hp hidden solo topN
-      times = hpTimes hp
+      times = hpOffsets hp
       n = VU.length times
       tEnd = VU.last times
       -- Until the cursor is moved it sits on the peak census: the last one
       -- is often taken as the program exits, with little left alive.
       peakIx = VU.maxIndex (hpTotals hp)
-      cursorIx = maybe peakIx (sampleIndexAt hp) cursorT
+      cursorIx = maybe peakIx (sampleIndexAt hp . (+ hpStart hp)) cursorT
   columnWith (padBottom 8 . tight . fillW) $
     readout
       [ ("breakdown", hpBreakdown hp)
@@ -380,7 +380,7 @@ nearestSample ts t =
 drawChart :: Palette -> MonoMetrics -> HeapProfile -> [Layer] -> Int -> Rect -> Maybe (Float, Float, [Text]) -> CanvasM ()
 drawChart pal mm hp ls cursorIx r hover = do
   let ChartGeom plot@(Rect px py pw ph) _ = chartGeom r
-      times = hpTimes hp
+      times = hpOffsets hp
       tEnd = max 1e-9 (VU.last times)
       ymax = maxStack ls
       sx t = px + realToFrac (t / tEnd) * pw
@@ -452,7 +452,7 @@ atCursor st hp i = do
           (\(_, b) -> Down (if byDelta then abs (bandDelta b i) else bandValues b VU.! i))
           [(k, b) | (k, b) <- zip [0 :: Int ..] (V.toList (hpBands hp)), bandValues b VU.! i > 0 || bandDelta b i /= 0]
   rowWith (tight . gap 10 . fillW) $ do
-    labelWith (alignMid . fontMuted) (fmtSec (hpTimes hp VU.! i) <> ", " <> fmtBytesD total <> " live")
+    labelWith (alignMid . fontMuted) (fmtSec (hpOffset hp i) <> ", " <> fmtBytesD total <> " live")
     flex
     checkboxWith alignMid "Sort by change since the previous census" (hsByDelta st)
   rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
@@ -563,7 +563,7 @@ retentionView st hp i
       openSet <- readVar (hsRetOpen st)
       let tree = retainTree hp i
           rows = flattenTree openSet "" 0 tree
-      hint ("Census at " <> fmtSec (hpTimes hp VU.! i) <> ". Read top-down: who holds (or allocated) the bytes, down to the closures. For exact retainer paths, snapshot the running program with Source: Live graph (ghc-debug).")
+      hint ("Census at " <> fmtSec (hpOffset hp i) <> ". Read top-down: who holds (or allocated) the bytes, down to the closures. For exact retainer paths, snapshot the running program with Source: Live graph (ghc-debug).")
       paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
         forM_ rows $ \(path, depth, node, hasKids, isOpen) -> withKey path $ do
           picked <- selectableRow False id $ do

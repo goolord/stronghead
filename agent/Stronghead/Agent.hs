@@ -136,6 +136,7 @@ renderStats s =
             , ("gc_elapsed_ns", toInteger (gc_elapsed_ns s))
             , ("cpu_ns", toInteger (cpu_ns s))
             , ("elapsed_ns", toInteger (elapsed_ns s))
+            , ("init_elapsed_ns", toInteger (init_elapsed_ns s))
             , ("gc_gen", fromIntegral (gcdetails_gen g))
             , ("gc_live_bytes", toInteger (gcdetails_live_bytes g))
             , ("gc_large_objects_bytes", toInteger (gcdetails_large_objects_bytes g))

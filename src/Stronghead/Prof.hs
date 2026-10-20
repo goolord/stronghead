@@ -15,11 +15,14 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
+import Stronghead.Source (SrcLoc, parseSrcLoc)
 
 data CostCentre = CostCentre
   { ccName :: !Text
   , ccModule :: !Text
   , ccSrc :: !Text
+  , ccLoc :: !SrcLoc
+    -- ^ 'ccSrc' parsed.
   , ccNo :: !Int
   , ccEntries :: !Integer
   , ccTime :: !Double
@@ -73,7 +76,7 @@ row hasSrc l =
         no : entries : it : ia : hT : hA : _ ->
           Just
             ( depth
-            , CostCentre name modu srcLoc (readI no) (readI entries) (readD it) (readD ia) (readD hT) (readD hA) []
+            , CostCentre name modu srcLoc (parseSrcLoc srcLoc) (readI no) (readI entries) (readD it) (readD ia) (readD hT) (readD hA) []
             )
         _ -> Nothing
   where

@@ -23,6 +23,7 @@ import NanoUI
 import Stronghead.Dump (CodeFile (..), CodeKind (..), lineTokens, loadCodeFile)
 import Stronghead.Format (tshow)
 import Stronghead.Ghci
+import Stronghead.Source (SrcSpan (..))
 import System.FilePath (isAbsolute, takeFileName, (</>))
 import UI.Code
 import UI.Common

@@ -57,6 +57,9 @@ library
         Stronghead.Dump
         Stronghead.Ghci
         Stronghead.Live
+        Stronghead.Source
+        Stronghead.Run
+        Stronghead.Ref
         Stronghead.Format
         Stronghead.Debug
         Stronghead.Debug.Graph
@@ -147,6 +150,8 @@ test-suite stronghead-test
     build-depends:
         base >=4.20 && <4.23,
         containers >=0.6 && <0.9,
+        filepath >=1.4 && <1.6,
+        ghc-events >=0.20 && <0.22,
         stronghead,
         text >=2.0 && <2.2,
         vector >=0.13 && <0.14

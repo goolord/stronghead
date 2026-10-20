@@ -33,6 +33,7 @@ module Stronghead.Eventlog.Model
     -- * Timeline
   , Timeline (..)
   , emptyTimeline
+  , CostCentreInfo (..)
   , ThreadInfo (..)
   , GCEvent (..)
   , Marker (..)
@@ -49,6 +50,8 @@ module Stronghead.Eventlog.Model
   , threadName
   ) where
 
+import Data.IntMap.Strict (IntMap)
+import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Text (Text)
@@ -58,6 +61,8 @@ import Data.Word (Word32, Word64, Word8)
 import GHC.RTS.Events (ThreadStopStatus (..))
 import Stronghead.Format (tshow)
 import Stronghead.HeapProfile (HeapProfile)
+import Stronghead.Run (RunInfo, emptyRunInfo)
+import Stronghead.Source (SrcLoc)
 
 -- ---------------------------------------------------------------------------
 -- Spans
@@ -357,12 +362,25 @@ data Timeline = Timeline
   , tlMarkers :: !(V.Vector Marker)
   , tlHeapProfile :: !(Maybe HeapProfile)
   , tlInfo :: ![(Text, Text)]
+  , tlRun :: !RunInfo
+  , tlCostCentres :: !(IntMap CostCentreInfo)
+    -- ^ By id, from a profiled program's @HeapProfCostCentre@ events.
   , tlEventCount :: !Int
   }
   deriving (Show)
 
 emptyTimeline :: Timeline
-emptyTimeline = Timeline 0 0 V.empty V.empty M.empty V.empty VU.empty VU.empty VU.empty V.empty Nothing [] 0
+emptyTimeline = Timeline 0 0 V.empty V.empty M.empty V.empty VU.empty VU.empty VU.empty V.empty Nothing [] emptyRunInfo IM.empty 0
+
+-- | A cost centre as the eventlog defines it.
+data CostCentreInfo = CostCentreInfo
+  { cciId :: !Int
+  , cciLabel :: !Text
+  , cciModule :: !Text
+  , cciSrc :: !SrcLoc
+  , cciCaf :: !Bool
+  }
+  deriving (Eq, Show)
 
 data Summary = Summary
   { smDuration :: !Double

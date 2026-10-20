@@ -12,8 +12,6 @@ module Stronghead.Ghci
   , stopGhci
   , ghciAlive
     -- * Output parsing
-  , SrcSpan (..)
-  , parseSrcSpan
   , StopInfo (..)
   , parseStop
   , parseBreakpointSet
@@ -34,6 +32,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Text.Read qualified as TR
+import Stronghead.Source (SrcSpan, parseSrcSpan)
 import System.IO
 import System.Process
 
@@ -137,45 +136,6 @@ haskellString = T.pack . show . T.unpack
 
 -- ---------------------------------------------------------------------------
 -- Parsing
-
-data SrcSpan = SrcSpan
-  { ssFile :: !Text
-  , ssLine :: !Int
-  , ssCol :: !Int
-  , ssEndLine :: !Int
-  , ssEndCol :: !Int
-  }
-  deriving (Eq, Show)
-
--- | @file:12:3-20@, @file:12:3@, or @file:(12,3)-(14,5)@.
-parseSrcSpan :: Text -> Maybe SrcSpan
-parseSrcSpan t0 =
-  let t = T.strip t0
-   in case T.breakOnEnd ":(" t of
-        (pre, rest)
-          | not (T.null pre) -> do
-              let file = T.dropEnd 2 pre
-              (l1, r1) <- num rest
-              (c1, r2) <- num (T.drop 1 r1)
-              let r3 = T.drop 3 r2 -- ")-("
-              (l2, r4) <- num r3
-              (c2, _) <- num (T.drop 1 r4)
-              pure (SrcSpan file l1 c1 l2 c2)
-        _ -> simple t
-  where
-    num s = either (const Nothing) Just (TR.decimal s)
-    simple t =
-      -- Split from the right: the file may contain ':' (C:\...).
-      let parts = T.splitOn ":" t
-       in case reverse parts of
-            colPart : linePart : fileParts@(_ : _) -> do
-              (l, _) <- num linePart
-              (c1, rest) <- num colPart
-              let c2 = case T.stripPrefix "-" rest of
-                    Just more -> maybe c1 fst (num more)
-                    Nothing -> c1
-              pure (SrcSpan (T.intercalate ":" (reverse fileParts)) l c1 l c2)
-            _ -> Nothing
 
 data StopInfo = StopInfo
   { stName :: !Text
