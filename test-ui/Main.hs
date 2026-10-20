@@ -1,10 +1,13 @@
 -- | The links between panels ("UI.Link"), driven headlessly through
 -- nano-ui's test harness: clicks, Ctrl+clicks, right-click menus, peeks and
--- history, against stub lenses that record what they were asked to do.
+-- history, against stub lenses that record what they were asked to do; and
+-- the shared clock ("UI.Clock"): the cursor and range a time view sets on
+-- the bus, and a snapping cursor kept in step with them.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (unless, void, when)
+import Data.Foldable (for_)
 import Data.IORef
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -14,6 +17,8 @@ import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
 import Stronghead.Ref
 import System.Exit (exitFailure)
+import UI.Clock
+import UI.Common (TimeView (..))
 import UI.Link
 import UI.Palette
 
@@ -64,6 +69,34 @@ view w = do
   paletteView env (wPalette w) [Hit "command" "Do nothing" "" (HitRun (record "nothing"))]
   publishHover (wBus w)
   pure clicked
+
+-- | A time view of one second of run @prog:1@, 400 pixels wide, that
+-- scrubs, with a cursor of its own that snaps to "censuses" every 100 ms.
+data Clock = Clock
+  { cBus :: !Bus
+  , cTether :: !(Tether Int)
+  , cCensus :: !(Var (Maybe Int))
+  , cSteps :: !(IORef [Int])
+  , cGo :: !(IORef (Maybe Ref))
+  , cRect :: !(IORef Rect)
+  }
+
+run :: RunKey
+run = RunKey "prog:1"
+
+clockView :: Clock -> NanoUI ()
+clockView c = do
+  let timeline = (lens PTimeline) {lensShows = \case RInstant {} -> True; RRange {} -> True; _ -> False}
+      env = Env (cBus c) [timeline] PHeap (\_ -> pure ())
+  go <- liftIO (atomicModifyIORef' (cGo c) (Nothing,))
+  for_ go (goTo env)
+  resp <- canvasConfigured defaultCanvasConfig {canvasLayout = fixedWH 400 100 defaultLayout, canvasTrackPointer = True} (\_ -> pure ())
+  let r = respRect resp
+  liftIO (writeIORef (cRect c) r)
+  _ <- timeGestures env (linearAxis run (TimeView 0 1e9) (rectX r) (rectW r)) resp ScrubDrag
+  tether (cBus c) (cTether c) run (cCensus c) (\t -> Just (round (fromIntegral t / 1e8 :: Double))) (\i -> Just (fromIntegral i * 100000000))
+  (dir, _) <- stepKeys
+  when (dir /= 0) (liftIO (modifyIORef' (cSteps c) (dir :)))
 
 main :: IO ()
 main = do
@@ -167,6 +200,46 @@ main = do
   check "Enter goes to it" . (== ["timeline thread/prog:1/7"]) =<< logged
   check "in its panel" . (== PTimeline) =<< tab
   check "and closes the palette" . not =<< readVarIO (plOpen (wPalette w))
+
+  putStrLn "the shared clock"
+  cctx <- newContext
+  c <- Clock <$> newBus <*> newTether <*> newVar Nothing <*> newIORef [] <*> newIORef Nothing <*> newIORef (Rect 0 0 0 0)
+  let cframe inp = evalUi cctx inp (clockView c)
+      shifted inp = inp {inputModifiers = (inputModifiers inp) {modShift = True}}
+      cursor = readVarIO (busCursor (cBus c))
+      range = readVarIO (busRange (cBus c))
+  warmup cctx inp0 (clockView c)
+  Rect x y _ h <- readIORef (cRect c)
+  let at px = V2 (x + px) (y + h / 2)
+      (p1, r1) = clickPair inp0 (at 130)
+  mapM_ cframe [p1, r1, inp0]
+  -- Pointer positions are floats: a time is good to well under a pixel.
+  let near a b = abs (fromIntegral a - fromIntegral b :: Double) < 1e5
+  check "a click moves the cursor to its time" . maybe False (\(r, t) -> r == run && near t (325000000 :: Int)) =<< cursor
+  check "a snapping view takes it up, snapped" . (== Just 3) =<< readVarIO (cCensus c)
+  writeVarIO (cCensus c) (Just 7)
+  _ <- cframe inp0
+  check "moving the view's own cursor moves the shared one" . (== Just (run, 700000000)) =<< cursor
+  writeVarIO (busCursor (cBus c)) (Just (RunKey "other:2", 5))
+  _ <- cframe inp0
+  check "a cursor from another run is left alone" . (== Just 7) =<< readVarIO (cCensus c)
+  let press = shifted (pressAt inp0 (at 40))
+      hold = holdAt press (at 200)
+  mapM_ cframe [press, hold, releaseAt hold, inp0]
+  check "Shift+drag selects a range" . maybe False (\(r, a, b) -> r == run && near a (100000000 :: Int) && near b (500000000 :: Int)) =<< range
+  check "without moving the cursor" . (== Just (RunKey "other:2", 5)) =<< cursor
+  let (sp, sr) = clickPair (shifted inp0) (at 300)
+  mapM_ cframe [sp, sr, inp0]
+  check "Shift+click clears it" . (== Nothing) =<< range
+  writeIORef (cGo c) (Just (RInstant run 42))
+  _ <- cframe inp0
+  check "going to an instant moves the cursor there" . (== Just (run, 42)) =<< cursor
+  writeIORef (cGo c) (Just (RRange run 10 20))
+  _ <- cframe inp0
+  check "going to a range selects it" . (== Just (run, 10, 20)) =<< range
+  _ <- cframe (keyInp (KeyChar ']') inp0)
+  _ <- cframe (keyInp (KeyChar '[') inp0)
+  check "[ and ] step" . (== [-1, 1]) =<< readIORef (cSteps c)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

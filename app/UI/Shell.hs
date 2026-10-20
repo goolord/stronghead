@@ -42,11 +42,11 @@ import UI.Timeline
 -- | How to drive the panel, for the status bar.
 panelHint :: Panel -> T.Text
 panelHint = \case
-  PTimeline -> "Wheel to zoom, drag to pan, double-click to fit"
-  PHeap -> "Drag across the chart to move the census cursor"
+  PTimeline -> "Wheel to zoom, drag to pan, click or drag the ruler for the cursor, Shift+drag for a range, [ ] step collections"
+  PHeap -> "Drag the chart to move the cursor, wheel to zoom, drag the time axis to pan, Shift+drag for a range, [ ] step censuses"
   PCore -> "Hover a name to find it in every pane, click it to jump to its binding"
   PDebugger -> "Click the gutter to set or clear a breakpoint"
-  PLive -> "Samples arrive four times a second"
+  PLive -> "Click or drag a chart to move the cursor, Shift+drag for a range; samples arrive four times a second"
 
 tabNamed :: T.Text -> Panel
 tabNamed = fromMaybe PTimeline . panelNamed
@@ -244,7 +244,10 @@ appView app = do
   core <- coreLoad (appCore app)
   debugSrc <- debugLoad (appDebug app)
   live <- liveLoad (appLive app)
-  let logProfile = timeline >>= lpTimeline >>= tlHeapProfile
+  let logTl = timeline >>= lpTimeline
+      logProfile = logTl >>= tlHeapProfile
+  timelineSync (appBus app) (appTimeline app) timeline
+  heapSync (appBus app) (appHeap app) heap logTl (maybe False lpFollowing timeline)
 
   active <- readVar (appTab app)
   heapL <- heapLens (appHeap app) heap logProfile
@@ -253,7 +256,7 @@ appView app = do
   let env =
         Env
           { envBus = appBus app
-          , envLenses = [timelineLens (appTimeline app) timeline, heapL, coreL, debugL, liveLens (appLive app) live]
+          , envLenses = [timelineLens (appBus app) (writeVar (appTab app) PTimeline) (appTimeline app) timeline, heapL, coreL, debugL, liveLens (appLive app) live]
           , envPanel = active
           , envSwitch = writeVar (appTab app)
           }
@@ -274,10 +277,10 @@ appView app = do
         themed th $ whenM (toolButton "Open…") (askOpen app)
     columnWith (tight . grow . gap 0) . withKey (fromEnum active) $ case active of
       PTimeline -> timelineView env (appTimeline app) timeline
-      PHeap -> heapView env (appHeap app) heap logProfile
+      PHeap -> heapView env (appHeap app) heap logTl
       PCore -> coreView env (appCore app) core
       PDebugger -> debugView env (appDebug app) debugSrc
-      PLive -> liveView env (appLive app) live $ \p -> do
+      PLive -> liveView env (appLive app) live logTl $ \p -> do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
     statusBar app env active timeline live

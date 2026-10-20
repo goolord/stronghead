@@ -47,6 +47,27 @@ Time-keyed links (a thread, a census, an instant) join artifacts from the
 same run, matched by program name and pid. Code-keyed links (a binding, a
 source line) join across runs.
 
+### One clock
+
+The Timeline, the heap chart and Live's charts share one cursor and one
+range in program time, for every view of the same run.
+
+- **Moving the cursor anywhere moves it everywhere.** Click the Timeline or
+  drag its ruler, drag the heap chart, or click or drag a Live chart. The
+  heap chart snaps it to the nearest census. **[** and **]** step it through
+  collections on the Timeline (with Shift, censuses) and censuses on the
+  heap chart.
+- **Shift+drag** on any of them selects a range, and every other view of the
+  run shades it; Shift+click clears it. **Analyse range** in the Timeline's
+  inspector, or on a range's right-click menu, lists the collections and
+  pauses, allocation, the threads that ran, heap growth, censuses and
+  markers inside it, all as links.
+- `traceMarkerIO` markers show on every time axis of the run.
+- A `.hp` file keeps its own clock, which is not elapsed time. When an
+  eventlog of the same run is loaded, its censuses are paired with the
+  eventlog's by their totals and put on program time; otherwise the heap
+  chart says its times are approximate.
+
 ## Panels
 
 ### Timeline (eventlog)
@@ -63,15 +84,22 @@ with a progress bar) and **follows a log the program is still writing**.
 - One row per Haskell thread: running, **blocked** (red, with the reason: MVar,
   STM, black hole and its owner, foreign call, throwTo ...) and runnable.
 - `traceMarkerIO` markers run through every track; `traceEventIO` messages are
-  ticks on the ruler.
+  ticks on the ruler. The **Markers** pane lists them, with a filter, as
+  links that move the cursor.
+- Ticks on the heap strip mark the heap censuses. A collection's inspector
+  links to the heap after it, and a census offers the collection it
+  followed.
 - Click any slice for the inspector: thread, label, duration, why it stopped,
   the process allocation rate during the slice, the thread's whole history
-  (time running, time off-CPU by reason, capabilities). With nothing selected
-  the inspector lists the longest GC pauses and the most-blocked threads.
+  (time running, time off-CPU by reason, capabilities). A blocked span says
+  **who woke it**: the thread running on the capability that posted the
+  wakeup. With nothing selected the inspector lists the longest GC pauses
+  and the most-blocked threads, the cursor and the selected range.
 
-Wheel zooms around the pointer, drag pans, double-click fits. Each track keeps
-prefix sums of time per span kind, so a zoomed-out pixel column is two binary
-searches however many spans it covers.
+Wheel zooms around the pointer, drag pans, double-click fits. A click also
+moves the shared cursor; drag the ruler to scrub it, and Shift+drag to select
+a range. Each track keeps prefix sums of time per span kind, so a zoomed-out
+pixel column is two binary searches however many spans it covers.
 
 ### Heap & leaks
 
@@ -79,7 +107,12 @@ Heap profiles from either the eventlog's heap samples (`+RTS -l -hT`, `-hi`,
 ...) or a `.hp` file, plus `.prof` cost-centre profiles.
 
 - Stacked residency bands over time, with a legend to hide or solo bands and a
-  scrub cursor.
+  census cursor, which is the shared cursor snapped to a census. Drag the
+  chart to move it, wheel to zoom, drag the time axis below the chart to pan
+  (double-click it to fit), and Shift+drag to select a range. **Lock to
+  Timeline** shows the Timeline's window and pans and zooms it. While an
+  eventlog is followed, the cursor stays on the newest census until you move
+  it. A `.hp` file is read again as it grows.
 - **At cursor**: every band at a census, sortable by size or by change since
   the previous census.
 - **Leak suspects**: bands ranked by how leak-like their curve is (steady
@@ -211,9 +244,12 @@ main = withAgent defaultAgentConfig $ do
 Build it `-threaded` and run it with `+RTS -T`. The agent listens on
 `127.0.0.1:4777` and streams RTS statistics and the live thread list (labels
 and blocking status) four times a second. The panel charts allocation rate,
-live bytes, GC pauses and thread count. If the program also writes an eventlog
-(`+RTS -l -ol<file>`), the agent flushes it on the same cadence, and
-**Follow in Timeline** (or `--follow`) tails it live.
+live bytes, GC pauses and thread count on program time. If the program also
+writes an eventlog (`+RTS -l -ol<file>`), the agent flushes it on the same
+cadence, and **Follow in Timeline** (or `--follow`) tails it live. The
+charts then show the eventlog's markers and the shared cursor and range: a
+click or drag on a chart moves the cursor, and Shift+drag selects that range
+in the Timeline.
 
 ## Try it
 

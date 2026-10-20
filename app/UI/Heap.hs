@@ -4,11 +4,17 @@
 -- cost-centre tree from a @.prof@ file. With the @ghc-debug@ build flag it
 -- can also snapshot a running program's closure graph and show exact
 -- retainer paths and thunks that survive between snapshots.
+--
+-- The chart is a time view ("UI.Clock"): its census cursor follows the
+-- shared cursor of the same run and moves it, and it shows the run's
+-- markers and the shared range. Drag moves the cursor, the wheel zooms,
+-- dragging the time axis pans and Shift+drag selects a range.
 module UI.Heap
   ( HeapState (..)
   , HeapSource (..)
   , newHeapState
   , heapLoad
+  , heapSync
   , heapView
   , openHp
   , openProf
@@ -16,8 +22,9 @@ module UI.Heap
   , heapLens
   ) where
 
-import Control.Exception (displayException)
-import Control.Monad (forM_, unless, when)
+import Control.Concurrent (threadDelay)
+import Control.Exception (IOException, displayException, try)
+import Control.Monad (forM_, join, unless, when)
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
@@ -34,15 +41,19 @@ import Data.Word (Word64)
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
+import Stronghead.Clock
 import Stronghead.Debug
 import Stronghead.Dump (nameKey)
+import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Format
 import Stronghead.HeapProfile
 import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run (runFromSocket, runKey, runKeysMatch)
 import Stronghead.Source (parseSrcLoc, renderSrcSpan, srcLocSpan)
+import System.Directory (getFileSize)
 import System.FilePath (takeFileName)
+import UI.Clock
 import UI.Common
 import UI.Link
 
@@ -85,11 +96,28 @@ data HeapState = HeapState
   { hsSource :: !(Var HeapSource)
   , hsHpPath :: !(Var (Maybe FilePath))
   , hsProfPath :: !(Var (Maybe FilePath))
-  , hsHpTask :: !(Task FilePath (Either String HeapProfile))
+  , hsHpTask :: !(Task (FilePath, Integer) (Either String HeapProfile))
+    -- ^ Keyed by the file's size, so a profile still being written is read
+    -- again as it grows.
+  , hsHpWatch :: !(Stream FilePath (Maybe Integer))
   , hsProfTask :: !(Task FilePath (Either String ProfFile))
   , hsHidden :: !(Var (Set Text))
   , hsSolo :: !(Var (Maybe Text))
   , hsCursor :: !(Var (Maybe Double))
+    -- ^ The census the cursor is on, as its offset ('hpOffset'). 'Nothing':
+    -- the peak census, or the newest while following.
+  , hsView :: !(Var (Maybe TimeView))
+    -- ^ The chart's window on the profile's own clock, in ns. 'Nothing'
+    -- fits the profile.
+  , hsLock :: !(Var Bool)
+    -- ^ Show the Timeline's window instead.
+  , hsPanning :: !(Var Bool)
+    -- ^ A drag that began on the time axis.
+  , hsTether :: !(Tether Double)
+  , hsTracking :: !(Var Bool)
+    -- ^ While following an eventlog, the cursor stays on the newest census
+    -- until it is moved.
+  , hsFollowing :: !(Var Bool)
   , hsTab :: !(Var HeapTab)
   , hsTopN :: !(Var Float)
   , hsHpDialog :: !(Var (Maybe FileDialogId))
@@ -132,10 +160,17 @@ newHeapState = do
   hsHpPath <- newVar Nothing
   hsProfPath <- newVar Nothing
   hsHpTask <- newTask
+  hsHpWatch <- newStream
   hsProfTask <- newTask
   hsHidden <- newVar S.empty
   hsSolo <- newVar Nothing
   hsCursor <- newVar Nothing
+  hsView <- newVar Nothing
+  hsLock <- newVar False
+  hsPanning <- newVar False
+  hsTether <- newTether
+  hsTracking <- newVar True
+  hsFollowing <- newVar False
   hsTab <- newVar AtCursor
   hsTopN <- newVar 12
   hsHpDialog <- newVar Nothing
@@ -176,6 +211,7 @@ openHp st p = do
   writeVar (hsHpPath st) (Just p)
   writeVar (hsSource st) FromHpFile
   writeVar (hsCursor st) Nothing
+  writeVar (hsView st) Nothing
   writeVar (hsHidden st) S.empty
   writeVar (hsSolo st) Nothing
 
@@ -197,7 +233,11 @@ heapLoad st = do
   hp <- readVar (hsHpPath st)
   prof <- readVar (hsProfPath st)
   req <- readVar (hsDbgReq st)
-  hlHp <- traverse (\p -> useTaskStatus (hsHpTask st) p (loadHp p)) hp
+  -- A .hp file is written a census at a time; read it again when it grows.
+  size <- scope $ traverse (\p -> useStream (hsHpWatch st) p Nothing (\update -> watchSize p (update . const))) hp
+  hlHp <- scope $ case (hp, join size) of
+    (Just p, Just n) -> Just <$> useTaskStatus (hsHpTask st) (p, n) (loadHp p)
+    _ -> pure Nothing
   hlProf <- traverse (\p -> useTaskStatus (hsProfTask st) p (loadProf p)) prof
   hlSnap <- traverse (\r@(_, target, opts) -> useTaskStatus (hsDbgTask st) r (takeSnapshot opts target)) req
   case (req, hlSnap) of
@@ -216,6 +256,18 @@ heapLoad st = do
     _ -> pure ()
   pure HeapLoaded {..}
 
+-- | Report a file's size when it changes, checking once a second; -1 when
+-- it can't be read. Never returns.
+watchSize :: FilePath -> (Maybe Integer -> IO ()) -> IO ()
+watchSize p report = go Nothing
+  where
+    go prev = do
+      r <- try (getFileSize p)
+      let now = Just (either (\(_ :: IOException) -> -1) id r)
+      when (now /= prev) (report now)
+      threadDelay 1000000
+      go now
+
 done :: Maybe (TaskStatus (Either String a)) -> Maybe (Either String a)
 done = \case
   Just (TaskDone r) -> Just r
@@ -223,8 +275,9 @@ done = \case
   Just (TaskFailed e _) -> Just (Left (show e))
   _ -> Nothing
 
-heapView :: Env -> HeapState -> HeapLoaded -> Maybe HeapProfile -> NanoUI ()
-heapView env st loaded fromLog = columnWith (tight . gap 0 . grow) $ do
+heapView :: Env -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
+heapView env st loaded logTl = columnWith (tight . gap 0 . grow) $ do
+  let fromLog = logTl >>= tlHeapProfile
   useFileDialog (hsHpDialog st) $ \case
     p : _ -> openHp st p
     [] -> pure ()
@@ -265,7 +318,7 @@ heapView env st loaded fromLog = columnWith (tight . gap 0 . grow) $ do
         else emptyState title body commands
     Right hp
       | VU.null (hpTimes hp) -> scope (emptyState "The heap profile has no samples" ["The program may have exited before the first census. Take censuses more often with -i0.05."] [])
-      | otherwise -> scope (profileView env st loaded hp)
+      | otherwise -> scope (profileView env st loaded logTl hp)
 
 -- ---------------------------------------------------------------------------
 -- The stacked chart
@@ -288,30 +341,116 @@ stackLayers hp hidden solo topN =
    in [Layer (bandName b) (bandColor i (bandName b)) (bandValues b) | (i, b) <- top]
         ++ [Layer ("(" <> tshow (length rest) <> " more)") (colorRGB 140 140 140) other | not (null rest)]
 
-profileView :: Env -> HeapState -> HeapLoaded -> HeapProfile -> NanoUI ()
-profileView env st loaded hp = do
+-- | The profile on show: the @.hp@ file's, or else the eventlog's.
+shownProfile :: HeapSource -> HeapLoaded -> Maybe HeapProfile -> Maybe HeapProfile
+shownProfile source loaded fromLog = case source of
+  FromHpFile -> case done (hlHp loaded) of
+    Just (Right hp) -> Just hp
+    _ -> Nothing
+  _ -> fromLog
+
+-- | The profile's clock against program time. The eventlog's samples are
+-- on it. A @.hp@ file's censuses are paired with the eventlog's by their
+-- totals when both come from one run; on its own a @.hp@ file's clock only
+-- stands in for program time (spike V3).
+profileClock :: HeapSource -> HeapProfile -> Maybe HeapProfile -> ClockMap
+profileClock source hp fromLog = case fromLog of
+  _ | source /= FromHpFile -> secondsClock True
+  Just lp
+    | runKeysMatch (runKey (hpRun hp)) (runKey (hpRun lp))
+    , pairs@(_ : _) <- pairByTotals (hpTotals hp) (hpTotals lp) ->
+        pairedClock [(hpTimes hp VU.! i, hpTimes lp VU.! j * 1e9) | (i, j) <- pairs]
+  _ -> secondsClock False
+
+-- | The run the chart's moments belong to: the eventlog's, when a @.hp@
+-- file is paired with it.
+profileRun :: HeapSource -> HeapProfile -> Maybe HeapProfile -> ClockMap -> RunKey
+profileRun source hp fromLog clock = case fromLog of
+  Just lp | source == FromHpFile, cmExact clock -> runKey (hpRun lp)
+  _ -> runKey (hpRun hp)
+
+-- | Keep the census cursor in step with the shared cursor of the run, and,
+-- while an eventlog is followed, on the newest census until it is moved.
+-- Called every frame, whatever is showing.
+heapSync :: Bus -> HeapState -> HeapLoaded -> Maybe Timeline -> Bool -> NanoUI ()
+heapSync bus st loaded logTl following = do
+  source <- readVar (hsSource st)
+  wasFollowing <- readVar (hsFollowing st)
+  when (following /= wasFollowing) $ do
+    writeVar (hsFollowing st) following
+    when following (writeVar (hsTracking st) True)
+  let fromLog = logTl >>= tlHeapProfile
+  for_ (shownProfile source loaded fromLog) $ \hp -> unless (VU.null (hpTimes hp)) $ do
+    let clock = profileClock source hp fromLog
+        offsets = hpOffsets hp
+        newest = VU.last offsets
+        tracks = following && source == FromEventlog
+    tracking <- readVar (hsTracking st)
+    cur <- readVar (hsCursor st)
+    when (tracks && tracking && cur /= Just newest) (writeVar (hsCursor st) (Just newest))
+    tether
+      bus
+      (hsTether st)
+      (profileRun source hp fromLog clock)
+      (hsCursor st)
+      (\t -> Just (offsets VU.! nearestIndex (hpTimes hp) (fromProgramNs clock (fromIntegral t))))
+      (\o -> Just (round (max 0 (toProgramNs clock (hpTimes hp VU.! nearestIndex offsets o)))))
+    after <- readVar (hsCursor st)
+    when (tracks && tracking && after /= Just newest) (writeVar (hsTracking st) False)
+
+profileView :: Env -> HeapState -> HeapLoaded -> Maybe Timeline -> HeapProfile -> NanoUI ()
+profileView env st loaded logTl hp = do
   th <- uiTheme
   let pal = palette th
+      bus = envBus env
   hidden <- readVar (hsHidden st)
   solo <- readVar (hsSolo st)
   topN <- round <$> readVar (hsTopN st)
   cursorT <- readVar (hsCursor st)
+  source <- readVar (hsSource st)
+  following <- readVar (hsFollowing st)
+  tracking <- readVar (hsTracking st)
+  locked <- readVar (hsLock st)
+  own <- readVar (hsView st)
+  window <- readVar (busWindow bus)
   mm <- monoMetrics 0.85
   let ls = stackLayers hp hidden solo topN
       times = hpOffsets hp
       n = VU.length times
       tEnd = VU.last times
+      fromLog = logTl >>= tlHeapProfile
+      clock = profileClock source hp fromLog
+      rk = profileRun source hp fromLog clock
       -- Until the cursor is moved it sits on the peak census: the last one
       -- is often taken as the program exits, with little left alive.
       peakIx = VU.maxIndex (hpTotals hp)
-      cursorIx = maybe peakIx (sampleIndexAt hp . (+ hpStart hp)) cursorT
+      cursorIx = maybe peakIx (nearestIndex times) cursorT
+      approx = if cmExact clock then "" else " (approx.)"
+      -- The chart's window, on the profile's clock in ns.
+      -- A little room after the last census, so a cursor on it shows.
+      lo = hpStart hp * 1e9
+      hi = let end = VU.last (hpTimes hp) * 1e9 in max (lo + 1e6) (end + 0.015 * (end - lo))
+      fromProg p = fromProgramNs clock p * 1e9
+      toProg x = toProgramNs clock (x / 1e9)
+      lockable = maybe False (runKeysMatch rk . fst) window
+      lockedTo = case window of
+        Just (r, w) | locked, runKeysMatch r rk -> Just (r, TimeView (fromProg (tvStart w)) (fromProg (tvEnd w)))
+        _ -> Nothing
+      v = maybe (maybe (TimeView lo hi) (clampView lo hi) own) snd lockedTo
+      setView v' = case lockedTo of
+        Just (r, _) -> writeVar (busWindow bus) (Just (r, TimeView (toProg (tvStart v')) (toProg (tvEnd v'))))
+        Nothing -> writeVar (hsView st) (Just (clampView lo hi v'))
+      fitView = case lockedTo of
+        Just (r, _) -> writeVar (busWindow bus) (Just (r, TimeView (toProg lo) (toProg hi)))
+        Nothing -> writeVar (hsView st) Nothing
+  stepCensus st hp v cursorIx
   columnWith (padBottom 8 . tight . fillW) $
     readout
       [ ("breakdown", hpBreakdown hp)
       , ("censuses", tshow n)
       , ("profiled", fmtSec tEnd)
       , ("peak total", fmtBytesD (VU.maximum (hpTotals hp)))
-      , ("cursor at", fmtSec (times VU.! cursorIx))
+      , ("cursor at" <> approx, fmtSec (times VU.! cursorIx))
       , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx))
       ]
   tab <- readVar (hsTab st)
@@ -319,36 +458,66 @@ profileView env st loaded hp = do
     if
       | pid == paneChart -> do
           let actions = do
-                paneMeta "Drag across to move the census cursor"
+                paneMeta $
+                  if
+                    | source /= FromHpFile -> "Program time"
+                    | cmExact clock -> "Program time, paired with the eventlog's censuses"
+                    | otherwise -> "Approximate: a .hp file keeps its own clock"
+                scope $ when (following && source == FromEventlog) $
+                  if tracking
+                    then paneMeta "· following the newest census"
+                    else whenM (buttonWith (alignMid . padXY 8 2 . tight) "Follow the latest") (writeVar (hsTracking st) True)
                 flex
                 scope $ for_ solo $ \s -> whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
                 scope $ unless (S.null hidden) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show all bands") (writeVar (hsHidden st) S.empty)
+                scope $ when (isJust own && isNothing lockedTo) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Fit") fitView
+                disabledWhen (not lockable) $ checkboxWith alignMid "Lock to Timeline" (hsLock st)
                 labelWith (alignMid . fontMuted . fontSizeScale 0.85) ("Top " <> tshow topN <> " bands")
                 sliderWith (alignMid . fixedW 110) 3 30 (hsTopN st)
           paneWith (padAll 8) ctx "Residency" actions $ do
-            mouse <- uiMousePos
+            inp <- askInput
+            let mouse = inputMousePos inp
+                mods = inputModifiers inp
             sid <- currentId
             prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
-            let geom = chartGeom prev
-                hoverT = if rectContains (cgPlot geom) mouse then Just (cgTime geom tEnd (v2X mouse)) else Nothing
+            let plot0 = chartPlot prev
                 hoverLines = do
-                  t <- hoverT
-                  let i = nearestSample times t
+                  guard' (rectContains plot0 mouse)
+                  let i = nearestIndex (hpTimes hp) (xToTime v (rectX plot0) (rectW plot0) (v2X mouse) / 1e9)
                       stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
                       ymax = maxStack ls
-                      bytesAtMouse = (1 - (v2Y mouse - rectY (cgPlot geom)) / rectH (cgPlot geom)) * realToFrac ymax
+                      bytesAtMouse = (1 - (v2Y mouse - rectY plot0) / rectH plot0) * realToFrac ymax
                       under = [l | (l, lo', hi') <- zip3 ls stackAt (drop 1 stackAt), realToFrac bytesAtMouse >= lo', realToFrac bytesAtMouse < hi']
                   pure $
-                    ("t = " <> fmtSec (times VU.! i) <> ", total " <> fmtBytesD (hpTotals hp VU.! i))
+                    ("t = " <> fmtSec (times VU.! i) <> approx <> ", total " <> fmtBytesD (hpTotals hp VU.! i))
                       : [lyName l <> ": " <> fmtBytesD (lyValues l VU.! i) | l <- take 1 under]
+            marks <- marksFor env rk logTl
             resp <-
               canvasConfigured
                 defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
-                (\r -> drawChart pal mm hp ls cursorIx r (hoverT >> fmap (v2X mouse,v2Y mouse,) hoverLines))
-            canvasLinks env resp (chartRefAt hp ls (respRect resp))
+                (\r -> drawChart pal mm hp ls v cursorIx (chartAxis rk clock v (chartPlot r)) marks {tmCursor = Nothing} r (fmap (v2X mouse,v2Y mouse,) hoverLines))
+            let plot@(Rect px py pw ph) = chartPlot (respRect resp)
+                onAxis = v2Y mouse >= py + ph && v2X mouse >= px && v2X mouse <= px + pw
+            canvasLinks env resp (chartRefAt hp ls v (respRect resp))
+            -- Shift+drag selects a range; a drag that starts on the time
+            -- axis pans; any other drag moves the cursor; the wheel zooms.
+            brushing <- timeGestures env (chartAxis rk clock v plot) resp ScrubNone
+            panning <- readVar (hsPanning st)
+            let panNow
+                  | respHovered resp && pressedIn MouseLeft inp = onAxis && not (modShift mods) && not (modCtrl mods)
+                  | otherwise = panning && heldIn MouseLeft inp
+            when (panNow /= panning) (writeVar (hsPanning st) panNow)
+            (wx, wy) <- useWheelDeltaOn resp
+            when (wy /= 0) $ setView (zoomAround (0.8 ** realToFrac wy) (xToTime v px pw (v2X mouse)) v)
+            when (wx /= 0) $ let d = realToFrac wx * viewWidth v * 0.1 in setView (TimeView (tvStart v - d) (tvEnd v - d))
             drag <- useDrag2DOn resp
-            when (dragActive drag) $
-              writeVar (hsCursor st) (Just (cgTime (chartGeom (respRect resp)) tEnd (v2X (dragPosition drag))))
+            let dx = v2X (dragDelta drag)
+            when (panNow && dragActive drag && dx /= 0) $
+              let d = realToFrac dx / realToFrac pw * viewWidth v in setView (TimeView (tvStart v - d) (tvEnd v - d))
+            when (respHovered resp && pressedIn MouseLeft inp && inputMouseClicks inp >= 2 && onAxis) fitView
+            when (dragActive drag && not panNow && not brushing && not (modCtrl mods) && not (modShift mods)) $ do
+              let i = nearestIndex (hpTimes hp) (xToTime v px pw (v2X (dragPosition drag)) / 1e9)
+              when (cursorT /= Just (times VU.! i)) $ writeVar (hsCursor st) (Just (times VU.! i))
       | pid == paneLegend ->
           paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)))) (legend env st hp hidden solo)
       | otherwise -> do
@@ -361,6 +530,21 @@ profileView env st loaded hp = do
             Leaks -> leakView env st hp
             Retention -> retentionView env st hp cursorIx
             CostCentres -> costCentreTree env st (done (hlProf loaded))
+  where
+    guard' c = if c then Just () else Nothing
+
+-- | @[@ and @]@ move the cursor to the previous or next census; the chart
+-- follows it when it leaves the window.
+stepCensus :: HeapState -> HeapProfile -> TimeView -> Int -> NanoUI ()
+stepCensus st hp v i = do
+  (dir, _) <- stepKeys
+  let j = max 0 (min (VU.length (hpTimes hp) - 1) (i + dir))
+      t = hpTimes hp VU.! j * 1e9
+  when (dir /= 0 && j /= i) $ do
+    writeVar (hsCursor st) (Just (hpOffset hp j))
+    own <- readVar (hsView st)
+    for_ own $ \_ -> unless (t >= tvStart v && t <= tvEnd v) $
+      writeVar (hsView st) (Just (TimeView (t - viewWidth v / 2) (t + viewWidth v / 2)))
 
 analysisTitle :: HeapTab -> Text
 analysisTitle = \case
@@ -369,26 +553,27 @@ analysisTitle = \case
   Retention -> "Retention tree"
   CostCentres -> "Cost centres"
 
-data ChartGeom = ChartGeom {cgPlot :: !Rect, cgTime :: Double -> Float -> Double}
+-- | The plot inside the chart canvas: room on the left for the bytes axis
+-- and below for the time axis.
+chartPlot :: Rect -> Rect
+chartPlot (Rect x y w h) = Rect (x + 72) (y + 8) (max 10 (w - 80)) (max 10 (h - 30))
 
-chartGeom :: Rect -> ChartGeom
-chartGeom (Rect x y w h) =
-  let plot = Rect (x + 72) (y + 8) (max 10 (w - 80)) (max 10 (h - 30))
-   in ChartGeom plot (\tEnd px -> max 0 (min tEnd (realToFrac ((px - rectX plot) / rectW plot) * tEnd)))
+-- | Program time across the plot, through the profile's clock.
+chartAxis :: RunKey -> ClockMap -> TimeView -> Rect -> Axis
+chartAxis rk clock v (Rect px _ pw _) =
+  Axis rk (\p -> timeToX v px pw (fromProgramNs clock p * 1e9)) (\x -> toProgramNs clock (xToTime v px pw x / 1e9))
 
 -- | What the pointer is on in the chart: the band under it, or else the
 -- census nearest it.
-chartRefAt :: HeapProfile -> [Layer] -> Rect -> V2 -> Maybe Ref
-chartRefAt hp ls r m@(V2 mx my)
-  | not (rectContains plot m) || VU.null times = Nothing
+chartRefAt :: HeapProfile -> [Layer] -> TimeView -> Rect -> V2 -> Maybe Ref
+chartRefAt hp ls v r m@(V2 mx my)
+  | not (rectContains plot m) || VU.null (hpTimes hp) = Nothing
   | otherwise = case under of
       l : _ | V.any ((== lyName l) . bandName) (hpBands hp) -> Just (RBand (lyName l))
       _ -> Just (RCensus (runKey (hpRun hp)) i)
   where
-    geom = chartGeom r
-    plot = cgPlot geom
-    times = hpOffsets hp
-    i = nearestSample times (cgTime geom (VU.last times) mx)
+    plot = chartPlot r
+    i = nearestIndex (hpTimes hp) (xToTime v (rectX plot) (rectW plot) mx / 1e9)
     stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
     bytes = realToFrac ((1 - (my - rectY plot) / rectH plot) * realToFrac (maxStack ls)) :: Double
     under = [l | (l, lo, hi) <- zip3 ls stackAt (drop 1 stackAt), bytes >= lo, bytes < hi]
@@ -398,17 +583,12 @@ maxStack ls = case ls of
   [] -> 1
   _ -> max 1 (VU.maximum (foldr1 (VU.zipWith (+)) (map lyValues ls)))
 
-nearestSample :: VU.Vector Double -> Double -> Int
-nearestSample ts t =
-  snd (minimum [(abs (ts VU.! i - t), i) | i <- [0 .. VU.length ts - 1]])
-
-drawChart :: Palette -> MonoMetrics -> HeapProfile -> [Layer] -> Int -> Rect -> Maybe (Float, Float, [Text]) -> CanvasM ()
-drawChart pal mm hp ls cursorIx r hover = do
-  let ChartGeom plot@(Rect px py pw ph) _ = chartGeom r
-      times = hpOffsets hp
-      tEnd = max 1e-9 (VU.last times)
+drawChart :: Palette -> MonoMetrics -> HeapProfile -> [Layer] -> TimeView -> Int -> Axis -> Marks -> Rect -> Maybe (Float, Float, [Text]) -> CanvasM ()
+drawChart pal mm hp ls v cursorIx axis marks r hover = do
+  let plot@(Rect px py pw ph) = chartPlot r
+      times = hpTimes hp
       ymax = maxStack ls
-      sx t = px + realToFrac (t / tEnd) * pw
+      sx t = timeToX v px pw (t * 1e9)
       sy b = py + ph - realToFrac (b / ymax) * ph
       font = mmFont mm
   -- Grid and axes.
@@ -416,9 +596,14 @@ drawChart pal mm hp ls cursorIx r hover = do
   forM_ (takeWhile (<= ymax) [ystep, 2 * ystep ..]) $ \b -> do
     drawStroke (V2 px (sy b)) (V2 (px + pw) (sy b)) 1 (pGrid pal)
     drawTextWith font (V2 (px - 6) (sy b)) AlignEnd AlignMiddle (fmtBytesD b) (pMuted pal)
-  let tstep = niceStep (tEnd / 8)
-  forM_ (takeWhile (<= tEnd) [0, tstep ..]) $ \t ->
-    drawTextWith font (V2 (sx t) (py + ph + 12)) AlignCenter AlignMiddle (fmtSec t) (pMuted pal)
+  -- Time ticks, labelled from the start of the run.
+  let o0 = tvStart v / 1e9 - hpStart hp
+      o1 = tvEnd v / 1e9 - hpStart hp
+      tstep = niceStep ((o1 - o0) / 8)
+      firstTick = fromIntegral (ceiling (o0 / tstep) :: Integer) * tstep
+  drawRect (Rect px (py + ph) pw 22) (alpha 0.025 (pText pal))
+  forM_ (take 100 (takeWhile (<= o1) [firstTick, firstTick + tstep ..])) $ \o ->
+    drawTextWith font (V2 (sx (o + hpStart hp)) (py + ph + 12)) AlignCenter AlignMiddle (fmtSec o) (pMuted pal)
   -- Stacked bands, bottom up.
   let n = VU.length times
       xs = [sx (times VU.! i) | i <- [0 .. n - 1]]
@@ -431,11 +616,13 @@ drawChart pal mm hp ls cursorIx r hover = do
         when (n == 1) $ drawRect (Rect px (sy (top VU.! 0)) 6 (sy (base VU.! 0) - sy (top VU.! 0))) (lyColor l)
         go top rest
   withClip plot $ go (VU.replicate n 0) ls
-  -- Census ticks along the bottom, and the cursor.
-  forM_ xs $ \xx -> drawStroke (V2 xx (py + ph)) (V2 xx (py + ph + 3)) 1 (pMuted pal)
+  -- The shared range and the run's markers, census ticks along the
+  -- bottom, and the census cursor.
+  drawMarks pal axis plot marks
+  withClip (Rect px py pw (ph + 4)) $ forM_ xs $ \xx -> drawStroke (V2 xx (py + ph)) (V2 xx (py + ph + 3)) 1 (pMuted pal)
   when (cursorIx < n) $ do
     let cx = sx (times VU.! cursorIx)
-    drawStroke (V2 cx py) (V2 cx (py + ph)) 2 (pAccent pal)
+    when (cx >= px && cx <= px + pw) $ drawStroke (V2 cx py) (V2 cx (py + ph)) 2 (pAccent pal)
   for_ hover $ \(hx, hy, lines') -> do
     drawStroke (V2 hx py) (V2 hx (py + ph)) 1 (pCursor pal)
     let tw = fromIntegral (maximum (1 : map T.length lines')) * mmCharW mm + 16
@@ -974,7 +1161,17 @@ heapLens st loaded fromLog = do
         Just (_, DebugUnix p, _) | Just ri <- runFromSocket (T.pack p) -> runKey ri
         _ -> RunKey "?:?"
       band b = profile >>= \hp -> V.find ((== b) . bandName) (hpBands hp)
-      census r i = profile >>= \hp -> if runKeysMatch r (runKey (hpRun hp)) && i >= 0 && i < VU.length (hpTimes hp) then Just hp else Nothing
+      -- A census index means this profile's censuses only when the ref
+      -- names its run exactly: an eventlog and a .hp file of one run count
+      -- theirs differently.
+      -- An eventlog census can be shown with a .hp file on show, by
+      -- switching to the eventlog's samples.
+      censusIn r i hp = r == runKey (hpRun hp) && i >= 0 && i < VU.length (hpTimes hp)
+      census r i = case (profile, fromLog) of
+        (Just hp, _) | censusIn r i hp -> Just hp
+        (_, Just lp) | censusIn r i lp -> Just lp
+        _ -> Nothing
+      logCensus r i = source == FromHpFile && maybe False (censusIn r i) fromLog && not (maybe False (censusIn r i) profile)
       instantIn r t = profile >>= \hp ->
         let s = fromIntegral t / 1e9
          in if fromEventlog && runKeysMatch r (runKey (hpRun hp)) && not (VU.null (hpTimes hp)) && s >= VU.head (hpTimes hp) && s <= VU.last (hpTimes hp) then Just hp else Nothing
@@ -988,7 +1185,9 @@ heapLens st loaded fromLog = do
         Just t | cnType n == "TSO", Right (tid, "") <- TR.decimal t -> Just (RThread snapRun tid)
         _ -> Nothing
       sourceOf = (>>= srcLocSpan . parseSrcLoc)
-      cursorIx hp = maybe (VU.maxIndex (hpTotals hp)) (sampleIndexAt hp . (+ hpStart hp)) cursorT
+      rangeIn r a b = if b > a then instantIn r a >> instantIn r b else Nothing
+      nearestOffset hp t = hpOffset hp (nearestIndex (hpTimes hp) (fromIntegral t / 1e9))
+      cursorIx hp = maybe (VU.maxIndex (hpTotals hp)) (nearestIndex (hpOffsets hp)) cursorT
       awayFromLiveGraph = when (source == FromGhcDebug) (writeVar (hsSource st) FromEventlog)
       toLiveGraph = writeVar (hsSource st) FromGhcDebug
   pure
@@ -997,6 +1196,7 @@ heapLens st loaded fromLog = do
           RBand b -> isJust (band b)
           RCensus r i -> isJust (census r i)
           RInstant r t -> isJust (instantIn r t)
+          RRange r a b -> isJust (rangeIn r a b)
           RCostCentre m l -> isJust (costCentre m l)
           RClosure s a -> isJust (closure s a)
           RThunkGroup k -> isJust (group k)
@@ -1004,8 +1204,16 @@ heapLens st loaded fromLog = do
           _ -> False
       , lensReveal = \case
           RBand b -> awayFromLiveGraph >> writeVar (hsSolo st) (Just b)
-          RCensus r i -> for_ (census r i) $ \hp -> awayFromLiveGraph >> writeVar (hsCursor st) (Just (hpOffset hp i))
-          RInstant r t -> for_ (instantIn r t) $ \hp -> awayFromLiveGraph >> writeVar (hsCursor st) (Just (fromIntegral t / 1e9 - hpStart hp))
+          RCensus r i -> for_ (census r i) $ \hp -> do
+            awayFromLiveGraph
+            when (logCensus r i) (writeVar (hsSource st) FromEventlog)
+            writeVar (hsCursor st) (Just (hpOffset hp i))
+          RInstant r t -> for_ (instantIn r t) $ \hp -> awayFromLiveGraph >> writeVar (hsCursor st) (Just (nearestOffset hp t))
+          RRange r a b -> for_ (rangeIn r a b) $ \_ -> do
+            awayFromLiveGraph
+            let pad = fromIntegral (b - a) * 0.05
+            writeVar (hsLock st) False
+            writeVar (hsView st) (Just (TimeView (fromIntegral a - pad) (fromIntegral b + pad)))
           RCostCentre m l -> for_ (costCentre m l) $ \c -> do
             awayFromLiveGraph
             writeVar (hsTab st) CostCentres
@@ -1049,7 +1257,7 @@ heapLens st loaded fromLog = do
           _ -> []
       , lensPeek = \case
           RBand b -> (\bd -> bandPeek bd (profile >>= \hp -> Just (hp, cursorIx hp))) <$> band b
-          RCensus r i -> (\hp -> fact "live" (fmtBytesD (hpTotals hp VU.! i))) <$> census r i
+          RCensus r i -> (\hp -> fact "live" (fmtBytesD (hpTotals hp VU.! i)) >> fact "taken at" (fmtSec (hpOffset hp i) <> if fromEventlog || logCensus r i then "" else " (the .hp file's clock)")) <$> census r i
           RCostCentre m l -> ccPeek <$> costCentre m l
           RClosure s a -> (\n -> closurePeek latest n) <$> closure s a
           RThunkGroup k -> (\g -> fact "in the latest snapshot" (fmtInt (tgCount g) <> " thunks, " <> fmtBytes (fromIntegral (tgBytes g)))) <$> group k

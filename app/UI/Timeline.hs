@@ -1,8 +1,12 @@
 -- | The eventlog timeline: capability tracks, the GC pressure strip, the
--- heap strip, markers, per-thread rows and the slice inspector.
+-- heap strip with its censuses, markers, per-thread rows, the slice
+-- inspector and the markers list.
 --
 -- Wheel zooms around the pointer, dragging pans, a click selects the slice
--- under the pointer, and a double click fits the whole log.
+-- under the pointer and moves the shared cursor there, and a double click
+-- fits the whole log. Dragging on the ruler scrubs the cursor, Shift+drag
+-- selects a range, and @[@ and @]@ step the cursor through collections
+-- (with Shift, through censuses).
 module UI.Timeline
   ( TimelineState (..)
   , newTimelineState
@@ -10,10 +14,12 @@ module UI.Timeline
   , timelineView
   , openEventlog
   , timelineLens
+  , timelineSync
   ) where
 
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
+import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
@@ -26,12 +32,15 @@ import Data.Word (Word32, Word64)
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
+import Stronghead.Clock (stepTime)
 import Stronghead.Eventlog
 import Stronghead.Eventlog.Model
 import Stronghead.Format
+import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Ref
 import Stronghead.Run (runKey, runKeysMatch)
 import System.FilePath (takeFileName)
+import UI.Clock
 import UI.Common
 import UI.Link
 
@@ -41,6 +50,7 @@ data TrackRef = OnCap !Int | OnThread !Word32
 data Sel
   = SelSpan !TrackRef !Int
   | SelGC !Int
+  | SelRange !Word64 !Word64
   deriving (Eq, Show)
 
 data TimelineState = TimelineState
@@ -56,12 +66,20 @@ data TimelineState = TimelineState
   , tsDialog :: !(Var (Maybe FileDialogId))
   , tsFocusThread :: !(Var (Maybe Word32))
   , tsPanes :: !Workbench
+  , tsScrub :: !(Var Bool)
+    -- ^ A drag that began on the ruler, moving the cursor.
+  , tsMarkerFilter :: !(Var Text)
+  , tsMarkerEvents :: !(Var Bool)
+    -- ^ List traceEvent messages with the markers.
+  , tsWindowSeen :: !(IORef (Maybe (RunKey, TimeView)))
+    -- ^ The window last published to the bus.
   }
 
-paneCaps, paneThreads, paneInspector :: Word64
+paneCaps, paneThreads, paneInspector, paneMarkers :: Word64
 paneCaps = 1
 paneThreads = 2
 paneInspector = 3
+paneMarkers = 4
 
 newTimelineState :: IO TimelineState
 newTimelineState = do
@@ -75,7 +93,11 @@ newTimelineState = do
   tsPressAt <- newVar Nothing
   tsDialog <- newVar Nothing
   tsFocusThread <- newVar Nothing
-  tsPanes <- newVar (Just (Split 10 AxisV 0.74 (Split 11 AxisH 0.5 (Pane paneCaps) (Pane paneThreads)) (Pane paneInspector)))
+  tsPanes <- newVar (Just (Split 10 AxisV 0.74 (Split 11 AxisH 0.5 (Pane paneCaps) (Pane paneThreads)) (Split 12 AxisH 0.64 (Pane paneInspector) (Pane paneMarkers))))
+  tsScrub <- newVar False
+  tsMarkerFilter <- newVar ""
+  tsMarkerEvents <- newVar False
+  tsWindowSeen <- newIORef Nothing
   pure TimelineState {..}
 
 openEventlog :: TimelineState -> FilePath -> Bool -> NanoUI ()
@@ -95,6 +117,27 @@ timelineLoad st = do
     Nothing -> pure Nothing
     Just p ->
       Just <$> useStream (tsStream st) (p, follow) (LoadProgress 0 0 Nothing Nothing False follow) (\update -> streamEventlog follow p (update . const))
+
+-- | Publish the visible window for views locked to the Timeline, and take
+-- up a window one of them wrote. Called every frame, whatever is showing.
+timelineSync :: Bus -> TimelineState -> Maybe LoadProgress -> NanoUI ()
+timelineSync bus st mprog = case mprog >>= lpTimeline of
+  Nothing -> do
+    shared <- readVar (busWindow bus)
+    when (isJust shared) (writeVar (busWindow bus) Nothing)
+  Just tl -> do
+    let rk = runKey (tlRun tl)
+        lo = fromIntegral (tlStart tl)
+        hi = fromIntegral (tlEnd tl)
+    shared <- readVar (busWindow bus)
+    seen <- liftIO (readIORef (tsWindowSeen st))
+    case shared of
+      Just (r, w) | shared /= seen, r == rk -> writeVar (tsView st) (Just (clampView lo hi w))
+      _ -> pure ()
+    mv <- readVar (tsView st)
+    let now = Just (rk, maybe (TimeView lo hi) (clampView lo hi) mv)
+    when (now /= shared) (writeVar (busWindow bus) now)
+    liftIO (writeIORef (tsWindowSeen st) now)
 
 -- ---------------------------------------------------------------------------
 -- Geometry
@@ -197,6 +240,8 @@ body env st tl = do
       summary = summarize tl
   mv <- readVar (tsView st)
   let v = maybe full (clampView lo hi) mv
+  marks <- marksFor env (runKey (tlRun tl)) (Just tl)
+  stepCursor env st tl v
   columnWith (padBottom 8 . tight . fillW) $
     readout
       [ ("duration", fmtSec (smDuration summary))
@@ -215,15 +260,18 @@ body env st tl = do
   workbench (tsPanes st) $ \pid ctx ->
     if
       | pid == paneCaps ->
-          paneWith tight ctx "Capabilities" (capsLegend pal) (mainCanvas env st pal mm tl v sel)
+          paneWith tight ctx "Capabilities" (capsLegend pal) (mainCanvas env st pal mm tl v sel marks)
       | pid == paneThreads ->
-          paneWith tight ctx "Threads" (threadsHeader st pal tl) (threadsSection env st pal mm tl v sel)
+          paneWith tight ctx "Threads" (threadsHeader st pal tl) (threadsSection env st pal mm tl v sel marks)
+      | pid == paneMarkers ->
+          paneWith tight ctx "Markers" (markersHeader st tl) (markersList env st tl)
       | otherwise -> do
           let title = case sel of
                 Nothing -> "Overview"
                 Just (SelGC _) -> "Collection"
                 Just (SelSpan _ _) -> "Slice"
-          paneWith tight ctx title (inspectorActions st sel) $
+                Just (SelRange _ _) -> "Range"
+          paneWith tight ctx title (inspectorActions env st tl sel marks) $
             paneScroll (grow . tight) $
               columnWith (padAll 12 . gap 6 . fillW) (inspector env st tl v sel)
 
@@ -236,19 +284,22 @@ capsLegend pal = do
   legendDot (pBlocked pal) "stopped to block"
   legendDot (pMarker pal) "marker"
 
-inspectorActions :: TimelineState -> Maybe Sel -> NanoUI ()
-inspectorActions st sel = do
+inspectorActions :: Env -> TimelineState -> Timeline -> Maybe Sel -> Marks -> NanoUI ()
+inspectorActions env st tl sel marks = do
   flex
+  scope $ for_ (tmRange marks) $ \(a, b) -> unless (sel == Just (SelRange a b)) $
+    whenM (buttonWith (alignMid . padXY 8 2 . tight) "Analyse range") (analyseRange env st tl a b)
   focus <- readVar (tsFocusThread st)
   scope $ when (isJust focus) $
     whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear highlight") (writeVar (tsFocusThread st) Nothing)
   scope $ when (isJust sel) $
     whenM (buttonWith (alignMid . padXY 8 2 . tight) "Back to overview") (writeVar (tsSel st) Nothing)
 
--- | Apply wheel zoom, drag pan and double-click fit for a canvas whose plot
--- area spans @[plotX, plotX + plotW]@.
-navigate :: TimelineState -> Timeline -> TimeView -> Response -> Float -> Float -> Bool -> NanoUI ()
-navigate st tl v resp plotX plotW wheelZooms = do
+-- | Apply wheel zoom, drag pan (unless @pan@ is off: a range or the cursor
+-- is being dragged) and double-click fit for a canvas whose plot area spans
+-- @[plotX, plotX + plotW]@.
+navigate :: TimelineState -> Timeline -> TimeView -> Response -> Float -> Float -> Bool -> Bool -> NanoUI ()
+navigate st tl v resp plotX plotW wheelZooms pan = do
   let lo = fromIntegral (tlStart tl)
       hi = fromIntegral (tlEnd tl)
       setView = writeVar (tsView st) . Just . clampView lo hi
@@ -262,12 +313,12 @@ navigate st tl v resp plotX plotW wheelZooms = do
     setView (TimeView (tvStart v - realToFrac wx * viewWidth v * 0.1) (tvEnd v - realToFrac wx * viewWidth v * 0.1))
   drag <- useDrag2DOn resp
   let dx = v2X (dragDelta drag)
-  when (dragActive drag && dx /= 0) $ do
+  when (pan && dragActive drag && dx /= 0) $ do
     let dt = realToFrac dx / realToFrac plotW * viewWidth v
     setView (TimeView (tvStart v - dt) (tvEnd v - dt))
   when (respHovered resp && pressedIn MouseLeft inp) $ do
     writeVar (tsPressAt st) (Just mouse)
-    when (inputMouseClicks inp >= 2) (writeVar (tsView st) Nothing)
+    when (pan && inputMouseClicks inp >= 2) (writeVar (tsView st) Nothing)
 
 -- | Whether this frame's click is a click and not the end of a pan.
 isClick :: TimelineState -> Response -> NanoUI Bool
@@ -280,10 +331,12 @@ isClick st resp
         Just (V2 px py) -> abs (px - v2X mouse) + abs (py - v2Y mouse) < 5
         Nothing -> True
 
-mainCanvas :: Env -> TimelineState -> Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> NanoUI ()
-mainCanvas env st pal mm tl v sel = do
+mainCanvas :: Env -> TimelineState -> Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> NanoUI ()
+mainCanvas env st pal mm tl v sel marks = do
   let nCaps = V.length (tlCaps tl)
-  mouse <- uiMousePos
+      rk = runKey (tlRun tl)
+  inp <- askInput
+  let mouse = inputMousePos inp
   -- Geometry from last frame's rect: interaction runs before layout.
   sid <- currentId
   prevRect <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
@@ -296,16 +349,31 @@ mainCanvas env st pal mm tl v sel = do
         , canvasTrackPointer = True
         , canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)
         }
-      (\r -> drawMain pal mm tl v sel (if rectContains r mouse then hover else Nothing) r)
+      (\r -> drawMain pal mm tl v sel marks (if rectContains r mouse then hover else Nothing) r)
   let rows = layoutRows (respRect resp) nCaps
-  navigate st tl v resp (rPlotX rows) (rPlotW rows) True
+      axis = linearAxis rk v (rPlotX rows) (rPlotW rows)
+      Rect _ ry _ rh = rRuler rows
+      onRuler = v2Y mouse >= ry && v2Y mouse < ry + rh && v2X mouse >= rPlotX rows
+      mods = inputModifiers inp
+      timeAt x = round (max 0 (axToNs axis (max (rPlotX rows) (min (rPlotX rows + rPlotW rows) x)))) :: Word64
+  brushing <- timeGestures env axis resp ScrubNone
+  -- A drag that begins on the ruler scrubs the cursor instead of panning.
+  scrub <- readVar (tsScrub st)
+  let scrubNow
+        | respHovered resp && pressedIn MouseLeft inp = onRuler && not (modShift mods) && not (modCtrl mods)
+        | otherwise = scrub && heldIn MouseLeft inp
+  when (scrubNow /= scrub) (writeVar (tsScrub st) scrubNow)
+  when scrubNow $ setCursor (envBus env) rk (timeAt (v2X mouse))
+  navigate st tl v resp (rPlotX rows) (rPlotW rows) True (not brushing && not scrubNow)
   canvasLinks env resp (refAtMain tl v rows)
   clicked <- isClick st resp
-  when clicked $ writeVar (tsSel st) (pickMain tl v rows mouse)
+  when (clicked && not brushing && not (modCtrl mods)) $ do
+    writeVar (tsSel st) (pickMain tl v rows mouse)
+    when (v2X mouse >= rPlotX rows) $ setCursor (envBus env) rk (timeAt (v2X mouse))
 
 -- | The entity at a point on the main canvas: the thread running in a
--- capability's slice, a collection, the nearest marker on the ruler, or the
--- instant on the heap strip.
+-- capability's slice, a collection, the nearest marker on the ruler, or on
+-- the heap strip the census under the pointer or else the instant.
 refAtMain :: Timeline -> TimeView -> Rows -> V2 -> Maybe Ref
 refAtMain tl v rows m@(V2 mx my)
   | mx < rPlotX rows || mx > rPlotX rows + rPlotW rows = Nothing
@@ -322,7 +390,7 @@ refAtMain tl v rows m@(V2 mx my)
               , let d = if mkTime mk > tw then mkTime mk - tw else tw - mkTime mk
               , d <= tol * 2
               ]
-        | inRow (rMem rows) -> Just (RInstant rk tw)
+        | inRow (rMem rows) -> Just (maybe (RInstant rk tw) (RCensus rk) (censusNear tl tw (tol * 2)))
         | otherwise -> Nothing
   where
     rk = runKey (tlRun tl)
@@ -342,6 +410,15 @@ pickMain tl v rows (V2 mx my) =
         []
           | inRow (rGC rows) -> SelGC <$> pickGC tl tw tol
           | otherwise -> Nothing
+
+-- | The census nearest @t@, within @tol@.
+censusNear :: Timeline -> Word64 -> Word64 -> Maybe Int
+censusNear tl t tol =
+  let cs = censusTimes tl
+      d c = if c > t then c - t else t - c
+   in case [(d c, j) | (j, c) <- zip [0 ..] (VU.toList cs), d c <= tol] of
+        [] -> Nothing
+        near -> Just (snd (minimum near))
 
 pickGC :: Timeline -> Word64 -> Word64 -> Maybe Int
 pickGC tl t tol =
@@ -400,7 +477,10 @@ hoverInfo tl v rows m@(V2 mx my)
             [ ("live " <>) . fmtBytes <$> seriesValueAt (tlLive tl) tw
             , ("heap " <>) . fmtBytes <$> seriesValueAt (tlHeapSize tl) tw
             , ("allocating " <>) . fmtRate <$> seriesRateBetween (tlAlloc tl) (if tw > win then tw - win else 0) (tw + win)
+            , censusLine <$> censusNear tl tw (tol * 2)
             ]
+    censusLine j =
+      "census " <> tshow (j + 1) <> maybe "" (\hp -> ": " <> fmtBytesD (hpTotals hp VU.! j) <> " profiled") (tlHeapProfile tl)
     markerDetails =
       [ (if mkIsMarker mk then "marker: " else "event: ") <> mkText mk
       | mk <- V.toList (tlMarkers tl)
@@ -424,8 +504,8 @@ threadLabel tl tid = maybe ("thread " <> tshow tid) threadName (M.lookup tid (tl
 -- ---------------------------------------------------------------------------
 -- Drawing
 
-drawMain :: Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Maybe (Float, Float, [Text]) -> Rect -> CanvasM ()
-drawMain pal mm tl v sel hover r@(Rect x _ _ _) = do
+drawMain :: Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> Maybe (Float, Float, [Text]) -> Rect -> CanvasM ()
+drawMain pal mm tl v sel marks hover r@(Rect x _ _ _) = do
   let rows = layoutRows r (V.length (tlCaps tl))
       px = rPlotX rows
       pw = rPlotW rows
@@ -459,6 +539,15 @@ drawMain pal mm tl v sel hover r@(Rect x _ _ _) = do
   label' (my' + 12) "Heap"
   sub (my' + 30) "size, live"
   drawMemStrip pal v (rMem rows) tl
+  -- The shared cursor and range, down the whole plot, with a handle on the
+  -- ruler to drag.
+  let plot = Rect px (rectY (rRuler rows)) pw (rectY (rMem rows) + rectH (rMem rows) - rectY (rRuler rows))
+  drawMarks pal (linearAxis (runKey (tlRun tl)) v px pw) plot marks {tmMarkers = []}
+  for_ (tmCursor marks) $ \t -> do
+    let cx = timeToX v px pw (fromIntegral t)
+        top = rectY (rRuler rows)
+    when (cx >= px && cx <= px + pw) $
+      drawPath (P.polygon [V2 (cx - 5) top, V2 (cx + 5) top, V2 cx (top + 7)]) (pAccent pal)
   for_ hover $ \(hx, hy, ls) -> do
     drawStroke (V2 hx (rectY r)) (V2 hx (rectY r + rectH r)) 1 (pCursor pal)
     drawTooltip pal mm r hx hy ls
@@ -622,6 +711,14 @@ drawMemStrip pal v r@(Rect x y w h) tl = do
     case pts (tlLive tl) of
       ps@(_ : _ : _) -> drawStrokePath (P.polyline (steps ps)) 1.5 (pLive pal)
       _ -> pure ()
+    -- Censuses as ticks along the bottom.
+    let cs = censusTimes tl
+        c0 = floorW (tvStart v)
+        inView = VU.filter (\c -> c >= c0 && fromIntegral c <= tvEnd v) cs
+    when (VU.length inView <= floor w) $
+      VU.forM_ inView $ \c -> do
+        let cx = timeToX v x w (fromIntegral c)
+        drawStroke (V2 cx (y + h - 7)) (V2 cx (y + h)) 1.5 (pText pal)
 
 -- | At most two points per pixel: the first and the maximum.
 downsample :: Float -> [(Float, Word64)] -> [(Float, Word64)]
@@ -662,8 +759,8 @@ threadsHeader st pal tl = do
   legendDot (pBlocked pal) "blocked"
   legendDot (pRunnable pal) "runnable"
 
-threadsSection :: Env -> TimelineState -> Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> NanoUI ()
-threadsSection env st pal mm tl v sel = do
+threadsSection :: Env -> TimelineState -> Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> NanoUI ()
+threadsSection env st pal mm tl v sel marks = do
   do
     filt <- T.toLower <$> readVar (tsThreadFilter st)
     focus <- readVar (tsFocusThread st)
@@ -702,7 +799,7 @@ threadsSection env st pal mm tl v sel = do
                         dur = fmtNs (fromIntegral (srEnd s - srStart s))
                      in if
                           | srKind s == kindRun -> ["running " <> dur <> ", then " <> stopName (srStop s)]
-                          | srKind s == kindBlocked -> [stopName (srStop s) <> " for " <> dur] ++ ownerLine tl (srAux s)
+                          | srKind s == kindBlocked -> [stopName (srStop s) <> " for " <> dur] ++ ownerLine tl (srAux s) ++ wakerLine tl ti s
                           | otherwise -> ["runnable for " <> dur <> " (" <> stopName (srStop s) <> ")"]
     resp <-
       canvasConfigured
@@ -728,10 +825,12 @@ threadsSection env st pal mm tl v sel = do
             case sel of
               Just (SelSpan (OnThread tid) k) | tid == tiId ti -> outlineSpan pal v rowRect (tiTrack ti) k
               _ -> pure ()
-          -- Markers through the rows, and a scroll indicator.
+          -- Markers through the rows, the shared cursor and range, and a
+          -- scroll indicator.
           withClip (Rect px y pw h) $ forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
             let mx = timeToX v px pw (fromIntegral (mkTime mk))
             drawStroke (V2 mx y) (V2 mx (y + h)) 1 (alpha 0.35 (pMarker pal))
+          drawMarks pal (linearAxis rk v px pw) (Rect px y pw h) marks {tmMarkers = []}
           when (contentH > h) $ do
             let barH = max 20 (h * h / contentH)
                 barY = y + (h - barH) * (scrollY / max 1 (contentH - h))
@@ -745,10 +844,13 @@ threadsSection env st pal mm tl v sel = do
     (_, wy) <- useWheelDeltaOn resp
     unless (modCtrl (inputModifiers inp)) $
       when (wy /= 0) $ writeVar (tsThreadScroll st) (max 0 (min maxScroll (scrollY - wy * threadRowH * 3)))
-    navigate st tl v resp (plotX r) (plotW r) False
+    brushing <- timeGestures env (linearAxis rk v (plotX r) (plotW r)) resp ScrubNone
+    navigate st tl v resp (plotX r) (plotW r) False (not brushing)
     canvasLinks env resp (\(V2 _ my) -> RThread rk . tiId <$> listToMaybe (drop (rowAt r my) threads))
     clicked <- isClick st resp
-    when clicked $ do
+    when (clicked && not brushing && not (modCtrl (inputModifiers inp)) && v2X mouse >= plotX r) $
+      setCursor (envBus env) rk (round (max 0 (xToTime v (plotX r) (plotW r) (v2X mouse))))
+    when (clicked && not brushing) $ do
       let row = drop (rowAt r (v2Y mouse)) threads
       case row of
         ti : _ -> do
@@ -763,6 +865,13 @@ ownerLine tl owner
   | owner == 0 = []
   | otherwise = ["(black hole owned by " <> threadLabel tl owner <> ")"]
 
+-- | Who woke a thread out of a blocked span, for its hover text.
+wakerLine :: Timeline -> ThreadInfo -> SpanRec -> [Text]
+wakerLine tl ti s = case wokenBy ti s of
+  Just (_, w) | w /= 0 -> ["woken by " <> threadLabel tl w]
+  Just _ -> ["woken by the runtime"]
+  Nothing -> []
+
 legendDot :: Color -> Text -> NanoUI ()
 legendDot c txt = rowWith (tight . gap 5 . alignMid) $ do
   _ <- canvas (fixedWH 9 9 . alignMid) (\r -> drawRoundedRect r 2 c)
@@ -774,7 +883,8 @@ legendDot c txt = rowWith (tight . gap 5 . alignMid) $ do
 inspector :: Env -> TimelineState -> Timeline -> TimeView -> Maybe Sel -> NanoUI ()
 inspector env st tl v sel = case sel of
   Just (SelSpan ref i) -> scope $ spanInspector env st tl ref i
-  Just (SelGC i) | i < V.length (tlGCs tl) -> scope $ gcInspector st tl (tlGCs tl V.! i)
+  Just (SelGC i) | i < V.length (tlGCs tl) -> scope $ gcInspector env st tl i (tlGCs tl V.! i)
+  Just (SelRange a b) -> scope $ rangeInspector env st tl a b
   _ -> scope $ overview env st tl v
 
 zoomTo :: TimelineState -> Timeline -> Word64 -> Word64 -> NanoUI ()
@@ -810,6 +920,10 @@ spanInspector env st tl ref i = do
       scope $ when (srAux s /= 0) $ do
         prose env ["Waiting on a black hole being evaluated by ", refInline (RThread rk (srAux s)) (threadLabel tl (srAux s)), "."]
         whenM (button "Show owner thread") (writeVar (tsFocusThread st) (Just (srAux s)))
+      scope $ for_ (M.lookup tid (tlThreads tl) >>= (`wokenBy` s)) $ \(at, w) ->
+        if w /= 0
+          then kvLink env "Woken by" (RThread rk w) (threadLabel tl w <> ", after " <> fmtNs (fromIntegral (at - srStart s)))
+          else kv "Woken by" ("the runtime, after " <> fmtNs (fromIntegral (at - srStart s)))
       scope $ for_ (seriesRateBetween (tlAlloc tl) (srStart s) (srEnd s)) $ \rate ->
         kv "Allocation rate" (fmtRate rate <> " (whole process)")
       rowWith (padTop 4 . tight . gap 6) $ do
@@ -844,16 +958,24 @@ threadStats tl ti = do
         numCell 84 id (fmtNs (fromIntegral ns))
         numCell 52 fontMuted (fmtPct (fromIntegral ns / life))
 
-gcInspector :: TimelineState -> Timeline -> GCEvent -> NanoUI ()
-gcInspector st tl g = do
+gcInspector :: Env -> TimelineState -> Timeline -> Int -> GCEvent -> NanoUI ()
+gcInspector env st tl i g = do
   labelWith (fontMedium . fontSizeScale 1.05 . padBottom 4) ("Garbage collection" <> genText (gcGen g))
   let pause = fromIntegral (gcEnd g - gcStart g)
+      rk = runKey (tlRun tl)
   kv "Starts at" (fmtNs (fromIntegral (gcStart g - tlStart tl)))
   kv "Pause" (fmtNs pause)
   kv "Copied" (fmtBytes (gcCopied g))
   kv "GC threads" (tshow (gcParThreads g))
   for_ (seriesValueAt (tlLive tl) (gcEnd g)) $ \b -> kv "Live after" (fmtBytes b)
-  whenM (button "Zoom to collection") (zoomTo st tl (gcStart g) (gcEnd g))
+  scope $ case censusAfterCollection tl i of
+    Just j -> kvLink env "Heap after this collection" (RCensus rk j) ("census " <> tshow (j + 1))
+    Nothing
+      | isJust (tlHeapProfile tl) -> kv "Heap after this collection" "no census at this collection"
+      | otherwise -> pure ()
+  rowWith (padTop 4 . tight . gap 6) $ do
+    whenM (button "Zoom to collection") (zoomTo st tl (gcStart g) (gcEnd g))
+    whenM (button "Move the cursor here") (setCursor (envBus env) rk (gcStart g))
   hint $
     if gcGen g >= 1
       then "A major collection copies (or marks) the whole live heap: its pause grows with residency. Frequent major GCs with rising live bytes usually mean a space leak; see the Heap tab."
@@ -862,8 +984,27 @@ gcInspector st tl g = do
 overview :: Env -> TimelineState -> Timeline -> TimeView -> NanoUI ()
 overview env st tl v = do
   let rk = runKey (tlRun tl)
-  hint "Click a slice on a capability, a thread row or the GC strip to inspect it."
+      bus = envBus env
+  hint "Click a slice on a capability, a thread row or the GC strip to inspect it. Shift+drag selects a range to analyse."
   kv "Window" (fmtNs (viewWidth v))
+  cursor <- readVar (busCursor bus)
+  scope $ case cursor of
+    Just (r, t) | runKeysMatch r rk -> rowWith (fillW . tight . gap 8) $ do
+      labelWith (alignBaseline . fontMuted) "Cursor"
+      flex
+      linkText env (RInstant rk t) alignBaseline (fmtNs (fromIntegral t - fromIntegral (tlStart tl)))
+    _ -> pure ()
+  range <- readVar (busRange bus)
+  scope $ case range of
+    Just (r, a, b) | runKeysMatch r rk -> do
+      rowWith (fillW . tight . gap 8) $ do
+        labelWith (alignBaseline . fontMuted) "Range"
+        flex
+        linkText env (RRange rk a b) alignBaseline (fmtNs (fromIntegral a - fromIntegral (tlStart tl)) <> " to " <> fmtNs (fromIntegral b - fromIntegral (tlStart tl)))
+      rowWith (tight . gap 6) $ do
+        whenM (button "Analyse range") (analyseRange env st tl a b)
+        whenM (button "Clear range") (writeVar (busRange bus) Nothing)
+    _ -> pure ()
   sectionTitle "Longest GC pauses"
   let gcs = take 8 (sortOn (\(_, g) -> Down (gcEnd g - gcStart g)) (zip [0 :: Int ..] (V.toList (tlGCs tl))))
   rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
@@ -898,13 +1039,142 @@ overview env st tl v = do
   sectionTitle "Program"
   forM_ (tlInfo tl) $ \(k, val) -> kv k (T.take 300 val)
 
+-- | Show what happened in a range in the inspector, and make it the range
+-- every time view shades.
+analyseRange :: Env -> TimelineState -> Timeline -> Word64 -> Word64 -> NanoUI ()
+analyseRange env st tl a b = do
+  setRange (envBus env) (runKey (tlRun tl)) a b
+  writeVar (tsSel st) (Just (SelRange a b))
+
+-- | Zoom to a range, with a little room either side.
+zoomToRange :: TimelineState -> Timeline -> Word64 -> Word64 -> NanoUI ()
+zoomToRange st tl a b = do
+  let pad = max 1000 (fromIntegral (b - a) * 0.05)
+  writeVar (tsView st) (Just (clampView (fromIntegral (tlStart tl)) (fromIntegral (tlEnd tl)) (TimeView (fromIntegral a - pad) (fromIntegral b + pad))))
+
+rangeInspector :: Env -> TimelineState -> Timeline -> Word64 -> Word64 -> NanoUI ()
+rangeInspector env st tl a b = do
+  let rk = runKey (tlRun tl)
+      rs = rangeStats tl a b
+      dur = fromIntegral (b - a) :: Double
+      at t = fmtNs (fromIntegral t - fromIntegral (tlStart tl))
+      gcs = tlGCs tl
+      pause g = gcEnd g - gcStart g
+  labelWith (fontMedium . fontSizeScale 1.05 . padBottom 4) "Range"
+  kv "From" (at a)
+  kv "To" (at b)
+  kv "Duration" (fmtNs dur)
+  rowWith (padTop 4 . tight . gap 6) $ do
+    whenM (button "Zoom to range") (zoomToRange st tl a b)
+    whenM (button "Clear range") (writeVar (busRange (envBus env)) Nothing >> writeVar (tsSel st) Nothing)
+  sectionTitle "Collections"
+  kv "Collections, major" (fmtInt (length (rsCollections rs)) <> ", " <> fmtInt (rsMajor rs))
+  kv "Time paused" (fmtNs (fromIntegral (rsPauseTotal rs)) <> "  (" <> fmtPct (fromIntegral (rsPauseTotal rs) / max 1 dur) <> ")")
+  scope $ for_ (rsLongest rs >>= \i -> (i,) <$> gcs V.!? i) $ \(i, g) ->
+    kvLink env "Longest pause" (RCollection rk i) (fmtNs (fromIntegral (pause g)) <> " at " <> at (gcStart g))
+  let worst = take 6 (sortOn (\(_, g) -> Down (pause g)) [(i, g) | i <- rsCollections rs, Just g <- [gcs V.!? i]])
+  scope $ unless (length worst < 2) $ forM_ worst $ \(i, g) -> withKey i $ do
+    picked <- linkRow env (RCollection rk i) False id $ do
+      numCell 72 id (fmtNs (fromIntegral (pause g)))
+      cell (fillW . fontMuted) (if gcGen g >= 1 then "major" else "minor")
+      numCell 84 fontMuted (at (gcStart g))
+    when picked (writeVar (tsSel st) (Just (SelGC i)))
+  sectionTitle "Allocation"
+  scope $ case rsAllocated rs of
+    Just n -> do
+      kv "Allocated" (fmtBytes n)
+      kv "Rate" (fmtRate (fromIntegral n / max 1e-9 (dur / 1e9)))
+    Nothing -> hint "No allocation counter in this range. The RTS posts it at each collection."
+  sectionTitle "Heap"
+  let growth name (sa, sb) = for_ ((,) <$> sa <*> sb) $ \(va, vb) ->
+        kv name (fmtBytes va <> " → " <> fmtBytes vb <> "  (" <> (if vb >= va then "+" <> fmtBytes (vb - va) else "−" <> fmtBytes (va - vb)) <> ")")
+  growth "Live" (rsLive rs)
+  growth "Heap size" (rsHeap rs)
+  scope $ forM_ (zip [0 :: Int ..] (take 12 (rsCensuses rs))) $ \(k, j) -> withKey k $
+    for_ (censusTimes tl VU.!? j) $ \t -> do
+      picked <- linkRow env (RCensus rk j) False id $ do
+        cell fillW ("census " <> tshow (j + 1))
+        numCell 84 fontMuted (at t)
+      when picked (setCursor (envBus env) rk t)
+  sectionTitle ("Threads that ran (" <> fmtInt (length (rsThreads rs)) <> ")")
+  forM_ (take 12 (rsThreads rs)) $ \(tid, ns) -> withKey tid $ do
+    picked <- linkRow env (RThread rk tid) False id $ do
+      cell fillW (threadLabel tl tid)
+      numCell 72 id (fmtNs (fromIntegral ns))
+      numCell 52 fontMuted (fmtPct (fromIntegral ns / max 1 dur))
+    when picked (writeVar (tsFocusThread st) (Just tid))
+  scope $ unless (null (rsMarkers rs)) $ do
+    sectionTitle ("Markers (" <> fmtInt (length (rsMarkers rs)) <> ")")
+    forM_ (take 40 (rsMarkers rs)) $ \i -> withKey ("m" <> tshow i) $ for_ (tlMarkers tl V.!? i) $ \mk -> do
+      picked <- linkRow env (RMarker rk i) False id $ do
+        numCell 84 fontMuted (at (mkTime mk))
+        cell (fillW . if mkIsMarker mk then id else fontMuted) (mkText mk)
+      when picked (setCursor (envBus env) rk (mkTime mk))
+
+-- | @[@ and @]@ move the cursor to the previous or next collection; with
+-- Shift, census. The view follows when the cursor leaves it.
+stepCursor :: Env -> TimelineState -> Timeline -> TimeView -> NanoUI ()
+stepCursor env st tl v = do
+  (dir, shifted) <- stepKeys
+  when (dir /= 0) $ do
+    let bus = envBus env
+        rk = runKey (tlRun tl)
+    cursor <- readVar (busCursor bus)
+    let from = case cursor of
+          Just (r, t) | runKeysMatch r rk -> t
+          _ -> if dir > 0 then floorW (tvStart v) else ceiling (tvEnd v)
+        stops = if shifted then censusTimes tl else VU.fromList (map gcStart (V.toList (tlGCs tl)))
+    for_ (stepTime dir stops from) $ \t -> do
+      setCursor bus rk t
+      unless (fromIntegral t >= tvStart v && fromIntegral t <= tvEnd v) (centreOn st tl t)
+
+-- ---------------------------------------------------------------------------
+-- Markers
+
+markersHeader :: TimelineState -> Timeline -> NanoUI ()
+markersHeader st tl = do
+  paneMeta (fmtInt (V.length (V.filter mkIsMarker (tlMarkers tl))))
+  searchInputConfigured
+    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fixedW 110 . padXY 0 0) defaultLayout}
+    (tsMarkerFilter st)
+  flex
+  checkboxWith alignMid "Events" (tsMarkerEvents st)
+
+-- | Every marker in the log, as links; clicking one moves the cursor to it.
+markersList :: Env -> TimelineState -> Timeline -> NanoUI ()
+markersList env st tl = do
+  filt <- T.toLower <$> readVar (tsMarkerFilter st)
+  events <- readVar (tsMarkerEvents st)
+  let rk = runKey (tlRun tl)
+      rows =
+        [ (i, mk)
+        | (i, mk) <- zip [0 :: Int ..] (V.toList (tlMarkers tl))
+        , events || mkIsMarker mk
+        , T.null filt || filt `T.isInfixOf` T.toLower (mkText mk)
+        ]
+  if null rows
+    then columnWith (padAll 12 . fillW) $
+      hint $
+        if V.null (tlMarkers tl)
+          then "No markers in this log. Debug.Trace.traceMarkerIO posts one, and it shows on every time axis."
+          else "No marker matches."
+    else paneScroll (grow . tight) $ columnWith (padXY 4 4 . tight . fillW . gap 0) $
+      forM_ (take 2000 rows) $ \(i, mk) -> withKey i $ do
+        picked <- linkRow env (RMarker rk i) False id $ do
+          numCell 76 fontMuted (fmtNs (fromIntegral (mkTime mk) - fromIntegral (tlStart tl)))
+          cell (fillW . if mkIsMarker mk then id else fontMuted) (mkText mk)
+        when picked $ do
+          setCursor (envBus env) rk (mkTime mk)
+          centreOn st tl (mkTime mk)
+
 -- ---------------------------------------------------------------------------
 -- Lens
 
 -- | What the timeline can show of the entities other panels name: threads,
--- collections and markers of its run, and instants and ranges in it.
-timelineLens :: TimelineState -> Maybe LoadProgress -> Lens
-timelineLens st mprog = case mprog >>= lpTimeline of
+-- collections, censuses and markers of its run, and instants and ranges in
+-- it. @switch@ brings the Timeline to the front.
+timelineLens :: Bus -> NanoUI () -> TimelineState -> Maybe LoadProgress -> Lens
+timelineLens bus switch st mprog = case mprog >>= lpTimeline of
   Nothing -> lens PTimeline
   Just tl ->
     let rk = runKey (tlRun tl)
@@ -913,26 +1183,41 @@ timelineLens st mprog = case mprog >>= lpTimeline of
         thread r t = if mine r then M.lookup t (tlThreads tl) else Nothing
         gc r i = if mine r then tlGCs tl V.!? i else Nothing
         marker r i = if mine r then tlMarkers tl V.!? i else Nothing
+        -- A census index means this log's censuses only when the ref names
+        -- this run exactly: a .hp file's censuses count differently.
+        census r j = if r == rk then censusTimes tl VU.!? j else Nothing
+        offset t = fmtNs (fromIntegral (t - min t (tlStart tl)))
      in (lens PTimeline)
           { lensShows = \case
               RThread r t -> isJust (thread r t)
               RCollection r i -> isJust (gc r i)
               RMarker r i -> isJust (marker r i)
+              RCensus r j -> isJust (census r j)
               RInstant r t -> mine r && inLog t
               RRange r a b -> mine r && inLog a && b > a
               _ -> False
-          , lensReveal = revealIn st tl
+          , lensReveal = revealIn bus st tl
           , lensTitle = \case
               RThread r t -> threadName <$> thread r t
               RCollection r i -> (\g -> "Collection #" <> tshow (i + 1) <> genText (gcGen g)) <$> gc r i
               RMarker r i -> (\mk -> (if mkIsMarker mk then "Marker " else "Event ") <> T.take 60 (mkText mk)) <$> marker r i
-              RInstant r t | mine r -> Just ("t = " <> fmtNs (fromIntegral (t - min t (tlStart tl))))
+              RInstant r t | mine r -> Just ("t = " <> offset t)
+              RRange r a b | mine r -> Just ("Range " <> offset a <> " to " <> offset b)
               _ -> Nothing
+          , lensRelated = \case
+              RCollection r i | isJust (gc r i) -> [("Heap after this collection", RCensus rk j) | Just j <- [censusAfterCollection tl i]]
+              RCensus r j | isJust (census r j) -> [("Show collection", RCollection rk i) | Just i <- [collectionBeforeCensus tl j]]
+              _ -> []
+          , lensActions = \case
+              RRange r a b | mine r, inLog a, b > a -> [Action "Analyse range" (Right (writeVar (busRange bus) (Just (rk, a, b)) >> writeVar (tsSel st) (Just (SelRange a b)) >> switch))]
+              _ -> []
           , lensPeek = \case
               RThread r t -> threadPeek tl <$> thread r t
               RCollection r i -> gcPeek tl <$> gc r i
-              RMarker r i -> (\mk -> fact "at" (fmtNs (fromIntegral (mkTime mk - min (mkTime mk) (tlStart tl))))) <$> marker r i
+              RMarker r i -> (\mk -> fact "at" (offset (mkTime mk))) <$> marker r i
+              RCensus r j -> (\t -> fact "taken at" (offset t)) <$> census r j
               RInstant r t | mine r, inLog t -> Just (instantPeek tl t)
+              RRange r a b | mine r, inLog a, b > a -> Just (rangePeek tl a b)
               _ -> Nothing
           , lensHits =
               [ Hit "thread" (threadName ti) ("ran " <> fmtNs (fromIntegral (tiRunTime ti))) (HitRef (RThread rk (tiId ti)))
@@ -943,8 +1228,8 @@ timelineLens st mprog = case mprog >>= lpTimeline of
                    ]
           }
 
-revealIn :: TimelineState -> Timeline -> Ref -> NanoUI ()
-revealIn st tl = \case
+revealIn :: Bus -> TimelineState -> Timeline -> Ref -> NanoUI ()
+revealIn bus st tl = \case
   RThread _ t -> do
     writeVar (tsFocusThread st) (Just t)
     writeVar (tsThreadFilter st) ""
@@ -953,9 +1238,16 @@ revealIn st tl = \case
   RCollection _ i -> for_ (tlGCs tl V.!? i) $ \g -> do
     writeVar (tsSel st) (Just (SelGC i))
     zoomTo st tl (gcStart g) (gcEnd g)
-  RMarker _ i -> for_ (tlMarkers tl V.!? i) (centreOn st tl . mkTime)
+  RMarker _ i -> for_ (tlMarkers tl V.!? i) $ \mk -> do
+    setCursor bus (runKey (tlRun tl)) (mkTime mk)
+    centreOn st tl (mkTime mk)
+  RCensus _ j -> for_ (censusTimes tl VU.!? j) $ \t -> do
+    setCursor bus (runKey (tlRun tl)) t
+    centreOn st tl t
   RInstant _ t -> centreOn st tl t
-  RRange _ a b -> zoomTo st tl a b
+  RRange _ a b -> do
+    zoomToRange st tl a b
+    writeVar (tsSel st) (Just (SelRange a b))
   _ -> pure ()
 
 -- | Move the view to put @t@ in the middle, keeping its width (or a
@@ -988,6 +1280,14 @@ gcPeek tl g = do
   fact "at" (fmtNs (fromIntegral (gcStart g - min (gcStart g) (tlStart tl))))
   fact "copied" (fmtBytes (gcCopied g))
   for_ (seriesValueAt (tlLive tl) (gcEnd g)) $ \b -> fact "live after" (fmtBytes b)
+
+rangePeek :: Timeline -> Word64 -> Word64 -> NanoUI ()
+rangePeek tl a b = do
+  let rs = rangeStats tl a b
+  fact "lasts" (fmtNs (fromIntegral (b - a)))
+  fact "collections" (fmtInt (length (rsCollections rs)) <> ", paused " <> fmtNs (fromIntegral (rsPauseTotal rs)))
+  for_ (rsAllocated rs) $ \n -> fact "allocated" (fmtBytes n)
+  fact "threads ran" (fmtInt (length (rsThreads rs)))
 
 instantPeek :: Timeline -> Word64 -> NanoUI ()
 instantPeek tl t = do

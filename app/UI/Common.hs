@@ -50,6 +50,8 @@ module UI.Common
   , MonoMetrics (..)
   , drawTextClipped
   , drawLineChart
+  , chartTimeX
+  , chartXTime
   , ChartSeries (..)
   , fillRow
   , asRow
@@ -471,12 +473,19 @@ data ChartSeries = ChartSeries
   , csFill :: !Bool
   }
 
+-- | Where @t@ falls across a 'drawLineChart' of @[x0, x1]@ in @r@.
+chartTimeX :: Rect -> (Double, Double) -> Double -> Float
+chartTimeX (Rect x _ w _) (x0, x1) t = x + 4 + realToFrac ((t - x0) / max 1e-9 (x1 - x0)) * (w - 8)
+
+chartXTime :: Rect -> (Double, Double) -> Float -> Double
+chartXTime (Rect x _ w _) (x0, x1) px = x0 + realToFrac ((px - x - 4) / max 1 (w - 8)) * (x1 - x0)
+
 -- | A minimal line chart over @[x0, x1]@ with a zero-based y axis.
 drawLineChart :: Palette -> TextFont -> Rect -> (Double, Double) -> (Double -> Text) -> [ChartSeries] -> CanvasM ()
 drawLineChart pal font r@(Rect x y w h) (x0, x1) fmtY series = do
   drawRoundedRect r 6 (pTrackBg pal)
   let ymax = maximum (1e-9 : [v | s <- series, (_, v) <- csPoints s])
-      px t = x + 4 + realToFrac ((t - x0) / max 1e-9 (x1 - x0)) * (w - 8)
+      px = chartTimeX r (x0, x1)
       py v = y + h - 4 - realToFrac (v / ymax) * (h - 20)
   drawStroke (V2 x (y + h - 4)) (V2 (x + w) (y + h - 4)) 1 (pGrid pal)
   withClip r $ mapM_ (one px py) series

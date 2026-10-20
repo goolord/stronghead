@@ -667,6 +667,46 @@ how far C1 can trust each clock. Then P1a.
     where they lead instead.
   - **Peeks on canvases.** Canvases keep their own hover text, and get
     right-click and Ctrl+click.
+- **P2** is in place:
+  - The bus carries the cursor, the range and the Timeline's visible window
+    (`busCursor`, `busRange`, `busWindow`), all in program time and keyed by
+    run. `UI.Clock` holds what every time view shares: an `Axis`, drawing
+    the cursor, range and markers (`drawMarks`), Shift+drag and scrubbing
+    (`timeGestures`), `[` and `]` (`stepKeys`), and the `Tether` that keeps
+    a snapping cursor (the heap chart's census) in step with the shared one.
+  - `Stronghead.Clock` holds the time helpers: the nearest sample, stepping,
+    and `ClockMap`, which puts a `.hp` file on program time by pairing its
+    censuses with the eventlog's by total (V3), or says it can't.
+  - The model gained every `WakeupThread` with its waker (`tiWakeups`,
+    `wokenBy`), the census ↔ collection joins and `rangeStats`.
+  - Going to an `RInstant` moves the cursor, and going to an `RRange` selects
+    it.
+  - The heap chart's gestures: drag moves the cursor (as before), the wheel
+    zooms, a drag on the time axis pans and a double-click there fits,
+    Shift+drag selects a range. **Lock to Timeline** writes its pans and
+    zooms to the Timeline's window, which the Timeline takes up on its next
+    frame.
+- **Deferred from P2:**
+  - **Agent marks and snapshot instants on the time axes** (C3). Only
+    eventlog markers are drawn; the other two need A3 and A4.
+  - **Stepping on Live's charts.** `[` and `]` step through collections and
+    censuses on the Timeline and the heap chart. Live keeps only five
+    minutes of frames, and its collections are counts between frames, not
+    events.
+  - **Locking Live's charts to the Timeline.** They always show their last
+    five minutes; the cursor, range and markers already join them to it.
+  - **Census refs across artifacts.** An `RCensus` names a census of one
+    artifact (an eventlog's or a `.hp` file's), so refs are matched by exact
+    run key. A `.hp` file paired with an eventlog moves the shared cursor
+    exactly, but its census refs are not translated to the eventlog's, so
+    "Show collection" is offered only for the eventlog's censuses.
+  - **The cursor in the status bar** belongs with A7.
+  - **Top allocators in Analyse range** need cost-centre samples (D1).
+- **Seen while wiring P2:**
+  - A wakeup posted while its capability runs no thread (during GC, or by
+    the RTS itself) reads "woken by the runtime".
+  - Peeks on canvases are still deferred (from P1), so a blocked span's
+    waker shows in its hover text and the inspector rather than a peek.
 - **Seen while wiring, for P3:**
   - `-hi` bands are named by address. Their `InfoProv` label and span would
     read better in the legend and the census table.

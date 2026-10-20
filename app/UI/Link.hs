@@ -1,7 +1,8 @@
 -- | The links between panels.
 --
 -- Every panel reads and writes one 'Bus': the entity in focus, the one
--- under the pointer, and the navigation history. Every panel also offers a
+-- under the pointer, the navigation history, and the moment and range in
+-- program time that every time view of a run marks. Every panel also offers a
 -- 'Lens': what it can show, what it knows and what it can do for an entity
 -- named by a 'Ref'. The widgets here make any entity on screen a link:
 -- resting the pointer on it peeks at what every panel knows, right-clicking
@@ -56,6 +57,7 @@ import Data.List (nub)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Word (Word64)
 import NanoUI
 import Stronghead.Debug.Graph (ThunkKey (..), fmtClosureId)
 import Stronghead.Format (fmtNs, tshow)
@@ -100,6 +102,15 @@ data Bus = Bus
   , busForward :: !(Var [Location])
   , busMenu :: !(IORef (Maybe Ref))
     -- ^ What the open canvas context menu is about.
+  , busCursor :: !(Var (Maybe (RunKey, Word64)))
+    -- ^ The moment every time view of that run marks, in program time.
+  , busRange :: !(Var (Maybe (RunKey, Word64, Word64)))
+    -- ^ The range they shade.
+  , busWindow :: !(Var (Maybe (RunKey, TimeView)))
+    -- ^ The Timeline's visible window, for views locked to it. The Timeline
+    -- publishes it every frame and takes up a change another view writes.
+  , busBrush :: !(IORef (Maybe V2))
+    -- ^ Where a Shift+drag on a time view began.
   }
 
 -- | A place to come back to: a panel, and what was in focus there.
@@ -117,6 +128,10 @@ newBus = do
   busBack <- newVar []
   busForward <- newVar []
   busMenu <- newIORef Nothing
+  busCursor <- newVar Nothing
+  busRange <- newVar Nothing
+  busWindow <- newVar Nothing
+  busBrush <- newIORef Nothing
   pure Bus {..}
 
 -- | Make this frame's hovered entity the one every panel highlights. Call
@@ -214,7 +229,7 @@ homeOrder = \case
   RRange {} -> [PTimeline, PHeap, PLive]
   RCollection {} -> [PTimeline]
   RMarker {} -> [PTimeline]
-  RCensus {} -> [PHeap]
+  RCensus {} -> [PHeap, PTimeline]
   RBand {} -> [PHeap]
   RInfoTable {} -> [PHeap]
   RClosure {} -> [PHeap]
@@ -259,9 +274,16 @@ step env from to = do
       modifyVar (to bus) (take 100 . (here :))
       visit env loc
 
+-- | Going to an instant moves the cursor there, and going to a range
+-- selects it, in every time view of the run.
 visit :: Env -> Location -> NanoUI ()
 visit env (Location p mref) = do
-  writeVar (busFocus (envBus env)) mref
+  let bus = envBus env
+  writeVar (busFocus bus) mref
+  case mref of
+    Just (RInstant r t) -> writeVar (busCursor bus) (Just (r, t))
+    Just (RRange r a b) -> writeVar (busRange bus) (Just (r, a, b))
+    _ -> pure ()
   for_ mref $ \r ->
     for_ (listToMaybe [l | l <- envLenses env, lensPanel l == p, lensShows l r]) $ \l -> lensReveal l r
   envSwitch env p

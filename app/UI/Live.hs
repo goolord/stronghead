@@ -1,6 +1,11 @@
 -- | A "top" for a running Haskell program: connects to the agent in
 -- "Stronghead.Agent" and charts allocation, GC and residency as they
 -- happen, with the live thread list.
+--
+-- The charts run on program time, so they are time views like the
+-- Timeline's ("UI.Clock"): they show the shared cursor, range and the
+-- followed eventlog's markers, a click or drag moves the cursor, and
+-- Shift+drag selects a range there too.
 module UI.Live
   ( LiveState (..)
   , newLiveState
@@ -22,10 +27,12 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
 import NanoUI
+import Stronghead.Eventlog.Model (Timeline)
 import Stronghead.Format
 import Stronghead.Live
 import Stronghead.Ref
 import Stronghead.Run (runFromHello, runKey, runKeysMatch)
+import UI.Clock
 import UI.Common
 import UI.Link
 
@@ -86,6 +93,7 @@ liveLoad st = do
 -- | Per-second rates between consecutive frames.
 data Rates = Rates
   { rTime :: !Double
+    -- ^ Program time, in seconds.
   , rAlloc :: !Double
   , rGCs :: !Double
   , rGCPauseMs :: !Double
@@ -105,7 +113,7 @@ rates fs =
           d k = stat k b - stat k a
           newGC = d "gcs" > 0
        in Rates
-            { rTime = frTime b
+            { rTime = fromIntegral (frProgramNs b) / 1e9
             , rAlloc = d "allocated_bytes" / dt
             , rGCs = d "gcs" / dt
             , rGCPauseMs = if newGC then stat "gc_elapsed_ns" b / 1e6 else 0
@@ -115,8 +123,8 @@ rates fs =
             , rThreads = fromIntegral (length (frThreads b))
             }
 
-liveView :: Env -> LiveState -> Maybe LiveData -> (FilePath -> NanoUI ()) -> NanoUI ()
-liveView env st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
+liveView :: Env -> LiveState -> Maybe LiveData -> Maybe Timeline -> (FilePath -> NanoUI ()) -> NanoUI ()
+liveView env st mdata logTl followEventlog = columnWith (tight . gap 0 . grow) $ do
   want <- readVar (lvWant st)
   toolStrip $ do
     toolLabel "Agent"
@@ -137,7 +145,7 @@ liveView env st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
       disabledWhen (T.null (T.strip path)) $
         whenM (toolButton "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
   case mdata of
-    Just d | not (Seq.null (ldFrames d)) -> scope (dashboard env st d)
+    Just d | not (Seq.null (ldFrames d)) -> scope (dashboard env st d logTl)
     _ ->
       scope $
         emptyState
@@ -147,20 +155,23 @@ liveView env st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
           ]
           ["import Stronghead.Agent", " ", "main = withAgent defaultAgentConfig $ do", "  ..."]
 
-dashboard :: Env -> LiveState -> LiveData -> NanoUI ()
-dashboard env st d = do
+dashboard :: Env -> LiveState -> LiveData -> Maybe Timeline -> NanoUI ()
+dashboard env st d logTl = do
   th <- uiTheme
   let pal = palette th
       frames = ldFrames d
       rs = rates frames
       lastF = Seq.index frames (Seq.length frames - 1)
       latest = if null rs then Nothing else Just (last rs)
-      t0 = maybe 0 frTime (Seq.lookup 0 frames)
-      series f = [(rTime r - t0, f r) | r <- rs]
+      series f = [(rTime r, f r) | r <- rs]
       span' = case (rs, reverse rs) of
-        (r0 : _, rN : _) -> (rTime r0 - t0, rTime rN - t0)
+        (r0 : _, rN : _) -> (rTime r0, max (rTime r0 + 1e-3) (rTime rN))
         _ -> (0, 1)
       statsOn = stat "rts_stats" lastF > 0
+      -- Without +RTS -T a frame's time is when it arrived, which links to
+      -- nothing.
+      onClock = frProgramExact lastF
+      rk = liveRun d
   scope $ when (not statsOn) $
     columnWith (padXY 8 0 . padBottom 8 . tight . fillW) $
       callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
@@ -182,16 +193,27 @@ dashboard env st d = do
            , ("threads", tshow (length (frThreads lastF)))
            ]
   mm <- monoMetrics 0.8
-  let chart title color f fmtY fill' =
+  marks <- if onClock then marksFor env rk logTl else pure (Marks Nothing Nothing [])
+  let axisOf r = Axis rk (\ns -> chartTimeX r span' (ns / 1e9)) (\x -> chartXTime r span' x * 1e9)
+      inner (Rect x y w h) = Rect (x + 4) (y + 2) (max 1 (w - 8)) (max 1 (h - 6))
+      chart title color f fmtY fill' =
         columnWith (tight . gap 4 . fillW . fillH) $ do
           labelWith (fontMuted . fontSizeScale 0.88) title
-          _ <- canvas (fillW . fillH . minH 60) $ \r ->
-            drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color (series f) fill']
-          pure ()
+          resp <-
+            canvasConfigured
+              defaultCanvasConfig
+                { canvasLayout = (fillW . fillH . minH 60) defaultLayout
+                , canvasTrackPointer = True
+                , canvasCursor = if onClock then Just (\_ _ _ -> UiCursorCrosshair) else Nothing
+                }
+              $ \r -> do
+                drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color (series f) fill']
+                drawMarks pal (axisOf r) (inner r) marks
+          when onClock $ void (timeGestures env (axisOf (respRect resp)) resp ScrubDrag)
       counts = M.toList (M.fromListWith (+) [(statusGroup (ltStatus t), 1 :: Int) | t <- frThreads lastF])
   workbench (lvPanes st) $ \pid ctx ->
     if pid == paneCharts
-      then pane ctx "Runtime" (paneMeta ("last " <> fmtSec (snd span' - fst span'))) $ do
+      then pane ctx "Runtime" (paneMeta ("last " <> fmtSec (snd span' - fst span') <> if onClock then ", program time" else ", times approximate: run with +RTS -T")) $ do
         rowWith (tight . gap 16 . fillW . fillH) $ do
           chart "Allocation rate" (pRun pal) rAlloc fmtRate True
           chart "Live bytes after GC" (pLive pal) rLive fmtBytesD True
