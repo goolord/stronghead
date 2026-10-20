@@ -100,6 +100,21 @@ with a progress bar) and **follows a log the program is still writing**.
   **who woke it**: the thread running on the capability that posted the
   wakeup. With nothing selected the inspector lists the longest GC pauses
   and the most-blocked threads, the cursor and the selected range.
+- **Code on the timeline.** A profiled build (`-prof -fprof-auto`) run with
+  `+RTS -p -l` posts a cost-centre sample for every capability at each
+  profiler tick. Each capability gets a **code track** of the sampled top
+  frames, merged into runs and shaded ink per cost centre (collections in
+  the GC colour, idle time left empty); hover names the frame, its source
+  and its callers, and a click focuses the cost centre everywhere. A sample
+  belongs to the thread running on its capability, so the slice inspector
+  answers **What ran during this slice?**, a thread's inspector shows its
+  **CPU profile**, and **Analyse range** lists the top cost centres. Every
+  list says plainly when there are too few samples to trust: on Windows the
+  profiler's timer ticks about every 15 ms, not the 1 ms it asks for.
+- **Ticky.** A ticky build (`-ticky`) run with `+RTS -lT` writes each
+  closure's entries and allocation. The overview lists the counters,
+  **Analyse range** the top allocators in the range, and Core & STG puts
+  them on bindings and `let`s.
 
 Wheel zooms around the pointer, drag pans, double-click fits. A click also
 moves the shared cursor; drag the ruler to scrub it, and Shift+drag to select
@@ -134,7 +149,9 @@ Heap profiles from either the eventlog's heap samples (`+RTS -l -hT`, `-hi`,
 - Bands from an info-table profile (`-hi`) are named by their provenance
   ("thunk in main (Main.hs:82)") rather than an address. A `-hc` band's menu
   opens its stack in the `.prof` tree; any band's **Find in live graph**
-  lists the snapshot's closures with its closure type, name or source.
+  lists the snapshot's closures with its closure type, name or source, and
+  an `-hi` band's closures exactly, by info-table address, when the
+  snapshot is of the same run.
 - **Live graph (ghc-debug)**: exact retainer paths from the running program's
   closure graph, below.
 
@@ -151,7 +168,9 @@ through static reference tables the CAFs), and resumes it.
   Each closure shows its type, its size and the bytes it *holds* (each closure
   charged to its first retainer on a shortest path). Selecting one shows its
   shortest retainer path, summed up as e.g. "IS held by thunk plus, rooted at
-  CAF counter", and what it points to. Thunks are amber.
+  CAF counter", and what it points to. Thunks are amber. A thread (its TSO)
+  shows its **stack at the snapshot**, frame by frame, each frame a link to
+  the source of the code it returns to (with `-finfo-table-map`).
 - **Surviving thunks**: take snapshots a few seconds apart. Thunks still
   unevaluated in consecutive snapshots are listed, growing groups first, and
   shown red in the graph. The collector moves objects, so thunks are matched
@@ -230,10 +249,11 @@ focus keeps its notes in view, as does the line under the pointer.
   columns (cost centres and bands whose spans start in the binding's source,
   or that name it), sorted by clicking a header; **Hot and boxed only**
   keeps the bindings that cost at least 1% and box or allocate.
-
-- Bindings are listed by name with what happened to them: worker/wrapper
-  (`W/W`), `INLINE`/`NOINLINE`, boxing sites, STG `let` allocations, and
-  `gone` when a source binding no longer exists in Core (inlined away).
+- With a ticky eventlog loaded (`-ticky`, `+RTS -lT`) the list also gains
+  **entries** and **ticky** (bytes allocated) columns. Each counter is named
+  after its closure's STG binder (`main2_sat_s7qL{v} (Main) (fun) in s7qM`),
+  so it joins exactly to its `let` in the STG dump and through it to the
+  binding; without the dump it joins by the binding's name.
 - Selecting a binding lines up all three panes and explains it: arity,
   strictness signature, inline pragma, size, "Re-boxes values ...",
   "N let-bound closures in STG ...", with buttons that jump to each boxing
@@ -247,6 +267,7 @@ focus keeps its notes in view, as does the line under the pointer.
   `_info` (`main2_sat_s7qA_info`), and with `-fdistinct-constructor-tables`
   a constructor table (`I#_Main_3_con_info`) names its numbered site
   (`3 GHC.Internal.Types.I#! [x]`); both are exact joins within one build.
+  With ticky, each `let` also shows its closure's entries and allocation.
   Revealing a source line scrolls the STG pane to the code compiled from it.
 - Right-click any line, name or note: **Open in editor** runs the editor
   command from Settings at that line, and **Break here** sets a breakpoint.
@@ -266,8 +287,12 @@ that starts one).
 - Step into, step over (`:steplocal`), step out (`:stepout`), step module,
   continue, trace, history, back/forward, abandon. The current span is
   highlighted and followed.
-- **Local bindings** at each stop, marked as evaluated or `_thunk`, with
-  **Force WHNF**, **Force NF** and `:print` per binding.
+- **Local bindings** at each stop, each `:print`ed and shown as an
+  expandable tree, styled like the closure graph: constructors, records,
+  lists and tuples open level by level, and unevaluated parts are amber
+  `_t` thunks with their types. **Evaluate** takes a thunk to weak head
+  normal form (`seq`) and **Force** all the way (`:force`), in place; the
+  values are printed again and GHCi stays stopped where it was.
 - A console showing every command and its output, plus a prompt for raw GHCi
   commands. `:history` steps and stops are links to their source.
 - **Breakpoints** lists every breakpoint, in any file, as links.
@@ -345,10 +370,10 @@ backend; see [Live closure graph](#live-closure-graph-ghc-debug).
 | `src/Stronghead/Dump.hs` | Core/STG/source tokenising, bindings, optimisation notes, dump discovery |
 | `src/Stronghead/Ghci.hs` | GHCi subprocess driver and output parsers |
 | `src/Stronghead/Source.hs` | Source spans, the source index, the editor command |
-| `src/Stronghead/Join.hs` | Joins between artifacts: spans, cost centres, info tables and STG binders, `-hc` stacks and `.prof` paths, bands and closures |
+| `src/Stronghead/Join.hs` | Joins between artifacts: spans, cost centres, info tables, ticky counters and STG binders, `-hc` stacks and `.prof` paths, bands and closures |
 | `src/Stronghead/Live.hs` | Client for the agent's protocol |
 | `src/Stronghead/Debug.hs` | ghc-debug snapshots (the backend behind the `ghc-debug` flag) |
-| `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots |
+| `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots, thread stacks |
 | `src/Stronghead/Debug/Client.hs` | ghc-debug-client traversal (built only with the flag) |
 | `agent/Stronghead/Agent.hs` | The drop-in agent |
 | `app/UI/*.hs` | The nano-ui panels |
@@ -364,8 +389,10 @@ backend; see [Live closure graph](#live-closure-graph-ghc-debug).
   (200k by default, up to 1M). Weak pointers are not followed.
 - ghc-debug-stub does not build on Windows, so a Windows target can't be
   snapshotted; see [Platforms](#live-closure-graph-ghc-debug).
-- The eventlog carries no stack traces, so the thread inspector shows labels,
-  timing and blocking reasons, not stacks.
+- The eventlog carries no stack traces. A profiled build's cost-centre
+  samples say what each capability ran, coarsely (one sample per tick per
+  capability), and a ghc-debug snapshot gives each thread's stack; otherwise
+  the thread inspector shows labels, timing and blocking reasons.
 - ghc-events' thread-stop table predates GHC's renumbering of blocking
   reasons, so Stronghead reinterprets codes 16 and up (C calls, `throwTo`).
   GHC's raw code 21 (WinIO completion) still makes ghc-events fail to decode.

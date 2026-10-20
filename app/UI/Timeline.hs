@@ -1,6 +1,8 @@
--- | The eventlog timeline: capability tracks, the GC pressure strip, the
--- heap strip with its censuses, markers, per-thread rows, the slice
--- inspector and the markers list.
+-- | The eventlog timeline: capability tracks (with a code track each when
+-- a profiled build's cost-centre samples are in the log), the GC pressure
+-- strip, the heap strip with its censuses, markers, per-thread rows, the
+-- slice inspector and the markers list. A ticky build's counters annotate
+-- the code views through the lens.
 --
 -- Wheel zooms around the pointer, dragging pans, a click selects the slice
 -- under the pointer and moves the shared cursor there, and a double click

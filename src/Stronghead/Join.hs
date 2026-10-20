@@ -3,8 +3,8 @@
 --
 -- Everything here is pure. Code-keyed joins hold across runs of one build:
 -- cost centres and info tables are matched to source by their spans, and
--- info tables to STG binders by name. Each function says how exact its
--- join is.
+-- info tables and ticky counters to STG binders by name. Each function says
+-- how exact its join is.
 --
 -- The 'Annotation' is what a panel says about a span of source for the
 -- annotated code view: a heat bar in one of its lanes, a gutter mark or a

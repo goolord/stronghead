@@ -253,6 +253,14 @@ data Runtime = Runtime
 noRuntime :: Runtime
 noRuntime = Runtime 0 0 0 0 0
 
+-- | Bytes in a narrow column: 44.6M, 968B (binary units).
+fmtBytesShort :: Double -> Text
+fmtBytesShort b
+  | b >= 1024 ^ (3 :: Int) = fmtFixed 1 (b / 1024 ^ (3 :: Int)) <> "G"
+  | b >= 1024 ^ (2 :: Int) = fmtFixed 1 (b / 1024 ^ (2 :: Int)) <> "M"
+  | b >= 1024 = fmtFixed 1 (b / 1024) <> "K"
+  | otherwise = tshow (round b :: Int) <> "B"
+
 -- | A count in a narrow column: 4.2M, 51.6k, 7.
 fmtCount :: Double -> Text
 fmtCount n
@@ -569,19 +577,26 @@ panes env st loaded src core stg = do
                   LaneTime -> sortHeader st (fixedW 38 . alignEnd) "time" ByTime
                   LaneAlloc -> sortHeader st (fixedW 38 . alignEnd) "alloc" ByAlloc
                   LaneEntries -> sortHeader st (fixedW 44 . alignEnd) "entries" ByEntries
-                  LaneTicky -> sortHeader st (fixedW 64 . alignEnd) "ticky" ByTicky
+                  LaneTicky -> sortHeader st (fixedW 46 . alignEnd) "ticky" ByTicky
                   _ -> sortHeader st (fixedW 52 . alignEnd) "heap" ByHeap
             paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
               forM_ shown $ \e -> withKey (enKey e) $ do
                 let r = rt e
                 picked <- linkRow env (RBinding modName (enKey e)) (selected == Just (enKey e)) id $ do
-                  cell (fillW . minW 72 . fontMono . fontSizeScale 0.9) (T.take (if null lanes then 34 else 24) (enKey e))
-                  entryBadges e (isJust core)
+                  -- With several columns, the badges go under the name so
+                  -- the numbers keep their place.
+                  if length lanes >= 3 || LaneTicky `elem` lanes
+                    then columnWith (fillW . minW 72 . tight . gap 2 . alignMid) $ do
+                      labelWith (fillW . fontMono . fontSizeScale 0.9) (T.take 24 (enKey e))
+                      rowWith (tight . gap 4 . wrap . fillW) (entryBadges e (isJust core))
+                    else do
+                      cell (fillW . minW 72 . fontMono . fontSizeScale 0.9) (T.take (if null lanes then 34 else 24) (enKey e))
+                      entryBadges e (isJust core)
                   forM_ lanes $ \l -> withKey (laneName l) $ case l of
                     LaneTime -> numCell 38 (costTone (rtTime r)) (pct (rtTime r))
                     LaneAlloc -> numCell 38 (costTone (rtAlloc r)) (pct (rtAlloc r))
                     LaneEntries -> numCell 44 (if rtEntries r > 0 then id else fontMuted) (if rtEntries r > 0 then fmtCount (rtEntries r) else "·")
-                    LaneTicky -> numCell 64 (if rtTicky r > 0 then id else fontMuted) (if rtTicky r > 0 then fmtBytesD (rtTicky r) else "·")
+                    LaneTicky -> numCell 46 (if rtTicky r > 0 then id else fontMuted) (if rtTicky r > 0 then fmtBytesShort (rtTicky r) else "·")
                     _ -> numCell 52 (if rtHeap r > 0 then id else fontMuted) (if rtHeap r > 0 then fmtBytesD (rtHeap r) else "·")
                 when picked (select (enKey e))
       | pid == paneNotes ->

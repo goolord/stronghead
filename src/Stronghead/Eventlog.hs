@@ -9,8 +9,9 @@
 -- An eventlog is a sequence of per-capability blocks, so events are only
 -- ordered within a capability. Everything the builder tracks per capability
 -- (run and GC spans) is safe to fold in file order; everything global (GC
--- statistics, heap counters, heap samples, per-thread history) is collected
--- and sorted when a snapshot is taken.
+-- statistics, heap counters, heap samples, per-thread history, a profiled
+-- build's cost-centre samples, ticky counters) is collected and sorted when
+-- a snapshot is taken.
 module Stronghead.Eventlog
   ( Builder
   , emptyBuilder

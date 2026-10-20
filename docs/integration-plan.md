@@ -766,6 +766,93 @@ how far C1 can trust each clock. Then P1a.
     `cabal repl stronghead-sample`. Not checked end to end.
   - **A real `-hc` profile.** V4 found no non-empty `-hc` census on
     Windows, so the `.prof` path join is checked against fixtures only.
+- **P6** is in place, D1–D5, with the ghc-debug parts (D3, D4) built and
+  tested against the model but not run end to end:
+  - **D1.** The eventlog model keeps every `ProfSampleCostCentre`
+    (`tlProfSamples`), each with the thread running on its capability at
+    the time, so a thread's CPU profile is its samples. The samples merge
+    into per-capability runs of one top frame (`tlCodeRuns`), and
+    `tlSamplePeriod` is the gap the log shows between one capability's
+    samples. `codeProfile`, `sliceProfile` and `threadProfile` count top
+    frames, leaving the `IDLE` cost centre out. The Timeline draws a code
+    track under each capability (toggle **Code**), the span inspector
+    answers **What ran during this slice?**, the thread section shows its
+    CPU profile, and **Analyse range** and the overview list the top cost
+    centres, all as `RCostCentre` links with their spans. Each list says
+    when there are fewer than 30 samples, and names the timer's real
+    period when it is coarser than 5 ms. The Timeline lens shows, peeks,
+    finds and puts in the source any sampled cost centre, so Ctrl+click
+    reaches it without a `.prof` (its home order is now Heap, Core,
+    Timeline).
+  - On the sample's profiled run (`+RTS -p -l`, 4 s, `-N4`): 1,084
+    samples, one every 15.5 ms per capability (the 1 ms tick asked for runs
+    at the Windows timer's 1/64 s), 58% of them in `GC`, 12% idle.
+  - **D2.** Ticky counters are summed per counter, keeping each sample
+    (`tcSeries`): the RTS resets the counters after each sample, so the
+    samples are deltas. `Stronghead.Join.parseTickyName` reads the counter
+    names: `tickyBinder` puts the unique back (`go1{v s7vg}` is
+    `go1_s7vg`, `Main.main2{v r7mA}` stays qualified), and `tickyTopLevel`
+    follows the `in s7qM` parents to the top-level binding. A counter
+    joins its STG `let` through `siteOfTable`, as S4's IPE tables do. In
+    the sample's ticky build, 35 of its 36 counters name a binder in their
+    module's STG dump; the one that doesn't is GHC's `:Main.main`. Core &
+    STG's bindings list gains **entries** and **ticky** columns (sortable,
+    counted in "hot"), each `let` in the STG pane shows its counter, the
+    notes bar its totals, the Timeline's overview the counters, **Analyse
+    range** the top allocators from the samples in the range (`tickyBetween`),
+    and the palette every counter.
+  - **D3.** The client decodes each STACK's frames (`dereferenceStack`),
+    with each frame's info-table source (`getSourceInfo`), into
+    `cnFrames`. `threadStack` reads a TSO's stack top first, following
+    `UNDERFLOW_FRAME`s into older chunks and stopping on a loop. A TSO's
+    detail pane in the live graph shows **Stack at snapshot**, frames as
+    source links, and its peek (so a thread's peek in every panel) its top
+    frames.
+  - **D4.** `ClosureNode` keeps its info pointer (`cnInfo`). `matchBand`
+    matches an `-hi` band to closures by address when any closure carries
+    it, and falls back to source, type or name otherwise; **Find in live
+    graph** says which it used.
+  - **D5.** `Stronghead.Ghci` parses values (`parseValue`, `parsePrint`)
+    into trees: constructors (infix ones too), records, lists with an
+    unevaluated tail, tuples, literals, and `_t` thunks with their types.
+    At each stop the Debugger `:print`s every local binding and shows the
+    value as an expandable tree, thunks amber; **Evaluate** (`seq`) and
+    **Force** (`:force`) work on any named thunk, then reprint. Forcing no
+    longer runs through the resume path, so GHCi's stop is kept (the old
+    Force WHNF cleared it). Checked against `ghci` 9.14 on a small module:
+    `p = (_t1::P)` becomes `P (_t2::Int) (_t3::[Int])` after `_t1 \`seq\`
+    ()`, and `P 5 [2,4,6,8,10]` after `:force p`.
+  - `stronghead-ui-test` drives the value tree: its thunks show named and
+    typed, Evaluate and Force reach the right thunk, and a node closes to
+    the whole value.
+- **Deferred from P6:**
+  - **D3 and D4 end to end.** No ghc-debug target runs on this Windows
+    machine (the stub needs Unix sockets, and there is no WSL distro), so
+    the frame decoding and the info pointers are compiled
+    (`cabal build -f ghc-debug`) but never exercised against a real
+    debuggee (V6 is still open). Frame titles, underflow chains and the
+    exact band match are tested on hand-built snapshots only.
+  - **Stacks in the Timeline's thread inspector.** A thread's stack shows
+    in the TSO's detail pane and in its peek, which the Timeline's thread
+    rows already open; the inspector itself doesn't read the Heap's
+    snapshots.
+  - **Top allocators from cost-centre samples** (the P2 deferral).
+    Samples measure where the time went, not what was allocated; the
+    eventlog has no per-cost-centre allocation. Analyse range lists the
+    top cost centres by samples, and the top allocators from ticky when a
+    ticky log is loaded.
+  - **Ticky counters as their own refs.** Counters link to the binding
+    they are nested in (`RBinding`); there is no ref for an STG `let`, so
+    Ctrl+click on a counter opens the binding, not the `let`.
+  - **Ticky ↔ IPE by info table.** Counters carry their info table's
+    address, which joins `-hi` bands of the same run; a ticky build with
+    `-finfo-table-map` wasn't tried.
+  - **Debugger screenshots.** The value tree is checked headlessly
+    (`stronghead-ui-test`) and the parser against real `ghci` output; a
+    stopped session can't be started from the command line, so there is
+    no capture of it.
+  - **Code-track peeks.** As with every canvas (P1), the code track has
+    hover text, right-click and Ctrl+click, not a peek.
 
 ## Verification spikes
 
