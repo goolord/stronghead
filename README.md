@@ -15,6 +15,15 @@ Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`,
 `.dump-stg-final`, `.hs`); a directory is searched for Core/STG dumps. Files can
 also be opened from the header or dropped on the window.
 
+**Settings** (the header button, or Ctrl+,) holds the theme (system, light,
+dark), the interface scale (follow the display's DPI scaling, or 75–300%;
+Ctrl+= / Ctrl+- step it, Ctrl+0 goes back to following the display), which
+panel to open on, and the defaults for the Live agent address, the GHCi
+command and the Core view. They are saved as they change, with the window's
+size and position on quit, to `settings.conf` in the user config directory
+(`%APPDATA%\stronghead` on Windows, `~/.config/stronghead` elsewhere). The
+command line wins over them.
+
 ## Panels
 
 ### Timeline (eventlog)

@@ -1,32 +1,37 @@
--- | The window: a header with the panel tabs and a global Open, file
--- drag-and-drop, and the per-frame loaders that keep background work going
--- whichever panel is showing.
+-- | The window: a header with the panel tabs, a global Open and Settings,
+-- file drag-and-drop, and the per-frame loaders that keep background work
+-- going whichever panel is showing.
 module UI.Shell
   ( App
   , Options (..)
   , defaultOptions
   , newApp
   , appView
+  , saveAppSettings
   ) where
 
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isSuffixOf)
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import NanoUI
-import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
+import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askSdlEnv, defaultFileDialogOptions, setSdlUiScale, useFileDialog, windowZoom)
+import NanoUI.Shortcut qualified as K
 import Stronghead.Dump (kindForPath)
 import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Eventlog (LoadProgress (..))
 import Stronghead.Format (fmtBytes, tshow)
 import System.Directory (doesDirectoryExist, makeAbsolute)
 import System.FilePath (takeDirectory, takeFileName)
+import UI.Code (colouringName)
 import UI.Common
 import UI.Core
 import UI.Debugger
 import UI.Heap
 import UI.Live
+import UI.Settings
 import UI.Timeline
 
 data Panel = PTimeline | PHeap | PCore | PDebugger | PLive
@@ -49,10 +54,15 @@ panelHint = \case
   PDebugger -> "Click the gutter to set or clear a breakpoint"
   PLive -> "Samples arrive four times a second"
 
+-- | The panel's name on the command line and in the settings file.
+panelKey :: Panel -> T.Text
+panelKey = T.toLower . T.takeWhile (/= ' ') . panelTitle
+
+panelNamed :: T.Text -> Maybe Panel
+panelNamed name = lookup name [(panelKey p, p) | p <- [minBound .. maxBound]]
+
 tabNamed :: T.Text -> Panel
-tabNamed name = case [p | p <- [minBound .. maxBound], T.toLower (T.takeWhile (/= ' ') (panelTitle p)) == name] of
-  p : _ -> p
-  [] -> PTimeline
+tabNamed = fromMaybe PTimeline . panelNamed
 
 data App = App
   { appTab :: !(Var Panel)
@@ -69,6 +79,18 @@ data App = App
   , appMessage :: !(Var T.Text)
   , appStartTab :: !(Maybe Panel)
     -- ^ A panel asked for on the command line wins over the files' panels.
+  , appSettingsOpen :: !(Var Bool)
+  , appTheme :: !(Var ThemeChoice)
+  , appScale :: !(Var UiScale)
+  , appRestoreWindow :: !(Var Bool)
+  , appStartPanel :: !(Var (Maybe Panel))
+    -- ^ 'Nothing': the panel in use when the program last quit.
+  , appPlaceWindow :: !(Var (Maybe SavedWindow))
+    -- ^ Geometry to put the window back to on the first frame.
+  , appWindowSeen :: !(IORef (Maybe SavedWindow))
+    -- ^ The window's latest restored geometry, saved on quit.
+  , appSaved :: !(IORef Settings)
+    -- ^ What the settings file holds, so it is written only on a change.
   }
 
 -- | What the command line asked for.
@@ -86,17 +108,23 @@ data Options = Options
 defaultOptions :: Options
 defaultOptions = Options [] Nothing Nothing Nothing Nothing
 
-newApp :: Options -> IO App
-newApp Options {..} = do
-  let firstPanel
+-- | The app, starting from saved settings; the command line wins over them.
+newApp :: Settings -> Options -> IO App
+newApp settings Options {..} = do
+  let startPanel = cfgStartPanel settings >>= panelNamed
+      firstPanel
         | Just _ <- optDebug = PDebugger
         | Just _ <- optConnect = PLive
-        | otherwise = PTimeline
+        | otherwise = fromMaybe (tabNamed (cfgLastPanel settings)) startPanel
   appTab <- newVar (maybe firstPanel tabNamed optTab)
   appTimeline <- newTimelineState
   appHeap <- newHeapState
   appCore <- newCoreState
+  writeVarIO (csColouring appCore) (cfgColouring settings)
+  writeVarIO (csHideUniques appCore) (cfgHideUniques settings)
+  writeVarIO (csHideTypeable appCore) (cfgHideTypeable settings)
   appDebug <- newDebugState
+  writeVarIO (dsCommand appDebug) (cfgGhciCommand settings)
   appStartDebug <- newVar False
   for_ optDebug $ \path -> do
     dir <- makeAbsolute (takeDirectory path)
@@ -104,6 +132,8 @@ newApp Options {..} = do
     writeVarIO (dsFile appDebug) (T.pack (takeFileName path))
     writeVarIO appStartDebug True
   appLive <- newLiveState
+  writeVarIO (lvHost appLive) (cfgAgentHost settings)
+  writeVarIO (lvPort appLive) (cfgAgentPort settings)
   for_ optConnect $ \(host, port) -> do
     writeVarIO (lvHost appLive) host
     writeVarIO (lvPort appLive) port
@@ -113,7 +143,70 @@ newApp Options {..} = do
   appFollow <- newVar optFollow
   appMessage <- newVar ""
   let appStartTab = tabNamed <$> optTab
+  appSettingsOpen <- newVar False
+  appTheme <- newVar (cfgTheme settings)
+  appScale <- newVar (cfgScale settings)
+  appRestoreWindow <- newVar (cfgRestoreWindow settings)
+  appStartPanel <- newVar startPanel
+  appPlaceWindow <- newVar (if cfgRestoreWindow settings then cfgWindow settings else Nothing)
+  appWindowSeen <- newIORef (cfgWindow settings)
+  appSaved <- newIORef settings
   pure App {..}
+
+-- | The settings as they stand: the dialog's, the panels' defaults as last
+-- set, and the window's geometry.
+currentSettings :: App -> IO Settings
+currentSettings app = do
+  cfgTheme <- readVarIO (appTheme app)
+  cfgScale <- readVarIO (appScale app)
+  cfgRestoreWindow <- readVarIO (appRestoreWindow app)
+  cfgWindow <- readIORef (appWindowSeen app)
+  cfgStartPanel <- fmap panelKey <$> readVarIO (appStartPanel app)
+  cfgLastPanel <- panelKey <$> readVarIO (appTab app)
+  cfgAgentHost <- readVarIO (lvHost (appLive app))
+  cfgAgentPort <- readVarIO (lvPort (appLive app))
+  cfgGhciCommand <- readVarIO (dsCommand (appDebug app))
+  cfgColouring <- readVarIO (csColouring (appCore app))
+  cfgHideUniques <- readVarIO (csHideUniques (appCore app))
+  cfgHideTypeable <- readVarIO (csHideTypeable (appCore app))
+  pure Settings {..}
+
+-- | Save the settings with the window's final geometry; call once the
+-- window has closed.
+saveAppSettings :: App -> IO (Either T.Text ())
+saveAppSettings app = saveSettings =<< currentSettings app
+
+-- | Save whenever a setting changes. The window's geometry changes on every
+-- frame of a drag, so it alone waits for 'saveAppSettings' on quit.
+persistSettings :: App -> NanoUI ()
+persistSettings app = do
+  now <- liftIO (currentSettings app)
+  saved <- liftIO (readIORef (appSaved app))
+  when (now {cfgWindow = Nothing} /= saved {cfgWindow = Nothing}) $ do
+    liftIO (writeIORef (appSaved app) now)
+    liftIO (saveSettings now) >>= either (writeVar (appMessage app)) pure
+
+-- | Note the window's restored geometry, and put it back on the first frame.
+trackWindow :: App -> NanoUI ()
+trackWindow app = do
+  place <- readVar (appPlaceWindow app)
+  for_ place $ \sw -> do
+    writeVar (appPlaceWindow app) Nothing
+    -- Opening at a zoom other than 1 centres the window, so move it after.
+    for_ (swPosition sw) (uncurry moveWindowUi)
+    when (swMaximized sw) maximizeWindowUi
+  w <- askWindow
+  let Size ww wh = winSize w
+  liftIO $ unless (winMinimized w || winFullscreen w || ww <= 0 || wh <= 0) $
+    modifyIORef' (appWindowSeen app) $ \prev ->
+      if winMaximized w
+        then Just (maybe (SavedWindow (winSize w) (winPosition w) True) (\p -> p {swMaximized = True}) prev)
+        else Just (SavedWindow (winSize w) (winPosition w) False)
+
+-- | The zoom the window is running at, for showing and stepping from
+-- 'ScaleAuto'.
+currentZoom :: NanoUI Float
+currentZoom = askSdlEnv >>= maybe (pure 1) (liftIO . windowZoom)
 
 -- | Route a path to the panel that reads it.
 openAny :: App -> FilePath -> NanoUI ()
@@ -129,6 +222,12 @@ openAny app p = do
 
 appView :: App -> NanoUI ()
 appView app = do
+  -- Settings first, so the whole frame is drawn in the chosen theme.
+  choice <- readVar (appTheme app)
+  setUiTheme . strongheadTheme . choiceAppearance choice =<< systemAppearance
+  setSdlUiScale . uiScaleFactor =<< readVar (appScale app)
+  trackWindow app
+  settingsShortcuts app
   pending <- readVar (appPending app)
   unless (null pending) $ do
     writeVar (appPending app) []
@@ -166,6 +265,7 @@ appView app = do
         themed th $ navBar (appTab app)
         flex
         themed th $ document app active
+        themed th $ whenM (toolButton "Settings") (writeVar (appSettingsOpen app) True)
         themed th $ whenM (toolButton "Open…") $
           writeVar (appOpen app) . Just
             =<< askOpenFileDialog
@@ -185,6 +285,8 @@ appView app = do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
     statusBar app active timeline live
+  settingsModal app
+  persistSettings app
 
 -- | The file the active panel is showing, in the title bar.
 document :: App -> Panel -> NanoUI ()
@@ -241,3 +343,103 @@ navBar :: Var Panel -> NanoUI ()
 navBar v =
   rowWith (alignBottom . tight) $
     boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v
+
+-- ---------------------------------------------------------------------------
+-- Settings
+
+zoomIn, zoomOut, zoomReset, openSettings :: [K.Shortcut]
+zoomIn = [K.cmdOrCtrl <> K.key '=', K.cmdOrCtrl <> K.shift <> K.key '=', K.cmdOrCtrl <> K.key '+']
+zoomOut = [K.cmdOrCtrl <> K.key '-']
+zoomReset = [K.cmdOrCtrl <> K.key '0']
+openSettings = [K.cmdOrCtrl <> K.key ',']
+
+-- | The window-wide chords: open Settings, and step the interface scale.
+settingsShortcuts :: App -> NanoUI ()
+settingsShortcuts app = do
+  let pressed = fmap or . mapM shortcut
+  whenM (pressed openSettings) (writeVar (appSettingsOpen app) True)
+  bigger <- pressed zoomIn
+  smaller <- pressed zoomOut
+  reset <- pressed zoomReset
+  when (bigger || smaller) $ do
+    zoom <- currentZoom
+    modifyVar (appScale app) (stepScale (if bigger then 1 else -1) zoom)
+  when reset (writeVar (appScale app) ScaleAuto)
+
+settingsModal :: App -> NanoUI ()
+settingsModal app = do
+  zoom <- currentZoom
+  scale <- readVar (appScale app)
+  path <- liftIO settingsPath
+  let auto = if scale == ScaleAuto then Just zoom else Nothing
+      chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
+      headOr = \case k : _ -> k; [] -> mempty
+      input f v = textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . f) defaultLayout} v
+      core = appCore app
+  modalWith (fixedW 620) (appSettingsOpen app) "Settings" $
+    columnWith (fillW . tight . gap 8) $ do
+      sectionTitle "Appearance"
+      settingRow "Theme" $
+        boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} themeChoiceName (appTheme app)
+      settingRow "Interface scale" $ enumSelectWith (alignMid . fixedW 230) (uiScaleLabel auto) (appScale app)
+      settingNote $
+        chords [zoomIn, zoomOut] <> " step the scale; " <> chords [zoomReset] <> " follows the display again."
+      sectionTitle "Startup"
+      settingRow "Open on" $
+        selectWith
+          (alignMid . fixedW 230)
+          ("The panel last used" : map panelTitle [minBound .. maxBound])
+          (zoomVar (maybe 0 ((+ 1) . fromEnum)) (\i _ -> if i <= 0 then Nothing else Just (toEnum (i - 1))) (appStartPanel app))
+      settingRow "" $ checkboxWith alignMid "Reopen the window where it was, at the size it was" (appRestoreWindow app)
+      sectionTitle "Live"
+      settingRow "Agent address" $ do
+        input (fixedW 170) (lvHost (appLive app))
+        toolLabel ":"
+        input (fixedW 80) (lvPort (appLive app))
+      sectionTitle "Debugger"
+      settingRow "GHCi command" $ input (fixedW 260) (dsCommand (appDebug app))
+      sectionTitle "Core & STG"
+      settingRow "Colouring" $
+        boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring core)
+      settingRow "" $ do
+        checkboxWith alignMid "Hide uniques" (csHideUniques core)
+        checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable core)
+      settingNote "The Core & STG toolbar changes these too; the last choice is kept."
+      columnWith (padTop 12 . fillW . tight . gap 8) $ do
+        labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack path)
+        fillRow $ do
+          flex
+          whenM (toolButton "Reset to defaults") (resetSettings app)
+          whenM (styled primary (toolButton "Done")) (writeVar (appSettingsOpen app) False)
+
+-- | Every setting the dialog shows back to its default. The window's
+-- remembered geometry is left alone.
+resetSettings :: App -> NanoUI ()
+resetSettings app = do
+  let d = defaultSettings
+      core = appCore app
+  writeVar (appTheme app) (cfgTheme d)
+  writeVar (appScale app) (cfgScale d)
+  writeVar (appRestoreWindow app) (cfgRestoreWindow d)
+  writeVar (appStartPanel app) (cfgStartPanel d >>= panelNamed)
+  writeVar (lvHost (appLive app)) (cfgAgentHost d)
+  writeVar (lvPort (appLive app)) (cfgAgentPort d)
+  writeVar (dsCommand (appDebug app)) (cfgGhciCommand d)
+  writeVar (csColouring core) (cfgColouring d)
+  writeVar (csHideUniques core) (cfgHideUniques d)
+  writeVar (csHideTypeable core) (cfgHideTypeable d)
+
+-- | A setting: its name in a column of names, then its controls.
+settingRow :: T.Text -> NanoUI () -> NanoUI ()
+settingRow name controls =
+  rowWith (fillW . tight . gap 12) $ do
+    labelWith (alignMid . fixedW 130 . fontSizeScale 0.92) name
+    rowWith (alignMid . fillW . tight . gap 8) controls
+
+-- | A line of explanation under a setting, indented to its controls.
+settingNote :: T.Text -> NanoUI ()
+settingNote t = rowWith (padLeft 142 . fillW . tight) (labelWith (fillW . fontMuted . fontSizeScale 0.85) t)
+
+-- | A dropdown over a bounded enum, with a layout.
+enumSelectWith :: (Bounded a, Enum a) => (Layout -> Layout) -> (a -> T.Text) -> Var a -> NanoUI ()
+enumSelectWith f name v = selectWith f (map name [minBound .. maxBound]) (zoomVar fromEnum (\i _ -> toEnum i) v)

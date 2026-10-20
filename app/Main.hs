@@ -10,40 +10,53 @@
 -- @--tab NAME@ (timeline, heap, core, debugger, live) picks the starting
 -- panel, @--connect@ connects the Live panel to a program's agent, and
 -- @--follow@ tails an eventlog the program is still writing, and @--debug@
--- starts a GHCi session on a module. For development, @STRONGHEAD_CAPTURE=out.bmp@ saves a screenshot
+-- starts a GHCi session on a module. Preferences (theme, interface scale,
+-- window geometry, the panels' defaults) are loaded from and saved to the
+-- settings file ("UI.Settings"). For development, @STRONGHEAD_CAPTURE=out.bmp@ saves a screenshot
 -- once the window has been up for @STRONGHEAD_CAPTURE_DELAY@ seconds
 -- (default 3) and exits.
 module Main (main) where
 
 import Control.Monad (when)
+import Data.Maybe (isNothing)
 import Data.Text qualified as T
+import Data.Text.IO qualified as T
 import NanoUI
 import NanoUI.Backend.Sdl (NanoUIFont (..), SdlOptions (..), askSdlEnv, defaultSdlOptions, runSdlApp, saveScreenshot)
 import System.Environment (getArgs, lookupEnv)
+import System.IO (stderr)
 import Text.Read (readMaybe)
 import UI.Common (strongheadTheme)
+import UI.Settings
 import UI.Shell
 
 main :: IO ()
 main = do
   args <- getArgs
-  app <- newApp (parseArgs args defaultOptions)
+  settings <- loadSettings
+  app <- newApp settings (parseArgs args defaultOptions)
   capture <- lookupEnv "STRONGHEAD_CAPTURE"
   delay <- maybe 3 (\s -> maybe 3 id (readMaybe s)) <$> lookupEnv "STRONGHEAD_CAPTURE_DELAY"
   started <- newVar (Nothing :: Maybe Double)
+  let window = if cfgRestoreWindow settings then cfgWindow settings else Nothing
   runSdlApp
     defaultSdlOptions
       { sdlWindowSettings =
           defaultWindowSettings
             { wsTitle = "Stronghead"
-            , wsSize = Size 1500 960
+            , wsSize = maybe (Size 1500 960) swSize window
+            , wsPosition = maybe WindowPositionDefault (uncurry WindowPositionAt) (window >>= swPosition)
             , wsMinSize = Just (Size 960 640)
             }
-      , sdlAppThemeFor = Just strongheadTheme
+      , sdlAppThemeFor = Just (strongheadTheme . choiceAppearance (cfgTheme settings))
+      , sdlAppUiScale = uiScaleFactor (cfgScale settings)
       , sdlAppFontSize = 15
       , sdlAppMonoFont = FontSearch ["JetBrains Mono", "Cascadia Mono", "Source Code Pro", "Consolas", "DejaVu Sans Mono", "monospace"]
       }
     (appView app >> maybe (pure ()) (captureAfter started delay) capture)
+  -- A screenshot run leaves the user's settings as they were.
+  when (isNothing capture) $
+    saveAppSettings app >>= either (T.hPutStrLn stderr) pure
 
 parseArgs :: [String] -> Options -> Options
 parseArgs args o = case args of
