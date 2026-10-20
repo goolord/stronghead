@@ -766,6 +766,100 @@ how far C1 can trust each clock. Then P1a.
     `cabal repl stronghead-sample`. Not checked end to end.
   - **A real `-hc` profile.** V4 found no non-empty `-hc` census on
     Windows, so the `.prof` path join is checked against fixtures only.
+- **P4** is in place, A1–A7:
+  - **Protocol v2** (A1). After its hello the agent sends an `I` line:
+    version, working directory, executable, the full command line
+    (`getFullArgs`, so `+RTS` options included), the heap profile's
+    breakdown and interval (`getProfFlags`), whether an eventlog is being
+    written (`getTraceFlags`) and whether it takes commands. Fields are
+    percent-encoded; the arguments are encoded one by one and joined by
+    commas. Each `T` line is followed by `C <tid> <capability>`.
+  - Commands carry an id and are answered by `A <id> ok [t=<ns>]` or `A <id>
+    error <text>`. `t` is `elapsed_ns + init_elapsed_ns` just after the
+    command ran, under `+RTS -T`. Every command but `flush` also posts an
+    eventlog marker (the mark's text, or `stronghead: major GC` and so on),
+    so it reaches a followed Timeline by itself. `agentAcceptCommands ::
+    Maybe Bool` defaults to on only for a loopback address. The agent reads
+    its working directory through `getcwd` / `_wgetcwd`, to stay on `base`,
+    `bytestring` and `network`.
+  - Tests cover the v2 lines and v1 lines still parsing, and run an agent in
+    the test process: its info line, capabilities, commands and their
+    replies, commands turned off, what a v1 client reads from it (only lines
+    it knows or skips), and a v2 client against a fake v1 agent that never
+    reads.
+  - **Attach** (A2). `Stronghead.Attach` works out the eventlog (`-ol`,
+    else `<stem>.eventlog` for `-po`, else `<program>.eventlog`, in the
+    working directory), the `.hp`, the ghc-debug socket by pid and the dumps
+    under the working directory, and checks each. Live shows what Connect
+    found in one line, with the reason for each skip in its tooltip; the
+    shell opens the rest (`applyAttach`). A v1 agent gets a callout saying
+    to rebuild.
+  - **Actions** (A3). `liveRemote` gives one list, each action with why it
+    can't run, for the Live toolbar, the palette (the Live lens's hits) and
+    the status bar's menu: **Mark…** (M from any panel, a prompt with a
+    default text), **Major GC**, **Census now**, **Start/Stop heap
+    profiling**; and through the heap panel's ghc-debug target **Snapshot**,
+    **Census + snapshot**, **Snapshot twice, 2 s apart** and **Pause** /
+    **Resume** (`Stronghead.Debug.pauseTarget` holds a connection paused).
+  - Each action becomes a `Moment` on the bus (`busMoments`) as it is sent,
+    at the program time the latest frame suggests. `drawMarks` draws moments
+    on every time axis with a square cap: dashed while estimated, solid once
+    the reply stamps it, and only the cap once the followed eventlog's own
+    marker has arrived (`confirmMoments` takes up that marker's time). On a
+    Live chart or the Timeline's ruler a moment is an `RInstant` link.
+  - **Snapshot stamping** (A4). Before a snapshot is requested, the agent
+    posts `stronghead: snapshot N` and its reply gives the program time;
+    without commands the followed eventlog's `WallClockTime` anchor converts
+    the wall clock, and failing that the latest frame does. Live shades and
+    labels the stretches with no frames ("paused 3.2 s" when Stronghead
+    paused or snapshotted the program then, "no samples" otherwise).
+  - **Threads** (A5). A Live row, a Timeline thread and a TSO were one ref
+    already; the peek of a thread now shows the Timeline's and Live's facts
+    together. Live rows gained the capability from `C` lines and a strip of
+    the thread's status in each of the last 120 frames, in the Timeline's
+    running and blocked colours.
+  - **Data sources** (A6). `UI.Sources` is the header's popover, with runs
+    grouped by `Stronghead.Run.groupRuns` over every artifact's and
+    connection's `RunInfo`. Each source opens its panel; each run lists what
+    is missing with copyable build and run lines. **Same run as …** joins an
+    unmatched run by hand: the shell then gives that run's sources the other
+    run's `RunInfo` as it hands them to every panel (`linkTimeline`,
+    `linkHeap`, `linkLive`), and **Unlink** undoes it.
+  - **Status bar** (A7). The followed eventlog, the agent, the ghc-debug
+    target and GHCi each open their panel on a click and have a menu (stop
+    following, disconnect, reconnect, snapshot, stop or restart the
+    session). The shared cursor's time is shown and links to the instant.
+  - `--mark TEXT` sends a connected program a mark once it has streamed a
+    couple of seconds, for scripts and the screenshot check.
+  - Checked by hand on Windows: `stronghead-sample 300 +RTS -l -hT -i0.1 -T`
+    run from `scratch/`, then `stronghead --connect 127.0.0.1:4777 --mark
+    "p4 mark"`. Connect followed `stronghead-sample.eventlog` and the `.hp`,
+    took `scratch` as a source root, and skipped ghc-debug and dumps with
+    their reasons. The mark showed on Live's charts, stamped, and in the
+    Timeline's markers list and on its ruler.
+  - Found on the way: `getProgName` keeps `.exe` on Windows, but the RTS
+    names its files without it. Under the sample's late GC load frames come
+    a second or more apart, so a gap is measured against the usual spacing.
+- **Deferred from P4:**
+  - **Overwriting the project root.** Connect adds the program's working
+    directory to the source roots instead of writing the Project root
+    setting, which is saved and would outlive the connection.
+  - **Anything that needs a running ghc-debug-stub.** The socket found by
+    pid, snapshots from Live, Census + snapshot, Snapshot twice and
+    Pause/Resume build with `-f ghc-debug` and are tested through
+    `socketFor`, `probeAttach` and the actions' disabled states, but none
+    was run against a target: the stub needs Linux or WSL.
+  - **Program time on the snapshot itself.** The moment carries it; the
+    heap panel's snapshot label still reads the wall clock, and changing
+    `HeapSnapshot` belongs with the Phase 6 work on `Stronghead.Debug`.
+  - **Undoing a probable match in one click.** Only runs joined by hand can
+    be unlinked; a same-program, no-pid match stays on.
+  - **Moments across restarts.** They live on the bus; sessions (W3) would
+    keep them.
+  - **Path mapping for a remote program.** A working directory that isn't
+    on this machine is skipped, and said to be.
+  - **Statuses between frames.** A thread's strip samples its status four
+    times a second; the Timeline has the exact spans.
 
 ## Verification spikes
 
