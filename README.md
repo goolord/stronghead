@@ -8,18 +8,23 @@ what is and isn't evaluated at a breakpoint.
 
 ```sh
 cabal run stronghead -- [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventlog]
-                        [--debug MODULE.hs] [FILE|DIR ...]
+                        [--debug MODULE.hs] [--goto REF] [FILE|DIR ...]
 ```
 
 Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`,
 `.dump-stg-final`, `.hs`); a directory is searched for Core/STG dumps. Files can
-also be opened from the header or dropped on the window.
+also be opened from the header or dropped on the window. `--goto` opens an
+entity by the reference **Copy reference** gives
+(`source/sample%2FMain.hs/82/1/82/1` is line 82 of the sample), once a panel
+has loaded it.
 
 **Settings** (the header button, or Ctrl+,) holds the theme (system, light,
 dark), the interface scale (follow the display's DPI scaling, or 75–300%;
 Ctrl+= / Ctrl+- step it, Ctrl+0 goes back to following the display), which
-panel to open on, and the defaults for the Live agent address, the GHCi
-command and the Core view. They are saved as they change, with the window's
+panel to open on, the defaults for the Live agent address, the GHCi
+command and the Core view, the **project root** sources are looked up under,
+and the **editor command** that "Open in editor" runs
+(`code -g {file}:{line}:{col}`, say). They are saved as they change, with the window's
 size and position on quit, to `settings.conf` in the user config directory
 (`%APPDATA%\stronghead` on Windows, `~/.config/stronghead` elsewhere). The
 command line wins over them.
@@ -93,6 +98,10 @@ Heap profiles from either the eventlog's heap samples (`+RTS -l -hT`, `-hi`,
   band.
 - **Cost centres**: the `.prof` call tree with individual and inherited
   time/allocation.
+- Bands from an info-table profile (`-hi`) are named by their provenance
+  ("thunk in main (Main.hs:82)") rather than an address. A `-hc` band's menu
+  opens its stack in the `.prof` tree; any band's **Find in live graph**
+  lists the snapshot's closures with its closure type, name or source.
 - **Live graph (ghc-debug)**: exact retainer paths from the running program's
   closure graph, below.
 
@@ -158,7 +167,36 @@ saved with ghc-debug's `GHC.Debug.Snapshot.makeSnapshot`.
 ### Core / STG
 
 Point it at a folder of `-ddump-to-file` dumps (cabal puts them under
-`dist-newstyle/`) and it pairs each module's source, Core and STG.
+`dist-newstyle/`) and it pairs each module's source, Core and STG. Dumps
+from a threaded or profiled build (`Main.thr.dump-stg-final`) are paired too.
+Sources are found beside the dumps, in the project the dump folder is in (up
+to its `.cabal` file), under the **project root** setting and the
+debugger's directory; any source file found this way opens here, with or
+without dumps, when another panel links to it.
+
+The source pane shows what the runtime saw of each line, in lanes of ink
+bars between the line numbers and the code:
+
+| Lane | From | Bar |
+| --- | --- | --- |
+| time, alloc | a `.prof` (`-prof -fprof-auto`, `+RTS -p`), by each cost centre's span | share of time and allocation |
+| heap | an info-table profile (`-finfo-table-map`, `+RTS -hi`), by each band's span | bytes live at the heap cursor; thunks in orange |
+| live | a ghc-debug snapshot, by each closure's source | bytes in the snapshot; thunks orange, survivors red |
+
+A line takes the costs of the smallest spans covering it, so a nested cost
+centre's lines show its own. Muted notes after the code give the numbers and
+a binding's badges, and the gutter shows breakpoints and the debugger's
+stop. Every bar and note is a link: a click goes to the cost centre, band or
+closure, a right-click lists what every panel can do with it. The line in
+focus keeps its notes in view, as does the line under the pointer.
+
+- Bindings are listed by name with what happened to them: worker/wrapper
+  (`W/W`), `INLINE`/`NOINLINE`, boxing sites, STG `let` allocations, and
+  `gone` when a source binding no longer exists in Core (inlined away).
+  With runtime data loaded the list gains **time**, **alloc** and **heap**
+  columns (cost centres and bands whose spans start in the binding's source,
+  or that name it), sorted by clicking a header; **Hot and boxed only**
+  keeps the bindings that cost at least 1% and box or allocate.
 
 - Bindings are listed by name with what happened to them: worker/wrapper
   (`W/W`), `INLINE`/`NOINLINE`, boxing sites, STG `let` allocations, and
@@ -171,6 +209,14 @@ Point it at a folder of `-ddump-to-file` dumps (cabal puts them under
   module qualifiers and `$w` prefixes are normalised away, so `go` in the
   source lights up `Main.$wgo` and `go_s1x2`); clicking a name jumps to its
   binding. **Hide uniques** strips `_a1Bc`-style suffixes from the display.
+- The STG pane marks each `let` and boxing site with the bytes its closures
+  hold at the heap cursor. An info table's name is its STG binder plus
+  `_info` (`main2_sat_s7qA_info`), and with `-fdistinct-constructor-tables`
+  a constructor table (`I#_Main_3_con_info`) names its numbered site
+  (`3 GHC.Internal.Types.I#! [x]`); both are exact joins within one build.
+  Revealing a source line scrolls the STG pane to the code compiled from it.
+- Right-click any line, name or note: **Open in editor** runs the editor
+  command from Settings at that line, and **Break here** sets a breakpoint.
 
 ```sh
 ghc -O2 -ddump-simpl -ddump-stg-final -ddump-to-file Main.hs
@@ -190,7 +236,16 @@ that starts one).
 - **Local bindings** at each stop, marked as evaluated or `_thunk`, with
   **Force WHNF**, **Force NF** and `:print` per binding.
 - A console showing every command and its output, plus a prompt for raw GHCi
-  commands.
+  commands. `:history` steps and stops are links to their source.
+- **Breakpoints** lists every breakpoint, in any file, as links.
+- The stop names its binding, a link to it in Core & STG.
+- **Break here from anywhere**: right-click a line in Core & STG, a cost
+  centre, a band, a closure or a surviving thunk. With a session it breaks
+  on the line (`:break Module line`), loading its module first if needed;
+  without one it starts the GHCi command from Settings on the file the
+  source index finds (a `cabal` or `stack` command in its project, plain
+  GHCi in its directory). Bindings break by name (`:break Module.name`).
+- The source pane carries the same lanes and notes as Core & STG's.
 
 `--debug path/to/Main.hs` starts a session on that module straight away.
 
@@ -253,6 +308,8 @@ backend; see [Live closure graph](#live-closure-graph-ghc-debug).
 | `src/Stronghead/Prof.hs` | `.prof` cost-centre tree |
 | `src/Stronghead/Dump.hs` | Core/STG/source tokenising, bindings, optimisation notes, dump discovery |
 | `src/Stronghead/Ghci.hs` | GHCi subprocess driver and output parsers |
+| `src/Stronghead/Source.hs` | Source spans, the source index, the editor command |
+| `src/Stronghead/Join.hs` | Joins between artifacts: spans, cost centres, info tables and STG binders, `-hc` stacks and `.prof` paths, bands and closures |
 | `src/Stronghead/Live.hs` | Client for the agent's protocol |
 | `src/Stronghead/Debug.hs` | ghc-debug snapshots (the backend behind the `ghc-debug` flag) |
 | `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots |

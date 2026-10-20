@@ -23,6 +23,7 @@ import Control.Concurrent (forkIO)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
+import Data.IntMap.Strict qualified as IM
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
@@ -245,16 +246,33 @@ data Runtime = Runtime
     -- ^ Bytes live at the heap cursor.
   }
 
+-- | Annotations indexed for joining them to bindings: those in the source
+-- file by the line their span starts on, the rest by the name they give.
+data Joinable = Joinable
+  { jnByLine :: !(IM.IntMap [Annotation])
+  , jnByName :: !(M.Map (Text, Text) [Annotation])
+  }
+
+joinable :: Maybe (SrcSpan -> Bool) -> [Annotation] -> Joinable
+joinable inSource anns =
+  Joinable
+    { jnByLine = IM.fromListWith (++) [(ssLine sp, [a]) | Just here <- [inSource], a <- anns, Just sp <- [anSpan a], here sp]
+    , jnByName = M.fromListWith (++) [(n, [a]) | a <- anns, Just n <- [anName a]]
+    }
+
 -- | A binding's costs: every annotation whose span starts in its source
 -- lines (a cost centre's span overlapping the binding, nested ones
 -- included), or, with no source binding, every one naming it.
-runtimeOf :: Text -> Maybe (SrcSpan -> Bool) -> [Annotation] -> Entry -> Runtime
-runtimeOf modName inSource anns e =
+runtimeOf :: Text -> Bool -> Joinable -> Entry -> Runtime
+runtimeOf modName haveSource jn e =
   Runtime (total LaneTime) (total LaneAlloc) (total LaneHeap)
   where
-    mine = case (inSource, listToMaybe (enSrc e)) of
-      (Just here, Just b) -> [a | a <- anns, Just sp <- [anSpan a], here sp, spanStartsIn sp (bdFirst b + 1) (bdLast b + 1)]
-      _ -> [a | a <- anns, anName a == Just (modName, enKey e)]
+    mine = case listToMaybe (enSrc e) of
+      Just b | haveSource ->
+        let (_, from) = IM.split (bdFirst b) (jnByLine jn)
+            (inside, _) = IM.split (bdLast b + 2) from
+         in concat (IM.elems inside)
+      _ -> M.findWithDefault [] (modName, enKey e) (jnByName jn)
     total lane = sum [anValue a | a <- mine, anLane a == lane]
 
 -- | What its badges say, for the source pane's note on its first line.
@@ -363,8 +381,11 @@ panes env st loaded src core stg = do
       es = entries hideT src core stg
       modName = moduleOf src core stg
       srcNotes = maybe noNotes (\cf -> notesForFile ix (cfPath cf) anns) src
-      inSource = (\cf sp -> resolvesTo ix (cfPath cf) (ssFile sp)) <$> src
-      runtime = M.fromList [(enKey e, runtimeOf modName inSource anns e) | e <- es]
+      -- Each reported path is resolved once.
+      reported = M.fromList [(ssFile sp, ()) | a <- anns, Just sp <- [anSpan a]]
+      inSource = (\cf -> let here = M.mapWithKey (\f _ -> resolvesTo ix (cfPath cf) f) reported in \sp -> M.findWithDefault False (ssFile sp) here) <$> src
+      jn = joinable inSource anns
+      runtime = M.fromList [(enKey e, runtimeOf modName (isJust src) jn e) | e <- es]
       rt e = M.findWithDefault (Runtime 0 0 0) (enKey e) runtime
       lanes = [l | l <- [LaneTime, LaneAlloc, LaneHeap], any ((== l) . anLane) anns]
       heapTotal = sum [anValue a | a <- anns, anLane a == LaneHeap]

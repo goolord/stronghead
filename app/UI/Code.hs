@@ -417,7 +417,7 @@ codeView cv mm cfg = do
               -- underlined like a link.
               let (pinned, cols) = hintColumns (rightCol r l) toks (ccHints cfg l)
               case cols of
-                (a, _, _) : _ | pinned -> drawRect (Rect (colX a - cw) ly (x + w - colX a + cw) lh) (alpha 0.94 (inkPane (ink th)))
+                (a, _, _) : _ | pinned -> drawRect (Rect (colX a - cw) ly (x + w - colX a + cw) lh) (inkPane (ink th))
                 _ -> pure ()
               forM_ cols $ \(a, b, (txt, _)) -> do
                 let tx = colX a

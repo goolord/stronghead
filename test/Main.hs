@@ -64,12 +64,13 @@ main = do
     Left e -> check ("parseProf: " <> e) False
     Right pf -> do
       let flat = flattenCC (pfRoots pf)
-      check "four cost centres" (length flat == 4)
-      check "nesting from indentation" (map fst flat == [0, 1, 2, 1])
+      check "five cost centres" (length flat == 5)
+      check "nesting from indentation" (map fst flat == [0, 1, 2, 1, 1])
+      check "a source with spaces keeps the columns after it" (ccTime (snd (flat !! 4)) == 0.2 && ccNo (snd (flat !! 4)) == 5)
       check "inherited time parsed" (ccInhTime (snd (flat !! 2)) == 60.5)
       check "cost-centre spans parsed" $
         map (ccLoc . snd) flat
-          == [SrcBuiltIn, SrcAt (SrcSpan "Main.hs" 9 1 9 20), SrcAt (SrcSpan "Main.hs" 5 1 5 20), SrcEntireModule]
+          == [SrcBuiltIn, SrcAt (SrcSpan "Main.hs" 9 1 9 20), SrcAt (SrcSpan "Main.hs" 5 1 5 20), SrcEntireModule, SrcNoLocation]
       check "run from the header" $
         runFromProfHeader (pfHeader pf) == (runFromArgs ["prog", "+RTS", "-p", "-RTS"]) {riStarted = Just "Fri Oct 16 21:49 2026"}
 
@@ -408,6 +409,7 @@ profText =
     , " main        Main      Main.hs:9:1-20    2          1    1.0    1.0    80.0   90.0"
     , "  go         Main      Main.hs:5:1-20    3       1000   60.0   70.0    60.5   70.0"
     , " CAF         GHC.IO    <entire-module>   4          0    0.5    0.1     0.5    0.1"
+    , " CAF         GHC.Conc  <no location info> 5         0    0.2    0.0     0.2    0.0"
     ]
 
 coreText :: Text

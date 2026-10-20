@@ -669,9 +669,63 @@ how far C1 can trust each clock. Then P1a.
     right-click and Ctrl+click.
 - **Seen while wiring, for P3:**
   - `-hi` bands are named by address. Their `InfoProv` label and span would
-    read better in the legend and the census table.
+    read better in the legend and the census table. *(Done in P3.)*
   - A dump folder without sources beside it shows "Source not loaded" until
-    the source index (S8) can find the sources elsewhere.
+    the source index (S8) can find the sources elsewhere. *(Done in P3.)*
+- **P3** is in place, S1–S9:
+  - `Stronghead.Join` holds the pure joins, each tested in `test/Main.hs`:
+    span containment and overlap, `.prof` totals per cost centre
+    (recursion counted once), per-line attribution (the smallest span
+    covering a line owns it), IPE table names to STG binders and to
+    numbered constructor sites, `-hc` stacks to `.prof` paths, bands to
+    closures, and closures grouped by source.
+  - Lenses gained `lensAnnotations` (heat bars, gutter marks and notes, each
+    with its entity) and `lensSpan` (where an entity is in the source).
+    The Heap lens annotates from the `.prof`, the `-hi` census at the
+    cursor and the latest snapshot; Core adds binding badges; the Debugger
+    adds breakpoints, candidates and the stop.
+  - `UI.Code` draws the lanes, marks and notes, and `annotatedCode` makes
+    every bar and note a link. Core & STG's source pane and the Debugger's
+    use it; the STG pane carries the heap of each `let` and boxing site.
+  - Core & STG builds a `SourceIndex` in a `useTask` from the project root
+    setting, the dump folder and its project, and the debugger's
+    directory. A module without its source beside the dumps finds it
+    through the STG's `src<...>` notes, then by module name.
+  - Break here works from any ref a lens gives a span, and starts GHCi on
+    the resolved file when no session runs. Checked end to end with `ghci`
+    on a standalone file (`:break 4`, then `main` stops in `Main.fib`).
+  - Settings gained the project root and the editor command.
+  - `--goto REF` opens an entity on start; the screenshot check uses it.
+  - Found on the way: `.prof` rows whose `SRC` is `<no location info>`
+    shifted every number column. `parseProf` now reads placeholders with
+    spaces whole.
+  - The STG pane follows a revealed source line through its `src<...>`
+    notes, scrolled to the code's indentation.
+- **Deferred from P3:**
+  - **Renaming the tab "Code".** The panel's key, `core`, is its
+    `--tab` name and its settings value, and the title derives the key.
+    Renaming means splitting the two; the content is still the Core/STG
+    pairing, so the title stays "Core & STG" for now.
+  - **Ticky columns on bindings.** They need D2.
+  - **Scrolling to the opened `.prof` row.** A `-hc` band opens and selects
+    its path, but the tree does not scroll to it (the P1 `scrollIntoView`
+    gap).
+  - **Exact band ↔ closure joins.** **Find in live graph** matches by
+    closure type, constructor name or source span; by info table it needs
+    D4.
+  - **Peeks on bars and notes.** They have clicks and menus; hover peeks on
+    canvases are still deferred from P1.
+  - **Locate… for unresolved paths.** Actions that can't find a file say to
+    set the project root instead.
+  - **Breakpoint toggling in Core & STG's gutter.** Its menu has Break here;
+    the gutter click stays the Debugger's.
+  - **Runtime lanes in the Core pane.** Core dumps carry no source notes
+    without `-g`, so only the source and STG panes are annotated.
+  - **Break here on the sample itself.** It imports `stronghead:agent`, so
+    plain `ghci` can't load it; set the GHCi command to
+    `cabal repl stronghead-sample`. Not checked end to end.
+  - **A real `-hc` profile.** V4 found no non-empty `-hc` census on
+    Windows, so the `.prof` path join is checked against fixtures only.
 
 ## Verification spikes
 
@@ -789,7 +843,7 @@ What this changes in the plan:
   which a non-profiled build leaves out.
 - Core & STG's dump discovery should strip a way suffix (`.thr`, `.p`,
   `.dyn`) from the module name. This is a P3 prerequisite and is not done in
-  P0.
+  P0. *(Done in P3: `dumpModuleName`.)*
 - D1 should expect sparse profiler samples on Windows.
 
 ## Testing

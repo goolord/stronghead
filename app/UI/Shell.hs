@@ -481,9 +481,9 @@ settingsModal app = do
         checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable core)
       settingNote "The Core & STG toolbar changes these too; the last choice is kept."
       sectionTitle "Source"
-      settingRow "Project root" $ inputHint "folder whose sources the panels link to" (fillW) (csProjectRoot core)
+      settingRow "Project root" $ inputHint "folder whose sources the panels link to" fillW (csProjectRoot core)
       settingNote "Sources are also found beside the dumps, in the project the dump folder is in, and under the debugger's directory."
-      settingRow "Editor command" $ inputHint "code -g {file}:{line}:{col}" (fillW) (csEditor core)
+      settingRow "Editor command" $ inputHint "code -g {file}:{line}:{col}" fillW (csEditor core)
       settingNote "Run by \"Open in editor\" on any source line; {file}, {line} and {col} are filled in."
       columnWith (padTop 12 . fillW . tight . gap 8) $ do
         labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack path)

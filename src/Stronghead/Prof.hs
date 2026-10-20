@@ -69,6 +69,10 @@ row hasSrc l =
   let depth = T.length (T.takeWhile (== ' ') l)
       ws = T.words l
       (name, modu, srcLoc, nums)
+        | hasSrc, n : m : s : more <- ws, "<" `T.isPrefixOf` s, not (">" `T.isSuffixOf` s) =
+            -- A placeholder with spaces: "<no location info>".
+            let (inside, after) = break (">" `T.isSuffixOf`) more
+             in (n, m, T.unwords (s : inside ++ take 1 after), drop 1 after)
         | hasSrc, n : m : s : more <- ws = (n, m, s, more)
         | n : m : more <- ws = (n, m, "", more)
         | otherwise = ("", "", "", [])

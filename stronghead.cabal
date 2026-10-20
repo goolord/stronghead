@@ -155,11 +155,13 @@ test-suite stronghead-ui-test
     hs-source-dirs:   test-ui app
     main-is:          Main.hs
     other-modules:
+        UI.Code
         UI.Common
         UI.Link
         UI.Palette
     build-depends:
         base >=4.20 && <4.23,
+        containers >=0.6 && <0.9,
         filepath >=1.4 && <1.6,
         nano-ui ^>=0.2,
         stronghead,
