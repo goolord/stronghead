@@ -1113,6 +1113,7 @@ dbgDetail env st sn snap marked sel selPath = case sel >>= (`M.lookup` snapNodes
       fact "held" (fmtBytes (fromIntegral (M.findWithDefault 0 (cnId n) (snapHeld snap))))
     scope $ for_ (M.lookup (cnId n) marked) $ \k ->
       badge Danger ("its thunk group has survived " <> tshow k <> " snapshots")
+    stackAtSnapshot env snap n
     sectionTitle "Retained by"
     hint (describePath selPath)
     forM_ (zip [0 :: Int ..] selPath) $ \(d, p) -> withKey ("p:" <> fmtClosureId (cnId p)) $ do
@@ -1131,18 +1132,44 @@ dbgDetail env st sn snap marked sel selPath = case sel >>= (`M.lookup` snapNodes
           cell (fontMono . fontSizeScale 0.85) (fmtBytes (fromIntegral (cnSize k)))
         when picked $ reveal st snap (cnId k)
 
+-- | A thread's stack when the snapshot was taken, top frame first: each
+-- frame's code, as a link to its source when the target was built with
+-- @-finfo-table-map@.
+stackAtSnapshot :: Env -> HeapSnapshot -> ClosureNode -> NanoUI ()
+stackAtSnapshot env snap n = scope $ when (cnType n == "TSO") $ do
+  let frames = threadStack snap (cnId n)
+  sectionTitle ("Stack at snapshot (" <> fmtInt (length frames) <> " frames)")
+  scope $ when (null frames) $
+    hint "No frames: the thread's stack was not reached before the closure limit, or this build of Stronghead decodes no stacks."
+  forM_ (zip [0 :: Int ..] (take 60 frames)) $ \(i, f) -> withKey ("f:" <> tshow i) $
+    case sfSource f >>= srcLocSpan . parseSrcLoc of
+      Just sp -> do
+        _ <- linkRow env (RSource sp) False id $ frameRow i f
+        pure ()
+      Nothing -> rowWith (padXY 8 2 . tight . gap 8 . fillW) (frameRow i f)
+  scope $ when (length frames > 60) $ labelWith (fontMuted . fontSizeScale 0.85) (fmtInt (length frames - 60) <> " more frames")
+  where
+    frameRow i f = do
+      cell (fixedW 22 . fontMuted . fontSizeScale 0.85) (tshow i)
+      columnWith (tight . gap 0 . fillW . alignMid) $ do
+        labelWith (fillW . fontSizeScale 0.9) (frameTitle f)
+        scope $ for_ (sfSource f) $ \s -> labelWith (fillW . fontMono . fontMuted . fontSizeScale 0.8) s
+      cell (fontMuted . fontSizeScale 0.8) (sfType f)
+
 dbgBiggest :: Env -> HeapState -> Int -> HeapSnapshot -> M.Map ClosureId Int -> NanoUI ()
 dbgBiggest env st sn snap marked = readVar (hsDbgFind st) >>= \case
   Just b -> dbgMatching env st sn snap marked b
   Nothing -> dbgBiggestAll env st sn snap marked
 
--- | The closures a heap band stands for ('closureMatchesBand').
+-- | The closures a heap band stands for: exactly by info table when the
+-- snapshot has the pointers, else by source, type or name ('matchBand').
 dbgMatching :: Env -> HeapState -> Int -> HeapSnapshot -> M.Map ClosureId Int -> Band -> NanoUI ()
 dbgMatching env st sn snap marked b = do
   let held i = M.findWithDefault 0 i (snapHeld snap)
-      matches = take 300 (sortOn (Down . held . cnId) [n | n <- M.elems (snapNodes snap), closureMatchesBand b n])
+      (how, found) = matchBand b (M.elems (snapNodes snap))
+      matches = take 300 (sortOn (Down . held . cnId) found)
   rowWith (tight . gap 8 . fillW) $ do
-    labelWith (alignMid . fillW . fontSizeScale 0.92) ("Closures matching " <> bandTitle b <> (if isJust (bandProv b) then ", by source" else ", by closure type or name"))
+    labelWith (alignMid . fillW . fontSizeScale 0.92) ("Closures matching " <> bandTitle b <> ", " <> bandMatchName how)
     whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show the biggest retainers") (writeVar (hsDbgFind st) Nothing)
   scope $ when (null matches) $ hint "None in the latest snapshot. Bands from a heap profile match by closure type (-hT), constructor (-hd) or source (-hi, with -finfo-table-map on both sides)."
   paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
@@ -1432,3 +1459,8 @@ closurePeek latest n = do
   scope $ for_ latest $ \snap -> do
     fact "holds" (fmtBytes (fromIntegral (M.findWithDefault 0 (cnId n) (snapHeld snap))))
     labelWith (fontMuted . fontSizeScale 0.85 . fillW) (describePath (retainerPath snap (cnId n)))
+    -- A thread's top frames at the snapshot.
+    let frames = threadStack snap (cnId n)
+    scope $ unless (null frames) $
+      forM_ (zip [0 :: Int ..] (take 4 frames)) $ \(i, f) -> withKey i $
+        fact (if i == 0 then "stack" else "") (frameTitle f <> maybe "" (\s -> "  " <> s) (sfSource f))

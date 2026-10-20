@@ -17,6 +17,7 @@ import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
 import Stronghead.Dump (CodeKind (..), tokenizeLine)
+import Stronghead.Ghci (Value (..))
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
 import Stronghead.Ref
 import Stronghead.Source (SrcSpan (..))
@@ -24,6 +25,7 @@ import System.Exit (exitFailure)
 import UI.Clock
 import UI.Code
 import UI.Common (TimeView (..), monoMetrics)
+import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Link
 import UI.Palette
 
@@ -127,6 +129,14 @@ codeScene w cv point = do
   ev <- annotatedCode env cv mm cfg (const Nothing)
   liftIO (writeIORef point (lanePoint mm cfg (respRect (ceResp ev)) 1 0))
   publishHover (wBus w)
+
+-- | A value GHCi printed at a stop, @p = P (_t2::Int) (2 : (_t3::[Int]))@,
+-- as the Debugger's tree. Forcing records which thunk, and how deep.
+valueScene :: DebugState -> IORef [(Text, Bool)] -> NanoUI ()
+valueScene st forced = do
+  toggled <- readVar (dsToggled st)
+  valueTree st toggled False (\n deep -> liftIO (modifyIORef' forced ((n, deep) :))) "p" $
+    VCon "P" [VThunk "_t2" (Just "Int"), VList [VAtom "2"] (Just (VThunk "_t3" (Just "[Int]")))]
 
 main :: IO ()
 main = do
@@ -294,6 +304,30 @@ main = do
   mapM_ codeFrame [bDown, bUp, inp0, inp0]
   barMenu <- collectOverlayTextSpans codeCtx inp0
   check "right-clicking a heat bar opens its entity's menu" (hasText "thunk in go" barMenu && hasText "Show in Heap & leaks" barMenu)
+
+  putStrLn "ghci values"
+  valCtx <- newContext
+  dst <- newDebugState
+  forced <- newIORef []
+  let valFrame inp = evalUi valCtx inp (valueScene dst forced)
+      valClick pos = do
+        let (press, release) = clickPair inp0 pos
+        mapM_ valFrame [press, release, inp0]
+      valSpans = collectTextSpans valCtx
+      textAt name = maybe (fail ("no span " <> T.unpack name)) pure . findExact name
+  _ <- warmup2 valCtx inp0 (valueScene dst forced)
+  tree <- valSpans
+  check "a value opens as a tree, its thunks named and typed" $
+    all (`hasText` tree) ["P", "_t2", ":: Int", "list of 1, then unevaluated", "_t3", "rest"]
+  evaluate' <- textAt "Evaluate" tree
+  valClick evaluate'
+  force' <- textAt "Force" =<< valSpans
+  valClick force'
+  check "a thunk is forced in place, to WHNF or all the way" . (== [("_t3", True), ("_t3", False)]) =<< readIORef forced
+  con <- textAt "P" =<< valSpans
+  valClick con
+  closed <- valSpans
+  check "a node closes to the whole value" (hasText "P _t2 (2 : _t3)" closed && not (hasText "rest" closed))
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

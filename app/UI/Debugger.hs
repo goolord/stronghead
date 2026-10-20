@@ -15,13 +15,16 @@ module UI.Debugger
   , debugLoad
   , debugView
   , debugLens
+  , valueTree
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef
+import Data.Char (isDigit)
 import Data.Map.Strict qualified as M
+import Data.Set qualified as S
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -53,7 +56,10 @@ data DebugState = DebugState
   , dsInput :: !(Var Text)
   , dsStop :: !(Var (Maybe StopInfo))
   , dsBindings :: !(Var [GhciBinding])
-  , dsForced :: !(Var (M.Map Text Text))
+  , dsValues :: !(Var (M.Map Text Value))
+    -- ^ Each binding's value as @:print@ shows it, its thunks named.
+  , dsToggled :: !(Var (S.Set Text))
+    -- ^ Value-tree nodes opened or closed by hand, by path.
   , dsBreaks :: !(Var (M.Map (FilePath, Int) Int))
     -- ^ Breakpoint numbers by (file, 1-based line).
   , dsSourcePath :: !(Var (Maybe FilePath))
@@ -76,7 +82,8 @@ newDebugState = do
   dsInput <- newVar ""
   dsStop <- newVar Nothing
   dsBindings <- newVar []
-  dsForced <- newVar M.empty
+  dsValues <- newVar M.empty
+  dsToggled <- newVar S.empty
   dsBreaks <- newVar M.empty
   dsSourcePath <- newVar Nothing
   dsSource <- newTask
@@ -137,12 +144,46 @@ runIn st g cmds = do
     when (resumes c) $ do
       let stop = parseStop out
       writeVarIO (dsStop st) stop
-      writeVarIO (dsForced st) M.empty
       for_ (stop >>= stSpan) $ \s -> writeVarIO (dsSourcePath st) (Just (resolve dir (ssFile s)))
-      b <- if isJust stop then ghciCommand g ":show bindings" else pure ""
-      writeVarIO (dsBindings st) (parseBindings b)
+      if isJust stop
+        then refreshLocals st g
+        else writeVarIO (dsBindings st) [] >> writeVarIO (dsValues st) M.empty
   alive <- ghciAlive g
   writeVarIO (dsRunning st) alive
+
+-- | Read the local bindings, and @:print@ each, which names its thunks
+-- (@_t1@, @_t2@) so they can be forced. GHCi's own @_t@ bindings are left
+-- out: they show inside the values.
+refreshLocals :: DebugState -> Ghci -> IO ()
+refreshLocals st g = do
+  b <- ghciCommand g ":show bindings"
+  let bs = [x | x <- parseBindings b, not (isThunkBinding (gbName x))]
+  writeVarIO (dsBindings st) bs
+  vals <- forM (take 24 bs) $ \x -> do
+    out <- ghciCommand g (":print " <> gbName x)
+    pure [(gbName x, v) | (n, v) <- parsePrint out, n == gbName x]
+  writeVarIO (dsValues st) (M.fromList (concat vals))
+
+isThunkBinding :: Text -> Bool
+isThunkBinding n = case T.stripPrefix "_t" n of
+  Just d -> not (T.null d) && T.all isDigit d
+  Nothing -> False
+
+-- | Force a binding or a named thunk in place, to weak head normal form
+-- (@seq@) or all the way (@:force@), then print the values again. GHCi
+-- stays stopped where it was, unless forcing runs into a breakpoint.
+forceValue :: DebugState -> IO () -> Text -> Bool -> IO ()
+forceValue st wake name deep = void . forkIO $ do
+  writeVarIO (dsBusy st) True >> wake
+  readIORef (dsSession st) >>= \case
+    Nothing -> appendConsole st ["<no GHCi session: press Start>"]
+    Just g -> do
+      let cmd = if deep then ":force " <> name else name <> " `seq` ()"
+      out <- ghciCommand g cmd
+      appendConsole st (("λ> " <> cmd) : T.lines out)
+      for_ (parseStop out) (writeVarIO (dsStop st) . Just)
+      refreshLocals st g
+  writeVarIO (dsBusy st) False >> wake
 
 startSession :: DebugState -> IO () -> IO ()
 startSession st wake = startSessionThen st wake []
@@ -237,7 +278,7 @@ debugView env st ix source = columnWith (tight . gap 0 . grow) $ do
   workbench (dsPanes st) $ \pid ctx ->
     if
       | pid == paneSource -> sourcePane env st ix ctx source stop send
-      | pid == paneLocals -> pane ctx "Local bindings" (pure ()) (bindingsPane st stop send)
+      | pid == paneLocals -> pane ctx "Local bindings" (pure ()) (bindingsPane st stop)
       | pid == paneBreaks -> breaksPane env st ctx send
       | otherwise -> consolePane env st ctx send
 
@@ -340,46 +381,87 @@ breaksPane env st ctx send = do
             cell (fillW . fontMono . fontSizeScale 0.9) (T.pack (takeFileName f) <> ":" <> tshow l)
           disabledWhen (not running) $ whenM (buttonWith (alignMid . padXY 6 0 . tight) "Delete") (deleteBreak st send (Just f, l) n)
 
-bindingsPane :: DebugState -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
-bindingsPane st stop send = do
+-- | The local bindings at the stop, each value an expandable tree.
+bindingsPane :: DebugState -> Maybe StopInfo -> NanoUI ()
+bindingsPane st stop = do
   bindings <- readVar (dsBindings st)
-  forced <- readVar (dsForced st)
+  values <- readVar (dsValues st)
+  toggled <- readVar (dsToggled st)
+  busy <- readVar (dsBusy st)
+  wake <- askWake
+  let force name deep = liftIO (forceValue st wake name deep)
   scope $ case (stop, bindings) of
     (Nothing, _) -> hint "Not stopped at a breakpoint. Set one in the gutter, then use Step into or Run."
     (Just _, []) -> hint "No local bindings at this location."
     _ -> pure ()
   paneScroll (grow . tight) $ columnWith (tight . fillW . gap 4) $
-    forM_ bindings $ \b -> withKey (gbName b) $ panelWith (padXY 8 5 . gap 3 . fillW) $ do
-      let thunk = valueIsThunk (gbValue b)
+    forM_ bindings $ \b -> withKey (gbName b) $ panelWith (padXY 8 5 . gap 2 . fillW) $ do
+      let value = maybe (parseValue <$> gbValue b) Just (M.lookup (gbName b) values)
+          name = gbName b
       rowWith (tight . gap 6 . fillW) $ do
-        cell (fontMono . fontMedium) (gbName b)
-        cell (fontMono . fontMuted . fillW . fontSizeScale 0.9) (":: " <> gbType b)
-        scope $ if thunk then badge Muted "_thunk" else badge Success "evaluated"
-      scope $ for_ (gbValue b) $ \v ->
-        unless (v == "_") $ labelWith (fontMono . fillW . (if thunk then fontMuted else id)) (T.take 400 v)
-      scope $ for_ (M.lookup (gbName b) forced) $ \v -> labelWith (fontMono . fontTone Success . fillW) (T.take 400 v)
-      rowWith (tight . gap 6) $ do
-        let name = gbName b
-        whenM (buttonWith tight "Force WHNF") $ do
-          send [name <> " `seq` ()", ":print " <> name]
-          captureForce name (":print " <> name)
-        whenM (buttonWith tight "Force NF") $ do
-          send [":force " <> name]
-          captureForce name (":force " <> name)
-        whenM (buttonWith tight ":print") (send [":print " <> name])
+        cell (fontMono . fontMedium . alignMid) name
+        cell (fontMono . fontMuted . fillW . fontSizeScale 0.9 . alignMid) (":: " <> gbType b)
+        scope $ case value of
+          Nothing -> badge Warning "thunk"
+          Just (VThunk _ _) -> badge Warning "thunk"
+          Just v | valueHasThunks v -> badge Warning "partly evaluated"
+          Just _ -> badge Success "evaluated"
+        disabledWhen busy $ do
+          whenM (buttonWith (alignMid . padXY 6 0 . tight) "WHNF") (force name False)
+          whenM (buttonWith (alignMid . padXY 6 0 . tight) "Force all") (force name True)
+      scope $ for_ value $ \v -> valueTree st toggled busy force name v
+  scope $ unless (null bindings) $
+    hint "Thunks are amber. Evaluate takes one to weak head normal form (seq), Force evaluates it all the way (:force); the values are printed again afterwards."
+
+-- | A value as an expandable tree, styled like the closure graph: thunks
+-- amber, each one GHCi named (@_t3@) with buttons that force it in place.
+valueTree :: DebugState -> S.Set Text -> Bool -> (Text -> Bool -> NanoUI ()) -> Text -> Value -> NanoUI ()
+valueTree st toggled busy force root v0 = columnWith (tight . fillW . gap 0) $
+  forM_ (take 400 (flattenValue toggled root v0)) $ \(path, depth, label', v, open, expandable) -> withKey path $
+    rowWith (tight . fillW . gap 4) $ do
+      clicked <- selectableRow False fillW $ do
+        spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
+        cell (fixedW 14 . fontMuted) (if expandable then (if open then "▾" else "▸") else " ")
+        scope $ unless (T.null label') $ cell (fontMono . fontMuted . fontSizeScale 0.9) label'
+        cell (fillW . fontMono . fontSizeScale 0.9 . (case v of VThunk _ _ -> fontTone Warning; _ -> id)) (T.take 160 (nodeText open v))
+        scope $ case v of
+          VThunk _ (Just ty) -> cell (fontMono . fontMuted . fontSizeScale 0.85) (":: " <> T.take 60 ty)
+          _ -> pure ()
+      when (clicked && expandable) $ modifyVar (dsToggled st) (\s -> if S.member path s then S.delete path s else S.insert path s)
+      scope $ case v of
+        VThunk n _ | isThunkBinding n -> disabledWhen busy $ do
+          whenM (buttonWith (alignMid . padXY 6 0 . tight) "Evaluate") (force n False)
+          whenM (buttonWith (alignMid . padXY 6 0 . tight) "Force") (force n True)
+        _ -> pure ()
+
+-- | Rows of a value tree: path, depth, field label, value, whether it is
+-- open and whether it can be. The first two levels start open.
+flattenValue :: S.Set Text -> Text -> Value -> [(Text, Int, Text, Value, Bool, Bool)]
+flattenValue toggled root = go root 0 ""
   where
-    -- The forced value is read back from the console once the command ran.
-    captureForce name cmd = do
-      wake <- askWake
-      liftIO . void . forkIO $ do
-        readIORef (dsSession st) >>= \case
-          Nothing -> pure ()
-          Just g -> do
-            out <- ghciCommand g cmd
-            modifyVarIO (dsForced st) (M.insert name (T.strip (last ("" : T.lines out))))
-            b <- ghciCommand g ":show bindings"
-            writeVarIO (dsBindings st) (parseBindings b)
-            wake
+    go path d label' v =
+      let kids = children v
+          expandable = not (null kids)
+          open = expandable && (d < 2) /= S.member path toggled
+       in (path, d, label', v, open, expandable)
+            : (if open then concat [go (path <> "/" <> tshow i) (d + 1) l k | (i, (l, k)) <- zip [0 :: Int ..] kids] else [])
+    children = \case
+      VCon _ fs -> [("", f) | f <- fs]
+      VRecord _ fs -> [(f <> " =", x) | (f, x) <- fs]
+      VList xs t -> [("", x) | x <- xs] ++ [("rest", r) | Just r <- [t]]
+      VTuple xs -> [("", x) | x <- xs]
+      _ -> []
+
+-- | What a tree node says: an open node names its shape, a closed one shows
+-- the whole value.
+nodeText :: Bool -> Value -> Text
+nodeText open v = case v of
+  VThunk n _ -> if n == "_" then "unevaluated" else n
+  VCon c _ | open -> c
+  VRecord c _ | open -> c
+  VList xs t | open -> "list of " <> tshow (length xs) <> maybe "" (const ", then unevaluated") t
+  VTuple _ | open -> "tuple"
+  _ -> renderValue v
 
 consolePane :: Env -> DebugState -> PaneGridCtx -> ([Text] -> NanoUI ()) -> NanoUI ()
 consolePane env st ctx send = do

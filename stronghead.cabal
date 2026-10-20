@@ -160,11 +160,13 @@ test-suite stronghead-ui-test
         UI.Clock
         UI.Code
         UI.Common
+        UI.Debugger
         UI.Link
         UI.Palette
     build-depends:
         base >=4.20 && <4.23,
         containers >=0.6 && <0.9,
+        directory ^>=1.3,
         filepath >=1.4 && <1.6,
         nano-ui ^>=0.2,
         stronghead,
