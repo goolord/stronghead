@@ -248,7 +248,7 @@ homeOrder = \case
   RInfoTable {} -> [PHeap]
   RClosure {} -> [PHeap]
   RThunkGroup {} -> [PHeap]
-  RCostCentre {} -> [PHeap, PCore]
+  RCostCentre {} -> [PHeap, PCore, PTimeline]
   RSource {} -> [PCore, PDebugger]
   RBinding {} -> [PCore, PDebugger]
   RModule {} -> [PCore]

@@ -404,7 +404,8 @@ main = do
   putStrLn "ticky"
   let ticky = snapshot (foldl feedEvent emptyBuilder [E.Event t e Nothing | (t, e) <- tickyFixture])
   check "counters summed over samples, most allocation first" $
-    [(tcId c, tcEntries c, tcAlloc c, tcSamples c) | c <- V.toList (tlTicky ticky)] == [(3, 1, 828, 2), (1, 1, 496, 1), (2, 0, 0, 0)]
+    [(tcId c, tcEntries c, tcAlloc c, VU.length (tcSeries c)) | c <- V.toList (tlTicky ticky)] == [(3, 1, 828, 2), (1, 1, 496, 1), (2, 0, 0, 0)]
+  check "ticky in a range" ([(tcId c, e, a) | (c, e, a) <- tickyBetween ticky 20 30] == [(3, 0, 700), (1, 1, 496)])
   check "a local closure's counter" $
     parseTickyName "main2_sat_s7qL{v} (Main) (fun) in s7qM" == Just (TickyName "main2_sat_s7qL" Nothing "Main" ["fun"] (Just "s7qM"))
   let go3 = parseTickyName "go3{v r9BH} (Stronghead.Agent) (fun)"

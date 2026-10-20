@@ -70,6 +70,7 @@ module Stronghead.Eventlog.Model
   , fewSamples
     -- * Ticky
   , TickyCounter (..)
+  , tickyBetween
   ) where
 
 import Data.IntMap.Strict (IntMap)
@@ -684,6 +685,22 @@ data TickyCounter = TickyCounter
     -- ^ Bytes its code allocated.
   , tcAllocd :: !Word64
     -- ^ Bytes of its own closures allocated (with @-ticky-allocd@).
-  , tcSamples :: !Int
+  , tcSeries :: !(VU.Vector (Word64, Word64, Word64))
+    -- ^ Each sample: when it was taken, and the entries and allocation
+    -- since the one before.
   }
   deriving (Eq, Show)
+
+-- | The counters with entries or allocation between two moments, and how
+-- much, most allocation first. A sample covers the time since the one
+-- before it, so a range is as fine as the sampling (each major GC with
+-- @-lT@).
+tickyBetween :: Timeline -> Word64 -> Word64 -> [(TickyCounter, Word64, Word64)]
+tickyBetween tl a b =
+  sortOn
+    (\(_, _, al) -> Down al)
+    [ (c, sum (map fst in'), sum (map snd in'))
+    | c <- V.toList (tlTicky tl)
+    , let in' = [(e, al) | (t, e, al) <- VU.toList (tcSeries c), t > a, t <= b]
+    , any (\(e, al) -> e > 0 || al > 0) in'
+    ]

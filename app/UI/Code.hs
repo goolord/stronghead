@@ -185,7 +185,7 @@ notesForFile ix path anns =
 placedNotes :: [(Int, Int, Annotation)] -> FileNotes
 placedNotes placed = FileNotes {..}
   where
-    fnLanes = [l | l <- [LaneTime, LaneAlloc, LaneHeap, LaneLive], any (\(_, _, a) -> anLane a == l && anValue a > 0) placed]
+    fnLanes = [l | l <- [LaneTime, LaneAlloc, LaneHeap, LaneLive, LaneEntries, LaneTicky], any (\(_, _, a) -> anLane a == l && anValue a > 0) placed]
     fnBars = IM.unionsWith (++) (map laneBars fnLanes)
     laneBars l =
       let owners = lineOwners [(a0, b, (a0, a)) | (a0, b, a) <- placed, anLane a == l, anValue a > 0]

@@ -20,6 +20,7 @@ module UI.Timeline
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.IORef
+import Data.IntMap.Strict qualified as IM
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
@@ -33,12 +34,15 @@ import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
 import Stronghead.Clock (stepTime)
+import Stronghead.Dump (nameKey)
 import Stronghead.Eventlog
 import Stronghead.Eventlog.Model
 import Stronghead.Format
 import Stronghead.HeapProfile (HeapProfile (..))
+import Stronghead.Join (Annotation (..), Lane (..), Shade (..), TickyName (..), parseTickyName, tickyBinder, tickyTopLevel, tickyUnique)
 import Stronghead.Ref
 import Stronghead.Run (runKey, runKeysMatch)
+import Stronghead.Source (renderSrcLoc, renderSrcSpan, srcLocSpan)
 import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
@@ -73,6 +77,9 @@ data TimelineState = TimelineState
     -- ^ List traceEvent messages with the markers.
   , tsWindowSeen :: !(IORef (Maybe (RunKey, TimeView)))
     -- ^ The window last published to the bus.
+  , tsCode :: !(Var Bool)
+    -- ^ Show a code track under each capability, from a profiled build's
+    -- cost-centre samples.
   }
 
 paneCaps, paneThreads, paneInspector, paneMarkers :: Word64
@@ -98,6 +105,7 @@ newTimelineState = do
   tsMarkerFilter <- newVar ""
   tsMarkerEvents <- newVar False
   tsWindowSeen <- newIORef Nothing
+  tsCode <- newVar True
   pure TimelineState {..}
 
 openEventlog :: TimelineState -> FilePath -> Bool -> NanoUI ()
@@ -144,7 +152,7 @@ timelineSync bus st mprog = case mprog >>= lpTimeline of
 
 -- | The label gutter is the same width on every canvas, so the capability
 -- tracks and the thread rows share one time axis down the column.
-gutterW, plotMargin, rulerH, capGap, stripGap, gcH, memH, threadRowH :: Float
+gutterW, plotMargin, rulerH, capGap, stripGap, gcH, memH, threadRowH, codeH :: Float
 gutterW = 172
 plotMargin = 12
 rulerH = 28
@@ -153,13 +161,18 @@ stripGap = 14
 gcH = 54
 memH = 54
 threadRowH = 20
+codeH = 15
+
+-- | The height a code track adds under its capability.
+codeExtra :: Bool -> Float
+codeExtra code = if code then codeH + 2 else 0
 
 -- | Capability tracks share whatever height the pane gives them, within
 -- reason.
-capHeight :: Float -> Int -> Float
-capHeight h nCaps =
+capHeight :: Float -> Int -> Bool -> Float
+capHeight h nCaps code =
   let spare = h - rulerH - 2 * stripGap - gcH - memH - 8
-   in max 14 (min 40 (spare / fromIntegral (max 1 nCaps) - capGap))
+   in max 14 (min 40 (spare / fromIntegral (max 1 nCaps) - capGap - codeExtra code))
 
 plotX, plotW :: Rect -> Float
 plotX r = rectX r + gutterW
@@ -170,28 +183,57 @@ data Rows = Rows
   , rPlotW :: !Float
   , rRuler :: !Rect
   , rCaps :: ![Rect]
+  , rCode :: ![Rect]
+    -- ^ Each capability's code track, when shown.
   , rGC :: !Rect
   , rMem :: !Rect
   }
 
-mainHeight :: Int -> Float
-mainHeight nCaps = rulerH + fromIntegral nCaps * (14 + capGap) + 2 * stripGap + gcH + memH + 8
+mainHeight :: Int -> Bool -> Float
+mainHeight nCaps code = rulerH + fromIntegral nCaps * (14 + capGap + codeExtra code) + 2 * stripGap + gcH + memH + 8
 
-layoutRows :: Rect -> Int -> Rows
-layoutRows r@(Rect _ y _ h) nCaps =
+layoutRows :: Rect -> Int -> Bool -> Rows
+layoutRows r@(Rect _ y _ h) nCaps code =
   let px = plotX r
       pw = plotW r
-      capH = capHeight h nCaps
-      capY i = y + rulerH + fromIntegral i * (capH + capGap)
+      capH = capHeight h nCaps code
+      capY i = y + rulerH + fromIntegral i * (capH + codeExtra code + capGap)
       gcY = capY nCaps + stripGap
    in Rows
         { rPlotX = px
         , rPlotW = pw
         , rRuler = Rect px y pw rulerH
         , rCaps = [Rect px (capY i) pw capH | i <- [0 .. nCaps - 1]]
+        , rCode = [Rect px (capY i + capH + 2) pw codeH | code, i <- [0 .. nCaps - 1]]
         , rGC = Rect px gcY pw gcH
         , rMem = Rect px (gcY + gcH + stripGap) pw memH
         }
+
+-- | Whether the code tracks show: there are samples and they are on.
+codeShown :: TimelineState -> Timeline -> NanoUI Bool
+codeShown st tl = (&& not (V.null (tlProfSamples tl))) <$> readVar (tsCode st)
+
+-- | The code run at a point on a code track.
+codeRunAt :: Timeline -> TimeView -> Rows -> V2 -> Maybe (Int, CodeRun)
+codeRunAt tl v rows (V2 mx my) = case [i | (i, Rect _ ry _ rh) <- zip [0 ..] (rCode rows), my >= ry, my < ry + rh] of
+  c : _ | Just runs <- tlCodeRuns tl V.!? c ->
+    let t = max 0 (xToTime v (rPlotX rows) (rPlotW rows) mx)
+        tol = 3 * viewWidth v / realToFrac (rPlotW rows)
+        i = lowerBoundBy crEnd runs (floorW (t - tol))
+     in listToMaybe
+          [ (c, r)
+          | r <- V.toList (V.take 3 (V.drop i runs))
+          , fromIntegral (crStart r) - tol <= t
+          , fromIntegral (crEnd r) + tol >= t
+          , not (idleCostCentre tl (crCostCentre r))
+          ]
+  _ -> Nothing
+
+idleCostCentre :: Timeline -> Int -> Bool
+idleCostCentre tl i = maybe False isIdleCostCentre (IM.lookup i (tlCostCentres tl))
+
+costCentreRef :: Timeline -> Int -> Maybe Ref
+costCentreRef tl i = (\c -> RCostCentre (cciModule c) (cciLabel c)) <$> IM.lookup i (tlCostCentres tl)
 
 -- ---------------------------------------------------------------------------
 -- View
@@ -260,7 +302,7 @@ body env st tl = do
   workbench (tsPanes st) $ \pid ctx ->
     if
       | pid == paneCaps ->
-          paneWith tight ctx "Capabilities" (capsLegend pal) (mainCanvas env st pal mm tl v sel marks)
+          paneWith tight ctx "Capabilities" (capsLegend st pal tl) (mainCanvas env st pal mm tl v sel marks)
       | pid == paneThreads ->
           paneWith tight ctx "Threads" (threadsHeader st pal tl) (threadsSection env st pal mm tl v sel marks)
       | pid == paneMarkers ->
@@ -275,8 +317,10 @@ body env st tl = do
             paneScroll (grow . tight) $
               columnWith (padAll 12 . gap 6 . fillW) (inspector env st tl v sel)
 
-capsLegend :: Palette -> NanoUI ()
-capsLegend pal = do
+capsLegend :: TimelineState -> Palette -> Timeline -> NanoUI ()
+capsLegend st pal tl = do
+  scope $ unless (V.null (tlProfSamples tl)) $
+    checkboxWith alignMid ("Code (" <> fmtInt (V.length (tlProfSamples tl)) <> " samples)") (tsCode st)
   flex
   legendDot (pRun pal) "running"
   legendDot (pGC pal) "minor GC"
@@ -336,21 +380,24 @@ mainCanvas env st pal mm tl v sel marks = do
   let nCaps = V.length (tlCaps tl)
       rk = runKey (tlRun tl)
   inp <- askInput
+  code <- codeShown st tl
+  (isFocus, _) <- isFocusOrHover env
   let mouse = inputMousePos inp
   -- Geometry from last frame's rect: interaction runs before layout.
   sid <- currentId
   prevRect <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
-  let rows0 = layoutRows prevRect nCaps
+  let rows0 = layoutRows prevRect nCaps code
       hover = hoverInfo tl v rows0 mouse
+      focusCC i = maybe False isFocus (costCentreRef tl i)
   resp <-
     canvasConfigured
       defaultCanvasConfig
-        { canvasLayout = (fillW . fillH . minH (mainHeight nCaps)) defaultLayout
+        { canvasLayout = (fillW . fillH . minH (mainHeight nCaps code)) defaultLayout
         , canvasTrackPointer = True
         , canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)
         }
-      (\r -> drawMain pal mm tl v sel marks (if rectContains r mouse then hover else Nothing) r)
-  let rows = layoutRows (respRect resp) nCaps
+      (\r -> drawMain pal mm tl v sel marks code focusCC (if rectContains r mouse then hover else Nothing) r)
+  let rows = layoutRows (respRect resp) nCaps code
       axis = linearAxis rk v (rPlotX rows) (rPlotW rows)
       Rect _ ry _ rh = rRuler rows
       onRuler = v2Y mouse >= ry && v2Y mouse < ry + rh && v2X mouse >= rPlotX rows
@@ -368,7 +415,10 @@ mainCanvas env st pal mm tl v sel marks = do
   canvasLinks env resp (refAtMain tl v rows)
   clicked <- isClick st resp
   when (clicked && not brushing && not (modCtrl mods)) $ do
-    writeVar (tsSel st) (pickMain tl v rows mouse)
+    -- A click on a code track focuses its cost centre everywhere.
+    case codeRunAt tl v rows mouse of
+      Just (_, run) -> setFocus env (costCentreRef tl (crCostCentre run))
+      Nothing -> writeVar (tsSel st) (pickMain tl v rows mouse)
     when (v2X mouse >= rPlotX rows) $ setCursor (envBus env) rk (timeAt (v2X mouse))
 
 -- | The entity at a point on the main canvas: the thread running in a
@@ -377,6 +427,7 @@ mainCanvas env st pal mm tl v sel marks = do
 refAtMain :: Timeline -> TimeView -> Rows -> V2 -> Maybe Ref
 refAtMain tl v rows m@(V2 mx my)
   | mx < rPlotX rows || mx > rPlotX rows + rPlotW rows = Nothing
+  | Just (_, run) <- codeRunAt tl v rows m = costCentreRef tl (crCostCentre run)
   | otherwise = case pickMain tl v rows m of
       Just (SelSpan (OnCap c) j) ->
         let s = trackSpan (tlCaps tl V.! c) j
@@ -439,13 +490,28 @@ hoverInfo tl v rows m@(V2 mx my)
     tol = round (4 * viewWidth v / realToFrac (rPlotW rows)) :: Word64
     timeLine = "t = " <> fmtNs (t - fromIntegral (tlStart tl))
     inRow (Rect _ ry _ rh) = my >= ry && my < ry + rh
-    details = case [i | (i, r) <- zip [0 :: Int ..] (rCaps rows), inRow r] of
-      i : _ -> capDetails i
-      []
-        | inRow (rGC rows) -> gcDetails
-        | inRow (rMem rows) -> memDetails
-        | inRow (rRuler rows) -> markerDetails
-        | otherwise -> []
+    details = case codeRunAt tl v rows m of
+      Just (c, run) -> codeDetails c run
+      Nothing -> case [i | (i, r) <- zip [0 :: Int ..] (rCaps rows), inRow r] of
+        i : _ -> capDetails i
+        []
+          | inRow (rGC rows) -> gcDetails
+          | inRow (rMem rows) -> memDetails
+          | inRow (rRuler rows) -> markerDetails
+          | any inRow (rCode rows) -> ["no sample here"]
+          | otherwise -> []
+    -- A code run: its top frame, where that is, and the frames below.
+    codeDetails c run =
+      let stack = maybe [] (VU.toList . psStack) (tlProfSamples tl V.!? crFirst run)
+          callers = [costCentreName tl (fromIntegral f) | f <- take 4 (drop 1 stack)]
+          n = crSamples run
+       in ["capability " <> tshow c <> " ran " <> costCentreName tl (crCostCentre run)]
+            ++ [ "at " <> renderSrcLoc (cciSrc cc)
+               | Just cc <- [IM.lookup (crCostCentre run) (tlCostCentres tl)]
+               , Just _ <- [srcLocSpan (cciSrc cc)]
+               ]
+            ++ ["called from " <> T.intercalate " ← " callers | not (null callers)]
+            ++ [fmtInt n <> (if n == 1 then " sample" else " samples") <> ", one every " <> fmtNs (fromIntegral (tlSamplePeriod tl))]
     capDetails i =
       let tr = tlCaps tl V.! i
           base = "capability " <> tshow i
@@ -487,7 +553,6 @@ hoverInfo tl v rows m@(V2 mx my)
       , let d = if mkTime mk > tw then mkTime mk - tw else tw - mkTime mk
       , d <= tol * 2
       ]
-    _ = m
 
 catMaybes' :: [Maybe a] -> [a]
 catMaybes' = mapMaybe id
@@ -504,17 +569,15 @@ threadLabel tl tid = maybe ("thread " <> tshow tid) threadName (M.lookup tid (tl
 -- ---------------------------------------------------------------------------
 -- Drawing
 
-drawMain :: Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> Maybe (Float, Float, [Text]) -> Rect -> CanvasM ()
-drawMain pal mm tl v sel marks hover r@(Rect x _ _ _) = do
-  let rows = layoutRows r (V.length (tlCaps tl))
+drawMain :: Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> Bool -> (Int -> Bool) -> Maybe (Float, Float, [Text]) -> Rect -> CanvasM ()
+drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
+  let rows = layoutRows r (V.length (tlCaps tl)) code
       px = rPlotX rows
       pw = rPlotW rows
       font = mmFont mm
       label' y txt = drawTextClipped font (mmCharW mm) (V2 (x + 14) y) (gutterW - 26) txt (pText pal)
       sub y txt = drawTextClipped font (mmCharW mm) (V2 (x + 14) y) (gutterW - 26) txt (pMuted pal)
-      capsBottom = case reverse (rCaps rows) of
-        Rect _ cy _ ch : _ -> cy + ch
-        [] -> rectY (rRuler rows) + rulerH
+      capsBottom = maximum (rectY (rRuler rows) + rulerH : [cy + ch | Rect _ cy _ ch <- rCaps rows ++ rCode rows])
   drawGutter pal r
   drawRuler pal mm tl v (rRuler rows)
   forM_ (zip3 [0 :: Int ..] (rCaps rows) (V.toList (tlCaps tl))) $ \(i, cr@(Rect _ cy _ ch), tr) -> do
@@ -524,6 +587,9 @@ drawMain pal mm tl v sel marks hover r@(Rect x _ _ _) = do
     case sel of
       Just (SelSpan (OnCap j) k) | j == i -> outlineSpan pal v cr tr k
       _ -> pure ()
+  forM_ (zip3 [0 :: Int ..] (rCode rows) (V.toList (tlCodeRuns tl))) $ \(i, cr@(Rect _ cy _ ch), runs) -> do
+    sub (cy + ch / 2) ("  code " <> tshow i)
+    drawCodeTrack pal mm tl v cr runs focusCC
   -- Markers run down through the capability tracks.
   withClip (Rect px (rectY (rRuler rows)) pw (capsBottom - rectY (rRuler rows))) $
     forM_ (markersIn tl v) $ \mk -> do
@@ -624,6 +690,42 @@ drawTrack pal v r@(Rect x y w h) tr kinds markBlocked = do
                 when (hh > 0) $ drawRect (Rect (x + px0) (y + h - base - hh) (px1 - px0 + 1) hh) c
                 go (base + hh) rest
           go 0 (zip fs kinds)
+
+-- | A capability's code track: each run of samples with one top frame is
+-- a block, in an ink shade of its cost centre (collections in the GC
+-- colour, idle time left empty), named where it is wide enough. The cost
+-- centre in focus takes the accent.
+drawCodeTrack :: Palette -> MonoMetrics -> Timeline -> TimeView -> Rect -> V.Vector CodeRun -> (Int -> Bool) -> CanvasM ()
+drawCodeTrack pal mm tl v r@(Rect x y w h) runs focusCC = do
+  drawRect r (pTrackBg pal)
+  let i0 = lowerBoundBy crEnd runs (floorW (tvStart v))
+      inView = takeWhile (\cr -> fromIntegral (crStart cr) <= tvEnd v) (V.toList (V.drop i0 runs))
+      shown = [cr | cr <- inView, not (idleCostCentre tl (crCostCentre cr))]
+      info i = IM.lookup i (tlCostCentres tl)
+      isGC c = cciLabel c == "GC" && cciModule c == "GC"
+      -- A stable shade per cost centre, so neighbouring runs part.
+      shade i = fromIntegral ((i * 7919) `mod` 101) / 101 :: Float
+      colour i
+        | focusCC i = alpha 0.8 (pAccent pal)
+        | Just c <- info i, isGC c = alpha 0.75 (pGC pal)
+        | otherwise = alpha (0.14 + 0.3 * shade i) (pText pal)
+  withClip r $
+    if length shown <= floor w
+      then forM_ shown $ \cr -> do
+        let xa = max x (timeToX v x w (fromIntegral (crStart cr)))
+            xb = min (x + w) (timeToX v x w (fromIntegral (crEnd cr)))
+            bw = max 1 (xb - xa)
+        drawRect (Rect xa (y + 1) bw (h - 2)) (colour (crCostCentre cr))
+        when (bw > 40) $ for_ (info (crCostCentre cr)) $ \c ->
+          drawTextClipped (mmFont mm) (mmCharW mm) (V2 (xa + 3) (y + h / 2)) (bw - 6) (cciLabel c) (pText pal)
+      else do
+        -- Too many to draw: keep the most sampled run per pixel.
+        let buckets =
+              M.fromListWith
+                (\a b -> if crSamples a >= crSamples b then a else b)
+                [(floor (timeToX v x w (fromIntegral (crStart cr)) - x) :: Int, cr) | cr <- shown]
+        forM_ (M.toList buckets) $ \(px, cr) ->
+          drawRect (Rect (x + fromIntegral px) (y + 1) 1 (h - 2)) (colour (crCostCentre cr))
 
 -- | Merge consecutive columns with identical values.
 groupRuns :: Eq b => [(Float, b)] -> [(Float, Float, b)]
@@ -929,17 +1031,93 @@ spanInspector env st tl ref i = do
       rowWith (padTop 4 . tight . gap 6) $ do
         whenM (button "Zoom to slice") (zoomTo st tl (srStart s) (srEnd s))
         scope $ unless (srKind s == kindGC) $ whenM (button "Highlight thread") (writeVar (tsFocusThread st) (Just tid))
+      -- What the profiler saw running: on the capability, or wherever the
+      -- thread ran.
+      scope $ when (hasSamples && (srKind s == kindRun || srKind s == kindGC)) $ do
+        separator
+        sectionTitle "What ran during this slice?"
+        let cp = case ref of
+              OnCap c -> sliceProfile tl (Just c) tid (srStart s) (srEnd s)
+              OnThread _ -> sliceProfile tl Nothing tid (srStart s) (srEnd s)
+        codeRows env tl cp 8
+        sampleNote tl cp
       scope $ for_ (if srKind s == kindGC then Nothing else M.lookup tid (tlThreads tl)) $ \ti -> do
         separator
-        threadStats tl ti
+        threadStats env tl ti
       separator
-      hint "The eventlog records no stack traces. To see where a thread is, label it (GHC.Conc.labelThread), drop traceMarkerIO calls, or step it in the Debugger."
+      hint $
+        if hasSamples
+          then "Samples show the cost centre on top of the stack. Ctrl+click one to open it in the .prof tree (when loaded) or its source in Core & STG."
+          else "The eventlog records no stack traces. A profiled build (-prof -fprof-auto) run with +RTS -p -l samples what each capability runs, and this inspector then says what ran during a slice. Otherwise label threads (GHC.Conc.labelThread), drop traceMarkerIO calls, or step them in the Debugger."
     _ -> hint "The selection is no longer in the log."
   where
     rk = runKey (tlRun tl)
+    hasSamples = not (V.null (tlProfSamples tl))
 
-threadStats :: Timeline -> ThreadInfo -> NanoUI ()
-threadStats tl ti = do
+-- | Cost centres sampled, as links, with their samples and their share of
+-- the samples that were not idle.
+codeRows :: Env -> Timeline -> CodeProfile -> Int -> NanoUI ()
+codeRows env tl cp n = do
+  let counted = max 1 (cpSamples cp - cpIdle cp)
+  forM_ (take n (cpTop cp)) $ \(i, k) -> withKey ("cc" <> tshow i) $ for_ (costCentreRef tl i) $ \ref -> do
+    _ <- linkRow env ref False id $ do
+      columnWith (tight . gap 0 . fillW . alignMid) $ do
+        labelWith (fillW . fontMono . fontSizeScale 0.88) (costCentreName tl i)
+        scope $ for_ (IM.lookup i (tlCostCentres tl) >>= srcLocSpan . cciSrc) $ \sp ->
+          labelWith (fillW . fontMuted . fontSizeScale 0.8) (renderSrcSpan sp)
+      numCell 40 id (fmtInt k)
+      numCell 48 fontMuted (fmtPct (fromIntegral k / fromIntegral counted))
+    pure ()
+  scope $ when (cpIdle cp > 0) $
+    labelWith (fontMuted . fontSizeScale 0.85) (fmtInt (cpIdle cp) <> " idle samples left out")
+
+-- | Each ticky counter (most allocation first) with its parsed name and
+-- the name key of the top-level binding it is nested in.
+tickyNames :: Timeline -> [(TickyCounter, TickyName, Text)]
+tickyNames tl =
+  let named = [(c, tn) | c <- V.toList (tlTicky tl), Just tn <- [parseTickyName (tcName c)]]
+      byUnique = M.fromList [(u, tn) | (_, tn) <- named, Just u <- [tickyUnique tn]]
+   in [(c, tn, nameKey (tnName (tickyTopLevel (`M.lookup` byUnique) tn))) | (c, tn) <- named]
+
+-- | The binding a counter belongs to.
+tickyRef :: (TickyCounter, TickyName, Text) -> Ref
+tickyRef (_, tn, key) = RBinding (tnModule tn) key
+
+tickyNote :: Word64 -> Word64 -> Text
+tickyNote entries alloc = fmtInt entries <> " entries · " <> fmtBytes alloc <> " alloc"
+
+-- | Ticky counters with entries and allocation, as links to their
+-- bindings.
+tickyRows :: Env -> [((TickyCounter, TickyName, Text), Word64, Word64)] -> NanoUI ()
+tickyRows env rows = do
+  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+    colHeader fillW "closure"
+    colHeader (fixedW 64 . alignEnd) "entries"
+    colHeader (fixedW 72 . alignEnd) "alloc"
+  forM_ (zip [0 :: Int ..] rows) $ \(k, (x@(_, tn, key), e, al)) -> withKey ("t" <> tshow k) $ do
+    _ <- linkRow env (tickyRef x) False id $ do
+      columnWith (tight . gap 0 . fillW . alignMid) $ do
+        labelWith (fillW . fontMono . fontSizeScale 0.88) (tickyBinder tn)
+        labelWith (fillW . fontMuted . fontSizeScale 0.8) ("in " <> tnModule tn <> "." <> key)
+      numCell 64 id (fmtInt e)
+      numCell 72 id (fmtBytes al)
+    pure ()
+
+-- | How far to trust a handful of samples, in words.
+sampleNote :: Timeline -> CodeProfile -> NanoUI ()
+sampleNote tl cp
+  | cpSamples cp == 0 = hint ("No sample fell inside it: each capability was sampled once every " <> period <> "." <> coarse)
+  | fewSamples (cpSamples cp) =
+      hint ("Only " <> fmtInt (cpSamples cp) <> " samples, one every " <> period <> " on each capability: a hint of what ran, not a measurement." <> coarse)
+  | otherwise = pure ()
+  where
+    period = fmtNs (fromIntegral (tlSamplePeriod tl))
+    coarse
+      | tlSamplePeriod tl > 5000000 = " The profiler's timer ticked far slower than the 1 ms it asks for, as it does on Windows."
+      | otherwise = ""
+
+threadStats :: Env -> Timeline -> ThreadInfo -> NanoUI ()
+threadStats env tl ti = do
   sectionTitle (threadName ti)
   let created = fromMaybe (tlStart tl) (tiCreated ti)
       ended = fromMaybe (tlEnd tl) (tiFinished ti)
@@ -957,6 +1135,12 @@ threadStats tl ti = do
         cell (fillW . if stopIsBlocked code then fontTone Danger else fontMuted) (stopName code)
         numCell 84 id (fmtNs (fromIntegral ns))
         numCell 52 fontMuted (fmtPct (fromIntegral ns / life))
+  -- Its CPU profile: the samples taken while it ran, wherever it ran.
+  scope $ unless (V.null (tlProfSamples tl)) $ do
+    let cp = threadProfile tl (tiId ti)
+    sectionTitle ("Its CPU profile (" <> fmtInt (cpSamples cp) <> " samples)")
+    codeRows env tl cp 6
+    sampleNote tl cp
 
 gcInspector :: Env -> TimelineState -> Timeline -> Int -> GCEvent -> NanoUI ()
 gcInspector env st tl i g = do
@@ -1036,6 +1220,14 @@ overview env st tl v = do
       cell fillW (threadName ti)
       numCell 72 id (fmtNs (fromIntegral (tiRunTime ti)))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
+  scope $ unless (V.null (tlProfSamples tl)) $ do
+    let cp = codeProfile tl (const True) (tlStart tl) (tlEnd tl)
+    sectionTitle ("Most sampled code (" <> fmtInt (cpSamples cp) <> " samples)")
+    codeRows env tl cp 6
+    sampleNote tl cp
+  scope $ unless (V.null (tlTicky tl)) $ do
+    sectionTitle ("Ticky counters (" <> fmtInt (V.length (tlTicky tl)) <> ")")
+    tickyRows env (take 8 [(x, tcEntries c, tcAlloc c) | x@(c, _, _) <- tickyNames tl])
   sectionTitle "Program"
   forM_ (tlInfo tl) $ \(k, val) -> kv k (T.take 300 val)
 
@@ -1085,6 +1277,18 @@ rangeInspector env st tl a b = do
       kv "Allocated" (fmtBytes n)
       kv "Rate" (fmtRate (fromIntegral n / max 1e-9 (dur / 1e9)))
     Nothing -> hint "No allocation counter in this range. The RTS posts it at each collection."
+  scope $ unless (V.null (tlTicky tl)) $ do
+    sectionTitle "Top allocators (ticky)"
+    let named = M.fromList [(tcId c, x) | x@(c, _, _) <- tickyNames tl]
+        rows = [(x, e, al) | (c, e, al) <- tickyBetween tl a b, Just x <- [M.lookup (tcId c) named]]
+    scope $ when (null rows) $ hint "No ticky sample in this range: the RTS posts them at each major collection."
+    tickyRows env (take 8 rows)
+  scope $ unless (V.null (tlProfSamples tl)) $ do
+    sectionTitle "Code (cost-centre samples)"
+    let cp = codeProfile tl (const True) a b
+    codeRows env tl cp 8
+    sampleNote tl cp
+    hint "Samples count where the time went, not what was allocated: a ticky build (-ticky, +RTS -lT) counts allocation per closure."
   sectionTitle "Heap"
   let growth name (sa, sb) = for_ ((,) <$> sa <*> sb) $ \(va, vb) ->
         kv name (fmtBytes va <> " → " <> fmtBytes vb <> "  (" <> (if vb >= va then "+" <> fmtBytes (vb - va) else "−" <> fmtBytes (va - vb)) <> ")")
@@ -1187,6 +1391,25 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
         -- this run exactly: a .hp file's censuses count differently.
         census r j = if r == rk then censusTimes tl VU.!? j else Nothing
         offset t = fmtNs (fromIntegral (t - min t (tlStart tl)))
+        -- Cost centres the profiler sampled on top of a stack.
+        sampled m l = costCentreNamed tl m l >>= \c -> (c,) <$> IM.lookup (cciId c) (tlSampleCounts tl)
+        totalSamples = V.length (tlProfSamples tl)
+        ticky = tickyNames tl
+        tickyOf m k = [x | x@(_, tn, key) <- ticky, key == k, T.null m || tnModule tn == m]
+        -- Each counter's entries and allocation, for the STG pane and the
+        -- binding list: placed at its binder's STG let ("siteOfTable"),
+        -- else joined by the binding's name.
+        tickyAnns =
+          concat
+            [ [ Annotation Nothing table name LaneEntries (fromIntegral (tcEntries c)) ShadeInk "" ref
+              , Annotation Nothing table name LaneTicky (fromIntegral (tcAlloc c)) ShadeInk (tickyNote (tcEntries c) (tcAlloc c)) ref
+              ]
+            | x@(c, tn, key) <- ticky
+            , tcEntries c > 0 || tcAlloc c > 0
+            , let table = Just (tickyBinder tn <> "_info")
+                  name = Just (tnModule tn, key)
+                  ref = Just (tickyRef x)
+            ]
      in (lens PTimeline)
           { lensShows = \case
               RThread r t -> isJust (thread r t)
@@ -1195,6 +1418,7 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
               RCensus r j -> isJust (census r j)
               RInstant r t -> mine r && inLog t
               RRange r a b -> mine r && inLog a && b > a
+              RCostCentre m l -> isJust (sampled m l)
               _ -> False
           , lensReveal = revealIn bus st tl
           , lensTitle = \case
@@ -1203,10 +1427,12 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
               RMarker r i -> (\mk -> (if mkIsMarker mk then "Marker " else "Event ") <> T.take 60 (mkText mk)) <$> marker r i
               RInstant r t | mine r -> Just ("t = " <> offset t)
               RRange r a b | mine r -> Just ("Range " <> offset a <> " to " <> offset b)
+              RCostCentre m l -> (\(c, _) -> cciModule c <> "." <> cciLabel c) <$> sampled m l
               _ -> Nothing
           , lensRelated = \case
               RCollection r i | isJust (gc r i) -> [("Heap after this collection", RCensus rk j) | Just j <- [censusAfterCollection tl i]]
               RCensus r j | isJust (census r j) -> [("Show collection", RCollection rk i) | Just i <- [collectionBeforeCensus tl j]]
+              RCostCentre m l -> [("Go to source", RSource sp) | Just (c, _) <- [sampled m l], Just sp <- [srcLocSpan (cciSrc c)]]
               _ -> []
           , lensActions = \case
               RRange r a b | mine r, inLog a, b > a -> [Action "Analyse range" (Right (writeVar (busRange bus) (Just (rk, a, b)) >> writeVar (tsSel st) (Just (SelRange a b)) >> switch))]
@@ -1218,6 +1444,10 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
               RCensus r j -> (\t -> fact "taken at" (offset t)) <$> census r j
               RInstant r t | mine r, inLog t -> Just (instantPeek tl t)
               RRange r a b | mine r, inLog a, b > a -> Just (rangePeek tl a b)
+              RCostCentre m l -> (\(c, n) -> codePeek tl c n totalSamples) <$> sampled m l
+              RBinding m k | xs@(_ : _) <- tickyOf m k -> Just $ do
+                fact "ticky" (tickyNote (sum [tcEntries c | (c, _, _) <- xs]) (sum [tcAlloc c | (c, _, _) <- xs]))
+                fact "counters" (fmtInt (length xs) <> ", joined by name")
               _ -> Nothing
           , lensHits =
               [ Hit "thread" (threadName ti) ("ran " <> fmtNs (fromIntegral (tiRunTime ti))) (HitRef (RThread rk (tiId ti)))
@@ -1226,6 +1456,18 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
                 ++ [ Hit (if mkIsMarker mk then "marker" else "event") (mkText mk) (fmtNs (fromIntegral (mkTime mk - min (mkTime mk) (tlStart tl)))) (HitRef (RMarker rk i))
                    | (i, mk) <- take 5000 (zip [0 ..] (V.toList (tlMarkers tl)))
                    ]
+                ++ [ Hit "sampled code" (cciModule c <> "." <> cciLabel c) (fmtInt n <> " samples") (HitRef (RCostCentre (cciModule c) (cciLabel c)))
+                   | (i, n) <- IM.toList (tlSampleCounts tl)
+                   , Just c <- [IM.lookup i (tlCostCentres tl)]
+                   , not (isIdleCostCentre c)
+                   ]
+                ++ [ Hit "ticky counter" (tickyBinder tn) (tickyNote (tcEntries c) (tcAlloc c)) (HitRef (tickyRef x))
+                   | x@(c, tn, _) <- ticky
+                   ]
+          , lensAnnotations = tickyAnns
+          , lensSpan = \case
+              RCostCentre m l -> sampled m l >>= srcLocSpan . cciSrc . fst
+              _ -> Nothing
           }
 
 revealIn :: Bus -> TimelineState -> Timeline -> Ref -> NanoUI ()
@@ -1248,6 +1490,8 @@ revealIn bus st tl = \case
   RRange _ a b -> do
     zoomToRange st tl a b
     writeVar (tsSel st) (Just (SelRange a b))
+  -- The focus lights its runs up on the code tracks.
+  RCostCentre _ _ -> writeVar (tsCode st) True
   _ -> pure ()
 
 -- | Move the view to put @t@ in the middle, keeping its width (or a
@@ -1288,6 +1532,12 @@ rangePeek tl a b = do
   fact "collections" (fmtInt (length (rsCollections rs)) <> ", paused " <> fmtNs (fromIntegral (rsPauseTotal rs)))
   for_ (rsAllocated rs) $ \n -> fact "allocated" (fmtBytes n)
   fact "threads ran" (fmtInt (length (rsThreads rs)))
+
+codePeek :: Timeline -> CostCentreInfo -> Int -> Int -> NanoUI ()
+codePeek tl c n total = do
+  fact "on top of the stack" (fmtInt n <> " of " <> fmtInt total <> " samples, one every " <> fmtNs (fromIntegral (tlSamplePeriod tl)))
+  scope $ for_ (srcLocSpan (cciSrc c)) $ \sp -> fact "source" (renderSrcSpan sp)
+  scope $ when (fewSamples n) $ labelWith (fontMuted . fontSizeScale 0.85 . fillW) "Few samples: a hint, not a measurement."
 
 instantPeek :: Timeline -> Word64 -> NanoUI ()
 instantPeek tl t = do

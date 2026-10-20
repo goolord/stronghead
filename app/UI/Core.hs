@@ -85,7 +85,7 @@ data CoreState = CoreState
   }
 
 -- | The order of the binding list.
-data BindingSort = InFileOrder | ByTime | ByAlloc | ByHeap
+data BindingSort = InFileOrder | ByTime | ByAlloc | ByHeap | ByEntries | ByTicky
   deriving (Eq, Show)
 
 paneBindings, paneNotes, paneSource, paneCore, paneStg :: Word64
@@ -244,7 +244,22 @@ data Runtime = Runtime
   , rtAlloc :: !Double
   , rtHeap :: !Double
     -- ^ Bytes live at the heap cursor.
+  , rtEntries :: !Double
+    -- ^ Entries into it and the closures it allocates, from ticky.
+  , rtTicky :: !Double
+    -- ^ Bytes they allocated, from ticky.
   }
+
+noRuntime :: Runtime
+noRuntime = Runtime 0 0 0 0 0
+
+-- | A count in a narrow column: 4.2M, 51.6k, 7.
+fmtCount :: Double -> Text
+fmtCount n
+  | n >= 1e9 = fmtFixed 1 (n / 1e9) <> "G"
+  | n >= 1e6 = fmtFixed 1 (n / 1e6) <> "M"
+  | n >= 1e4 = fmtFixed 1 (n / 1e3) <> "k"
+  | otherwise = tshow (round n :: Int)
 
 -- | Annotations indexed for joining them to bindings: those in the source
 -- file by the line their span starts on, the rest by the name they give.
@@ -265,7 +280,7 @@ joinable inSource anns =
 -- included), or, with no source binding, every one naming it.
 runtimeOf :: Text -> Bool -> Joinable -> Entry -> Runtime
 runtimeOf modName haveSource jn e =
-  Runtime (total LaneTime) (total LaneAlloc) (total LaneHeap)
+  Runtime (total LaneTime) (total LaneAlloc) (total LaneHeap) 0 0
   where
     mine = case listToMaybe (enSrc e) of
       Just b | haveSource ->
@@ -385,17 +400,38 @@ panes env st loaded src core stg = do
       reported = M.fromList [(ssFile sp, ()) | a <- anns, Just sp <- [anSpan a]]
       inSource = (\cf -> let here = M.mapWithKey (\f _ -> resolvesTo ix (cfPath cf) f) reported in \sp -> M.findWithDefault False (ssFile sp) here) <$> src
       jn = joinable inSource anns
-      runtime = M.fromList [(enKey e, runtimeOf modName (isJust src) jn e) | e <- es]
-      rt e = M.findWithDefault (Runtime 0 0 0) (enKey e) runtime
-      lanes = [l | l <- [LaneTime, LaneAlloc, LaneHeap], any ((== l) . anLane) anns]
+      -- A ticky build's counters of this module.
+      tickyLane a = anLane a == LaneEntries || anLane a == LaneTicky
+      tickyHere = [a | a <- anns, tickyLane a, fmap fst (anName a) == Just modName]
+      -- The STG binding each line of the STG dump is in.
+      stgOwners = IM.fromList [(bdFirst b, (bdLast b, enKey e)) | e <- es, b <- enStg e]
+      stgOwner l = case IM.lookupLE l stgOwners of
+        Just (_, (lastLine, k)) | l <= lastLine -> Just k
+        _ -> Nothing
+      -- Each counter's binding: the one its STG let is in (exact), or,
+      -- without the STG dump, the one its name is nested in (by name).
+      tickyByEntry = M.fromListWith (++) $ case clSites loaded of
+        Just sites -> [(k, [a]) | a <- tickyHere, Just t <- [anTable a], Just l <- [siteOfTable sites t Nothing], Just k <- [stgOwner l]]
+        Nothing -> [(k, [a]) | a <- tickyHere, Just (_, k) <- [anName a]]
+      withTicky e r =
+        let as = M.findWithDefault [] (enKey e) tickyByEntry
+         in r {rtEntries = sum [anValue a | a <- as, anLane a == LaneEntries], rtTicky = sum [anValue a | a <- as, anLane a == LaneTicky]}
+      runtime = M.fromList [(enKey e, withTicky e (runtimeOf modName (isJust src) jn e)) | e <- es]
+      rt e = M.findWithDefault noRuntime (enKey e) runtime
+      lanes = [l | l <- [LaneTime, LaneAlloc, LaneHeap], any ((== l) . anLane) anns] ++ [l | not (null tickyHere), l <- [LaneEntries, LaneTicky]]
       heapTotal = sum [anValue a | a <- anns, anLane a == LaneHeap]
+      tickyTotal = sum [anValue a | a <- tickyHere, anLane a == LaneTicky]
       boxedOrAlloc e = any (not . null . nBoxing . bdNotes) (enCore e) || any (not . null . nAllocs . bdNotes) (enStg e)
-      isHot e = let r = rt e in rtTime r >= 1 || rtAlloc r >= 1 || rtHeap r >= 0.01 * heapTotal && rtHeap r > 0
+      isHot e =
+        let r = rt e
+         in rtTime r >= 1 || rtAlloc r >= 1 || rtHeap r >= 0.01 * heapTotal && rtHeap r > 0 || rtTicky r >= 0.01 * tickyTotal && rtTicky r > 0
       sorted = case sortBy' of
         InFileOrder -> id
         ByTime -> sortOn (Down . rtTime . rt)
         ByAlloc -> sortOn (Down . rtAlloc . rt)
         ByHeap -> sortOn (Down . rtHeap . rt)
+        ByEntries -> sortOn (Down . rtEntries . rt)
+        ByTicky -> sortOn (Down . rtTicky . rt)
       shown =
         sorted
           [ e
@@ -411,12 +447,13 @@ panes env st loaded src core stg = do
           for_ (listToMaybe (enSrc e)) (scrollToLine vSrc . bdFirst)
           for_ (listToMaybe (enCore e)) (scrollToLine vCore . bdFirst)
           for_ (listToMaybe (enStg e)) (scrollToLine vStg . bdFirst)
-      -- The heap each STG closure site holds, joined by info-table name.
+      -- The heap each STG closure site holds, joined by info-table name,
+      -- and each let's ticky counter, joined by its binder.
       stgPlaced = case clSites loaded of
         Just sites ->
           [ (l, l, a)
           | a <- anns
-          , anLane a == LaneHeap
+          , anLane a == LaneHeap || tickyLane a && fmap fst (anName a) == Just (sgModule sites)
           , Just t <- [anTable a]
           , Just l <- [siteOfTable sites t (anSpan a)]
           ]
@@ -531,6 +568,8 @@ panes env st loaded src core stg = do
                 forM_ lanes $ \l -> withKey (laneName l) $ case l of
                   LaneTime -> sortHeader st (fixedW 38 . alignEnd) "time" ByTime
                   LaneAlloc -> sortHeader st (fixedW 38 . alignEnd) "alloc" ByAlloc
+                  LaneEntries -> sortHeader st (fixedW 44 . alignEnd) "entries" ByEntries
+                  LaneTicky -> sortHeader st (fixedW 64 . alignEnd) "ticky" ByTicky
                   _ -> sortHeader st (fixedW 52 . alignEnd) "heap" ByHeap
             paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
               forM_ shown $ \e -> withKey (enKey e) $ do
@@ -541,6 +580,8 @@ panes env st loaded src core stg = do
                   forM_ lanes $ \l -> withKey (laneName l) $ case l of
                     LaneTime -> numCell 38 (costTone (rtTime r)) (pct (rtTime r))
                     LaneAlloc -> numCell 38 (costTone (rtAlloc r)) (pct (rtAlloc r))
+                    LaneEntries -> numCell 44 (if rtEntries r > 0 then id else fontMuted) (if rtEntries r > 0 then fmtCount (rtEntries r) else "·")
+                    LaneTicky -> numCell 64 (if rtTicky r > 0 then id else fontMuted) (if rtTicky r > 0 then fmtBytesD (rtTicky r) else "·")
                     _ -> numCell 52 (if rtHeap r > 0 then id else fontMuted) (if rtHeap r > 0 then fmtBytesD (rtHeap r) else "·")
                 when picked (select (enKey e))
       | pid == paneNotes ->
@@ -597,6 +638,9 @@ notesBar st e core r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
     fact "time" (fmtFixed 1 (rtTime r) <> "%")
     fact "allocation" (fmtFixed 1 (rtAlloc r) <> "%")
     fact "heap at the cursor" (fmtBytesD (rtHeap r))
+    scope $ when (rtEntries r > 0 || rtTicky r > 0) $ do
+      fact "ticky entries" (fmtCount (rtEntries r))
+      fact "ticky allocation" (fmtBytesD (rtTicky r))
   let verdicts =
         concat
           [ [ "Not in the optimised Core: inlined into its callers (or dropped as dead code)." | isJust core, null (enCore e), not (null (enSrc e)) ]

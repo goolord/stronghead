@@ -112,8 +112,9 @@ data Builder = Builder
     -- ^ Cost-centre samples: time, capability, stack. Newest first.
   , bTickyDefs :: !(M.Map Word64 (Text, Int, Text, Word64))
     -- ^ Ticky counters by id: name, arity, argument kinds, info table.
-  , bTickySums :: !(M.Map Word64 (Word64, Word64, Word64, Int))
-    -- ^ Entries, allocation, allocated and samples, summed so far.
+  , bTickySums :: !(M.Map Word64 [(Word64, Word64, Word64, Word64)])
+    -- ^ Each counter's samples: time, entries, allocation, allocated.
+    -- Newest first.
   , bCount :: !Int
   , bMin :: !Word64
   , bMax :: !Word64
@@ -214,8 +215,7 @@ globalEvent b t = \case
   TickyCounterDef {tickyCtrDefId, tickyCtrDefArity, tickyCtrDefKinds, tickyCtrDefName, tickyCtrInfoTbl} ->
     b {bTickyDefs = M.insert tickyCtrDefId (tickyCtrDefName, fromIntegral tickyCtrDefArity, tickyCtrDefKinds, tickyCtrInfoTbl) (bTickyDefs b)}
   TickyCounterSample {tickyCtrSampleId, tickyCtrSampleEntryCount, tickyCtrSampleAllocs, tickyCtrSampleAllocd} ->
-    let add (e, a, d, n) (e', a', d', n') = (e + e', a + a', d + d', n + n')
-     in b {bTickySums = M.insertWith add tickyCtrSampleId (tickyCtrSampleEntryCount, tickyCtrSampleAllocs, tickyCtrSampleAllocd, 1) (bTickySums b)}
+    b {bTickySums = M.insertWith (++) tickyCtrSampleId [(t, tickyCtrSampleEntryCount, tickyCtrSampleAllocs, tickyCtrSampleAllocd)] (bTickySums b)}
   HeapProfSampleBegin {} -> heap (beginSample t)
   HeapBioProfSampleBegin {} -> heap (beginSample t)
   HeapProfSampleEnd {} -> heap endSample
@@ -299,9 +299,9 @@ snapshot b
       _ -> 0
     period = samplePeriod (V.toList samples)
     ticky =
-      [ TickyCounter i name arity kinds info e a d n
+      [ TickyCounter i name arity kinds info (sum [e | (_, e, _, _) <- ss]) (sum [a | (_, _, a, _) <- ss]) (sum [d | (_, _, _, d) <- ss]) (VU.fromList [(t, e, a) | (t, e, a, _) <- ss])
       | (i, (name, arity, kinds, info)) <- M.toList (bTickyDefs b)
-      , let (e, a, d, n) = M.findWithDefault (0, 0, 0, 0) i (bTickySums b)
+      , let ss = reverse (M.findWithDefault [] i (bTickySums b))
       ]
     gcSpans = [(srStart s, srEnd s) | cb <- caps, s <- cbSpans (closeOpen end 0 0 cb), srKind s == kindGC]
     series = VU.fromList . sortOn fst
