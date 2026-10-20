@@ -18,6 +18,7 @@ import Stronghead.Debug
 import Stronghead.Dump
 import Stronghead.Eventlog (emptyBuilder, feedEvent, snapshot)
 import Stronghead.Eventlog.Model
+import Stronghead.Fuzzy
 import Stronghead.Ghci
 import Stronghead.HeapProfile
 import Stronghead.Live
@@ -194,6 +195,23 @@ main = do
   check "unknown program" (matchRuns emptyRunInfo {riPid = Just 4242} hello == DifferentRuns)
   check "merge prefers the first" (mergeRunInfo hpRunInfo hello == hpRunInfo {riPid = Just 4242})
   check "run key" (runKey fromLog == RunKey "stronghead-sample:4242" && runKey hpRunInfo == RunKey "stronghead-sample:?")
+  check "run keys match" $
+    runKeysMatch (runKey fromLog) (runKey hello)
+      && runKeysMatch (runKey fromLog) (runKey hpRunInfo)
+      && runKeysMatch (RunKey "?:?") (runKey hello)
+      && not (runKeysMatch (runKey fromLog) (RunKey "stronghead-sample:1"))
+      && not (runKeysMatch (runKey fromLog) (RunKey "other:4242"))
+      && not (runKeysMatch (RunKey "?:4242") (RunKey "other:?"))
+
+  putStrLn "fuzzy matching"
+  check "subsequence across punctuation" (isJust (fuzzyScore "wk3" "worker-3 (14)") && isJust (fuzzyScore "worker 3" "worker-3"))
+  check "no match" (fuzzyScore "xyz" "worker-3" == Nothing && fuzzyScore "ba" "ab" == Nothing)
+  check "case ignored" (isJust (fuzzyScore "GO" "Main.go"))
+  check "empty query matches all" (fuzzyScore "" "anything" == Just 0)
+  check "exact beats prefix beats middle" $
+    take 2 (map snd (fuzzyRank "go" id ["algorithm", "goal", "go", "lego"])) == ["go", "goal"]
+  check "word starts beat scattered letters" $
+    map snd (fuzzyRank "mb" id ["number", "map-builder"]) == ["map-builder", "number"]
 
   putStrLn "refs"
   let rk = RunKey "stronghead-sample:4242"

@@ -24,6 +24,29 @@ size and position on quit, to `settings.conf` in the user config directory
 (`%APPDATA%\stronghead` on Windows, `~/.config/stronghead` elsewhere). The
 command line wins over them.
 
+## Links between panels
+
+Threads, collections, markers, heap bands, censuses, cost centres, closures,
+thunk groups, bindings and source lines are links wherever they appear, and
+the same entity in every panel.
+
+- **Resting the pointer** on one peeks at what every panel knows about it.
+  Rows for the same entity in other panels are washed faintly.
+- **Right-click** lists every panel that can show it ("Show in Timeline"),
+  what goes with it ("Go to allocation site", "Go to thread"), and the
+  panels' actions ("Break here (GHCi)"). Actions that can't run yet say why.
+- **Ctrl+click** goes to it in its home panel. **Alt+←** / **Alt+→**, the
+  mouse's back and forward buttons, or the arrows in the header retrace your
+  steps.
+- **Ctrl+K** searches everything loaded: threads, bindings, cost centres,
+  bands, closures, markers, and commands.
+- **Ctrl+1** to **Ctrl+5** switch panels. A click focuses an entity, and the
+  status bar shows the focus; **Esc** clears it.
+
+Time-keyed links (a thread, a census, an instant) join artifacts from the
+same run, matched by program name and pid. Code-keyed links (a binding, a
+source line) join across runs.
+
 ## Panels
 
 ### Timeline (eventlog)

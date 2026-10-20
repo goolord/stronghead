@@ -1,6 +1,8 @@
--- | The window: a header with the panel tabs, a global Open and Settings,
--- file drag-and-drop, and the per-frame loaders that keep background work
--- going whichever panel is showing.
+-- | The window: a header with the panel tabs, history, the palette, a
+-- global Open and Settings, file drag-and-drop, and the per-frame loaders
+-- that keep background work going whichever panel is showing. The panels'
+-- lenses are built here each frame from what the loaders returned, so every
+-- panel can link to every other ("UI.Link").
 module UI.Shell
   ( App
   , Options (..)
@@ -11,6 +13,7 @@ module UI.Shell
   ) where
 
 import Control.Monad (forM_, unless, when)
+import Data.Char (intToDigit)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isSuffixOf)
@@ -30,20 +33,11 @@ import UI.Common
 import UI.Core
 import UI.Debugger
 import UI.Heap
+import UI.Link
 import UI.Live
+import UI.Palette
 import UI.Settings
 import UI.Timeline
-
-data Panel = PTimeline | PHeap | PCore | PDebugger | PLive
-  deriving (Eq, Show, Enum, Bounded)
-
-panelTitle :: Panel -> T.Text
-panelTitle = \case
-  PTimeline -> "Timeline"
-  PHeap -> "Heap & leaks"
-  PCore -> "Core & STG"
-  PDebugger -> "Debugger"
-  PLive -> "Live"
 
 -- | How to drive the panel, for the status bar.
 panelHint :: Panel -> T.Text
@@ -53,13 +47,6 @@ panelHint = \case
   PCore -> "Hover a name to find it in every pane, click it to jump to its binding"
   PDebugger -> "Click the gutter to set or clear a breakpoint"
   PLive -> "Samples arrive four times a second"
-
--- | The panel's name on the command line and in the settings file.
-panelKey :: Panel -> T.Text
-panelKey = T.toLower . T.takeWhile (/= ' ') . panelTitle
-
-panelNamed :: T.Text -> Maybe Panel
-panelNamed name = lookup name [(panelKey p, p) | p <- [minBound .. maxBound]]
 
 tabNamed :: T.Text -> Panel
 tabNamed = fromMaybe PTimeline . panelNamed
@@ -91,6 +78,8 @@ data App = App
     -- ^ The window's latest restored geometry, saved on quit.
   , appSaved :: !(IORef Settings)
     -- ^ What the settings file holds, so it is written only on a change.
+  , appBus :: !Bus
+  , appPalette :: !CommandPalette
   }
 
 -- | What the command line asked for.
@@ -151,6 +140,8 @@ newApp settings Options {..} = do
   appPlaceWindow <- newVar (if cfgRestoreWindow settings then cfgWindow settings else Nothing)
   appWindowSeen <- newIORef (cfgWindow settings)
   appSaved <- newIORef settings
+  appBus <- newBus
+  appPalette <- newPalette
   pure App {..}
 
 -- | The settings as they stand: the dialog's, the panels' defaults as last
@@ -255,38 +246,99 @@ appView app = do
   live <- liveLoad (appLive app)
   let logProfile = timeline >>= lpTimeline >>= tlHeapProfile
 
+  active <- readVar (appTab app)
+  heapL <- heapLens (appHeap app) heap logProfile
+  coreL <- coreLens (appCore app) core
+  debugL <- debugLens (appDebug app) debugSrc
+  let env =
+        Env
+          { envBus = appBus app
+          , envLenses = [timelineLens (appTimeline app) timeline, heapL, coreL, debugL, liveLens (appLive app) live]
+          , envPanel = active
+          , envSwitch = writeVar (appTab app)
+          }
+  navShortcuts app env
+
   th <- uiTheme
   let i = ink th
-  active <- readVar (appTab app)
   columnWith (tight . grow . gap 0) $ do
     styled (panelStyle (background (inkGround i) . borderWidth 0 . cornerRadius 0)) $
       panelWith (asRow . fillW . fixedH 46 . padLeft 20 . padRight 8 . padTop 0 . padBottom 0 . gap 18) $ do
         labelWith (alignMid . fontSemiBold . fontSizeScale 1.08) "Stronghead"
+        themed th $ history env
         themed th $ navBar (appTab app)
         flex
         themed th $ document app active
+        themed th $ whenM (toolButton "Go to…") (openPalette (appPalette app))
         themed th $ whenM (toolButton "Settings") (writeVar (appSettingsOpen app) True)
-        themed th $ whenM (toolButton "Open…") $
-          writeVar (appOpen app) . Just
-            =<< askOpenFileDialog
-              defaultFileDialogOptions
-                { dialogAllowMany = True
-                , dialogFilters =
-                    [ FileFilter "Stronghead inputs" "eventlog;hp;prof;dump-simpl;dump-stg-final;dump-stg;hs"
-                    , FileFilter "All files" "*"
-                    ]
-                }
+        themed th $ whenM (toolButton "Open…") (askOpen app)
     columnWith (tight . grow . gap 0) . withKey (fromEnum active) $ case active of
-      PTimeline -> timelineView (appTimeline app) timeline
-      PHeap -> heapView (appHeap app) heap logProfile
-      PCore -> coreView (appCore app) core
-      PDebugger -> debugView (appDebug app) debugSrc
-      PLive -> liveView (appLive app) live $ \p -> do
+      PTimeline -> timelineView env (appTimeline app) timeline
+      PHeap -> heapView env (appHeap app) heap logProfile
+      PCore -> coreView env (appCore app) core
+      PDebugger -> debugView env (appDebug app) debugSrc
+      PLive -> liveView env (appLive app) live $ \p -> do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
-    statusBar app active timeline live
+    statusBar app env active timeline live
   settingsModal app
+  paletteView env (appPalette app) (commands app env)
   persistSettings app
+  publishHover (appBus app)
+
+askOpen :: App -> NanoUI ()
+askOpen app =
+  writeVar (appOpen app) . Just
+    =<< askOpenFileDialog
+      defaultFileDialogOptions
+        { dialogAllowMany = True
+        , dialogFilters =
+            [ FileFilter "Stronghead inputs" "eventlog;hp;prof;dump-simpl;dump-stg-final;dump-stg;hs"
+            , FileFilter "All files" "*"
+            ]
+        }
+
+-- | Back and forward through the places links went to, each with a tooltip
+-- naming where it leads.
+history :: Env -> NanoUI ()
+history env = rowWith (alignMid . tight . gap 2) $ do
+  let bus = envBus env
+      step label locs go = do
+        resp <- disabledWhen (null locs) (buttonWith' (alignMid . padXY 8 2 . tight) label)
+        for_ (take 1 locs) $ \loc -> tooltip resp (describe loc)
+        when (respClicked resp) (go env)
+      describe (Location p r) = panelTitle p <> maybe "" ((": " <>) . refTitle env) r
+  back <- readVar (busBack bus)
+  forward <- readVar (busForward bus)
+  step "←" back goBack
+  step "→" forward goForward
+
+-- | Window-wide navigation: the palette, history, the panels by number,
+-- and Esc to drop the focus.
+navShortcuts :: App -> Env -> NanoUI ()
+navShortcuts app env = do
+  let pressed = fmap or . mapM shortcut
+      digit n = K.cmdOrCtrl <> K.key (intToDigit n)
+  whenM (pressed [K.cmdOrCtrl <> K.key 'k']) (openPalette (appPalette app))
+  inp <- askInput
+  back <- pressed [K.alt <> K.key KeyLeft]
+  forward <- pressed [K.alt <> K.key KeyRight]
+  when (back || pressedIn MouseBack inp) (goBack env)
+  when (forward || pressedIn MouseForward inp) (goForward env)
+  forM_ (zip [1 :: Int ..] [minBound .. maxBound]) $ \(n, p) ->
+    whenM (pressed [digit n]) (writeVar (appTab app) p)
+  whenM (pressed [K.key KeyEscape]) (setFocus env Nothing)
+
+-- | The palette's own commands, ahead of what the panels have loaded.
+commands :: App -> Env -> [Hit]
+commands app env =
+  [Hit "panel" (panelTitle p) ("Ctrl+" <> tshow n) (HitRun (writeVar (appTab app) p)) | (n, p) <- zip [1 :: Int ..] [minBound .. maxBound]]
+    ++ [ Hit "command" "Open file…" "" (HitRun (askOpen app))
+       , Hit "command" "Settings" "Ctrl+," (HitRun (writeVar (appSettingsOpen app) True))
+       , Hit "command" "Back" "Alt+Left" (HitRun (goBack env))
+       , Hit "command" "Forward" "Alt+Right" (HitRun (goForward env))
+       , Hit "command" "Clear the focus" "Esc" (HitRun (setFocus env Nothing))
+       ]
 
 -- | The file the active panel is showing, in the title bar.
 document :: App -> Panel -> NanoUI ()
@@ -311,8 +363,8 @@ document app active = scope $ case active of
 
 -- | Background work from every panel on the left, how to drive the active
 -- panel on the right.
-statusBar :: App -> Panel -> Maybe LoadProgress -> Maybe LiveData -> NanoUI ()
-statusBar app active timeline live = do
+statusBar :: App -> Env -> Panel -> Maybe LoadProgress -> Maybe LiveData -> NanoUI ()
+statusBar app env active timeline live = do
   th <- uiTheme
   let i = ink th
       item = labelWith (alignMid . fontSizeScale 0.85)
@@ -336,6 +388,11 @@ statusBar app active timeline live = do
         labelWith (alignMid . fontSizeScale 0.85 . fontTone Warning) msg
         whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")
       flex
+      focus <- readVar (busFocus (envBus env))
+      scope $ for_ focus $ \r -> do
+        labelWith (alignMid . fontMuted . fontSizeScale 0.85) "Focus"
+        linkText env r (alignMid . fontSizeScale 0.85) (T.take 60 (refTitle env r))
+        whenM (buttonWith (alignMid . padXY 6 0 . tight) "Clear") (setFocus env Nothing)
       labelWith (alignMid . fontMuted . fontSizeScale 0.85) (panelHint active)
 
 -- | The panels, as folder tabs along the bottom of the title bar.

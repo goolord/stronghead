@@ -8,6 +8,7 @@ module UI.Debugger
   , newDebugState
   , debugLoad
   , debugView
+  , debugLens
   ) where
 
 import Control.Concurrent (forkIO)
@@ -23,10 +24,12 @@ import NanoUI
 import Stronghead.Dump (CodeFile (..), CodeKind (..), lineTokens, loadCodeFile)
 import Stronghead.Format (tshow)
 import Stronghead.Ghci
-import Stronghead.Source (SrcSpan (..))
+import Stronghead.Ref
+import Stronghead.Source (SrcSpan (..), mkSourceIndex, renderSrcSpan, resolveSource)
 import System.FilePath (isAbsolute, takeFileName, (</>))
 import UI.Code
 import UI.Common
+import UI.Link
 
 data DebugState = DebugState
   { dsCommand :: !(Var Text)
@@ -152,8 +155,8 @@ stopSession st wake = do
 -- ---------------------------------------------------------------------------
 -- View
 
-debugView :: DebugState -> Maybe (Either String CodeFile) -> NanoUI ()
-debugView st source = columnWith (tight . gap 0 . grow) $ do
+debugView :: Env -> DebugState -> Maybe (Either String CodeFile) -> NanoUI ()
+debugView env st source = columnWith (tight . gap 0 . grow) $ do
   wake <- askWake
   running <- readVar (dsRunning st)
   busy <- readVar (dsBusy st)
@@ -194,15 +197,16 @@ debugView st source = columnWith (tight . gap 0 . grow) $ do
       whenM (styled destructive (toolButton "Abandon")) (send [":abandon"])
   workbench (dsPanes st) $ \pid ctx ->
     if
-      | pid == 1 -> sourcePane st ctx source stop send
+      | pid == 1 -> sourcePane env st ctx source stop send
       | pid == 2 -> pane ctx "Local bindings" (pure ()) (bindingsPane st stop send)
       | otherwise -> consolePane st ctx send
 
 isNothing' :: Maybe a -> Bool
 isNothing' = maybe True (const False)
 
-sourcePane :: DebugState -> PaneGridCtx -> Maybe (Either String CodeFile) -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
-sourcePane st ctx source stop send = do
+sourcePane :: Env -> DebugState -> PaneGridCtx -> Maybe (Either String CodeFile) -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
+sourcePane env st ctx source stop send = do
+  dir <- readVar (dsDir st)
   path <- readVar (dsSourcePath st)
   breaks <- readVar (dsBreaks st)
   mm <- monoMetrics 0.9
@@ -219,7 +223,8 @@ sourcePane st ctx source stop send = do
         flex
         scope $ for_ stop $ \s -> do
           labelWith (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) ("Stopped in " <> stName s)
-          for_ (stSpan s) $ \sp -> labelWith (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (T.pack (takeFileName (T.unpack (ssFile sp))) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
+          for_ (stSpan s) $ \sp ->
+            linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (T.pack (takeFileName (T.unpack (ssFile sp))) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
   ev <- paneWith tight ctx "Source" header $ do
     scope $ case source of
       Just (Left e) -> columnWith (padXY 12 6) $ labelWith (fontTone Danger) (T.pack e)
@@ -243,6 +248,11 @@ sourcePane st ctx source stop send = do
         , ccEmpty = "Start a session and load a module to see its source."
         }
 
+  let lineRef = case (ceHoverKey ev, cf, path) of
+        (Just k, Just c, _) | M.member k (cfByKey c) -> Just (RBinding (cfModule c) k)
+        (_, _, Just p) | Just l <- ceHoverLine ev -> Just (RSource (SrcSpan (T.pack p) (l + 1) 1 (l + 1) 1))
+        _ -> Nothing
+  canvasLinks env (ceResp ev) (const lineRef)
   -- Follow the stop location.
   let stopLine = maybe 0 ssLine here
   seen <- readVar (dsSeenLines st)
@@ -328,3 +338,70 @@ consolePane st ctx send = do
           unless (T.null (T.strip cmd)) $ do
             send [cmd]
             writeVar (dsInput st) ""
+
+-- ---------------------------------------------------------------------------
+-- Lens
+
+-- | What the debugger can show of the entities other panels name: lines of
+-- the module GHCi has loaded. It can also set breakpoints on any line of
+-- that module, or on any binding by name.
+debugLens :: DebugState -> Maybe (Either String CodeFile) -> NanoUI Lens
+debugLens st source = do
+  path <- readVar (dsSourcePath st)
+  running <- readVar (dsRunning st)
+  busy <- readVar (dsBusy st)
+  stop <- readVar (dsStop st)
+  breaks <- readVar (dsBreaks st)
+  dir <- readVar (dsDir st)
+  wake <- askWake
+  let cf = case source of
+        Just (Right c) -> Just c
+        _ -> Nothing
+      inLoaded sp = maybe False (\p -> isJust (resolveSource (mkSourceIndex [] [p]) Nothing (ssFile sp))) path
+      send cmds = liftIO (runCommands st wake cmds)
+      ready
+        | not running = Left "start a GHCi session first"
+        | busy = Left "GHCi is busy"
+        | otherwise = Right ()
+      breakAt sp = do
+        ready
+        c <- maybe (Left "the module's source is not loaded") Right cf
+        if inLoaded sp then Right (send [":break " <> cfModule c <> " " <> tshow (ssLine sp)]) else Left "load its module in GHCi first"
+      breakOn m k = ready >> Right (send [":break " <> (if T.null m then k else m <> "." <> k)])
+      stopHere sp = [s | s <- maybe [] pure (stop >>= stSpan), inLoaded sp, ssLine s == ssLine sp]
+      breakHere sp = [n | Just p <- [path], Just n <- [M.lookup (p, ssLine sp) breaks], inLoaded sp]
+      stopped = isJust stop
+      command label cmd = Hit "debugger" label "GHCi" (HitRun (send [cmd]))
+  pure
+    (lens PDebugger)
+      { lensShows = \case
+          RSource sp -> inLoaded sp
+          RBreakpoint f l -> M.member (f, l) breaks
+          _ -> False
+      , lensReveal = \case
+          RSource sp -> scrollToLine (dsCode st) (ssLine sp - 1)
+          RBreakpoint _ l -> scrollToLine (dsCode st) (l - 1)
+          _ -> pure ()
+      , lensTitle = \case
+          RBreakpoint f l -> (\n -> "Breakpoint " <> tshow n <> " at " <> T.pack (takeFileName f) <> ":" <> tshow l) <$> M.lookup (f, l) breaks
+          _ -> Nothing
+      , lensActions = \case
+          RSource sp -> [Action "Break here (GHCi)" (breakAt sp)]
+          RBinding m k -> [Action ("Break on entry to " <> k <> " (GHCi)") (breakOn m k)]
+          _ -> []
+      , lensPeek = \case
+          RSource sp
+            | not (null (stopHere sp) && null (breakHere sp)) -> Just $ do
+                forM_ (stopHere sp) $ \s -> fact "stopped here" (renderSrcSpan s {ssFile = T.pack (takeFileName (resolve dir (ssFile s)))})
+                forM_ (breakHere sp) $ \n -> fact "breakpoint" (tshow n)
+          _ -> Nothing
+      , lensHits =
+          if not running
+            then [Hit "debugger" "Start GHCi session" "Debugger" (HitRun (liftIO (startSession st wake))) | not busy]
+            else
+              [command "Step" ":step" | stopped]
+                ++ [command "Step over" ":steplocal" | stopped]
+                ++ [command "Step out" ":stepout" | stopped]
+                ++ [command "Continue" ":continue" | stopped]
+                ++ [command "Show breakpoints" ":show breaks"]
+      }

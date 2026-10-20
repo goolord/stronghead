@@ -638,6 +638,41 @@ Done when:
 Where to start: P0, beginning with spikes V1–V3, because they decide S4 and
 how far C1 can trust each clock. Then P1a.
 
+### Progress
+
+- **P0** landed in `8005143`. The spike findings are below.
+- **P1** is in place, P1a and P1b together:
+  - `UI.Link` holds the bus, lenses, link widgets, peeks, menus and history.
+  - `UI.Palette` and `Stronghead.Fuzzy` make up the palette.
+  - Each panel exports a lens: `timelineLens`, `heapLens`, `coreLens`,
+    `debugLens` and `liveLens`.
+  - `stronghead-ui-test` drives clicks, Ctrl+clicks, menus, peeks, history
+    and the palette headlessly through nano-ui's harness.
+  - Two pieces of later phases arrived early, because the lenses made them
+    one line each:
+    - **Break here** and **Break on entry** (S5) work for the module GHCi has
+      loaded.
+    - A census, or an instant on the Timeline's heap strip, moves the heap
+      cursor (a first step of C1).
+- **Deferred from P1:**
+  - **Scrolling revealed list rows into view.** nano-ui's `scrollIntoView`
+    takes a `Context`, which the public API doesn't hand out. Revealing
+    clears the filter, or sets it to the item (cost centres), and the
+    timeline's thread rows scroll exactly. An upstream `scrollIntoViewUi`
+    would close the gap.
+  - **Pin.** It belongs with the pinboard (W2).
+  - **Opening a menu from the keyboard** (Shift+F10). `contextMenu` only
+    opens on a right-click.
+  - **The recent-locations menu.** Back and forward carry tooltips naming
+    where they lead instead.
+  - **Peeks on canvases.** Canvases keep their own hover text, and get
+    right-click and Ctrl+click.
+- **Seen while wiring, for P3:**
+  - `-hi` bands are named by address. Their `InfoProv` label and span would
+    read better in the legend and the census table.
+  - A dump folder without sources beside it shows "Source not loaded" until
+    the source index (S8) can find the sources elsewhere.
+
 ## Verification spikes
 
 Run in P0. Each records what to try and the fallback if the assumption fails.

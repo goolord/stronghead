@@ -19,6 +19,7 @@ module Stronghead.Run
   , wallToProgram
   , RunKey (..)
   , runKey
+  , runKeysMatch
     -- * From each source
   , programName
   , splitRtsArgs
@@ -103,6 +104,22 @@ newtype RunKey = RunKey Text
 
 runKey :: RunInfo -> RunKey
 runKey ri = RunKey (maybe "?" id (riProgram ri) <> ":" <> maybe "?" (T.pack . show) (riPid ri))
+
+-- | Whether time-keyed references from two runs may be joined: the same
+-- key, the same program where one side does not know the pid, or a side
+-- that knows nothing at all (a ghc-debug target reached over TCP, say).
+-- The last two are guesses, and whoever shows the join should say so.
+runKeysMatch :: RunKey -> RunKey -> Bool
+runKeysMatch a b
+  | a == b = True
+  | unknown a || unknown b = True
+  | otherwise =
+      let (pa, ia) = parts a
+          (pb, ib) = parts b
+       in pa /= "?" && pa == pb && (ia == "?" || ib == "?")
+  where
+    parts (RunKey k) = let (p, i) = T.breakOnEnd ":" k in (T.dropEnd 1 p, i)
+    unknown k = parts k == ("?", "?")
 
 -- ---------------------------------------------------------------------------
 -- Sources

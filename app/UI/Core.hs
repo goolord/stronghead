@@ -9,6 +9,7 @@ module UI.Core
   , openCodeFile
   , openDumpDir
   , CoreLoaded (..)
+  , coreLens
   ) where
 
 import Control.Monad (forM_, unless, when)
@@ -24,9 +25,12 @@ import NanoUI hiding (Binding)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
 import Stronghead.Dump
 import Stronghead.Format (tshow)
+import Stronghead.Ref
+import Stronghead.Source (Resolved (..), SrcSpan (..), mkSourceIndex, resolveSource)
 import System.FilePath (takeFileName)
 import UI.Code
 import UI.Common
+import UI.Link
 
 data CoreState = CoreState
   { csRoot :: !(Var (Maybe FilePath))
@@ -49,6 +53,9 @@ data CoreState = CoreState
   , csHot :: !(Var (Maybe Text))
   , csViews :: !(CodeViewState, CodeViewState, CodeViewState)
   , csPanes :: !Workbench
+  , csPending :: !(Var (Maybe Ref))
+    -- ^ A binding or line another panel asked to show, applied once its
+    -- module is loaded.
   }
 
 paneBindings, paneNotes, paneSource, paneCore, paneStg :: Word64
@@ -85,6 +92,7 @@ newCoreState = do
   coreView' <- newCodeViewState
   stgView <- newCodeViewState
   let csViews = (srcView, coreView', stgView)
+  csPending <- newVar Nothing
   csPanes <-
     newVar . Just $
       Split 10 AxisV 0.17 (Pane paneBindings) $
@@ -150,8 +158,8 @@ entries hideTypeable src core stg =
 hasWorker :: Entry -> Bool
 hasWorker e = any (("$w" `T.isPrefixOf`) . stripQualifier . bdName) (enCore e ++ enStg e)
 
-coreView :: CoreState -> CoreLoaded -> NanoUI ()
-coreView st loaded = columnWith (tight . gap 0 . grow) $ do
+coreView :: Env -> CoreState -> CoreLoaded -> NanoUI ()
+coreView env st loaded = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (csDirDialog st) $ \case
     p : _ -> openDumpDir st p
     [] -> pure ()
@@ -201,7 +209,7 @@ coreView st loaded = columnWith (tight . gap 0 . grow) $ do
     | isJust root && clArtifacts loaded == Just [] && isNothing core && isNothing stg ->
         scope $ emptyState "No dumps in that folder" ["No .dump-simpl or .dump-stg-final files were found under it. Build with -ddump-to-file, then open the folder again."] dumpCommands
     | isNothing core && isNothing stg && isNothing src -> scope intro
-    | otherwise -> scope (panes st src core stg)
+    | otherwise -> scope (panes env st src core stg)
 
 dumpCommands :: [Text]
 dumpCommands =
@@ -218,8 +226,8 @@ intro =
     ]
     dumpCommands
 
-panes :: CoreState -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> NanoUI ()
-panes st src core stg = do
+panes :: Env -> CoreState -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> NanoUI ()
+panes env st src core stg = do
   hideU <- readVar (csHideUniques st)
   hideT <- readVar (csHideTypeable st)
   colouring <- readVar (csColouring st)
@@ -233,12 +241,33 @@ panes st src core stg = do
       shown = [e | e <- es, T.null filt || filt `T.isInfixOf` T.toLower (enKey e)]
       selEntry = selected >>= \k -> listToMaybe [e | e <- es, enKey e == k]
       (vSrc, vCore, vStg) = csViews st
+      modName = moduleOf src core stg
       select k = do
         writeVar (csSelected st) (Just k)
         for_ (listToMaybe [e | e <- es, enKey e == k]) $ \e -> do
           for_ (listToMaybe (enSrc e)) (scrollToLine vSrc . bdFirst)
           for_ (listToMaybe (enCore e)) (scrollToLine vCore . bdFirst)
           for_ (listToMaybe (enStg e)) (scrollToLine vStg . bdFirst)
+  -- Another panel's request, once the module it names is the one loaded.
+  pending <- readVar (csPending st)
+  for_ pending $ \case
+    RBinding m k | T.null m || m == modName -> do
+      writeVar (csPending st) Nothing
+      when (any ((== k) . enKey) es) (select k)
+    RSource sp | Just cf <- src, inFile cf sp -> do
+      writeVar (csPending st) Nothing
+      for_ (listToMaybe [enKey e | e <- es, b <- enSrc e, bdFirst b <= ssLine sp - 1, bdLast b >= ssLine sp - 1]) select
+      scrollToLine vSrc (ssLine sp - 1)
+    _ -> pure ()
+  focus <- readVar (busFocus (envBus env))
+  let focusLines = case (focus, src) of
+        (Just (RSource sp), Just cf) | inFile cf sp -> [(ssLine sp - 1, ssEndLine sp - 1, alpha 0.16 (pAccent pal))]
+        _ -> []
+      codeRef kind mcf ev = case ceHoverKey ev of
+        Just k | any ((== k) . enKey) es -> Just (RBinding modName k)
+        _ -> case (kind, mcf, ceHoverLine ev) of
+          (KindSource, Just cf, Just l) -> Just (RSource (SrcSpan (T.pack (cfPath cf)) (l + 1) 1 (l + 1) 1))
+          _ -> Nothing
       codePane ctx title cv mcf kind = paneWith tight ctx title (paneMeta (maybe "not loaded" (T.pack . takeFileName . cfPath) mcf)) $ do
         let ranges = case (selEntry, mcf) of
               (Just e, Just _) ->
@@ -249,6 +278,7 @@ panes st src core stg = do
                     KindStg -> enStg e
                 ]
               _ -> []
+              ++ (if kind == KindSource then focusLines else [])
             allocMarks = case (selEntry, kind) of
               (Just e, KindStg) -> concatMap (nAllocs . bdNotes) (enStg e)
               _ -> []
@@ -277,6 +307,7 @@ panes st src core stg = do
         -- its binding, if it has one.
         let (hs, hc, hg) = csHovers st
         writeVar (case kind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
+        canvasLinks env (ceResp ev) (const (codeRef kind mcf ev))
         for_ (ceClickedKey ev) $ \k -> when (any ((== k) . enKey) es) (select k)
   workbench (csPanes st) $ \pid ctx ->
     if
@@ -285,7 +316,7 @@ panes st src core stg = do
             searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter bindings", sicLayout = fillW defaultLayout} (csFilter st)
             paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
               forM_ shown $ \e -> withKey (enKey e) $ do
-                picked <- selectableRow (selected == Just (enKey e)) id $ do
+                picked <- linkRow env (RBinding modName (enKey e)) (selected == Just (enKey e)) id $ do
                   cell (fillW . fontMono . fontSizeScale 0.9) (T.take 34 (enKey e))
                   entryBadges e (isJust core)
                 when picked (select (enKey e))
@@ -352,3 +383,91 @@ notesBar st e core stg = panelWith (padXY 10 6 . gap 4 . fillW) $ do
       whenM (buttonWith tight ("alloc @" <> tshow (l + 1))) (scrollToLine vStg l)
   let _ = stg
   pure ()
+
+-- | The module the loaded files are of.
+moduleOf :: Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Text
+moduleOf src core stg = maybe "" cfModule (listToMaybe (concatMap (maybe [] pure) [core, stg, src]))
+
+-- | Whether a span is in this file, as far as its path says.
+inFile :: CodeFile -> SrcSpan -> Bool
+inFile cf sp = case resolveSource (mkSourceIndex [] [cfPath cf]) Nothing (ssFile sp) of
+  Just _ -> True
+  Nothing -> False
+
+-- ---------------------------------------------------------------------------
+-- Lens
+
+-- | What the Core panel can show of the entities other panels name: the
+-- bindings and lines of the loaded module, and any module or source file of
+-- the dump folder, which it loads first.
+coreLens :: CoreState -> CoreLoaded -> NanoUI Lens
+coreLens st loaded = do
+  let ok = \case
+        Just (Right cf) -> Just cf
+        _ -> Nothing
+      src = ok (clSource loaded)
+      core = ok (clCore loaded)
+      stg = ok (clStg loaded)
+      arts = fromMaybe [] (clArtifacts loaded)
+      es = entries False src core stg
+      modName = moduleOf src core stg
+      sources = maybe [] (pure . cfPath) src ++ [f | a <- arts, Just f <- [maSource a]]
+      ix = mkSourceIndex [] sources
+      fileOf sp = rsPath <$> resolveSource ix Nothing (ssFile sp)
+      here m = T.null m || m == modName
+      entry m k = if here m then listToMaybe [e | e <- es, enKey e == k] else Nothing
+      artIndex p = listToMaybe [i | (i, a) <- zip [0 ..] arts, p a]
+      loadedFile = cfPath <$> src
+      entryAt l = listToMaybe [e | e <- es, b <- enSrc e, bdFirst b <= l, bdLast b >= l]
+      switchTo p = for_ (artIndex p) (writeVar (csModule st))
+      binding m k = "binding " <> (if T.null m then k else m <> "." <> k)
+  pure
+    (lens PCore)
+      { lensShows = \case
+          RBinding m k -> isJust (entry m k) || isJust (artIndex ((== m) . maModule))
+          RModule m -> m == modName || isJust (artIndex ((== m) . maModule))
+          RSource sp -> isJust (fileOf sp)
+          _ -> False
+      , lensReveal = \r -> case r of
+          RBinding m _ -> do
+            unless (here m) $ switchTo ((== m) . maModule)
+            writeVar (csPending st) (Just r)
+          RModule m -> unless (m == modName) $ switchTo ((== m) . maModule)
+          RSource sp -> for_ (fileOf sp) $ \f -> do
+            unless (loadedFile == Just f) $ switchTo ((== Just f) . maSource)
+            writeVar (csPending st) (Just r)
+          _ -> pure ()
+      , lensTitle = \case
+          RBinding m k | isJust (entry m k) -> Just (binding modName k)
+          _ -> Nothing
+      , lensRelated = \case
+          RBinding m k -> case (entry m k, src) of
+            (Just e, Just cf) ->
+              [ ("Go to source", RSource (SrcSpan (T.pack (cfPath cf)) (bdFirst b + 1) 1 (bdLast b + 1) 1))
+              | b <- take 1 (enSrc e)
+              ]
+            _ -> []
+          RSource sp | fmap Just (fileOf sp) == Just loadedFile -> [("Go to binding " <> enKey e, RBinding modName (enKey e)) | Just e <- [entryAt (ssLine sp - 1)]]
+          _ -> []
+      , lensPeek = \case
+          RBinding m k -> entryPeek (isJust core) <$> entry m k
+          RSource sp | fmap Just (fileOf sp) == Just loadedFile -> entryPeek (isJust core) <$> entryAt (ssLine sp - 1)
+          _ -> Nothing
+      , lensHits =
+          [Hit "binding" (enKey e) modName (HitRef (RBinding modName (enKey e))) | e <- es, not (isTypeableBinding (enKey e)), not (T.null (enKey e))]
+            ++ [Hit "module" (maModule a) (maybe "" (T.pack . takeFileName) (maSource a)) (HitRef (RModule (maModule a))) | a <- arts]
+      }
+
+-- | A binding's badges and what the optimiser recorded about it.
+entryPeek :: Bool -> Entry -> NanoUI ()
+entryPeek haveCore e = do
+  rowWith (tight . gap 6 . wrap . fillW) $ do
+    labelWith (fontMono . alignMid) (enKey e)
+    entryBadges e haveCore
+  scope $ forM_ (take 3 (enCore e)) $ \b -> withKey (bdName b) $ do
+    let n = bdNotes b
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      for_ (nArity n) $ \a -> fact "arity" (tshow a)
+      for_ (nStrictness n) $ \s -> factMono "Str" (T.take 40 s)
+  scope $ for_ (listToMaybe (enSrc e)) $ \b ->
+    labelWith (fontMuted . fontSizeScale 0.85) ("source lines " <> tshow (bdFirst b + 1) <> "–" <> tshow (bdLast b + 1))

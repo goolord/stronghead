@@ -60,6 +60,7 @@ library
         Stronghead.Source
         Stronghead.Run
         Stronghead.Ref
+        Stronghead.Fuzzy
         Stronghead.Format
         Stronghead.Debug
         Stronghead.Debug.Graph
@@ -107,7 +108,9 @@ executable stronghead
         UI.Heap
         UI.Core
         UI.Debugger
+        UI.Link
         UI.Live
+        UI.Palette
         UI.Settings
         UI.Shell
     build-depends:
@@ -141,6 +144,25 @@ executable stronghead-sample
     if flag(ghc-debug) && !os(windows)
         cpp-options:   -DGHC_DEBUG_STUB
         build-depends: ghc-debug-stub ^>=0.8
+
+-- The links between panels, driven headlessly through nano-ui's test
+-- harness. Builds the GUI modules it needs from app/.
+test-suite stronghead-ui-test
+    import:           extensions, warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test-ui app
+    main-is:          Main.hs
+    other-modules:
+        UI.Common
+        UI.Link
+        UI.Palette
+    build-depends:
+        base >=4.20 && <4.23,
+        filepath >=1.4 && <1.6,
+        nano-ui ^>=0.2,
+        stronghead,
+        text >=2.0 && <2.2
+    ghc-options:      -threaded
 
 test-suite stronghead-test
     import:           extensions, warnings

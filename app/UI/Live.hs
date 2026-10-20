@@ -7,13 +7,14 @@ module UI.Live
   , liveLoad
   , liveView
   , LiveData (..)
+  , liveLens
   ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, void, when)
 import Data.Foldable (for_, toList)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Word (Word64)
 import Data.Sequence (Seq, (|>))
 import Data.Sequence qualified as Seq
@@ -23,7 +24,10 @@ import Data.Text.Read qualified as TR
 import NanoUI
 import Stronghead.Format
 import Stronghead.Live
+import Stronghead.Ref
+import Stronghead.Run (runFromHello, runKey, runKeysMatch)
 import UI.Common
+import UI.Link
 
 data LiveState = LiveState
   { lvHost :: !(Var Text)
@@ -33,6 +37,8 @@ data LiveState = LiveState
   , lvStream :: !(Stream (String, Int, Int) LiveData)
   , lvEventlog :: !(Var Text)
   , lvThreadFilter :: !(Var Text)
+  , lvFocus :: !(Var (Maybe Int))
+    -- ^ A thread another panel asked to show.
   , lvPanes :: !Workbench
   }
 
@@ -51,6 +57,7 @@ newLiveState = do
   lvStream <- newStream
   lvEventlog <- newVar ""
   lvThreadFilter <- newVar ""
+  lvFocus <- newVar Nothing
   lvPanes <- newVar (Just (Split 10 AxisH 0.58 (Pane paneCharts) (Pane 2)))
   pure LiveState {..}
 
@@ -108,8 +115,8 @@ rates fs =
             , rThreads = fromIntegral (length (frThreads b))
             }
 
-liveView :: LiveState -> Maybe LiveData -> (FilePath -> NanoUI ()) -> NanoUI ()
-liveView st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
+liveView :: Env -> LiveState -> Maybe LiveData -> (FilePath -> NanoUI ()) -> NanoUI ()
+liveView env st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
   want <- readVar (lvWant st)
   toolStrip $ do
     toolLabel "Agent"
@@ -130,7 +137,7 @@ liveView st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
       disabledWhen (T.null (T.strip path)) $
         whenM (toolButton "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
   case mdata of
-    Just d | not (Seq.null (ldFrames d)) -> scope (dashboard st d)
+    Just d | not (Seq.null (ldFrames d)) -> scope (dashboard env st d)
     _ ->
       scope $
         emptyState
@@ -140,8 +147,8 @@ liveView st mdata followEventlog = columnWith (tight . gap 0 . grow) $ do
           ]
           ["import Stronghead.Agent", " ", "main = withAgent defaultAgentConfig $ do", "  ..."]
 
-dashboard :: LiveState -> LiveData -> NanoUI ()
-dashboard st d = do
+dashboard :: Env -> LiveState -> LiveData -> NanoUI ()
+dashboard env st d = do
   th <- uiTheme
   let pal = palette th
       frames = ldFrames d
@@ -193,13 +200,15 @@ dashboard st d = do
           chart "Threads" (pWakeup pal) rThreads (fmtFixed 0) False
       else pane ctx "Threads" (threadsHeader st counts) $ do
         filt <- T.toLower <$> readVar (lvThreadFilter st)
+        focus <- readVar (lvFocus st)
+        let rk = liveRun d
         let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
         rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
           colHeader (fixedW 56 . alignEnd) "id"
           colHeader fillW "label"
           colHeader (fixedW 240) "status"
         paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
-          forM_ threads $ \t -> withKey (ltId t) $ rowWith (padXY 8 3 . tight . gap 12 . fillW) $ do
+          forM_ threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
             numCell 56 fontMuted (tshow (ltId t))
             cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
             cell (fixedW 240 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
@@ -231,3 +240,40 @@ groupTone = \case
   "MVar" -> Warning
   "STM" -> Warning
   _ -> Muted
+
+-- | The run the agent describes.
+liveRun :: LiveData -> RunKey
+liveRun d = maybe (RunKey "?:?") (\(p, pid, _) -> runKey (runFromHello p pid)) (ldHello d)
+
+-- ---------------------------------------------------------------------------
+-- Lens
+
+-- | What Live can show of the entities other panels name: the threads the
+-- program has now, when it is the run they come from.
+liveLens :: LiveState -> Maybe LiveData -> Lens
+liveLens st mdata = case mdata of
+  Just d
+    | Just lastF <- Seq.lookup (Seq.length (ldFrames d) - 1) (ldFrames d) ->
+        let rk = liveRun d
+            thread r t = if runKeysMatch r rk then listToMaybe [lt | lt <- frThreads lastF, ltId lt == fromIntegral t] else Nothing
+         in (lens PLive)
+              { lensShows = \case
+                  RThread r t -> isJust (thread r t)
+                  _ -> False
+              , lensReveal = \case
+                  RThread _ t -> do
+                    writeVar (lvThreadFilter st) ""
+                    writeVar (lvFocus st) (Just (fromIntegral t))
+                  _ -> pure ()
+              , lensTitle = \case
+                  RThread r t -> (\lt -> if T.null (ltLabel lt) then "thread " <> tshow (ltId lt) else ltLabel lt <> " (" <> tshow (ltId lt) <> ")") <$> thread r t
+                  _ -> Nothing
+              , lensPeek = \case
+                  RThread r t -> (\lt -> fact "now" (ltStatus lt)) <$> thread r t
+                  _ -> Nothing
+              , lensHits =
+                  [ Hit "live thread" (if T.null (ltLabel lt) then "thread " <> tshow (ltId lt) else ltLabel lt) (ltStatus lt) (HitRef (RThread rk (fromIntegral (ltId lt))))
+                  | lt <- frThreads lastF
+                  ]
+              }
+  _ -> lens PLive

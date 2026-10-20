@@ -74,6 +74,9 @@ data CodeEvent = CodeEvent
   , ceClickedKey :: !(Maybe Text)
   , ceGutterClick :: !(Maybe Int)
   , ceClickedLine :: !(Maybe Int)
+  , ceHoverLine :: !(Maybe Int)
+    -- ^ The line under the pointer, 0-based.
+  , ceResp :: !Response
   }
 
 -- | Tokens as displayed: unique suffixes optionally stripped, with columns
@@ -119,6 +122,10 @@ codeView cv mm cfg = do
                   else Nothing
         | otherwise = Nothing
       hoverKey = nameKey . tkText . snd <$> hovered
+      hoverLine
+        | rectContains prev mouse =
+            let l = lineAt prev (v2Y mouse) in if l >= 0 && l < n then Just l else Nothing
+        | otherwise = Nothing
       hot = maybe (ccHot cfg) Just hoverKey
   resp <-
     canvasConfigured
@@ -186,6 +193,8 @@ codeView cv mm cfg = do
       , ceClickedKey = if respClicked resp then hoverKey else Nothing
       , ceGutterClick = if inGutter then clickedLine else Nothing
       , ceClickedLine = clickedLine
+      , ceHoverLine = hoverLine
+      , ceResp = resp
       }
 
 -- | What the code panes colour.
