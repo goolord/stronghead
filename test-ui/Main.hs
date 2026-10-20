@@ -30,6 +30,7 @@ import Stronghead.Ghci (Value (..))
 import Stronghead.Eventlog.Model (Marker (..), Timeline (..), emptyTimeline)
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
 import Stronghead.Live
+import Stronghead.Next (Fact (..), Have (..), Step (..), StepDo (..), haveNothing, strongStep)
 import Stronghead.Ref
 import Stronghead.Run (RunInfo (..), emptyRunInfo, runFromHello, runKey)
 import Stronghead.Session (Pin (..))
@@ -65,7 +66,7 @@ worldEnv w tab =
           { lensActions = \r ->
               if r == thread then [Action "Do thing" (Right (record "acted")), Action "Disabled thing" (Left "no data")] else []
           }
-   in Env (wBus w) [timeline, core, debugger] tab (writeVar (wTab w))
+   in Env (wBus w) [timeline, core, debugger] tab (writeVar (wTab w)) haveNothing Nothing
 
 data World = World
   { wTab :: !(Var Panel)
@@ -101,7 +102,7 @@ view w = do
           { lensActions = \r ->
               if r == thread then [Action "Do thing" (Right (record "acted")), Action "Disabled thing" (Left "no data")] else []
           }
-      env = Env (wBus w) [timeline, live, core, debugger] tab (writeVar (wTab w))
+      env = Env (wBus w) [timeline, live, core, debugger] tab (writeVar (wTab w)) haveNothing Nothing
   back <- liftIO (atomicModifyIORef' (wBack w) (False,))
   when back (goBack env)
   clicked <- column $ do
@@ -132,7 +133,7 @@ run = RunKey "prog:1"
 clockView :: Clock -> NanoUI ()
 clockView c = do
   let timeline = (lens PTimeline) {lensShows = \case RInstant {} -> True; RRange {} -> True; _ -> False}
-      env = Env (cBus c) [timeline] PHeap (\_ -> pure ())
+      env = Env (cBus c) [timeline] PHeap (\_ -> pure ()) haveNothing Nothing
   go <- liftIO (atomicModifyIORef' (cGo c) (Nothing,))
   for_ go (goTo env)
   resp <- canvasConfigured defaultCanvasConfig {canvasLayout = fixedWH 400 100 defaultLayout, canvasTrackPointer = True} (\_ -> pure ())
@@ -154,7 +155,7 @@ codeScene w cv point = do
   mm <- monoMetrics 0.88
   let record t = liftIO (modifyIORef' (wLog w) (t :))
       heap = (lens PHeap) {lensShows = (== band), lensReveal = \r -> record ("heap " <> refTarget r), lensTitle = \r -> if r == band then Just "thunk in go" else Nothing}
-      env = Env (wBus w) [heap] tab (writeVar (wTab w))
+      env = Env (wBus w) [heap] tab (writeVar (wTab w)) haveNothing Nothing
       src = ["module M where", "go = 1 + 2", ""]
       ann = (annotationAt (SrcSpan "M.hs" 2 6 2 10) LaneHeap 2048 "2 KiB live" (Just band)) {anShade = ShadeThunk}
       cfg =
@@ -378,7 +379,7 @@ main = do
       d0 = LiveData (Just ("prog", 1, 4)) (Just info) (Just box) (Seq.fromList [frame0]) M.empty Nothing
       hooks = DebugHooks (Left "built without ghc-debug") False Nothing
       rk = RunKey "prog:1"
-      renv = Env rbus [] PLive (\_ -> pure ())
+      renv = Env rbus [] PLive (\_ -> pure ()) haveNothing Nothing
       rframe d = evalUi rctx inp0 (liveTick rbus lv (Just d) Nothing hooks >> liveRemote rbus lv (Just d) Nothing hooks)
       named t = filter ((== t) . raLabel)
       enabled a = either (const False) (const True) (raRun a)
@@ -442,7 +443,7 @@ main = do
         , src "Agent" (runFromHello "prog" 1) [DLive, DLiveStats]
         , src "Cost centres" (runFromHello "renamed" 9) [DCostCentres]
         ]
-      senv = Env rbus [] PLive (\_ -> pure ())
+      senv = Env rbus [] PLive (\_ -> pure ()) haveNothing Nothing
       popover inp = evalUi sctx inp (sourcesPopover senv open (Rect 10 10 80 20) sources (\ss ri -> liftIO (writeIORef joined (map srcKind ss, riProgram ri))) (\_ -> pure ()))
   warmup sctx sinp (sourcesPopover senv open (Rect 10 10 80 20) sources (\_ _ -> pure ()) (\_ -> pure ()))
   listed <- collectOverlayTextSpans sctx sinp
@@ -500,6 +501,44 @@ main = do
   writeVarIO (busFocus (wBus w)) (Just binding)
   _ <- iframe iinp
   check "not following, it holds on" . (== Just thread) =<< readVarIO (inShown ins)
+
+  putStrLn "next steps"
+  let waker = RThread run 3
+      blockedR = RRange run 100 80000100
+      nenv tab =
+        (worldEnv w tab)
+          { envLenses =
+              [ (lens PTimeline)
+                  { lensShows = (`elem` [thread, waker])
+                  , lensReveal = \r -> liftIO (modifyIORef' (wLog w) (("timeline " <> refTarget r) :))
+                  , lensTitle = \r -> if r == waker then Just "worker-3" else Nothing
+                  , lensFacts = \r -> if r == thread then [FactBlocked blockedR 80000000 "MVar", FactWokenBy waker] else []
+                  }
+              ]
+          , envHave = haveNothing {haveTimeline = True}
+          }
+  check "the steps come from what the lenses know" (map stepDo (stepsFor (nenv PHeap) thread) == [StepGo blockedR, StepGo waker, StepLoad DSamples])
+  check "the waker is the strong step, for the peek" (fmap stepDo (strongStep (stepsFor (nenv PHeap) thread)) == Just (StepGo waker))
+  nctx <- newContext
+  nins <- newInspector
+  writeVarIO (busFocus (wBus w)) (Just thread)
+  writeIORef (wLog w) []
+  let nscene = do
+        tab <- readVar (wTab w)
+        let env = nenv tab
+        inspectorSync env nins
+        void (columnWith (fixedWH 700 900) (inspectorPane env nins floatingPane))
+      nframe inp = evalUi nctx inp nscene
+      nclick pos = let (p, r) = clickPair iinp pos in mapM_ nframe [p, r, iinp]
+  warmup2 nctx iinp nscene >>= \_ -> pure ()
+  _ <- nframe iinp
+  nspans <- collectTextSpans nctx
+  check "the inspector lists the next steps" (hasText "Next steps" nspans && hasText "Go to the thread that woke it" nspans)
+  check "each with its reason and the entity it leads to" (hasText "worker-3" nspans && hasText "80.00 ms blocked on MVar" nspans)
+  check "missing data says how to get it" (hasText "Cost-centre samples" nspans && hasText "+RTS -p -l -RTS" nspans)
+  wakeB <- findSpan "Go to the thread that woke it" nspans
+  nclick wakeB
+  check "a step's button follows the link" . elem "timeline thread/prog:1/3" =<< logged
 
   putStrLn "pinboard"
   pctx' <- newContext

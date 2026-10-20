@@ -32,6 +32,7 @@ module UI.Common
   , paneWith
   , paneMeta
   , readout
+  , readoutDelta
   , emptyState
   , paneScroll
   , paneScrollArea
@@ -430,14 +431,20 @@ paneMeta = labelWith (alignMid . fontMuted . fontSizeScale 0.85)
 -- | The vital numbers of a run as one instrument line: each value over its
 -- name, separated by hairlines. Wraps onto more lines when narrow.
 readout :: [(Text, Text)] -> NanoUI ()
-readout items =
+readout items = readoutDelta [(name, value, Nothing) | (name, value) <- items]
+
+-- | 'readout' with, under a value, its change against the baseline run
+-- when there is one.
+readoutDelta :: [(Text, Text, Maybe Text)] -> NanoUI ()
+readoutDelta items =
   rowWith (padXY 20 0 . padTop 10 . tight . gap 0 . fillW . wrap . lineGap 8) $
-    forM_ (zip [0 :: Int ..] items) $ \(i, (name, value)) -> withKey i $
+    forM_ (zip [0 :: Int ..] items) $ \(i, (name, value, delta)) -> withKey i $
       rowWith (tight . gap 0) $ do
         scope $ when (i > 0) (vrule 30)
         columnWith (padLeft (if i > 0 then 14 else 0) . padRight 14 . tight . gap 0) $ do
           labelWith (fontMono . fontSizeScale 1.12) value
           labelWith (fontMuted . fontSizeScale 0.8) name
+          scope $ for_ delta $ labelWith (fontMuted . fontMono . fontSizeScale 0.75)
 
 -- | What a pane says before it has anything to show: a title, what to do,
 -- and the commands to do it with.

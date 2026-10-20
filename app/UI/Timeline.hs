@@ -43,6 +43,8 @@ import Stronghead.Eventlog.Model
 import Stronghead.Format
 import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), TickyName (..), parseTickyName, tickyBinder, tickyTopLevel, tickyUnique)
+import Stronghead.Diff (Baseline (..), fmtChange)
+import Stronghead.Next (Fact (..))
 import Stronghead.Ref
 import Stronghead.Run (runKey, runKeysMatch)
 import Stronghead.Source (renderSrcLoc, renderSrcSpan, srcLocSpan)
@@ -282,18 +284,22 @@ body env bench st tl mprog = do
   mv <- readVar (tsView st)
   let v = maybe full (clampView lo hi) mv
   stepCursor env st tl v
+  -- Against the baseline run, when one is marked.
+  let base = envBaseline env >>= baSummary
+      vs f = (\b -> fmtChange (f b) (f summary) <> " vs baseline") <$> base
+      rate sm = fromIntegral (smAllocated sm) / max 1e-9 (smDuration sm)
   columnWith (padBottom 8 . tight . fillW) $
-    readout
-      [ ("duration", fmtSec (smDuration summary))
-      , ("mutator", fmtPct (smMutatorFrac summary))
-      , ("GC time", fmtPct (smGCFrac summary))
-      , ("collections, major", fmtInt (smGCCount summary) <> ", " <> fmtInt (smMajorGCs summary))
-      , ("longest pause", fmtNs (smGCPauseMax summary))
-      , ("allocated", fmtBytes (smAllocated summary))
-      , ("allocation rate", fmtRate (fromIntegral (smAllocated summary) / max 1e-9 (smDuration summary)))
-      , ("peak live", fmtBytes (smPeakLive summary))
-      , ("threads", fmtInt (smThreads summary))
-      , ("events", fmtInt (tlEventCount tl))
+    readoutDelta
+      [ ("duration", fmtSec (smDuration summary), vs smDuration)
+      , ("mutator", fmtPct (smMutatorFrac summary), vs smMutatorFrac)
+      , ("GC time", fmtPct (smGCFrac summary), vs smGCFrac)
+      , ("collections, major", fmtInt (smGCCount summary) <> ", " <> fmtInt (smMajorGCs summary), vs (fromIntegral . smGCCount))
+      , ("longest pause", fmtNs (smGCPauseMax summary), vs smGCPauseMax)
+      , ("allocated", fmtBytes (smAllocated summary), vs (fromIntegral . smAllocated))
+      , ("allocation rate", fmtRate (rate summary), vs rate)
+      , ("peak live", fmtBytes (smPeakLive summary), vs (fromIntegral . smPeakLive))
+      , ("threads", fmtInt (smThreads summary), Nothing)
+      , ("events", fmtInt (tlEventCount tl), Nothing)
       ]
   bnDraw bench (tsPanes st) (timelinePanes env st mprog)
 
@@ -1491,7 +1497,45 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
           , lensSpan = \case
               RCostCentre m l -> sampled m l >>= srcLocSpan . cciSrc . fst
               _ -> Nothing
+          , lensFacts = \case
+              RThread r t | Just ti <- thread r t -> threadFacts tl rk ti
+              RRange r a b | mine r, inLog a, b > a -> rangeFacts tl rk ticky a b
+              RBinding m k | xs@(_ : _) <- tickyOf m k -> [FactTicky (sum [tcEntries c | (c, _, _) <- xs]) (sum [tcAlloc c | (c, _, _) <- xs])]
+              _ -> []
           }
+
+-- | What the next steps need about a thread: its longest blocked span,
+-- who woke it from it or owned the black hole it waited on, and what it
+-- ran most.
+threadFacts :: Timeline -> RunKey -> ThreadInfo -> [Fact]
+threadFacts tl rk ti =
+  concat
+    [ [FactBlocked (RRange rk (srStart s) (srEnd s)) (srEnd s - srStart s) (T.replace "blocked on " "" (stopName (srStop s))) | Just s <- [longest]]
+    , [FactOwner (RThread rk (srAux s)) | Just s <- [longest], stopName (srStop s) == "blocked on black hole", srAux s /= 0, srAux s /= tiId ti]
+    , [FactWokenBy (RThread rk w) | Just s <- [longest], Just (_, w) <- [wokenBy ti s], w /= 0, w /= tiId ti]
+    , [FactRan (RCostCentre (cciModule c) (cciLabel c)) n | (i, n) : _ <- [cpTop (threadProfile tl (tiId ti))], Just c <- [IM.lookup i (tlCostCentres tl)]]
+    ]
+  where
+    tr = tiTrack ti
+    blocked = [s | i <- [0 .. trackLength tr - 1], let s = trackSpan tr i, srKind s == kindBlocked]
+    longest = listToMaybe (sortOn (\s -> Down (srEnd s - srStart s)) blocked)
+
+-- | What the next steps need about a range: the share of it spent paused,
+-- what was allocated and how live changed, the top allocator by ticky,
+-- what ran most, and the census at its end.
+rangeFacts :: Timeline -> RunKey -> [(TickyCounter, TickyName, Text)] -> Word64 -> Word64 -> [Fact]
+rangeFacts tl rk ticky a b =
+  concat
+    [ [FactGC (fromIntegral (rsPauseTotal rs) / fromIntegral (b - a)) (length (rsCollections rs))]
+    , [FactAllocation n (fst (rsLive rs)) (snd (rsLive rs)) | Just n <- [rsAllocated rs]]
+    , [FactTopAllocator r n | (r, n) : _ <- [sortOn (Down . snd) (M.toList allocs)], n > 0]
+    , [FactRan (RCostCentre (cciModule c) (cciLabel c)) n | (i, n) : _ <- [cpTop (codeProfile tl (const True) a b)], Just c <- [IM.lookup i (tlCostCentres tl)]]
+    , [FactCensusAtEnd (RCensus rk j) | j : _ <- [reverse (rsCensuses rs)]]
+    ]
+  where
+    rs = rangeStats tl a b
+    refOf = M.fromList [(tcId c, tickyRef x) | x@(c, _, _) <- ticky]
+    allocs = M.fromListWith (+) [(r, al) | (c, _, al) <- tickyBetween tl a b, Just r <- [M.lookup (tcId c) refOf]]
 
 revealIn :: Bus -> TimelineState -> Timeline -> Ref -> NanoUI ()
 revealIn bus st tl = \case

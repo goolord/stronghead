@@ -48,6 +48,10 @@ module UI.Workspace
   , paneLiveThreads
   , paneInspector
   , panePinboard
+  , paneWatchers
+  , paneDiffHeap
+  , paneDiffCosts
+  , paneDiffBindings
   , timelineTimePanes
     -- * Trees
   , treeKinds
@@ -132,9 +136,13 @@ paneLiveCharts, paneLiveThreads :: Word64
 paneLiveCharts = 501
 paneLiveThreads = 502
 
-paneInspector, panePinboard :: Word64
+paneInspector, panePinboard, paneWatchers, paneDiffHeap, paneDiffCosts, paneDiffBindings :: Word64
 paneInspector = 901
 panePinboard = 902
+paneWatchers = 903
+paneDiffHeap = 904
+paneDiffCosts = 905
+paneDiffBindings = 906
 
 paneKinds :: [PaneKind]
 paneKinds =
@@ -160,6 +168,10 @@ paneKinds =
   , PaneKind paneLiveThreads "live.threads" "Live threads" (Just PLive) False
   , PaneKind paneInspector "inspector" "Inspector" Nothing False
   , PaneKind panePinboard "pinboard" "Pinboard" Nothing False
+  , PaneKind paneWatchers "watchers" "Watchers" Nothing False
+  , PaneKind paneDiffHeap "diff.heap" "Heap diff" Nothing False
+  , PaneKind paneDiffCosts "diff.costs" "Cost-centre diff" Nothing False
+  , PaneKind paneDiffBindings "diff.bindings" "Binding diff" Nothing False
   ]
 
 paneKind :: Word64 -> Maybe PaneKind
@@ -298,6 +310,9 @@ userPresets =
         Split 1002 AxisV 0.34 (Pane paneHeapGraph) (Split 1003 AxisV 0.56 (Pane paneCoreSource) (Pane paneInspector))
   , Preset "Latency" $
       Split 1000 AxisV 0.72 (Split 1001 AxisH 0.55 (Pane paneTlCaps) (Pane paneTlThreads)) (Pane paneInspector)
+  , Preset "Before and after" $
+      Split 1000 AxisH 0.42 (Split 1001 AxisV 0.6 (Pane paneHeapChart) (Pane paneHeapBands)) $
+        Split 1002 AxisV 0.5 (Pane paneDiffHeap) (Split 1003 AxisH 0.5 (Pane paneDiffCosts) (Pane paneDiffBindings))
   ]
 
 -- ---------------------------------------------------------------------------

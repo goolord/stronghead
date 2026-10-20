@@ -1,6 +1,8 @@
 -- | The data sources popover, in the header: for each run the artifacts and
 -- connections Stronghead has from it, what each one adds, and what is
--- missing, with the build and run flags that add it, ready to copy.
+-- missing, with the build and run flags that add it, ready to copy. The
+-- kinds of data and their recipes are "Stronghead.Next"'s, which the
+-- inspector's next steps share.
 --
 -- Sources are put into runs by 'groupRuns' ("Stronghead.Run"): the same
 -- program and pid is one run, the same program with a pid missing on one
@@ -22,6 +24,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
 import Stronghead.Format (tshow)
+import Stronghead.Next (Datum (..), datumAdds, datumRecipe, datumTitle)
 import Stronghead.Run
 import UI.Common
 import UI.Link
@@ -43,57 +46,6 @@ data Source = Source
   , srcData :: ![Datum]
     -- ^ What it brings.
   }
-
--- | The kinds of data a run can have (the plan's "what each kind of data
--- adds").
-data Datum
-  = DTimeline
-  | DHeapCensus
-  | DHeapSource
-  | DCostCentres
-  | DDumps
-  | DLive
-  | DLiveStats
-  | DLiveGraph
-  | DDebugger
-  deriving (Eq, Show, Enum, Bounded)
-
-datumTitle :: Datum -> Text
-datumTitle = \case
-  DTimeline -> "Timeline"
-  DHeapCensus -> "Heap census on the clock"
-  DHeapSource -> "Heap by source location"
-  DCostCentres -> "Cost centres"
-  DDumps -> "Core & STG"
-  DLive -> "Live"
-  DLiveStats -> "RTS statistics"
-  DLiveGraph -> "Live graph"
-  DDebugger -> "Debugger"
-
-datumAdds :: Datum -> Text
-datumAdds = \case
-  DTimeline -> "threads, collections and markers; the program clock"
-  DHeapCensus -> "censuses on the timeline, the census ↔ collection links"
-  DHeapSource -> "bands that link to source lines and STG lets, the heap gutter"
-  DCostCentres -> "time and allocation per line and binding"
-  DDumps -> "binding notes, exact links from info tables to STG binders"
-  DLive -> "attach, marks and remote actions, threads now"
-  DLiveStats -> "allocation, GC and residency charts on program time"
-  DLiveGraph -> "retainer paths, surviving thunks, thread stacks"
-  DDebugger -> "Break here, values"
-
--- | What to build with and what to run with to get it.
-datumRecipe :: Datum -> (Maybe Text, Maybe Text)
-datumRecipe = \case
-  DTimeline -> (Just "-threaded -rtsopts", Just "+RTS -l -RTS")
-  DHeapCensus -> (Nothing, Just "+RTS -l -hT -i0.1 -RTS")
-  DHeapSource -> (Just "-finfo-table-map -fdistinct-constructor-tables", Just "+RTS -l -hi -i0.1 -RTS")
-  DCostCentres -> (Just "-prof -fprof-auto", Just "+RTS -p -RTS")
-  DDumps -> (Just "-ddump-simpl -ddump-stg-final -ddump-to-file", Nothing)
-  DLive -> (Just "build-depends: stronghead:agent; main = withAgent defaultAgentConfig ...", Nothing)
-  DLiveStats -> (Nothing, Just "+RTS -T -RTS")
-  DLiveGraph -> (Just "build-depends: ghc-debug-stub; main = withGhcDebug ... (Unix only)", Nothing)
-  DDebugger -> (Nothing, Just "ghci, or cabal repl")
 
 -- | The popover, anchored under its button in the header. @link ss ri@
 -- treats the sources @ss@ as from run @ri@; @unlink@ undoes that for the

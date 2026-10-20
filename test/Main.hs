@@ -24,6 +24,7 @@ import Stronghead.Agent (AgentConfig (..), defaultAgentConfig, startAgent)
 import Stronghead.Attach
 import Stronghead.Clock
 import Stronghead.Debug
+import Stronghead.Diff
 import Stronghead.Dump
 import Stronghead.Eventlog (emptyBuilder, feedEvent, snapshot)
 import Stronghead.Eventlog.Model
@@ -32,11 +33,13 @@ import Stronghead.Ghci
 import Stronghead.HeapProfile
 import Stronghead.Join
 import Stronghead.Live
+import Stronghead.Next
 import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run
 import Stronghead.Session
 import Stronghead.Source
+import Stronghead.Watch
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath (pathSeparator, (</>))
@@ -595,6 +598,187 @@ main = do
   check "a panel with nothing to say is left out" (not ("**Live**" `T.isInfixOf` report))
   check "the note as a quote" ("> holds the thunks\n> see line 82" `T.isInfixOf` report)
   check "no pins says so" ("No pins." `T.isInfixOf` pinsMarkdown "Pins" [] [])
+
+  putStrLn "next steps"
+  let leakRun = RunKey "stronghead-sample:4242"
+      line82 = SrcSpan "sample\\Main.hs" 82 5 82 40
+      heapHave = haveNothing {haveTimeline = True, haveHeapCensus = True, haveHeapSource = True}
+      leakFacts = [FactLeak 0.82 6, FactThunks, FactAllocated line82, FactInBinding "Main" "main2"]
+      leak0 = nextSteps heapHave (RBand "0x1") leakFacts
+      doing = map stepDo
+  check "leak: the allocation site first, and strongly" $
+    case leak0 of
+      s : _ -> stepDo s == StepGo (RSource line82) && stepStrong s && "Main.hs:82" `T.isInfixOf` stepReason s
+      [] -> False
+  check "leak: then the binding, then how to snapshot, then break where allocated" $
+    doing leak0 == [StepGo (RSource line82), StepGo (RBinding "Main" "main2"), StepLoad DLiveGraph, StepAct (RBand "0x1") "break where allocated"]
+  check "leak: with a ghc-debug target, snapshot twice is an action" $
+    StepAct (RBand "0x1") "snapshot twice" `elem` doing (nextSteps heapHave {haveLiveGraph = True} (RBand "0x1") leakFacts)
+  let group = RThunkGroup (ThunkKey "sat_s7qA" (Just "sample\\Main.hs:82:5-40") ["IORef"])
+      holder = RThread leakRun 12
+      leak1 = nextSteps heapHave {haveLiveGraph = True, haveSnapshots = 2} (RBand "0x1") (leakFacts ++ [FactSurviving group 2, FactHeldBy holder])
+  check "leak: after two snapshots, the surviving group and what holds it" $
+    doing leak1 == [StepGo (RSource line82), StepGo (RBinding "Main" "main2"), StepGo group, StepGo holder, StepAct (RBand "0x1") "break where allocated"]
+  check "leak: without -hi the first step says how to get provenance" $
+    map stepDo (take 1 (nextSteps haveNothing {haveHeapCensus = True} (RBand "THUNK_2_0") [FactLeak 0.9 8, FactThunks])) == [StepLoad DHeapSource]
+  check "a band that isn't a suspect gets only its provenance, weakly" $
+    let ss = nextSteps heapHave (RBand "0x2") [FactAllocated line82]
+     in doing ss == [StepGo (RSource line82)] && not (any stepStrong ss)
+  check "a surviving group: what holds it, then where to break" $
+    doing (nextSteps heapHave group [FactThunks, FactAllocated line82, FactHeldBy holder])
+      == [StepGo holder, StepGo (RSource line82), StepAct group "break where created"]
+  let blockedSpan = RRange leakRun 1000000000 1080000000
+      worker1 = RThread leakRun 4
+      showCC = RCostCentre "Main" "worker"
+      contHave = haveNothing {haveTimeline = True, haveSamples = True, haveDumps = True}
+      cont = nextSteps contHave (RThread leakRun 7) [FactBlocked blockedSpan 80000000 "MVar", FactWokenBy worker1, FactRan showCC 40]
+  check "contention: the blocked span, the waker, what it ran, the binding" $
+    doing cont == [StepGo blockedSpan, StepGo worker1, StepGo showCC, StepGo (RBinding "Main" "worker")]
+  check "contention: the waker is the strong step" (fmap stepDo (strongStep cont) == Just (StepGo worker1))
+  check "contention: a black hole's owner comes before the waker, and leads" $
+    let ss = nextSteps contHave (RThread leakRun 7) [FactBlocked blockedSpan 80000000 "black hole", FactOwner worker1, FactWokenBy (RThread leakRun 5)]
+     in take 3 (doing ss) == [StepGo blockedSpan, StepGo worker1, StepGo (RThread leakRun 5)] && fmap stepDo (strongStep ss) == Just (StepGo worker1)
+  check "contention: without samples, how to sample" $
+    StepLoad DSamples `elem` doing (nextSteps haveNothing {haveTimeline = True} (RThread leakRun 7) [FactBlocked blockedSpan 80000000 "MVar"])
+  check "contention: a short block is no strong suggestion" $
+    strongStep (nextSteps contHave (RThread leakRun 7) [FactBlocked blockedSpan 2000 "MVar", FactWokenBy worker1]) == Nothing
+  let hotHave = haveNothing {haveCostCentres = True, haveDumps = True}
+  check "hot path: a hot cost centre leads to its binding" $
+    case nextSteps hotHave (RCostCentre "Main" "go") [FactCost 35 20] of
+      [s] -> stepDo s == StepGo (RBinding "Main" "go") && stepStrong s && "35.0% of the time" `T.isInfixOf` stepReason s
+      _ -> False
+  check "hot path: without dumps, how to dump" $
+    doing (nextSteps haveNothing {haveCostCentres = True} (RCostCentre "Main" "go") [FactCost 35 20]) == [StepLoad DDumps]
+  check "hot path: without a .prof, how to profile first" $
+    take 1 (doing (nextSteps haveNothing {haveDumps = True} (RCostCentre "Main" "go") [])) == [StepLoad DCostCentres]
+  let goBinding = RBinding "Main" "go"
+      bindingSs = nextSteps heapHave {haveDumps = True} goBinding [FactBadges False 3 2, FactSiteHeap (RBand "0x2") 1048576]
+  check "hot path: the binding's lets, ticky, the heap they hold, break on entry" $
+    doing bindingSs == [StepGo goBinding, StepLoad DTicky, StepGo (RBand "0x2"), StepAct goBinding "break on entry"]
+  check "hot path: the lets' reason names the boxing" $
+    case bindingSs of
+      s : _ -> all (`T.isInfixOf` stepReason s) ["2 lets", "3 boxing sites", "no worker/wrapper split"]
+      [] -> False
+  check "hot path: with ticky the counters join the reason, and no ticky step" $
+    let ss = nextSteps heapHave {haveDumps = True, haveTicky = True} goBinding [FactBadges True 0 2, FactTicky 5000 1048576]
+     in StepLoad DTicky `notElem` doing ss && any (("5,000 entries" `T.isInfixOf`) . stepReason) ss
+  let range = RRange leakRun 2000000000 12000000000
+      census = RCensus leakRun 40
+      pressure = nextSteps haveNothing {haveTimeline = True, haveHeapCensus = True} range [FactGC 0.4 120, FactAllocation 10000000000 (Just 50000000) (Just 52000000), FactCensusAtEnd census]
+  check "GC pressure: analyse, allocators, the census, a bigger nursery" $
+    doing pressure == [StepAct range "analyse range", StepLoad DTicky, StepGo census, StepTry "+RTS -A64m -RTS"]
+  check "GC pressure: analyse and the nursery are strong" (map stepStrong pressure == [True, False, False, True])
+  check "GC pressure: when much survives, the leak suspect" $
+    let suspect = RBand "THUNK_2_0"
+        ss = nextSteps haveNothing {haveTimeline = True, haveHeapCensus = True, haveTicky = True} range [FactGC 0.1 10, FactAllocation 100000000 (Just 10000000) (Just 60000000), FactTopAllocator goBinding 80000000, FactTopSuspect suspect]
+     in doing ss == [StepAct range "analyse range", StepGo goBinding, StepGo suspect] && not (any stepStrong (take 1 ss))
+  check "a line of source offers to break there" (doing (nextSteps haveNothing (RSource line82) []) == [StepAct (RSource line82) "break here"])
+  check "recipes are shared with the data sources" (datumRecipe DTicky == (Just "-ticky", Just "+RTS -lT -RTS") && datumTitle DSamples == "Cost-centre samples")
+
+  putStrLn "watchers"
+  let secs x = round (x * 1e9 :: Double) :: Word64
+      on rule = rule {ruOn = True, ruCooldown = 0}
+      firedAt rules obs = [fiAt f | f <- snd (watchRun rules obs emptyWatchState)]
+      gcs = [ObsMajorGC (secs t) (v * 1e6) | (t, v) <- zip [1 ..] [10, 11, 12, 13, 12.9, 14, 15, 5, 6, 7, 8]]
+      liveUp = Rule (LiveUp 3) True [RespNotify] 0 0.05
+  check "the built-in rules are all off" (length defaultRules == 4 && not (any ruOn defaultRules))
+  check "a rule that is off never fires" (null (firedAt [liveUp {ruOn = False}] gcs))
+  check "live up across 3 collections fires once, until a real drop re-arms it" (firedAt [liveUp] gcs == [secs 4, secs 11])
+  check "a small dip neither breaks nor extends the run" $
+    firedAt [liveUp {ruTrigger = LiveUp 5}] (take 7 gcs) == [secs 7]
+  check "the cooldown holds the second firing back" (firedAt [liveUp {ruCooldown = 30}] gcs == [secs 4])
+  let frame t blocked = ObsThreads (secs t) [ThreadNow 7 "worker-7" (if blocked then Just "MVar" else Nothing), ThreadNow 1 "main" Nothing]
+      frames = [frame (fromIntegral i * 0.25) b | (i, b) <- zip [0 :: Int ..] ([True, True, True, True, True, False] ++ [True, True, True] ++ [False, False, False, False, False, False, False] ++ [True, True, True, True])]
+      blockedRule = on (Rule (BlockedOver 500) False [RespNotify] 10 0.5)
+      blockedFired = snd (watchRun [blockedRule] frames emptyWatchState)
+  check "a thread blocked past the limit fires, once per stretch" (map fiAt blockedFired == [secs 0.5, secs 4.5])
+  check "a short run between blocks doesn't count as a new stretch" (length blockedFired == 2)
+  check "it names the thread" (map fiSubject blockedFired == [AboutThread 7 "worker-7", AboutThread 7 "worker-7"])
+  check "threads in a foreign call, and the agent's own, are left out" $
+    null (firedAt [blockedRule] [ObsThreads (secs t) [ThreadNow 2 "IOManagerThread" (Just "ForeignCall"), ThreadNow 4 "stronghead-agent" (Just "MVar")] | t <- [0, 0.5, 1]])
+  check "blocked spans from an eventlog fire when long enough" $
+    firedAt [blockedRule] [ObsBlockedSpan 0 (secs 0.1) (ThreadNow 3 "" (Just "MVar")), ObsBlockedSpan (secs 1) (secs 1.6) (ThreadNow 3 "" (Just "MVar"))] == [secs 1.6]
+  let shares = [ObsGCShare (secs t) 1 s | (t, s) <- zip [1 ..] [0.6, 0.7, 0.65, 0.45, 0.6, 0.6, 0.6, 0.3, 0.6, 0.6, 0.6]]
+      gcRule = on (Rule (GCOver 50 2) False [RespNotify] 0 0.2)
+  check "GC over the limit for long enough fires" (take 1 (firedAt [gcRule] shares) == [secs 2])
+  check "and re-arms only once it falls below the hysteresis" (firedAt [gcRule] shares == [secs 2, secs 10])
+  let census t vs = ObsCensus (secs t) vs
+      censuses = [census t [("THUNK", v * 1e6), ("ARR_WORDS", 5e6), ("tiny", t * 10)] | (t, v) <- zip [1 ..] [1, 2, 3, 4, 5]]
+      bandFired = snd (watchRun [on (Rule (BandGrowing 3) False [RespNotify, RespMark] 0 0.02)] censuses emptyWatchState)
+  check "a band growing for 3 censuses fires, about that band" (map fiSubject bandFired == [AboutBand "THUNK"] && map fiAt bandFired == [secs 4])
+  check "a fired rule carries its responses" (map fiResponses bandFired == [[RespNotify, RespMark]])
+  let ruleText = encodeRule (on (Rule (GCOver 40 5) False [RespNotify, RespSnapshot] 15 0.25))
+  check "a rule round trips through its text" (decodeRule ruleText == Just (on (Rule (GCOver 40 5) False [RespNotify, RespSnapshot] 15 0.25)))
+  check "every built-in rule round trips" (all (\r -> decodeRule (encodeRule r) == Just r) defaultRules)
+  check "an unknown rule is refused; missing values take the defaults" $
+    decodeRule "nonsense n=3" == Nothing && fmap ruTrigger (decodeRule "live-up on=true") == Just (LiveUp 5)
+  check "saved rules replace the built-in ones by kind, in their order" $
+    map (triggerName . ruTrigger) (setRules [on (Rule (BandGrowing 9) False [] 0 0)]) == map (triggerName . ruTrigger) defaultRules
+      && ruTrigger (setRules [on (Rule (BandGrowing 9) False [] 0 0)] !! 3) == BandGrowing 9
+  let stats m = M.fromList m
+      f0 = Frame 0 1000000000 True (stats [("cpu_ns", 1e9), ("gc_cpu_ns", 2e8), ("major_gcs", 3), ("gc_gen", 0), ("gc_live_bytes", 1e6)]) [LiveThread 1 "running" "main" Nothing]
+      f1 = Frame 0.25 1250000000 True (stats [("cpu_ns", 2e9), ("gc_cpu_ns", 8e8), ("major_gcs", 4), ("gc_gen", 1), ("gc_live_bytes", 2e6)]) [LiveThread 1 "BlockedOnMVar" "main" Nothing]
+      fobs = frameObservations (Just f0) f1
+  check "frames give the threads, blocked or not" $
+    [ts | ObsThreads _ ts <- fobs] == [[ThreadNow 1 "main" (Just "MVar")]] && [ts | ObsThreads _ ts <- frameObservations Nothing f0] == [[ThreadNow 1 "main" Nothing]]
+  check "frames give the GC share of the CPU between them" ([s | ObsGCShare _ _ s <- fobs] == [0.6])
+  check "frames give a major collection when the last one was major" ([v | ObsMajorGC _ v <- fobs] == [2e6] && null [() | ObsMajorGC {} <- frameObservations (Just f1) f1 {frProgramNs = 1500000000}])
+  let lobs = timelineObservations sched 0 maxBound
+  check "an eventlog gives its blocked spans and censuses" $
+    length [() | ObsBlockedSpan _ _ th <- lobs, tnId th == 2, tnBlocked th == Just "blocked on MVar"] == 2 && length [() | ObsCensus 240 _ <- lobs] == 1
+  check "and only what came after the last look" (length (timelineObservations sched 200 maxBound) < length lobs && null (timelineObservations sched 260 maxBound))
+
+  putStrLn "diffs"
+  let ipe name label = InfoProv (name <> "_info") 15 KindThunk "Integer" label "Main" (SrcAt (SrcSpan "sample\\Main.hs" 82 5 82 40))
+      provBase = \case
+        "0x1" -> Just (ipe "main2_sat_s7qA" "main2")
+        _ -> Nothing
+      provCur = \case
+        "0x9" -> Just (ipe "main2_sat_s8bB" "main2")
+        _ -> Nothing
+      before = fromSamples "" "info table" 0 provBase [(t, [("0x1", t * 1e6), ("ARR_WORDS", 4e6), ("THUNK_2_0", t * 2e6), ("IS", t * 5e5)]) | t <- [1 .. 6]]
+      after = fromSamples "" "info table" 0 provCur [(t, [("0x9", 2e6), ("ARR_WORDS", 4e6), ("MUT_VAR_CLEAN", 2e6), ("IS", 32)]) | t <- [1 .. 6]]
+      changes = diffHeap before after
+      statusOf name = [bcStatus c | c <- changes, fmap bfName (bcBase c) == Just name || fmap bfName (bcCur c) == Just name]
+  check "a band that went away is gone" (statusOf "THUNK_2_0" == [BandGone])
+  check "and so is one left with a trace of what it held" (statusOf "IS" == [BandGone])
+  check "a band on the same source, under a new address, is matched by source" $
+    [(bcMatch c, bcStatus c) | c <- changes, fmap bfName (bcCur c) == Just "0x9"] == [(SameSource, BandShrank)]
+  check "an unchanged band is the same, by name" ([(bcMatch c, bcStatus c) | c <- changes, fmap bfName (bcCur c) == Just "ARR_WORDS"] == [(SameName, BandSame)])
+  check "a band only in the current run is new" (statusOf "MUT_VAR_CLEAN" == [BandNew])
+  check "biggest change in peak first" ((listToMaybe changes >>= bcBase >>= Just . bfName) == Just "THUNK_2_0")
+  check "the baseline's suspects keep their leak scores" $
+    all (isJust . bfScore) [bf | c <- changes, Just bf <- [bcBase c], bfName bf `elem` ["0x1", "THUNK_2_0"]]
+  check "growth is end minus start" ([bfGrowth bf | c <- changes, Just bf <- [bcBase c], bfName bf == "THUNK_2_0"] == [10e6])
+  check "a gone band still knows its site" (isNothing (changeFor changes "THUNK_2_0") && fmap (fmap ssLine . (>>= bandSite) . bcBase) (changeFor changes "0x9") == Just (Just 82))
+  let ct m n t a = CostTotal m n SrcNoLocation 1 t a t a
+      costs = diffCosts [ct "Main" "go" 60 50, ct "Main" "same" 5 5, ct "Main" "gone" 3 1] [ct "Main" "go" 10 5, ct "Main" "same" 5 5, ct "Main" "new" 2 2]
+  check "cost centres matched by module and name, biggest change first" $
+    map cgName costs == ["go", "gone", "new", "same"] && isNothing (cgCur (costs !! 1)) && isNothing (cgBase (costs !! 2))
+  let bsum k w b l sz = BindingSummary "Main" k w b l sz
+      bindings = diffBindings [bsum "go" False 2 3 (Just 40), bsum "same" False 0 1 (Just 5), bsum "gone" False 0 0 Nothing] [bsum "go" True 0 3 (Just 12), bsum "same" False 0 1 (Just 5), bsum "fresh" False 0 0 Nothing]
+  check "bindings whose badges changed, in words" $
+    [bgChanges c | c <- bindings, bgKey c == "go"] == [["worker/wrapper now", "boxing sites 2 → 0", "size 40 → 12 terms"]]
+  check "unchanged bindings are left out; new and gone ones say so" $
+    map bgKey bindings == ["fresh", "go", "gone"] && [bgChanges c | c <- bindings, bgKey c /= "go"] == [["new"], ["gone: inlined or removed"]]
+  let summaries = summariseModule "Main" (Just core) (Just (parseCodeFile KindStg "Main.dump-stg-final" stgText))
+  check "a module's bindings from its dumps, worker and wrapper as one" $
+    [(bsWorker s, bsBoxes s > 0) | s <- summaries, bsKey s == "go"] == [(True, True)] && "main" `elem` map bsKey summaries
+  check "changes against the baseline, in readouts" $
+    fmtChange 100 18 == "−82%" && fmtChange 100 112 == "+12%" && fmtChange 0 0 == "±0%" && fmtChange 0 5 == "new" && fmtChange 100 100.04 == "±0%" && relChange 0 1 == Nothing
+
+  putStrLn "sessions: watchers and baseline"
+  let watched =
+        emptySession
+          { sesWatchers = setRules [on (Rule (BlockedOver 250) False [RespNotify, RespMark] 5 0.3)]
+          , sesBaseline = noBaselinePaths {blEventlog = Just "scratch\\before.eventlog", blCostCentres = Just "scratch/before.prof", blDumps = Just "scratch/dumps before"}
+          }
+  check "watchers and the baseline round trip" (decodeSession (encodeSession watched) == Right watched)
+  check "a session names the baseline's artifacts" ("baseline.eventlog = scratch\\before.eventlog" `T.isInfixOf` encodeSession watched)
+  check "an older session gets the built-in rules and no baseline" $
+    fmap (\s -> (sesWatchers s, sesBaseline s)) (decodeSession "version = 1\n") == Right (defaultRules, noBaselinePaths)
+  check "a hand-written rule replaces its kind only" $
+    fmap (map ruOn . sesWatchers) (decodeSession "version = 1\nwatch.1 = band-growing n=4 on=true\n") == Right [False, False, False, True]
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

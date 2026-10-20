@@ -26,6 +26,9 @@ module UI.Heap
   , useDebugSocket
   , requestSnapshot
   , snapshotRunning
+    -- * For the shell's next steps and baseline
+  , heapOnShow
+  , snapshotCount
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -34,7 +37,7 @@ import Control.Monad (forM_, join, unless, void, when)
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as S
@@ -54,6 +57,8 @@ import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Format
 import Stronghead.HeapProfile
 import Stronghead.Join
+import Stronghead.Diff (Baseline (..), BandChange (..), BandFigures (..), BandStatus (..), changeFor, diffHeap, figuresTitle, fmtChange)
+import Stronghead.Next (Fact (..))
 import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run (runFromSocket, runKey, runKeysMatch)
@@ -364,6 +369,15 @@ stackLayers hp hidden solo topN =
    in [Layer (bandName b) (bandColor i (bandName b)) (bandValues b) | (i, b) <- top]
         ++ [Layer ("(" <> tshow (length rest) <> " more)") (colorRGB 140 140 140) other | not (null rest)]
 
+-- | The profile the panel charts, for the shell: the @.hp@ file's or the
+-- eventlog's.
+heapOnShow :: HeapState -> HeapLoaded -> Maybe HeapProfile -> NanoUI (Maybe HeapProfile)
+heapOnShow st loaded fromLog = (\source -> shownProfile source loaded fromLog) <$> readVar (hsSource st)
+
+-- | The ghc-debug snapshots kept.
+snapshotCount :: HeapState -> NanoUI Int
+snapshotCount st = (\(History _ ss) -> length ss) <$> readVar (hsDbgHistory st)
+
 -- | The profile on show: the @.hp@ file's, or else the eventlog's.
 shownProfile :: HeapSource -> HeapLoaded -> Maybe HeapProfile -> Maybe HeapProfile
 shownProfile source loaded fromLog = case source of
@@ -483,14 +497,19 @@ profileView env bench st loaded logTl hp = do
       approx = if cmExact clock then "" else " (approx.)"
   cw <- chartWindow (envBus env) st hp clock rk (any (`hasPane` tree) timelineTimePanes)
   stepCensus st hp (cwView cw) cursorIx
+  -- Against the baseline's heap profile, when one is marked.
+  let base = envBaseline env >>= baHeap
+      peakOf p = if VU.null (hpTotals p) then 0 else VU.maximum (hpTotals p)
+      suspects = length (leakSuspects hp)
   columnWith (padBottom 8 . tight . fillW) $
-    readout
-      [ ("breakdown", hpBreakdown hp)
-      , ("censuses", tshow (VU.length times))
-      , ("profiled", fmtSec (VU.last times))
-      , ("peak total", fmtBytesD (VU.maximum (hpTotals hp)))
-      , ("cursor at" <> approx, fmtSec (times VU.! cursorIx))
-      , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx))
+    readoutDelta
+      [ ("breakdown", hpBreakdown hp, Nothing)
+      , ("censuses", tshow (VU.length times), Nothing)
+      , ("profiled", fmtSec (VU.last times), Nothing)
+      , ("peak total", fmtBytesD (peakOf hp), (\b -> fmtChange (peakOf b) (peakOf hp) <> " vs baseline") <$> base)
+      , ("cursor at" <> approx, fmtSec (times VU.! cursorIx), Nothing)
+      , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx), Nothing)
+      , ("leak suspects", tshow suspects, (\b -> tshow (length (leakSuspects b)) <> " in the baseline") <$> base)
       ]
   bnDraw bench (hsPanes st) (heapPanes env st loaded logTl)
 
@@ -794,7 +813,26 @@ leakView :: Env -> HeapState -> HeapProfile -> NanoUI ()
 leakView env st hp = do
   let suspects = take 12 (leakSuspects hp)
       thunkBands = [b | b <- V.toList (hpBands hp), bandKind b == KindThunk]
+      -- Against the baseline: each suspect's band then, and the baseline's
+      -- suspects now.
+      changes = maybe [] (`diffHeap` hp) (envBaseline env >>= baHeap)
+      wereSuspects = [(c, bf) | c <- changes, Just bf <- [bcBase c], isJust (bfScore bf)]
   paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
+    scope $ unless (null wereSuspects) $ do
+      sectionTitle "Since the baseline"
+      hint "The baseline's leak suspects, and what became of them in the run on show."
+      forM_ (zip [0 :: Int ..] wereSuspects) $ \(i, (c, bf)) -> withKey ("base" <> tshow i) $ rowWith (gap 10 . fillW . padXY 8 0) $ do
+        let title = figuresTitle bf
+        case bcCur c of
+          Just cf -> linkText env (RBand (bfName cf)) id (T.take 60 title)
+          Nothing -> labelWith id (T.take 60 title)
+        flex
+        labelWith (fontMono . fixedW 180 . fontMuted) (fmtBytesD (bfPeak bf) <> " → " <> maybe "—" (fmtBytesD . bfPeak) (bcCur c))
+        labelWith (fixedW 200 . (if bcStatus c `elem` [BandGone, BandShrank] then fontTone Success else fontTone Warning)) $ case bcStatus c of
+          BandGone -> "gone"
+          BandShrank -> "much smaller (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")"
+          _ -> "still there (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")" <> maybe "" (const ", still a suspect") (bcCur c >>= bfScore)
+      separator
     scope $
       if null suspects
         then hint "No band grows steadily across censuses. If memory still climbs, profile by retainer (-hr) or cost centre (-hc), or take censuses more often (-i0.05)."
@@ -817,6 +855,12 @@ leakView env st hp = do
           fact "peak" (fmtBytesD (bandPeak b))
         _ <- canvas (fillW . fixedH 36) $ \r -> sparkBand r (bandColor (susBand s) (bandName b)) (bandValues b)
         scope $ for_ (bandProv b) $ \ip -> provenance env ip
+        scope $ unless (null changes) $ for_ (changeFor changes (bandName b)) $ \c ->
+          labelWith (fontMuted . fontSizeScale 0.85 . fillW) $ case bcBase c of
+            Nothing -> "New since the baseline."
+            Just bf ->
+              "In the baseline: peak " <> fmtBytesD (bfPeak bf) <> maybe ", not a suspect" (\sc -> ", leak score " <> fmtFixed 2 sc) (bfScore bf)
+                <> "; peak now " <> fmtChange (bfPeak bf) (bandPeak b) <> "."
         hint (diagnose hp b s)
     scope $ unless (null thunkBands) $ do
       separator
@@ -1339,6 +1383,7 @@ heapLens st loaded fromLog = do
   cursorT <- readVar (hsCursor st)
   totals <- readVar (hsCostTotals st)
   sources <- readVar (hsDbgSources st)
+  survivors <- readVar (hsDbgSurvivors st)
   let profile = case source of
         FromHpFile -> case done (hlHp loaded) of
           Just (Right hp) -> Just hp
@@ -1456,6 +1501,14 @@ heapLens st loaded fromLog = do
              ]
       awayFromLiveGraph = when (source == FromGhcDebug) (writeVar (hsSource st) FromEventlog)
       toLiveGraph = writeVar (hsSource st) FromGhcDebug
+      -- For the next steps: a band's suspect entry, the surviving groups
+      -- whose thunks it stands for, and what holds a closure.
+      suspectOf hp b = listToMaybe [s | s <- leakSuspects hp, bandName (hpBands hp V.! susBand s) == b]
+      survivorsOf bd = case latest of
+        Just snap -> [s | s <- survivors, not (null (snd (matchBand bd (mapMaybe (`M.lookup` snapNodes snap) (svSample s)))))]
+        Nothing -> []
+      holderOf i = latest >>= \snap -> anchorOf (retainerPath snap i) >>= \a -> Just (fromMaybe (RClosure sn (cnId a)) (threadOf a))
+      costTotal m l = listToMaybe [t | t <- maybe [] snd totals, ctName t == l || ctModule t <> "." <> ctName t == l, T.null m || ctModule t == m]
   pure
     (lens PHeap)
       { lensShows = \case
@@ -1526,6 +1579,25 @@ heapLens st loaded fromLog = do
           RBand b | Just bd <- band b -> bandActions b bd
           _ -> []
       , lensAnnotations = profAnns ++ heapAnns ++ liveAnns
+      , lensFacts = \case
+          RBand b | Just bd <- band b, Just hp <- profile ->
+            [FactLeak (susScore s) (susSurvived s) | Just s <- [suspectOf hp b]]
+              ++ [FactThunks | bandKind bd == KindThunk]
+              ++ [FactAllocated sp | Just ip <- [bandProv bd], Just sp <- [srcLocSpan (ipSrc ip)]]
+              ++ [FactInBinding (ipModule ip) (nameKey (ipLabel ip)) | Just ip <- [bandProv bd], not (T.null (ipLabel ip))]
+              ++ take 1 [FactSurviving (RThunkGroup (svKey s)) (svSurvived s) | s <- survivorsOf bd]
+              ++ take 1 [FactHeldBy h | s <- survivorsOf bd, i <- take 1 (svSample s), Just h <- [holderOf i]]
+          RThunkGroup k | Just g <- group k ->
+            FactThunks
+              : [FactAllocated sp | Just sp <- [sourceOf (tkSource k)]]
+              ++ take 1 [FactHeldBy h | i <- take 1 (tgSample g), Just h <- [holderOf i]]
+          RClosure s a | Just n <- closure s a ->
+            [FactThunks | cnKind n == NThunk]
+              ++ [FactAllocated sp | Just sp <- [sourceOf (cnSource n)]]
+              ++ [FactHeldBy h | Just h <- [holderOf a], h /= RClosure s a]
+          RCostCentre m l | Just t <- costTotal m l -> [FactCost (ctInhTime t) (ctInhAlloc t)]
+          RRange r a b | Just hp <- rangeIn r a b -> [FactTopSuspect (RBand (bandName (hpBands hp V.! susBand s))) | s <- take 1 (leakSuspects hp)]
+          _ -> []
       , lensSpan = \case
           RBand b -> band b >>= bandProv >>= srcLocSpan . ipSrc
           RCostCentre m l -> costCentre m l >>= srcLocSpan . ccLoc

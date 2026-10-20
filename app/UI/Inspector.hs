@@ -1,7 +1,9 @@
 -- | The entity inspector: everything every panel knows about one entity,
--- the long form of a peek. One section per panel that has something to
--- say, each with how that panel matched the entity, its facts, what goes
--- with it as links, and its actions as buttons.
+-- the long form of a peek. First what to do next ("Stronghead.Next"), each
+-- step a button that follows it, with its reason. Then one section per
+-- panel that has something to say, each with how that panel matched the
+-- entity, its facts, what goes with it as links, and its actions as
+-- buttons.
 --
 -- It follows the focus as it changes, and keeps its own back and forward
 -- through what it has shown, apart from the window's history. With
@@ -13,6 +15,7 @@ module UI.Inspector
   , inspect
   , inspectorPane
   , inspectorBody
+  , nextStepsSection
   ) where
 
 import Control.Monad (forM_, unless, void, when)
@@ -20,6 +23,7 @@ import Data.Foldable (for_)
 import Data.List (nub)
 import Data.Text qualified as T
 import NanoUI
+import Stronghead.Next (Step (..), StepDo (..), datumRecipe, datumTitle)
 import Stronghead.Ref (Ref (..), refTarget)
 import Stronghead.Source (renderSrcSpan)
 import UI.Common
@@ -120,6 +124,7 @@ inspectorBody env r = do
     (RSource _, _) -> pure ()
     (_, Just sp) -> kvLink env "source" (RSource sp) (renderSrcSpan sp)
     _ -> pure ()
+  scope $ nextStepsSection env (stepsFor env r)
   let sections =
         [ (l, peek, related, actions)
         | l <- ls
@@ -147,3 +152,40 @@ inspectorBody env r = do
               resp <- disabledWhen (either (const True) (const False) (actRun a)) (buttonWith' (padXY 8 2 . tight) (actLabel a))
               for_ (either Just (const Nothing) (actRun a)) (tooltip resp)
               when (respClicked resp) (either (const (pure ())) id (actRun a))
+
+-- | What to do next, in order: each step a button that follows it (its
+-- reason under it, or why it can't run as its tooltip), the entity it
+-- leads to as a link, and for missing data the lines that add it.
+nextStepsSection :: Env -> [Step] -> NanoUI ()
+nextStepsSection env steps = unless (null steps) $
+  columnWith (fillW . tight . gap 4 . padTop 6) $ do
+    labelWith (fontMedium . fontSizeScale 0.92) "Next steps"
+    forM_ (zip [1 :: Int ..] steps) $ \(i, s) -> withKey i $
+      columnWith (fillW . tight . gap 2) $ do
+        rowWith (fillW . tight . gap 8) $ do
+          labelWith (alignMid . fontMuted . fontSizeScale 0.85 . fixedW 14) (T.pack (show i))
+          let run = stepRun env s
+          scope $ case stepDo s of
+            -- Missing data has nothing to click: what to add is below it.
+            StepLoad _ -> labelWith (alignMid . fontMedium . fontSizeScale 0.9) (stepTitle s)
+            _ -> do
+              resp <- disabledWhen (either (const True) (const False) run) (buttonWith' (alignMid . padXY 8 2 . tight) (stepTitle s))
+              for_ (either Just (const Nothing) run) (tooltip resp)
+              when (respClicked resp) (either (const (pure ())) id run)
+          scope $ case stepDo s of
+            StepGo x -> linkText env x (alignMid . fontSizeScale 0.9) (T.take 60 (refTitle env x))
+            StepTry flag -> do
+              labelWith (alignMid . fontMono . fontSizeScale 0.85) flag
+              whenM (buttonWith (alignMid . padXY 6 0 . tight) "Copy") (void (setClipboard flag))
+            _ -> pure ()
+        labelWith (padLeft 22 . fillW . fontMuted . fontSizeScale 0.85) (stepReason s)
+        scope $ case stepDo s of
+          StepLoad d -> do
+            let (build, runWith) = datumRecipe d
+            labelWith (padLeft 22 . fillW . fontSizeScale 0.85) (datumTitle d)
+            forM_ (zip [0 :: Int ..] ([("build", b) | Just b <- [build]] ++ [("run", x) | Just x <- [runWith]])) $ \(j, (what, line)) -> withKey j $
+              rowWith (padLeft 22 . fillW . tight . gap 6) $ do
+                labelWith (alignMid . fixedW 34 . fontMuted . fontSizeScale 0.8) what
+                labelWith (alignMid . fillW . fontMono . fontSizeScale 0.8) line
+                whenM (buttonWith (alignMid . padXY 6 0 . tight) "Copy") (void (setClipboard line))
+          _ -> pure ()

@@ -15,6 +15,10 @@
 -- ("UI.Sources"); the status bar is the connection centre, where each live
 -- source opens its panel or its menu. Connect in Live attaches: what it
 -- finds is opened here ('applyAttach').
+--
+-- The shell also keeps the investigation's aids: what is loaded, for the
+-- inspector's next steps ('Have'); the watchers on the live streams
+-- ("UI.Watchers"); and the baseline run with its diffs ("UI.Baseline").
 module UI.Shell
   ( App
   , Options (..)
@@ -35,17 +39,21 @@ import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Sequence qualified as Seq
 import Data.Word (Word64)
 import Data.Text qualified as T
+import Data.Vector qualified as V
+import Data.Vector.Unboxed qualified as VU
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askSaveFileDialog, askSdlEnv, defaultFileDialogOptions, setSdlUiScale, useFileDialog, windowZoom)
 import NanoUI.Shortcut qualified as K
 import Stronghead.Attach (AttachKind (..), AttachStep (..))
 import Stronghead.Debug (DebugTarget (..), ghcDebugEnabled)
+import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
 import Stronghead.Dump (ModuleArtifacts (..), kindForPath)
-import Stronghead.Eventlog.Model (Timeline (..))
+import Stronghead.Eventlog.Model (Timeline (..), summarize)
 import Stronghead.Eventlog (LoadProgress (..))
 import Stronghead.Format (fmtBytes, fmtNs, tshow)
 import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Live (AgentInfo (..), Frame (..))
+import Stronghead.Next (Have (..))
 import Stronghead.Prof (ProfFile (..))
 import Stronghead.Ref (Ref (..), RunKey, parseRefTarget)
 import Stronghead.Run (RunInfo (..), emptyRunInfo, mergeRunInfo, runFromArgs, runFromHello, runFromProfHeader, runFromSocket, runKey)
@@ -55,6 +63,7 @@ import Data.Text.IO qualified as T
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute, renameFile)
 import System.FilePath (takeDirectory, takeExtension, takeFileName, (</>))
+import UI.Baseline
 import UI.Clock (confirmMoments)
 import UI.Code (colouringName)
 import UI.Common
@@ -69,6 +78,7 @@ import UI.Pinboard
 import UI.Settings
 import UI.Sources
 import UI.Timeline
+import UI.Watchers
 import UI.Workspace
 
 -- | How to drive the panel, for the status bar.
@@ -141,6 +151,8 @@ data App = App
   , appPendingModule :: !(Var (Maybe T.Text))
     -- ^ A session's module, picked once its dump folder is searched.
   , appReopenLast :: !(Var Bool)
+  , appWatchers :: !Watchers
+  , appBaseline :: !BaselineState
   }
 
 -- | What the command line asked for.
@@ -225,6 +237,8 @@ newApp settings Options {..} = do
   appSessionPath <- newVar Nothing
   appPendingModule <- newVar Nothing
   appReopenLast <- newVar (cfgReopenSession settings)
+  appWatchers <- newWatchers
+  appBaseline <- newBaselineState
   -- The last session comes back only when the command line asks for
   -- nothing of its own.
   let asked = not (null optFiles) || isJust optConnect || isJust optFollow || isJust optDebug
@@ -382,6 +396,63 @@ appView app = do
     writeVar (appMark app) Nothing
     sendMark bus (appLive app) live txt
 
+  -- The baseline, and the bindings of the dump folder on show.
+  dumpRoot <- readVar (csRoot (appCore app))
+  baseline <- baselineLoad (appBaseline app) dumpRoot
+  heapShown <- heapOnShow (appHeap app) heap logProfile
+  snapshots <- snapshotCount (appHeap app)
+  let isRight' = \case
+        Just (Right _) -> True
+        _ -> False
+      have =
+        Have
+          { haveTimeline = isJust logTl
+          , haveHeapCensus = maybe False (not . VU.null . hpTimes) heapShown
+          , haveHeapSource = maybe False ((== "info table") . hpBreakdown) heapShown
+          , haveCostCentres = isRight' (hlProf heap >>= taskResult)
+          , haveSamples = maybe False (not . V.null . tlProfSamples) logTl
+          , haveTicky = maybe False (not . V.null . tlTicky) logTl
+          , haveDumps = any isRight' [clCore core, clStg core]
+          , haveAgent = isNothing (commandsWhy live)
+          , haveLiveGraph = either (const False) (const True) (dhSnapshot hooks)
+          , haveSnapshots = snapshots
+          }
+      taskResult = \case
+        TaskDone r -> Just r
+        TaskRunning r -> r
+        _ -> Nothing
+  -- What marking the baseline now would keep.
+  logPath <- readVar (tsPath (appTimeline app))
+  heapSource <- readVar (hsSource (appHeap app))
+  hpPath <- readVar (hsHpPath (appHeap app))
+  profPath <- readVar (hsProfPath (appHeap app))
+  costTotalsNow <- readVar (hsCostTotals (appHeap app))
+  let costsNow = case (profPath, costTotalsNow) of
+        (Just p, Just (p', cts)) | p == p' -> Just cts
+        _ -> Nothing
+      basePaths =
+        BaselinePaths
+          { blEventlog = if isJust logTl then logPath else Nothing
+          , blHeapProfile = if heapSource == FromHpFile && isJust heapShown then hpPath else Nothing
+          , blCostCentres = if isJust costsNow then profPath else Nothing
+          , blDumps = dumpRoot
+          }
+      markNow
+        | basePaths == noBaselinePaths = Left "nothing to keep yet: open an eventlog, a heap or cost-centre profile, or a dump folder"
+        | otherwise = Right (markBaseline (appBaseline app) (Baseline basePaths (summarize <$> logTl) heapShown costsNow (boCurBindings baseline)))
+  -- Watchers act through the agent and the ghc-debug target, as Live does.
+  let remoteRun lbl = case [raRun a | a <- remote, raLabel a == lbl] of
+        r : _ -> r
+        [] -> Left "not available"
+      watchHooks =
+        WatchHooks
+          { whMark = maybe (Right (sendMark bus (appLive app) live)) Left (commandsWhy live)
+          , whCensus = remoteRun "Census now"
+          , whSnapshot = remoteRun "Snapshot"
+          }
+      following = maybe False lpFollowing timeline
+  watchTick (appWatchers app) watchHooks live logTl following
+
   active <- readVar (appTab app)
   heapL <- heapLens (appHeap app) heap logProfile
   -- Each lens may ask the ones built before it where an entity is in the
@@ -394,6 +465,8 @@ appView app = do
           , envLenses = [timelineLens (appBus app) (writeVar (appTab app) PTimeline) (appTimeline app) timeline, heapL, coreL, debugL, liveLens (appLive app) live moments remote]
           , envPanel = active
           , envSwitch = writeVar (appTab app)
+          , envHave = have
+          , envBaseline = boBaseline baseline
           }
   navShortcuts app env
   inspectorSync env (appInspector app)
@@ -407,10 +480,16 @@ appView app = do
         PCore -> corePanes env (appCore app) core site
         PDebugger -> debugPanes env (appDebug app) (clIndex core) debugSrc site
         PLive -> livePanes env (appLive app) live logTl site
+      watching = case (live, following) of
+        (Just d, _) | Just (p, _, _) <- ldHello d, isNothing (ldClosed d) -> "watching " <> p <> (if following then " and its eventlog" else "")
+        (_, True) -> "watching the followed eventlog"
+        _ -> "no live stream: connect in Live, or follow an eventlog"
+      diffNow = DiffNow heapShown costsNow markNow
       shellPanes pid ctx
         | pid == paneInspector = Just (inspectorPane env (appInspector app) ctx)
         | pid == panePinboard = Just (pinboardPane env (askExport app) ctx)
-        | otherwise = Nothing
+        | pid == paneWatchers = Just (watchersPane env (appWatchers app) watching ctx)
+        | otherwise = diffPanes env (appBaseline app) baseline diffNow pid ctx
       foreignKinds tree = [k | k <- maybe [] treeKinds tree, Just pk <- [paneKind k], maybe False (/= active) (pkPanel pk)]
       bench =
         Bench
@@ -466,10 +545,10 @@ appView app = do
       PLive -> liveView env bench (appLive app) live logTl remote $ \p -> do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
-    statusBar app env active timeline live heap hooks
+    statusBar app env active timeline live heap hooks baseline
   settingsModal app
   markPrompt bus (appLive app) live
-  paletteView env (appPalette app) (commands app env active)
+  paletteView env (appPalette app) (commands app env active markNow)
   poppedWindows app shellPanes providers
   persistSettings app
   publishHover (appBus app)
@@ -518,8 +597,8 @@ navShortcuts app env = do
   whenM (pressed [K.key KeyEscape]) (setFocus env Nothing)
 
 -- | The palette's own commands, ahead of what the panels have loaded.
-commands :: App -> Env -> Panel -> [Hit]
-commands app env active =
+commands :: App -> Env -> Panel -> Either T.Text (NanoUI ()) -> [Hit]
+commands app env active markNow =
   [Hit "panel" (panelTitle p) ("Ctrl+" <> tshow n) (HitRun (writeVar (appTab app) p)) | (n, p) <- zip [1 :: Int ..] [minBound .. maxBound]]
     ++ [ Hit "command" "Open file…" "" (HitRun (askOpen app))
        , Hit "command" "Settings" "Ctrl+," (HitRun (writeVar (appSettingsOpen app) True))
@@ -529,6 +608,8 @@ commands app env active =
        , Hit "command" "Export pins…" "Markdown" (HitRun (askExport app))
        , Hit "command" "Save session…" "" (HitRun (askSaveSession app))
        , Hit "command" "Open session…" "" (HitRun (askOpenSession app))
+       , Hit "command" "Mark as baseline" (either id (const "keep this run to compare the next with") markNow) (HitRun (either (writeVar (appMessage app)) id markNow))
+       , Hit "command" "Clear the baseline" "" (HitRun (clearBaseline (appBaseline app)))
        ]
     ++ [ Hit "pane" ("Add pane: " <> pkTitle k) (maybe "" panelTitle (pkPanel k)) (HitRun (activeBench app active >>= \wb -> modifyVar (wbTree wb) (Just . addPane (pkId k))))
        | k <- paneKinds
@@ -707,6 +788,8 @@ currentSession app = do
   layouts <- mapM (\wb -> (wbName wb,) . maybe "-" encodeTree <$> readVarIO (wbTree wb)) (allBenches app)
   presets <- readVarIO (appPresets app)
   popped <- readVarIO (appPopped app)
+  watchers <- readVarIO (wrRules (appWatchers app))
+  basePaths <- readVarIO (bvPaths (appBaseline app))
   pure
     Session
       { sesPanel = panelKey panel
@@ -736,6 +819,8 @@ currentSession app = do
       , sesLayouts = layouts
       , sesPresets = [(prName p, encodeTree (prTree p)) | p <- presets]
       , sesPopped = [maybe "" pkKey (paneKind (poKind p)) <> " " <> poFrom p | p <- popped]
+      , sesWatchers = watchers
+      , sesBaseline = basePaths
       }
 
 -- | Write a session, replacing the file only once the new one is whole.
@@ -820,6 +905,10 @@ applySession app Session {..} = do
   unless (null sesPresets) (writeVar (appPresets app) presets)
   writeVar (appPopped app) [Popped (pkId k) (T.strip from) | p <- sesPopped, let (key, from) = T.breakOn " " p, Just k <- [paneKindNamed key]]
   for_ (panelNamed sesPanel) (writeVar (appTab app))
+  writeVar (wrRules (appWatchers app)) sesWatchers
+  if sesBaseline == noBaselinePaths
+    then clearBaseline (appBaseline app)
+    else writeVar (bvPaths (appBaseline app)) sesBaseline
   unless (null bad) $ writeVar (appMessage app) ("Some arrangements could not be read and were left as they were: " <> T.intercalate "; " bad)
 
 -- | Open a session file.
@@ -877,8 +966,8 @@ document app active = scope $ case active of
 -- eventlog, the agent, the ghc-debug target, GHCi) opens its panel on a
 -- click and has a menu on a right-click. On the right, the cursor's time,
 -- the focus, and how to drive the active panel.
-statusBar :: App -> Env -> Panel -> Maybe LoadProgress -> Maybe LiveData -> HeapLoaded -> DebugHooks -> NanoUI ()
-statusBar app env active timeline live heap hooks = do
+statusBar :: App -> Env -> Panel -> Maybe LoadProgress -> Maybe LiveData -> HeapLoaded -> DebugHooks -> BaselineLoaded -> NanoUI ()
+statusBar app env active timeline live heap hooks baseline = do
   th <- uiTheme
   let i = ink th
       tl = appTimeline app
@@ -941,6 +1030,8 @@ statusBar app env active timeline live heap hooks = do
           whenM (menuItem "Stop the session") (liftIO (stopSession dbg wake))
           whenM (menuItem "Restart the session") (liftIO (stopSession dbg wake >> startSession dbg wake))
           whenM (menuItem "Show in Debugger") toDebugger
+      watchStatus env (appWatchers app)
+      baselineStatus (appBaseline app) baseline
       scope $ unless (T.null msg) $ do
         labelWith (alignMid . fontSizeScale 0.85 . fontTone Warning) msg
         whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")

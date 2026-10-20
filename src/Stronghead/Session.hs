@@ -4,7 +4,8 @@
 -- A session is what was open and where the investigation stood: the
 -- artifacts and dump folders, the connections, the pins with their notes,
 -- the shared cursor and range, the focus, each panel's arrangement of panes
--- and the panel in front. It is kept as @key = value@ lines, like the
+-- and the panel in front, the watchers' rules and the baseline's
+-- artifacts. It is kept as @key = value@ lines, like the
 -- settings file. Lists are numbered keys (@pin.1@, @pin.1.note@). Values are
 -- percent-encoded where they would otherwise be lost: a @%@, a line break,
 -- and spaces at either end. Unknown keys and unreadable values are skipped,
@@ -43,7 +44,9 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
 import Data.Word (Word64)
+import Stronghead.Diff (BaselinePaths (..), noBaselinePaths)
 import Stronghead.Ref (Ref (..), RunKey, parseRefTarget, refTarget)
+import Stronghead.Watch (Rule, decodeRule, defaultRules, encodeRule, setRules)
 
 -- ---------------------------------------------------------------------------
 -- Pins
@@ -112,6 +115,10 @@ data Session = Session
     -- ^ The user's named arrangements.
   , sesPopped :: ![Text]
     -- ^ Panes popped out into floating windows, by pane name.
+  , sesWatchers :: ![Rule]
+    -- ^ The watchers' rules, every built-in one.
+  , sesBaseline :: !BaselinePaths
+    -- ^ The baseline's artifacts, loaded again on open.
   }
   deriving (Eq, Show)
 
@@ -142,6 +149,8 @@ emptySession =
     , sesLayouts = []
     , sesPresets = []
     , sesPopped = []
+    , sesWatchers = defaultRules
+    , sesBaseline = noBaselinePaths
     }
 
 -- | The extension session files are recognised by, on the command line and
@@ -183,6 +192,11 @@ encodeSession Session {..} =
         ++ [("layout." <> name, tree) | (name, tree) <- sesLayouts]
         ++ concat [[("preset." <> tshow' i, name), ("preset." <> tshow' i <> ".layout", tree)] | (i, (name, tree)) <- zip [1 :: Int ..] sesPresets]
         ++ numbered "popped" sesPopped
+        ++ numbered "watch" (map encodeRule sesWatchers)
+        ++ opt "baseline.eventlog" (blEventlog sesBaseline)
+        ++ opt "baseline.heap-profile" (blHeapProfile sesBaseline)
+        ++ opt "baseline.cost-centres" (blCostCentres sesBaseline)
+        ++ opt "baseline.dumps" (blDumps sesBaseline)
     opt k = maybe [] (\p -> [(k, T.pack p)])
     numbered k vs = [(k <> "." <> tshow' i, v) | (i, v) <- zip [1 :: Int ..] vs]
     bool b = if b then "true" else "false"
@@ -227,6 +241,14 @@ decodeSession file
           , sesLayouts = [(name, v) | (k, v) <- M.toList kvs, Just name <- [T.stripPrefix "layout." k], not (T.null name)]
           , sesPresets = [(name, tree) | (i, name) <- indexed "preset", Just tree <- [M.lookup ("preset." <> i <> ".layout") kvs], not (T.null name)]
           , sesPopped = numbered "popped"
+          , sesWatchers = setRules [r | v <- numbered "watch", Just r <- [decodeRule v]]
+          , sesBaseline =
+              BaselinePaths
+                { blEventlog = path "baseline.eventlog"
+                , blHeapProfile = path "baseline.heap-profile"
+                , blCostCentres = path "baseline.cost-centres"
+                , blDumps = path "baseline.dumps"
+                }
           }
   where
     d = emptySession

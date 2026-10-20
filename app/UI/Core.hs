@@ -37,6 +37,7 @@ import NanoUI hiding (Binding)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
 import Stronghead.Dump
 import Stronghead.Format (fmtBytesD, fmtFixed, tshow)
+import Stronghead.Next (Fact (..))
 import Stronghead.Join
 import Stronghead.Ref
 import Stronghead.Source (Resolved (..), SourceIndex (..), SrcSpan (..), buildSourceIndex, editorCommand, mkSourceIndex, resolveModule, resolveSource, resolvesTo, sourceRoots)
@@ -819,6 +820,17 @@ coreLens st loaded spanOf anns = do
       , lensSpan = \case
           RBinding m k -> entry m k >>= bindingSpan
           _ -> Nothing
+      , lensFacts = \case
+          RBinding m k | Just e <- entry m k ->
+            FactBadges (hasWorker e) (sum (map (length . nBoxing . bdNotes) (enCore e))) (sum (map (length . nAllocs . bdNotes) (enStg e)))
+              -- The heap its lets hold: the bands whose info tables name
+              -- it, biggest first.
+              : take 1
+                [ FactSiteHeap r v
+                | (r, v) <- sortOn (Down . snd) (M.toList (M.fromListWith (+) [(r, anValue a) | a <- anns, anLane a == LaneHeap, anName a `elem` [Just (modName, k), Just (m, k)], Just r <- [anRef a]]))
+                , v > 0
+                ]
+          _ -> []
       }
 
 -- | A binding's badges and what the optimiser recorded about it.

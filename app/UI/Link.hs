@@ -39,6 +39,12 @@ module UI.Link
   , refTitle
   , refSpan
   , describeRef
+    -- * Next steps
+  , refFacts
+  , stepsFor
+  , stepRun
+  , stepTarget
+  , stepStrip
     -- * Navigation
   , goTo
   , showIn
@@ -71,7 +77,9 @@ import NanoUI
 import Stronghead.Debug.Graph (ThunkKey (..), fmtClosureId)
 import Stronghead.Format (fmtNs, tshow)
 import Stronghead.Ref
+import Stronghead.Diff (Baseline)
 import Stronghead.Join (Annotation)
+import Stronghead.Next
 import Stronghead.Session (Pin (..), pinToggle)
 import Stronghead.Source (SrcSpan, renderSrcSpan)
 import System.FilePath (takeFileName)
@@ -211,11 +219,14 @@ data Lens = Lens
   , lensSpan :: Ref -> Maybe SrcSpan
     -- ^ Where in the source an entity is, as far as this panel knows: a
     -- band's allocation site, a closure's info table, a binding's lines.
+  , lensFacts :: Ref -> [Fact]
+    -- ^ What this panel knows about an entity in the terms the next-steps
+    -- engine reasons in ("Stronghead.Next").
   }
 
 -- | A lens that shows nothing, to override field by field.
 lens :: Panel -> Lens
-lens p = Lens p (const False) (const (pure ())) (const Nothing) (const []) (const []) (const Nothing) [] [] (const Nothing)
+lens p = Lens p (const False) (const (pure ())) (const Nothing) (const []) (const []) (const Nothing) [] [] (const Nothing) (const [])
 
 -- | One panel's facts about an entity. The facts and notes are text, so
 -- the pinboard's report can carry them; what only draws (a sparkline, a
@@ -273,12 +284,15 @@ data Hit = Hit
 data HitTarget = HitRef !Ref | HitRun (NanoUI ())
 
 -- | What a view needs to draw links: the bus, this frame's lenses, the
--- panel on screen, and how to switch panels.
+-- panel on screen, and how to switch panels; what is loaded, for the next
+-- steps; and the baseline run, for the readouts' deltas.
 data Env = Env
   { envBus :: !Bus
   , envLenses :: [Lens]
   , envPanel :: !Panel
   , envSwitch :: Panel -> NanoUI ()
+  , envHave :: !Have
+  , envBaseline :: Maybe Baseline
   }
 
 -- | The best name any panel has for it.
@@ -510,6 +524,7 @@ peek env ref =
     scope $ unless (null related) $
       columnWith (padTop 4 . fillW . tight . gap 2) $
         forM_ (zip [0 :: Int ..] related) $ \(i, (lbl, r)) -> withKey i $ fact lbl (refTitle env r)
+    scope $ for_ (strongStep (stepsFor env ref)) (stepStrip env)
     labelWith (fontMuted . fontSizeScale 0.8 . padTop 4) "Ctrl+click to open, right-click for actions"
 
 -- | A piece of prose that links to an entity ('prose').
@@ -521,3 +536,53 @@ prose :: Env -> [Inline] -> NanoUI ()
 prose env inlines = do
   target <- richTextWith fillW inlines
   for_ (target >>= parseRefTarget) (goTo env)
+
+-- ---------------------------------------------------------------------------
+-- Next steps
+
+-- | What every panel knows about an entity, as facts for the engine.
+refFacts :: Env -> Ref -> [Fact]
+refFacts env r = nub (concatMap (`lensFacts` r) (envLenses env))
+
+-- | What to do next about an entity ("Stronghead.Next").
+stepsFor :: Env -> Ref -> [Step]
+stepsFor env r = nextSteps (envHave env) r (refFacts env r)
+
+-- | The entity a step leads to or acts on, if it names one.
+stepTarget :: Step -> Maybe Ref
+stepTarget s = case stepDo s of
+  StepGo r -> Just r
+  StepAct r _ -> Just r
+  _ -> Nothing
+
+-- | Follow a step, or why it can't be followed now. A link goes to its
+-- entity, an action is the first panel action for the entity (or palette
+-- command) whose label contains the step's, a flag to try is copied, and
+-- missing data says how to get it.
+stepRun :: Env -> Step -> Either Text (NanoUI ())
+stepRun env s = case stepDo s of
+  StepGo r
+    | any (`lensShows` r) (envLenses env) -> Right (goTo env r)
+    | otherwise -> Left "no panel has it loaded now"
+  StepAct r lbl ->
+    let want = T.toLower lbl
+        actions = [actRun a | l <- envLenses env, a <- lensActions l r, want `T.isInfixOf` T.toLower (actLabel a)]
+        commands = [Right run | l <- envLenses env, Hit _ label _ (HitRun run) <- lensHits l, want `T.isInfixOf` T.toLower label]
+     in case actions ++ commands of
+          a : _ -> a
+          [] -> Left "no panel offers it now"
+  StepTry flag -> Right (void (setClipboard flag))
+  StepLoad d ->
+    let (build, run) = datumRecipe d
+     in Left (datumTitle d <> ": " <> T.intercalate "; " (["build with " <> b | Just b <- [build]] ++ ["run with " <> x | Just x <- [run]]))
+
+-- | A strong step, in one line under a peek.
+stepStrip :: Env -> Step -> NanoUI ()
+stepStrip env s =
+  rowWith (padTop 6 . fillW . tight . gap 6) $ do
+    labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) "Next"
+    labelWith (alignBaseline . fontMedium . fontSizeScale 0.85) (stepTitle s)
+    scope $ for_ (stepTarget s) $ \r -> case stepDo s of
+      StepGo _ -> labelWith (alignBaseline . fontSizeScale 0.85) (T.take 50 (refTitle env r))
+      _ -> pure ()
+    labelWith (alignBaseline . fontMuted . fontSizeScale 0.8 . fillW) (stepReason s)

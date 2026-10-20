@@ -64,6 +64,9 @@ library
         Stronghead.Ref
         Stronghead.Session
         Stronghead.Join
+        Stronghead.Next
+        Stronghead.Watch
+        Stronghead.Diff
         Stronghead.Fuzzy
         Stronghead.Format
         Stronghead.Debug
@@ -106,6 +109,7 @@ executable stronghead
     hs-source-dirs:   app
     main-is:          Main.hs
     other-modules:
+        UI.Baseline
         UI.Clock
         UI.Code
         UI.Common
@@ -121,6 +125,7 @@ executable stronghead
         UI.Settings
         UI.Shell
         UI.Sources
+        UI.Watchers
         UI.Workspace
     build-depends:
         base >=4.20 && <4.23,
