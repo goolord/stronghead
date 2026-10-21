@@ -22,16 +22,19 @@ module UI.Settings
   ) where
 
 import Control.Exception (IOException, try)
+import Data.List ((!?))
+import Data.List.Extra (minimumOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, mapMaybe)
+import System.Directory (XdgDirectory (..), doesFileExist, getXdgDirectory)
+import System.FilePath ((</>))
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI (Appearance (..), Size (..))
-import Stronghead.Format (tshow)
+
+import Stronghead.Format (readDecimal, tshow)
 import Stronghead.TextFile (readTextFile, saveTextFile)
-import System.Directory (XdgDirectory (..), doesFileExist, getXdgDirectory)
-import System.FilePath ((</>))
-import Text.Read (readMaybe)
 import UI.Code (Colouring (..))
 
 data Settings = Settings
@@ -57,7 +60,7 @@ data Settings = Settings
   , cfgReopenSession :: !Bool
     -- ^ Reopen the session saved on quit.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The window's restored (not maximized) geometry, in layout units.
 data SavedWindow = SavedWindow
@@ -65,7 +68,7 @@ data SavedWindow = SavedWindow
   , swPosition :: !(Maybe (Int, Int))
   , swMaximized :: !Bool
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 defaultSettings :: Settings
 defaultSettings =
@@ -91,7 +94,7 @@ defaultSettings =
 -- Choices
 
 data ThemeChoice = ThemeSystem | ThemeLight | ThemeDark
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Show, Enum, Bounded)
 
 themeChoiceName :: ThemeChoice -> Text
 themeChoiceName = \case
@@ -120,7 +123,7 @@ data UiScale
   | Scale200
   | Scale250
   | Scale300
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 scalePercent :: UiScale -> Maybe Int
 scalePercent = \case
@@ -152,11 +155,10 @@ stepScale :: Int -> Float -> UiScale -> UiScale
 stepScale dir current s =
   let fixed = [Scale75 .. maxBound]
       here = case s of
-        ScaleAuto -> nearest
+        ScaleAuto -> minimumOn (\f -> abs (uiScaleFactor f - current)) fixed
         _ -> s
-      nearest = snd (minimum [(abs (uiScaleFactor f - current), f) | f <- fixed])
       i = length (takeWhile (/= here) fixed)
-   in fixed !! max 0 (min (length fixed - 1) (i + dir))
+   in fromMaybe here (fixed !? max 0 (min (length fixed - 1) (i + dir)))
 
 -- ---------------------------------------------------------------------------
 -- The file
@@ -261,7 +263,7 @@ decode file =
       "false" -> Just False
       _ -> Nothing
     readInt :: Text -> Maybe Int
-    readInt = readMaybe . T.unpack . T.strip
+    readInt = readDecimal . T.strip
     nonEmpty v = if T.null v then Nothing else Just v
     pair c v = case T.splitOn (T.singleton c) v of
       [a, b] -> (,) <$> readInt a <*> readInt b

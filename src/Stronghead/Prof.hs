@@ -9,9 +9,12 @@ module Stronghead.Prof
   ) where
 
 import Data.Char (isSpace)
+import Data.Maybe (fromMaybe)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
+
+import Stronghead.Format (readDecimal, readDouble)
 import Stronghead.Source (SrcLoc, parseSrcLoc)
 import Stronghead.TextFile (readTextFile)
 
@@ -31,14 +34,14 @@ data CostCentre = CostCentre
   , ccInhAlloc :: !Double
   , ccChildren :: ![CostCentre]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data ProfFile = ProfFile
   { pfHeader :: ![Text]
     -- ^ The summary lines before the tables (program, total time, alloc).
   , pfRoots :: ![CostCentre]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 loadProf :: FilePath -> IO (Either String ProfFile)
 loadProf path = parseProf <$> readTextFile path
@@ -84,8 +87,8 @@ row hasSrc l =
         _ -> Nothing
   where
     readI :: Integral a => Text -> a
-    readI t = either (const 0) fst (TR.decimal t)
-    readD t = either (const 0) fst (TR.double t)
+    readI = fromMaybe 0 . readDecimal
+    readD = fromMaybe 0 . readDouble
 
 -- | Turn an indentation-annotated preorder listing into a forest.
 build :: [(Int, CostCentre)] -> [CostCentre]

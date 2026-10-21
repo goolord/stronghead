@@ -33,19 +33,22 @@ module UI.Code
   , scrollToLineAt
   ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, guard, when)
 import Data.Foldable (for_)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
-import Data.List (maximumBy, sortOn)
+import Data.List (maximumBy, sortOn, unsnoc, (!?))
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Ord (Down (..), comparing)
 import Data.Set qualified as S
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
+
 import Stronghead.Dump (TokKind (..), Token (..), nameKey, stripUnique)
+import Stronghead.Format (tshow)
 import Stronghead.Join (Annotation (..), Lane (..), Mark (..), Shade (..), laneName, lineOwners)
 import Stronghead.Ref (Ref)
 import Stronghead.Source (SourceIndex, SrcSpan (..), resolvesTo)
@@ -82,7 +85,7 @@ data GutterMark
   | MarkCandidate
   | MarkCurrent
   | MarkDot !Color
-  deriving (Eq)
+  deriving stock (Eq)
 
 -- | One heat bar: a line's share of what its lane measures.
 data LineNote = LineNote
@@ -283,9 +286,7 @@ lanePoint mm cfg (Rect x y _ _) line lane =
 -- @right@) when the line runs past it. Says whether they were pinned.
 hintColumns :: Maybe Int -> [Token] -> [(Text, Maybe Ref)] -> (Bool, [(Int, Int, (Text, Maybe Ref))])
 hintColumns mright toks hints =
-  let end = case reverse toks of
-        t : _ -> tkCol t + T.length (tkText t)
-        [] -> 0
+  let end = maybe 0 (\(_, t) -> tkCol t + T.length (tkText t)) (unsnoc toks)
       total = sum (map (T.length . fst) hints) + 3 * (length hints - 1)
       natural = end + 3
       right = fromMaybe maxBound mright
@@ -340,9 +341,9 @@ codeView cv mm cfg = do
         l <- hoverLine
         let dx = v2X mouse - rectX prev - gutterW
             i = floor (dx / laneW)
-        if inside && dx >= 0 && v2X mouse < rectX prev + codeLeft && i >= 0 && i < length (ccLanes cfg)
-          then listToMaybe [b | b <- ccBars cfg l, lnLane b == ccLanes cfg !! i]
-          else Nothing
+        guard (inside && dx >= 0 && v2X mouse < rectX prev + codeLeft)
+        lane <- ccLanes cfg !? i
+        listToMaybe [b | b <- ccBars cfg l, lnLane b == lane]
       noteRef = case hoverHint of
         Just (_, (_, _, (_, r))) -> r
         Nothing -> hoverBar >>= lnRef
@@ -384,7 +385,7 @@ codeView cv mm cfg = do
             let ly = lineY l
                 mid = ly + lh / 2
                 toks = toksOf l
-            drawTextWith (mmFont mm) (V2 (x + gutterW - 8) mid) AlignEnd AlignMiddle (T.pack (show (l + 1))) (pMuted pal)
+            drawTextWith (mmFont mm) (V2 (x + gutterW - 8) mid) AlignEnd AlignMiddle (tshow (l + 1)) (pMuted pal)
             for_ (ccGutter cfg l) $ \case
               MarkBreakpoint -> drawCircle (V2 (x + 8) mid) 5 (pBlocked pal)
               MarkCandidate -> drawCircle (V2 (x + 8) mid) 2 (alpha 0.5 (pMuted pal))
@@ -471,7 +472,7 @@ data Colouring
   | BoxingColours
     -- ^ Only what the optimiser did: boxing sites in orange, unboxed values
     -- and primops in green, everything else plain.
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Show, Enum, Bounded)
 
 colouringName :: Colouring -> Text
 colouringName = \case

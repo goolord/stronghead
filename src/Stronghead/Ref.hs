@@ -17,16 +17,17 @@ module Stronghead.Ref
   , parseRefTarget
   ) where
 
+import Control.Monad (guard, (<=<))
 import Data.ByteString qualified as B
-import Data.Char (chr, digitToInt, isAlphaNum, isAscii, isHexDigit, ord)
+import Data.Char (digitToInt, isAlphaNum, isAscii, isHexDigit, ord)
+import Data.Either.Extra (eitherToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
-import Data.Text.Read qualified as TR
 import Data.Word (Word32, Word64)
-import Numeric (showHex)
+
 import Stronghead.Debug.Graph (ClosureId, ThunkKey (..))
-import Stronghead.Format (tshow)
+import Stronghead.Format (fmtHex, percentEncodeWhere, readDecimal, readHex, tshow)
 import Stronghead.Run (RunKey (..))
 import Stronghead.Source (SrcSpan (..))
 
@@ -52,7 +53,7 @@ data Ref
   | RThunkGroup !ThunkKey
   | RBreakpoint !FilePath !Int
   | RModule !Text
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | @thread/stronghead-sample:4242/12@.
 refTarget :: Ref -> Text
@@ -67,73 +68,57 @@ refTarget ref = T.intercalate "/" $ case ref of
   RBinding m k -> ["binding", escape m, escape k]
   RCostCentre m l -> ["cc", escape m, escape l]
   RBand b -> ["band", escape b]
-  RInfoTable a -> ["info", hex a]
-  RClosure sn a -> ["closure", tshow sn, hex a]
+  RInfoTable a -> ["info", fmtHex a]
+  RClosure sn a -> ["closure", tshow sn, fmtHex a]
   -- "~" never comes out of 'escape', so it can stand for a missing source.
   RThunkGroup (ThunkKey name src path) -> ["thunks", escape name, maybe "~" escape src] ++ map escape path
   RBreakpoint f l -> ["break", escape (T.pack f), tshow l]
   RModule m -> ["module", escape m]
   where
     run (RunKey k) = escape k
-    hex a = T.pack ("0x" <> showHex a "")
 
 parseRefTarget :: Text -> Maybe Ref
 parseRefTarget t = case T.splitOn "/" (T.strip t) of
   "thunks" : name : src : path -> do
     n <- unescape name
     sr <- if src == "~" then pure Nothing else Just <$> unescape src
-    p <- mapM unescape path
+    p <- traverse unescape path
     pure (RThunkGroup (ThunkKey n sr p))
   kind : raw -> do
-    fs <- mapM unescape raw
+    fs <- traverse unescape raw
     case (kind, fs) of
-      ("thread", [r, i]) -> RThread (RunKey r) <$> num i
-      ("instant", [r, i]) -> RInstant (RunKey r) <$> num i
-      ("range", [r, a, b]) -> RRange (RunKey r) <$> num a <*> num b
-      ("collection", [r, i]) -> RCollection (RunKey r) <$> num i
-      ("census", [r, i]) -> RCensus (RunKey r) <$> num i
-      ("marker", [r, i]) -> RMarker (RunKey r) <$> num i
-      ("source", [f, l, c, el, ec]) -> fmap RSource (SrcSpan f <$> num l <*> num c <*> num el <*> num ec)
+      ("thread", [r, i]) -> RThread (RunKey r) <$> readDecimal i
+      ("instant", [r, i]) -> RInstant (RunKey r) <$> readDecimal i
+      ("range", [r, a, b]) -> RRange (RunKey r) <$> readDecimal a <*> readDecimal b
+      ("collection", [r, i]) -> RCollection (RunKey r) <$> readDecimal i
+      ("census", [r, i]) -> RCensus (RunKey r) <$> readDecimal i
+      ("marker", [r, i]) -> RMarker (RunKey r) <$> readDecimal i
+      ("source", [f, l, c, el, ec]) -> fmap RSource (SrcSpan f <$> readDecimal l <*> readDecimal c <*> readDecimal el <*> readDecimal ec)
       ("binding", [m, k]) -> Just (RBinding m k)
       ("cc", [m, l]) -> Just (RCostCentre m l)
       ("band", [b]) -> Just (RBand b)
-      ("info", [a]) -> RInfoTable <$> hex a
-      ("closure", [sn, a]) -> RClosure <$> num sn <*> hex a
-      ("break", [f, l]) -> RBreakpoint (T.unpack f) <$> num l
+      ("info", [a]) -> RInfoTable <$> readHex a
+      ("closure", [sn, a]) -> RClosure <$> readDecimal sn <*> readHex a
+      ("break", [f, l]) -> RBreakpoint (T.unpack f) <$> readDecimal l
       ("module", [m]) -> Just (RModule m)
       _ -> Nothing
   [] -> Nothing
-  where
-    num :: (Integral a) => Text -> Maybe a
-    num s = case TR.decimal s of
-      Right (n, "") -> Just n
-      _ -> Nothing
-    hex s = case T.stripPrefix "0x" s of
-      Just h | Right (n, "") <- TR.hexadecimal h -> Just n
-      _ -> Nothing
 
 -- | Percent-encode the UTF-8 bytes of everything but ASCII letters, digits
 -- and @-_.:@, so a field never holds the separator, whitespace or @~@.
 escape :: Text -> Text
-escape = T.pack . concatMap byte . B.unpack . TE.encodeUtf8
-  where
-    byte w
-      | isAscii c && isAlphaNum c || c `elem` ("-_.:" :: String) = [c]
-      | otherwise = '%' : hexDigit (w `div` 16) : [hexDigit (w `mod` 16)]
-      where
-        c = chr (fromIntegral w)
-    hexDigit d = "0123456789ABCDEF" !! fromIntegral d
+escape = percentEncodeWhere (\c -> isAscii c && isAlphaNum c || c `elem` ("-_.:" :: String))
 
 unescape :: Text -> Maybe Text
-unescape s = do
-  bytes <- go (T.unpack s)
-  either (const Nothing) Just (TE.decodeUtf8' (B.pack bytes))
+unescape = eitherToMaybe . TE.decodeUtf8' . B.pack <=< go
   where
-    go = \case
-      [] -> Just []
-      '%' : a : b : rest
-        | isHexDigit a, isHexDigit b -> (fromIntegral (digitToInt a * 16 + digitToInt b) :) <$> go rest
-        | otherwise -> Nothing
-      c : rest
-        | c /= '%', isAscii c -> (fromIntegral (ord c) :) <$> go rest
-        | otherwise -> Nothing
+    go s = case T.uncons s of
+      Nothing -> Just []
+      Just ('%', r1) -> do
+        (a, r2) <- T.uncons r1
+        (b, rest) <- T.uncons r2
+        guard (isHexDigit a && isHexDigit b)
+        (fromIntegral (digitToInt a * 16 + digitToInt b) :) <$> go rest
+      Just (c, rest) -> do
+        guard (isAscii c)
+        (fromIntegral (ord c) :) <$> go rest

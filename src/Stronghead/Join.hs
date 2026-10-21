@@ -51,27 +51,32 @@ module Stronghead.Join
   , closuresBySource
   ) where
 
-import Data.Char (isDigit, isUpper)
+import Control.Applicative (empty)
+import Data.Char (isUpper)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
-import Data.List (groupBy, sortOn)
+import Data.List (sortOn)
+import Data.List.Extra (groupOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (isJust, listToMaybe)
+import Data.Maybe (fromMaybe, isJust, listToMaybe)
 import Data.Ord (Down (..))
+import Data.Void (Void)
+import Data.Word (Word64)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
-import Data.Word (Word64)
+import Text.Megaparsec (Parsec, between, chunk, eof, many, optional, parseMaybe, takeWhile1P)
+import Text.Megaparsec.Char (char, hspace)
+
 import Stronghead.Debug.Graph (ClosureId, ClosureNode (..), HeapSnapshot (..), NodeKind (..))
 import Stronghead.Dump (CodeFile (..), TokKind (..), Token (..), lineTokens)
+import Stronghead.Format (readDecimal, readHex, tshow)
 import Stronghead.HeapProfile (Band (..), BandKind (..), InfoProv (..))
 import Stronghead.Prof (CostCentre (..), flattenCC)
 import Stronghead.Ref (Ref)
-import Stronghead.Source (SrcLoc (..), SrcSpan (..), parseSrcLoc, pathComponents, srcLocSpan)
-import System.FilePath (takeFileName)
+import Stronghead.Source (SrcLoc (..), SrcSpan (..), parseSrcLoc, pathComponents, shortFileName, srcLocSpan)
 
 -- ---------------------------------------------------------------------------
 -- Spans
@@ -118,7 +123,7 @@ data Lane
     -- ^ No bar: only the trailing note (a binding's badges).
   | LaneMark !Mark
     -- ^ No bar: a gutter mark.
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 laneName :: Lane -> Text
 laneName = \case
@@ -134,12 +139,12 @@ laneName = \case
 -- | Ordered by precedence: a breakpoint shows over the stop, the stop over
 -- a candidate line.
 data Mark = CandidateMark | StopMark | BreakMark
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | How a bar is coloured. Bars are ink; only thunks and survivors get a
 -- signal colour.
 data Shade = ShadeInk | ShadeThunk | ShadeSurvivor
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 data Annotation = Annotation
   { anSpan :: !(Maybe SrcSpan)
@@ -157,7 +162,7 @@ data Annotation = Annotation
   , anRef :: !(Maybe Ref)
     -- ^ The entity it came from, which clicking it reveals.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | An annotation at a span.
 annotationAt :: SrcSpan -> Lane -> Double -> Text -> Maybe Ref -> Annotation
@@ -175,7 +180,7 @@ lineOwners :: [(Int, Int, a)] -> IntMap [a]
 lineOwners ranges = snd (foldl' step (IS.empty, IM.empty) groups)
   where
     size (a, b, _) = b - a
-    groups = groupBy (\x y -> size x == size y) (sortOn size [(a, max a b, v) | (a, b, v) <- ranges])
+    groups = groupOn size (sortOn size [(a, max a b, v) | (a, b, v) <- ranges])
     step (claimed, acc) grp =
       let own = [(l, [v]) | (a, b, v) <- grp, l <- [a .. b], not (IS.member l claimed)]
        in ( IS.union claimed (IS.fromList (map fst own))
@@ -199,7 +204,15 @@ data CostTotal = CostTotal
     -- count twice.
   , ctInhAlloc :: !Double
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
+
+instance Semigroup CostTotal where
+  a <> b =
+    a
+      { ctEntries = ctEntries a + ctEntries b
+      , ctTime = ctTime a + ctTime b
+      , ctAlloc = ctAlloc a + ctAlloc b
+      }
 
 -- | Every cost centre of a @.prof@ tree, by module, name and source, with
 -- its costs summed. Most expensive first.
@@ -209,17 +222,11 @@ costTotals roots =
     M.intersectionWith (\t (it, ia) -> t {ctInhTime = it, ctInhAlloc = ia}) individual inherited
   where
     key c = (ccModule c, ccName c, ccSrc c)
-    individual = M.fromListWith merge [(key c, CostTotal (ccModule c) (ccName c) (ccLoc c) (ccEntries c) (ccTime c) (ccAlloc c) 0 0) | (_, c) <- flattenCC roots]
+    individual = M.fromListWith (<>) [(key c, CostTotal (ccModule c) (ccName c) (ccLoc c) (ccEntries c) (ccTime c) (ccAlloc c) 0 0) | (_, c) <- flattenCC roots]
     inherited = M.fromListWith (\(a, b) (c, d) -> (a + c, b + d)) [(key c, (ccInhTime c, ccInhAlloc c)) | c <- concatMap (outermost []) roots]
     -- Inherited costs already include every nested occurrence of the same
     -- cost centre, so only the outermost of each nest counts.
     outermost seen c = [c | key c `notElem` seen] ++ concatMap (outermost (key c : seen)) (ccChildren c)
-    merge a b =
-      a
-        { ctEntries = ctEntries a + ctEntries b
-        , ctTime = ctTime a + ctTime b
-        , ctAlloc = ctAlloc a + ctAlloc b
-        }
 
 -- | A cost-centre band's frames, innermost first: @(12)leaf/go/MAIN@ is
 -- @leaf@, @go@, @MAIN@.
@@ -251,15 +258,16 @@ data TableName
   | TableOfCon !Text !Text !Int
     -- ^ @I#_Main_3_con_info@: constructor @I#@, module @Main@, site 3, from
     -- @-fdistinct-constructor-tables@.
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 parseTableName :: Text -> Maybe TableName
 parseTableName t
   | Just rest <- T.stripSuffix "_con_info" t =
       case reverse (T.splitOn "_" rest) of
-        n : modu : con@(_ : _)
-          | not (T.null n), T.all isDigit n, not (T.null modu) ->
-              Just (TableOfCon (T.intercalate "_" (reverse con)) modu (read (T.unpack n)))
+        nTxt : modu : con@(_ : _)
+          | not (T.null modu)
+          , Just n <- readDecimal nTxt ->
+              Just (TableOfCon (T.intercalate "_" (reverse con)) modu n)
         _ -> Nothing
   | Just binder <- T.stripSuffix "_info" t, not (T.null binder) = Just (TableOfBinder binder)
   | otherwise = Nothing
@@ -276,7 +284,7 @@ data StgSites = StgSites
   , sgNotes :: ![(SrcSpan, Int)]
     -- ^ @src<file:line:col>@ notes, and the line each is on.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Scan an STG dump once. A binder's line is the first line it starts:
 -- STG binds before it uses, in @let@s and in @case@ alternatives alike.
@@ -285,14 +293,14 @@ stgSites cf =
   StgSites
     { sgModule = cfModule cf
     , sgBinders = M.fromListWith min [(tkText t, i) | (i, t : _) <- lineToks, tkKind t == TkIdent]
-    , sgCons = M.fromListWith min [((lastSeg (tkText c), read (T.unpack (tkText n))), i) | (i, ts) <- lineToks, (n, c) <- numberedCons ts]
+    , sgCons = M.fromListWith min [((lastSeg (tkText c), k), i) | (i, ts) <- lineToks, (k, c) <- numberedCons ts]
     , sgNotes = [(sp, i) | i <- [0 .. V.length (cfLines cf) - 1], sp <- notes (cfLines cf V.! i)]
     }
   where
     lineToks = [(i, filter ((/= TkSpace) . tkKind) (lineTokens cf i)) | i <- [0 .. V.length (cfLines cf) - 1]]
-    numberedCons ts = [(n, c) | (n, c) <- zip ts (drop 1 ts), tkKind n == TkNumber, T.all isDigit (tkText n), tkKind c == TkCon]
+    numberedCons ts = [(k, c) | (n, c) <- zip ts (drop 1 ts), tkKind n == TkNumber, Just k <- [readDecimal (tkText n)], tkKind c == TkCon]
     lastSeg w = case T.breakOnEnd "." w of
-      (_, s) | not (T.null s), isUpper (T.head s) || T.head s == '(' -> s
+      (_, s) | Just (c, _) <- T.uncons s, isUpper c || c == '(' -> s
       _ -> w
     notes l = case T.breakOn "src<" l of
       (_, rest) | T.null rest -> []
@@ -333,37 +341,31 @@ data TickyName = TickyName
   , tnParent :: !(Maybe Text)
     -- ^ The unique of the closure it is defined in.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 parseTickyName :: Text -> Maybe TickyName
-parseTickyName raw = do
-  let (name, open) = T.breakOn "{" (T.strip raw)
-      (braces, close) = T.breakOn "}" (T.drop 1 open)
-  if T.null name || T.null close then Nothing else Just ()
-  unique <- case T.words braces of
-    ["v"] -> Just Nothing
-    ["v", u] -> Just (Just u)
-    _ -> Nothing
-  let (groups, rest) = parenGroups (T.drop 1 close)
-      (mods, flagGroups) = span (maybe False (isUpper . fst) . T.uncons) groups
-      modName = case mods of
-        m : _ -> m
-        [] -> maybe "" fst (qualifierOf name)
-  pure
-    TickyName
-      { tnName = name
-      , tnUnique = unique
-      , tnModule = modName
-      , tnFlags = concatMap (map T.strip . T.splitOn ",") flagGroups
-      , tnParent = T.strip <$> T.stripPrefix "in " rest
-      }
+parseTickyName = parseMaybe (hspace *> pTicky <* eof) . T.strip
   where
-    parenGroups t = case T.stripPrefix "(" (T.stripStart t) of
-      Just r ->
-        let (g, r') = T.breakOn ")" r
-            (gs, rest) = parenGroups (T.drop 1 r')
-         in (g : gs, rest)
-      Nothing -> ([], T.strip t)
+    pTicky :: Parsec Void Text TickyName
+    pTicky = do
+      name <- T.strip <$> takeWhile1P Nothing (\c -> c /= '{' && c /= ' ')
+      braces <- between (char '{') (char '}') (takeWhile1P Nothing (/= '}')) <* hspace
+      unique <- case T.words braces of
+        ["v"] -> pure Nothing
+        ["v", u] -> pure (Just u)
+        _ -> empty
+      groups <- many (between (char '(') (char ')') (takeWhile1P Nothing (/= ')')) <* hspace)
+      parent <- optional (chunk "in " *> (T.strip <$> takeWhile1P Nothing (const True)))
+      let (mods, flagGroups) = span (maybe False (isUpper . fst) . T.uncons) groups
+          modName = fromMaybe (maybe "" fst (qualifierOf name)) (listToMaybe mods)
+      pure
+        TickyName
+          { tnName = name
+          , tnUnique = unique
+          , tnModule = modName
+          , tnFlags = concatMap (map T.strip . T.splitOn ",") flagGroups
+          , tnParent = parent
+          }
 
 -- | A qualified name's module and the rest: @Main.main2@ is @Main@ and
 -- @main2@. The top-level @:Main.main@ GHC adds counts too.
@@ -419,11 +421,9 @@ bandTitle b = case bandProv b of
             KindUnknown -> "closure"
         inLabel = if T.null (ipLabel ip) then "" else " in " <> ipLabel ip
         at = case srcLocSpan (ipSrc ip) of
-          Just sp -> " (" <> T.pack (takeFileName (map slash (T.unpack (ssFile sp)))) <> ":" <> T.pack (show (ssLine sp)) <> ")"
+          Just sp -> " (" <> shortFileName (ssFile sp) <> ":" <> tshow (ssLine sp) <> ")"
           Nothing -> if T.null (ipModule ip) then "" else " (" <> ipModule ip <> ")"
      in what <> inLabel <> at
-  where
-    slash c = if c == '\\' then '/' else c
 
 -- | Whether a closure from a ghc-debug snapshot belongs to a heap band:
 -- by source span for an info-table band (exact for its code, though not
@@ -441,13 +441,11 @@ closureMatchesBand b n = case bandProv b of
 
 -- | An info-table band's table: @-hi@ names its bands by the address.
 bandInfoTable :: Band -> Maybe Word64
-bandInfoTable b = case T.stripPrefix "0x" (bandName b) of
-  Just h | Right (n, "") <- TR.hexadecimal h -> Just n
-  _ -> Nothing
+bandInfoTable = readHex . bandName
 
 -- | How a band was matched to closures.
 data BandMatch = ByInfoTable | BySource | ByName
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 bandMatchName :: BandMatch -> Text
 bandMatchName = \case
@@ -475,7 +473,7 @@ data SourceGroup = SourceGroup
   , sgSample :: !ClosureId
     -- ^ The biggest closure, to reveal.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Group a snapshot's closures by their source (built with
 -- @-finfo-table-map@), given the surviving thunks. Biggest first.

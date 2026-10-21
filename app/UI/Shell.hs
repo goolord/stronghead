@@ -30,28 +30,39 @@ module UI.Shell
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (forM, forM_, unless, void, when)
+import Control.Exception (IOException, try)
+import Control.Monad (forM_, unless, void, when)
+import Control.Monad.Extra (anyM, concatMapM)
+import Data.Bifunctor (first)
 import Data.Char (intToDigit)
+import Data.Containers.ListUtils (nubOrd)
+import Data.Either (isRight)
+import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (isSuffixOf, nub)
+import Data.List (isSuffixOf)
+import Data.List.Extra (chunksOf)
 import Data.Map.Strict qualified as M
-import Data.Either (isRight)
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Sequence qualified as Seq
+import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
 import Data.Word (Word64)
+import System.Directory (doesDirectoryExist, doesFileExist, makeAbsolute)
+import System.FilePath (takeDirectory, takeExtension, takeFileName, (</>))
+
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askSaveFileDialog, askSdlEnv, defaultFileDialogOptions, setSdlUiScale, useFileDialog, windowZoom)
 import NanoUI.Shortcut qualified as K
+
 import Stronghead.Attach (AttachKind (..), AttachStep (..))
 import Stronghead.Debug (DebugTarget (..), ghcDebugEnabled)
 import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
 import Stronghead.Dump (ModuleArtifacts (..), kindForPath)
-import Stronghead.Eventlog.Model (Timeline (..), summarize)
 import Stronghead.Eventlog (LoadProgress (..))
+import Stronghead.Eventlog.Model (Timeline (..), summarize)
 import Stronghead.Format (fmtBytes, fmtNs, tshow)
 import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Live (AgentInfo (..), Frame (..))
@@ -61,10 +72,6 @@ import Stronghead.Ref (Ref (..), RunKey, parseRefTarget)
 import Stronghead.Run (RunInfo (..), emptyRunInfo, mergeRunInfo, runFromArgs, runFromHello, runFromProfHeader, runFromSocket, runKey)
 import Stronghead.Session (Session (..), decodeSession, encodeSession, sessionExtension)
 import Stronghead.TextFile (readTextFile, saveTextFile)
-import Control.Exception (IOException, try)
-import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
-import System.Directory (doesDirectoryExist, doesFileExist, makeAbsolute)
-import System.FilePath (takeDirectory, takeExtension, takeFileName, (</>))
 import UI.Baseline
 import UI.Clock (confirmMoments)
 import UI.Code (colouringName)
@@ -258,7 +265,7 @@ newApp settings Options {..} = do
       then do
         path <- lastSessionPath
         exists <- doesFileExist path
-        if exists then either (const Nothing) Just <$> readSession path else pure Nothing
+        if exists then eitherToMaybe <$> readSession path else pure Nothing
       else pure Nothing
   appPendingSession <- newVar lastSession
   pure App {..}
@@ -409,16 +416,15 @@ appView app = do
   baseline <- baselineLoad (appBaseline app) dumpRoot
   heapShown <- heapOnShow (appHeap app) heap logProfile
   snapshots <- snapshotCount (appHeap app)
-  let isRight' = maybe False isRight
-      have =
+  let have =
         Have
           { haveTimeline = isJust logTl
           , haveHeapCensus = maybe False (not . VU.null . hpTimes) heapShown
           , haveHeapSource = maybe False ((== "info table") . hpBreakdown) heapShown
-          , haveCostCentres = isRight' (taskOutcome (hlProf heap))
+          , haveCostCentres = any isRight (taskOutcome (hlProf heap))
           , haveSamples = maybe False (not . V.null . tlProfSamples) logTl
           , haveTicky = maybe False (not . V.null . tlTicky) logTl
-          , haveDumps = any isRight' [clCore core, clStg core]
+          , haveDumps = any (any isRight) [clCore core, clStg core]
           , haveAgent = isNothing (commandsWhy live)
           , haveLiveGraph = isRight (dhSnapshot hooks)
           , haveSnapshots = snapshots
@@ -495,9 +501,9 @@ appView app = do
           { bnDraw = \wb own -> do
               tree <- readVar (wbTree wb)
               let kinds = maybe [] treeKinds tree
-                  others = nub [q | k <- foreignKinds tree, Just pk <- [paneKind k], Just q <- [pkPanel pk]]
+                  others = nubOrd [q | k <- foreignKinds tree, Just pk <- [paneKind k], Just q <- [pkPanel pk]]
               ownDraw <- own kinds
-              theirs <- mapM (`providers` kinds) others
+              theirs <- traverse (`providers` kinds) others
               workspace (benchPlaces app) (appPopped app) wb (foldr orPanes shellPanes (ownDraw : theirs))
           , bnMixed = \wb -> not . null . foreignKinds <$> readVar (wbTree wb)
           }
@@ -584,7 +590,7 @@ history env = rowWith (alignMid . tight . gap 2) $ do
 -- and Esc to drop the focus.
 navShortcuts :: App -> Env -> NanoUI ()
 navShortcuts app env = do
-  let pressed = fmap or . mapM shortcut
+  let pressed = anyM shortcut
       digit n = K.cmdOrCtrl <> K.key (intToDigit n)
   whenM (pressed [K.cmdOrCtrl <> K.key 'k']) (openPalette (appPalette app))
   inp <- askInput
@@ -671,7 +677,7 @@ panesPopover app active anchor = do
         labelWith (fontMedium . fontSizeScale 1.05) ("Panes in " <> panelTitle active)
         hint "Add a pane beside the others, then drag its header to place it. Its ⋯ menu moves it to another panel or pops it out."
         rowWith (fillW . tight . gap 16) $
-          forM_ (zip [0 :: Int ..] (chunk 3 groups)) $ \(ci, col) -> withKey ci $
+          forM_ (zip [0 :: Int ..] (chunksOf (max 1 ((length groups + 2) `div` 3)) groups)) $ \(ci, col) -> withKey ci $
             columnWith (fillW . tight . gap 2 . alignTop) $
               forM_ col $ \(title, ks) -> withKey title $ do
                 labelWith (fontMuted . fontSizeScale 0.85 . padTop 6) title
@@ -703,10 +709,6 @@ panesPopover app active anchor = do
           whenM (buttonWith (padXY 8 2 . tight) "Open session…") (askOpenSession app >> close)
         sessionPath <- readVar (appSessionPath app)
         hint (maybe "A session keeps what is open, the connections, the pins, the cursor, the focus and every arrangement." (\p -> "This session: " <> T.pack p) sessionPath)
-  where
-    chunk n xs = case splitAt (max 1 ((length xs + n - 1) `div` n)) xs of
-      (a, []) -> [a]
-      (a, rest) -> a : chunk (n - 1) rest
 
 -- | Panes popped out of a workbench, each in a floating window. Closing
 -- the window puts the pane back where it came from.
@@ -783,7 +785,7 @@ currentSession app = do
   cursor <- readVarIO (busCursor bus)
   range <- readVarIO (busRange bus)
   focus <- readVarIO (busFocus bus)
-  layouts <- mapM (\wb -> (wbName wb,) . maybe "-" encodeTree <$> readVarIO (wbTree wb)) (allBenches app)
+  layouts <- traverse (\wb -> (wbName wb,) . maybe "-" encodeTree <$> readVarIO (wbTree wb)) (allBenches app)
   presets <- readVarIO (appPresets app)
   popped <- readVarIO (appPopped app)
   watchers <- readVarIO (wrRules (appWatchers app))
@@ -827,10 +829,8 @@ writeSession path s = saveTextFile "the session" path (encodeSession s)
 
 readSession :: FilePath -> IO (Either T.Text Session)
 readSession path = do
-  r <- try (readTextFile path)
-  pure $ case r of
-    Left (e :: IOException) -> Left ("Could not read the session: " <> T.pack (show e))
-    Right txt -> decodeSession txt
+  r <- try @IOException (readTextFile path)
+  pure (first (\e -> "Could not read the session: " <> tshow e) r >>= decodeSession)
 
 -- | Save the session as it stands to where quitting keeps it. Call once the
 -- window has closed.
@@ -886,12 +886,16 @@ applySession app Session {..} = do
   writeVar (busCursor bus) sesCursor
   writeVar (busRange bus) sesRange
   writeVar (busFocus bus) sesFocus
-  bad <- fmap concat . forM (allBenches app) $ \wb -> case lookup (wbName wb) sesLayouts of
-    Nothing -> pure []
-    Just "-" -> [] <$ writeVar (wbTree wb) Nothing
-    Just t -> case decodeTree t of
-      Right tree -> [] <$ writeVar (wbTree wb) (Just tree)
-      Left e -> pure [wbName wb <> ": " <> e]
+  bad <-
+    concatMapM
+      ( \wb -> case lookup (wbName wb) sesLayouts of
+          Nothing -> pure []
+          Just "-" -> [] <$ writeVar (wbTree wb) Nothing
+          Just t -> case decodeTree t of
+            Right tree -> [] <$ writeVar (wbTree wb) (Just tree)
+            Left e -> pure [wbName wb <> ": " <> e]
+      )
+      (allBenches app)
   let presets = [Preset n t | (n, src) <- sesPresets, Right t <- [decodeTree src]]
   unless (null sesPresets) (writeVar (appPresets app) presets)
   writeVar (appPopped app) [Popped (pkId k) (T.strip from) | p <- sesPopped, let (key, from) = T.breakOn " " p, Just k <- [paneKindNamed key]]
@@ -1150,7 +1154,7 @@ sourcesOf app timeline heap core live links = do
         let key = runKey ri
          in Source kind detail (linkRun links ri) key (M.member key links) panel ds
       bySource hp = if hpBreakdown hp == "info table" then [DHeapCensus, DHeapSource] else [DHeapCensus]
-      ok = (>>= either (const Nothing) Just) . taskOutcome
+      ok = (>>= eitherToMaybe) . taskOutcome
   pure $
     concat
       [ [ source "Eventlog" (maybe "" T.pack logPath) (tlRun t) PTimeline (DTimeline : maybe [] bySource (tlHeapProfile t))
@@ -1195,7 +1199,7 @@ openSettings = [K.cmdOrCtrl <> K.key ',']
 -- | The window-wide chords: open Settings, and step the interface scale.
 settingsShortcuts :: App -> NanoUI ()
 settingsShortcuts app = do
-  let pressed = fmap or . mapM shortcut
+  let pressed = anyM shortcut
   whenM (pressed openSettings) (writeVar (appSettingsOpen app) True)
   bigger <- pressed zoomIn
   smaller <- pressed zoomOut

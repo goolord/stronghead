@@ -23,24 +23,28 @@ module Main (main) where
 
 import Control.Monad (when)
 import Data.Maybe (fromMaybe, isNothing)
+import System.Environment (lookupEnv)
+import System.IO (stderr)
+import Text.Read (readMaybe)
+
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import NanoUI
 import NanoUI.Backend.Sdl (NanoUIFont (..), SdlOptions (..), askSdlEnv, defaultSdlOptions, runSdlApp, saveScreenshot)
-import System.Environment (getArgs, lookupEnv)
-import System.IO (stderr)
-import Text.Read (readMaybe)
+import Options.Applicative qualified as Opt
+
 import UI.Common (strongheadTheme)
 import UI.Settings
 import UI.Shell
 
 main :: IO ()
 main = do
-  args <- getArgs
-  settings <- loadSettings
   capture <- lookupEnv "STRONGHEAD_CAPTURE"
-  app <- newApp settings (parseArgs args defaultOptions {optPersist = isNothing capture})
-  delay <- maybe 3 (\s -> fromMaybe 3 (readMaybe s)) <$> lookupEnv "STRONGHEAD_CAPTURE_DELAY"
+  opts <- Opt.execParser (optionsInfo (isNothing capture))
+  settings <- loadSettings
+  app <- newApp settings opts
+  delay <- maybe 3 (fromMaybe 3 . readMaybe) <$> lookupEnv "STRONGHEAD_CAPTURE_DELAY"
   started <- newVar (Nothing :: Maybe Double)
   let window = if cfgRestoreWindow settings then cfgWindow settings else Nothing
   runSdlApp
@@ -60,22 +64,32 @@ main = do
     (appView app >> maybe (pure ()) (captureAfter started delay) capture)
   -- A screenshot run leaves the user's settings and last session as they
   -- were.
-  when (isNothing capture) $ do
+  when (isNothing capture) do
     saveAppSettings app >>= either (T.hPutStrLn stderr) pure
     saveLastSession app >>= either (T.hPutStrLn stderr) pure
 
-parseArgs :: [String] -> Options -> Options
-parseArgs args o = case args of
-  "--tab" : name : rest -> parseArgs rest o {optTab = Just (T.toLower (T.pack name))}
-  "--connect" : addr : rest ->
-    let (host, port) = T.breakOnEnd ":" (T.pack addr)
-     in parseArgs rest o {optConnect = Just (if T.null host then ("127.0.0.1", port) else (T.dropEnd 1 host, port))}
-  "--follow" : f : rest -> parseArgs rest o {optFollow = Just f}
-  "--debug" : f : rest -> parseArgs rest o {optDebug = Just f}
-  "--goto" : r : rest -> parseArgs rest o {optGoto = Just (T.pack r)}
-  "--mark" : m : rest -> parseArgs rest o {optMark = Just (T.pack m)}
-  f : rest -> parseArgs rest o {optFiles = optFiles o ++ [f]}
-  [] -> o
+optionsInfo :: Bool -> Opt.ParserInfo Options
+optionsInfo persist =
+  Opt.info
+    (optionsParser persist Opt.<**> Opt.helper)
+    (Opt.fullDesc <> Opt.progDesc "A live debugger and profiler GUI for GHC programs")
+
+optionsParser :: Bool -> Opt.Parser Options
+optionsParser persist =
+  Options
+    <$> Opt.many (Opt.strArgument (Opt.metavar "FILE|DIR..."))
+    <*> Opt.optional (T.toLower <$> Opt.strOption (Opt.long "tab" <> Opt.metavar "NAME" <> Opt.help "Starting panel (timeline, heap, core, debugger, live)"))
+    <*> Opt.optional (parseConnect <$> Opt.strOption (Opt.long "connect" <> Opt.metavar "HOST:PORT" <> Opt.help "Connect Live panel to an agent"))
+    <*> Opt.optional (Opt.strOption (Opt.long "follow" <> Opt.metavar "FILE.eventlog" <> Opt.help "Follow an eventlog as it is written"))
+    <*> Opt.optional (Opt.strOption (Opt.long "debug" <> Opt.metavar "MODULE.hs" <> Opt.help "Start a GHCi session on a module"))
+    <*> Opt.optional (Opt.strOption (Opt.long "goto" <> Opt.metavar "REF" <> Opt.help "Open an entity by its reference"))
+    <*> Opt.optional (Opt.strOption (Opt.long "mark" <> Opt.metavar "TEXT" <> Opt.help "Send a mark to the connected program"))
+    <*> pure persist
+  where
+    parseConnect :: Text -> (Text, Text)
+    parseConnect addr =
+      let (host, port) = T.breakOnEnd ":" addr
+       in if T.null host then ("127.0.0.1", port) else (T.dropEnd 1 host, port)
 
 -- | Save a screenshot once the window has been up for a while, then quit.
 captureAfter :: Var (Maybe Double) -> Double -> FilePath -> NanoUI ()

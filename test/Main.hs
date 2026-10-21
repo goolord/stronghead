@@ -7,12 +7,14 @@ import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forever, unless, void)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as BC
+import Data.Either (fromRight, isLeft)
+import Data.Foldable (for_)
 import Data.IORef
 import Data.IntMap.Strict qualified as IM
+import Data.List ((!?))
 import Data.Map.Strict qualified as M
-import Data.Text (Text)
-import Data.Either (isLeft)
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
+import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
@@ -89,8 +91,8 @@ main = do
       let flat = flattenCC (pfRoots pf)
       check "five cost centres" (length flat == 5)
       check "nesting from indentation" (map fst flat == [0, 1, 2, 1, 1])
-      check "a source with spaces keeps the columns after it" (ccTime (snd (flat !! 4)) == 0.2 && ccNo (snd (flat !! 4)) == 5)
-      check "inherited time parsed" (ccInhTime (snd (flat !! 2)) == 60.5)
+      check "a source with spaces keeps the columns after it" (fmap (ccTime . snd) (flat !? 4) == Just 0.2 && fmap (ccNo . snd) (flat !? 4) == Just 5)
+      check "inherited time parsed" (fmap (ccInhTime . snd) (flat !? 2) == Just 60.5)
       check "cost-centre spans parsed" $
         map (ccLoc . snd) flat
           == [SrcBuiltIn, SrcAt (SrcSpan "Main.hs" 9 1 9 20), SrcAt (SrcSpan "Main.hs" 5 1 5 20), SrcEntireModule, SrcNoLocation]
@@ -207,9 +209,9 @@ main = do
   writeFile (dir </> "prog.eventlog") ""
   steps <- probeAttach "prog.exe" 42 v2 {aiCwd = T.pack dir} True (pure [dir </> "42-prog"])
   check "probe finds the eventlog" (map asPath steps == [Just (dir </> "prog.eventlog"), Nothing, Just (dir </> "42-prog"), Just dir, Nothing])
-  check "probe says what it skipped" ("isn't there" `T.isInfixOf` asNote (steps !! 1) && "no dumps" `T.isInfixOf` asNote (steps !! 4))
+  check "probe says what it skipped" (maybe False (("isn't there" `T.isInfixOf`) . asNote) (steps !? 1) && maybe False (("no dumps" `T.isInfixOf`) . asNote) (steps !? 4))
   away <- probeAttach "prog" 42 v2 {aiCwd = "/no/such/place"} False (pure [])
-  check "a directory elsewhere is skipped" (all (isNothing . asPath) away && "ghc-debug support" `T.isInfixOf` asNote (away !! 2))
+  check "a directory elsewhere is skipped" (all (isNothing . asPath) away && maybe False (("ghc-debug support" `T.isInfixOf`) . asNote) (away !? 2))
   removeDirectoryRecursive dir
 
   putStrLn "agent"
@@ -257,7 +259,7 @@ main = do
       woken tid = [M.lookup tid (tlThreads sched) >>= (`wokenBy` s) | s <- blockedSpans tid]
   check "every wakeup is recorded" (fmap (VU.length . tiWakeups) (M.lookup 2 (tlThreads sched)) == Just 2)
   check "the waker runs on the posting capability" (woken 2 == [Just (150, 1), Just (180, 3)])
-  check "a wakeup on the same capability names its waker too" (woken 2 !! 1 == Just (180, 3))
+  check "a wakeup on the same capability names its waker too" (woken 2 !? 1 == Just (Just (180, 3)))
   check "only cross-capability wakeups are track points" $
     map (VU.toList . VU.map (\(t, _, _) -> t)) (V.toList (tlCapPoints sched)) == [[150], []]
   check "a running span has no waker" $
@@ -723,7 +725,7 @@ main = do
     decodeRule "nonsense n=3" == Nothing && fmap ruTrigger (decodeRule "live-up on=true") == Just (LiveUp 5)
   check "saved rules replace the built-in ones by kind, in their order" $
     map (triggerName . ruTrigger) (setRules [on (Rule (BandGrowing 9) False [] 0 0)]) == map (triggerName . ruTrigger) defaultRules
-      && ruTrigger (setRules [on (Rule (BandGrowing 9) False [] 0 0)] !! 3) == BandGrowing 9
+      && fmap ruTrigger (setRules [on (Rule (BandGrowing 9) False [] 0 0)] !? 3) == Just (BandGrowing 9)
   let stats m = M.fromList m
       f0 = Frame 0 1000000000 True (stats [("cpu_ns", 1e9), ("gc_cpu_ns", 2e8), ("major_gcs", 3), ("gc_gen", 0), ("gc_live_bytes", 1e6)]) [LiveThread 1 "running" "main" Nothing]
       f1 = Frame 0.25 1250000000 True (stats [("cpu_ns", 2e9), ("gc_cpu_ns", 8e8), ("major_gcs", 4), ("gc_gen", 1), ("gc_live_bytes", 2e6)]) [LiveThread 1 "BlockedOnMVar" "main" Nothing]
@@ -763,7 +765,7 @@ main = do
   let ct m n t a = CostTotal m n SrcNoLocation 1 t a t a
       costs = diffCosts [ct "Main" "go" 60 50, ct "Main" "same" 5 5, ct "Main" "gone" 3 1] [ct "Main" "go" 10 5, ct "Main" "same" 5 5, ct "Main" "new" 2 2]
   check "cost centres matched by module and name, biggest change first" $
-    map cgName costs == ["go", "gone", "new", "same"] && isNothing (cgCur (costs !! 1)) && isNothing (cgBase (costs !! 2))
+    map cgName costs == ["go", "gone", "new", "same"] && maybe False (isNothing . cgCur) (costs !? 1) && maybe False (isNothing . cgBase) (costs !? 2)
   let bsum k w b l sz = BindingSummary "Main" k w b l sz
       bindings = diffBindings [bsum "go" False 2 3 (Just 40), bsum "same" False 0 1 (Just 5), bsum "gone" False 0 0 Nothing] [bsum "go" True 0 3 (Just 12), bsum "same" False 0 1 (Just 5), bsum "fresh" False 0 0 Nothing]
   check "bindings whose badges changed, in words" $
@@ -1047,7 +1049,7 @@ agentChecks check = do
   check "v2 agent: info line" (fmap aiVersion info == Just 2 && fmap aiCommands info == Just True && maybe False (not . T.null . aiCwd) info && maybe False (not . null . aiArgs) info)
   check "v2 agent: no heap profile or eventlog in this test" (fmap aiHeapProfile info == Just Nothing && fmap aiEventlog info == Just False)
   check "v2 agent: threads carry capabilities" (maybe False (any (isJust . ltCap) . frThreads) frame)
-  for_' box $ \b -> do
+  for_ box $ \b -> do
     sendCommand b 1 (CmdMark "test mark")
     sendCommand b 2 CmdGC
     sendCommand b 3 (CmdHeapProfiling False)
@@ -1061,7 +1063,7 @@ agentChecks check = do
   (events2, client2) <- listen 47772
   box2 <- waitFor events2 (\case LiveConnected b -> Just b; _ -> Nothing)
   info2 <- waitFor events2 (\case LiveInfo i -> Just i; _ -> Nothing)
-  for_' box2 $ \b -> sendCommand b 9 CmdGC
+  for_ box2 $ \b -> sendCommand b 9 CmdGC
   refused <- waitFor events2 (\case LiveReply 9 r -> Just r; _ -> Nothing)
   check "commands turned off: the info line says so" (fmap aiCommands info2 == Just False)
   check "commands turned off: refused" (case refused of Just (ReplyError e) -> "turned off" `T.isInfixOf` e; _ -> False)
@@ -1078,7 +1080,7 @@ agentChecks check = do
   threadDelay 100000
   (events3, client3) <- listen 47773
   box3 <- waitFor events3 (\case LiveConnected b -> Just b; _ -> Nothing)
-  for_' box3 $ \b -> sendCommand b 1 CmdGC
+  for_ box3 $ \b -> sendCommand b 1 CmdGC
   frames <- waitFor events3 (\case LiveFrame f -> Just f; _ -> Nothing)
   threadDelay 300000
   seen <- readIORef events3
@@ -1093,7 +1095,6 @@ agentChecks check = do
       t <- forkIO (connectLive "127.0.0.1" port (\e -> atomicModifyIORef' events (\es -> (es ++ [e], ()))))
       pure (events, t)
     stop t = void (forkIO (killThread t))
-    for_' m f = maybe (pure ()) f m
 
 -- | The first event that matches, waiting up to five seconds for it.
 waitFor :: IORef [LiveEvent] -> (LiveEvent -> Maybe a) -> IO (Maybe a)
@@ -1108,31 +1109,34 @@ waitFor events pick = go (100 :: Int)
 
 -- | A few frames' worth of an agent's lines, read as a v1 client would.
 rawLines :: Int -> IO [String]
-rawLines port = do
-  r <- try $ do
-    addr : _ <- N.getAddrInfo (Just N.defaultHints {N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
-    bracket (N.openSocket addr) N.close $ \sock -> do
-      N.connect sock (N.addrAddress addr)
-      let go acc n
-            | n <= (0 :: Int) = pure acc
-            | otherwise = do
-                chunk <- NB.recv sock 65536
-                if B.null chunk then pure acc else go (acc <> chunk) (n - BC.count '\n' chunk)
-      bytes <- go B.empty 60
-      pure [l | l <- lines (filter (/= '\r') (BC.unpack bytes)), not (null l)]
-  pure (either (\(_ :: SomeException) -> []) id r)
+rawLines port =
+  fromRight [] <$> try @SomeException do
+    addrs <- N.getAddrInfo (Just N.defaultHints {N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
+    case addrs of
+      [] -> pure []
+      addr : _ ->
+        bracket (N.openSocket addr) N.close $ \sock -> do
+          N.connect sock (N.addrAddress addr)
+          let go acc n
+                | n <= (0 :: Int) = pure acc
+                | otherwise = do
+                    chunk <- NB.recv sock 65536
+                    if B.null chunk then pure acc else go (acc <> chunk) (n - BC.count '\n' chunk)
+          bytes <- go B.empty 60
+          pure [l | l <- lines (filter (/= '\r') (BC.unpack bytes)), not (null l)]
 
 -- | An agent from before protocol v2: hello and frames, and it never reads
 -- the socket.
 fakeV1Agent :: Int -> IO ()
 fakeV1Agent port = do
-  addr : _ <- N.getAddrInfo (Just N.defaultHints {N.addrFlags = [N.AI_PASSIVE], N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
-  bracket (N.openSocket addr) N.close $ \sock -> do
-    N.setSocketOption sock N.ReuseAddr 1
-    N.bind sock (N.addrAddress addr)
-    N.listen sock 1
-    (conn, _) <- N.accept sock
-    NB.sendAll conn "H prog 7 1\n"
-    forever $ do
-      NB.sendAll conn "S rts_stats=0\nT 1 running main\nE\n"
-      threadDelay 50000
+  addrs <- N.getAddrInfo (Just N.defaultHints {N.addrFlags = [N.AI_PASSIVE], N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
+  for_ (listToMaybe addrs) $ \addr ->
+    bracket (N.openSocket addr) N.close $ \sock -> do
+      N.setSocketOption sock N.ReuseAddr 1
+      N.bind sock (N.addrAddress addr)
+      N.listen sock 1
+      (conn, _) <- N.accept sock
+      NB.sendAll conn "H prog 7 1\n"
+      forever $ do
+        NB.sendAll conn "S rts_stats=0\nT 1 running main\nE\n"
+        threadDelay 50000

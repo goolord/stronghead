@@ -19,16 +19,19 @@ module UI.Watchers
   ) where
 
 import Control.Monad (forM_, unless, void, when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_, toList)
 import Data.IORef
-import Data.List (insertBy, nub, sort)
+import Data.List (insertBy, (!?))
+import Data.Maybe (fromMaybe, isJust)
 import Data.Ord (Down (..), comparing)
-import Data.Maybe (isJust)
 import Data.Sequence qualified as Seq
+import Data.Word (Word64)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word64)
 import NanoUI
+
 import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Format (fmtFixed, fmtNs, tshow)
 import Stronghead.Live (Frame (..))
@@ -66,7 +69,7 @@ data FiredEvent = FiredEvent
     -- ^ The rule, as it read when it fired.
   , feDone :: ![Text]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 newWatchers :: IO Watchers
 newWatchers = do
@@ -235,9 +238,9 @@ watchersPane env w watching ctx = do
         labelWith (fontMedium . fontSizeScale 0.92) "Rules"
         hint "On the agent's frames and the followed eventlog. Each is off until switched on, and is saved with the session."
         forM_ (zip [0 :: Int ..] rules) $ \(i, r) -> withKey (triggerName (ruTrigger r)) $
-          ruleEditor (ruleVar i) r
+          ruleEditor (ruleVar i r) r
   where
-    ruleVar i = zoomVar (\rs -> rs !! i) (\r rs -> take i rs ++ [r] ++ drop (i + 1) rs) (wrRules w)
+    ruleVar i def = zoomVar (\rs -> fromMaybe def (rs !? i)) (\r rs -> take i rs ++ [r] ++ drop (i + 1) rs) (wrRules w)
 
 -- | One rule's controls.
 ruleEditor :: Var Rule -> Rule -> NanoUI ()
@@ -258,7 +261,7 @@ ruleEditor v r =
     rowWith (fillW . tight . gap 10) $ do
       labelWith (alignMid . fontMuted . fontSizeScale 0.85) "then"
       forM_ [minBound .. maxBound] $ \resp -> withKey (responseName resp) $
-        checkboxWith alignMid (responseName resp) (zoomVar (elem resp . ruResponses) (\b x -> x {ruResponses = sort (nub (if b then resp : ruResponses x else filter (/= resp) (ruResponses x)))}) v)
+        checkboxWith alignMid (responseName resp) (zoomVar (elem resp . ruResponses) (\b x -> x {ruResponses = nubOrd (if b then resp : ruResponses x else filter (/= resp) (ruResponses x))}) v)
   where
     param name cur lo hi set shown = knob name cur lo hi (\x x' -> x' {ruTrigger = set x (ruTrigger x')}) shown
     knob :: Text -> Float -> Float -> Float -> (Float -> Rule -> Rule) -> Text -> NanoUI ()

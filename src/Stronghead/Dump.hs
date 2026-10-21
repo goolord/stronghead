@@ -28,26 +28,34 @@ module Stronghead.Dump
   , occurrences
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Exception (IOException, try)
-import Control.Monad (filterM, forM)
+import Control.Monad.Extra (concatMapM, mapMaybeM, partitionM)
+import Data.Bifunctor (bimap)
 import Data.ByteString qualified as B
 import Data.Char (isAlpha, isAlphaNum, isDigit, isLower, isSpace, isUpper)
-import Data.List (isSuffixOf, sortOn)
+import Data.Either.Extra (eitherToMaybe)
+import Data.List (isSuffixOf, sort, unsnoc)
+import Data.List.Extra (stripSuffix)
 import Data.Map.Strict qualified as M
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Traversable (mapAccumL)
+import Data.Tuple (swap)
+import System.Directory (doesDirectoryExist, listDirectory)
+import System.FilePath (takeBaseName, takeExtension, takeFileName, (</>))
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
-import System.Directory (doesDirectoryExist, listDirectory)
+
 import Stronghead.Source (SrcSpan (..), parseSrcLoc, srcLocSpan)
 import Stronghead.TextFile (readTextFile)
-import System.FilePath (takeBaseName, takeExtension, takeFileName, (</>))
 
 data CodeKind = KindSource | KindCore | KindStg
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 data TokKind
   = TkIdent
@@ -61,14 +69,14 @@ data TokKind
   | TkPragma
     -- ^ Binder annotations like @[GblId, Arity=1]@ and @{-# ... #-}@.
   | TkSpace
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Token = Token
   { tkKind :: !TokKind
   , tkText :: !Text
   , tkCol :: !Int
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Facts about one binding.
 data Notes = Notes
@@ -86,7 +94,7 @@ data Notes = Notes
     -- ^ Lines with a @let@: in STG every one allocates a heap closure.
   , nJoins :: !Int
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Binding = Binding
   { bdName :: !Text
@@ -97,7 +105,7 @@ data Binding = Binding
   , bdLast :: !Int
   , bdNotes :: !Notes
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data CodeFile = CodeFile
   { cfPath :: !FilePath
@@ -112,11 +120,8 @@ data CodeFile = CodeFile
   }
 
 loadCodeFile :: CodeKind -> FilePath -> IO (Either String CodeFile)
-loadCodeFile kind path = do
-  r <- try (readTextFile path)
-  pure $ case r of
-    Left (e :: IOException) -> Left (show e)
-    Right txt -> Right (parseCodeFile kind path txt)
+loadCodeFile kind path =
+  bimap (show @IOException) (parseCodeFile kind path) <$> try (readTextFile path)
 
 kindForPath :: FilePath -> Maybe CodeKind
 kindForPath p
@@ -154,12 +159,7 @@ parseCodeFile kind path src =
 
 -- | Tokenise lines, carrying block-comment state across them.
 tokenizeLines :: CodeKind -> [Text] -> [[Token]]
-tokenizeLines kind = go False
-  where
-    go _ [] = []
-    go inC (l : ls) =
-      let (toks, inC') = tokenizeLine kind inC l
-       in toks : go inC' ls
+tokenizeLines kind = snd . mapAccumL (\inC l -> swap (tokenizeLine kind inC l)) False
 
 lineTokens :: CodeFile -> Int -> [Token]
 lineTokens cf i = fromMaybe [] (cfTokens cf V.!? i)
@@ -188,46 +188,46 @@ tokenizeLine :: CodeKind -> Bool -> Text -> ([Token], Bool)
 tokenizeLine kind inComment0 line = go inComment0 0 line []
   where
     kws = keywords kind
-    go inC col t acc
-      | T.null t = (reverse acc, inC)
-      | inC =
-          let (body, rest) = T.breakOn "-}" t
-              closed = not (T.null rest)
-              txt = body <> (if closed then "-}" else "")
-           in go (not closed) (col + T.length txt) (T.drop 2 rest) (Token TkComment txt col : acc)
-      | otherwise =
-          let c = T.head t
-              emit k n = go inC (col + n) (T.drop n t) (Token k (T.take n t) col : acc)
-           in if
-                | "{-#" `T.isPrefixOf` t ->
-                    let (body, rest) = T.breakOn "#-}" t
-                        n = T.length body + min 3 (T.length rest)
-                     in emit TkPragma n
-                | "{-" `T.isPrefixOf` t -> go True col t acc
-                | "--" `T.isPrefixOf` t, isLineComment t -> go inC (col + T.length t) "" (Token TkComment t col : acc)
-                | isSpace c -> emit TkSpace (T.length (T.takeWhile isSpace t))
-                | c == '"' -> emit TkString (stringLen t)
-                | c == '\'' && T.length t >= 3 && T.index t 2 == '\'' -> emit TkString (3 + hashes (T.drop 3 t))
-                | isDigit c ->
-                    let n = T.length (T.takeWhile (\x -> isAlphaNum x || x == '.' || x == 'e') t)
-                     in emit TkNumber (n + hashes (T.drop n t))
-                | c == '[' && kind /= KindSource && col == 0 -> emit TkPragma (T.length t)
-                | c == '[' && kind /= KindSource && annotationStart t -> emit TkPragma (bracketLen t)
-                | c == '\\' && kind == KindStg && T.length t >= 2 && T.index t 1 `elem` ("rus" :: String) -> emit TkKeyword 2
-                | c == '$' && T.length t >= 2 && identStart (T.index t 1) -> emit TkIdent (qualIdentLen t)
-                | identStart c ->
-                    let n = qualIdentLen t
-                        w = T.take n t
-                        k
-                          | w `elem` kws = TkKeyword
-                          | isUpper (T.head (lastSegment w)) = TkCon
-                          | otherwise = TkIdent
-                     in emit k n
-                | symChar c ->
-                    let n = T.length (T.takeWhile symChar t)
-                        w = T.take n t
-                     in emit (if w `elem` kws then TkKeyword else TkOperator) n
-                | otherwise -> emit TkOperator 1
+    go inC col t acc = case T.uncons t of
+      Nothing -> (reverse acc, inC)
+      Just (c, _)
+        | inC ->
+            let (body, rest) = T.breakOn "-}" t
+                closed = not (T.null rest)
+                txt = body <> (if closed then "-}" else "")
+             in go (not closed) (col + T.length txt) (T.drop 2 rest) (Token TkComment txt col : acc)
+        | otherwise ->
+            let emit k n = go inC (col + n) (T.drop n t) (Token k (T.take n t) col : acc)
+             in if
+                  | "{-#" `T.isPrefixOf` t ->
+                      let (body, rest) = T.breakOn "#-}" t
+                          n = T.length body + min 3 (T.length rest)
+                       in emit TkPragma n
+                  | "{-" `T.isPrefixOf` t -> go True col t acc
+                  | "--" `T.isPrefixOf` t, isLineComment t -> go inC (col + T.length t) "" (Token TkComment t col : acc)
+                  | isSpace c -> emit TkSpace (T.length (T.takeWhile isSpace t))
+                  | c == '"' -> emit TkString (stringLen t)
+                  | c == '\'' && T.length t >= 3 && T.index t 2 == '\'' -> emit TkString (3 + hashes (T.drop 3 t))
+                  | isDigit c ->
+                      let n = T.length (T.takeWhile (\x -> isAlphaNum x || x == '.' || x == 'e') t)
+                       in emit TkNumber (n + hashes (T.drop n t))
+                  | c == '[' && kind /= KindSource && col == 0 -> emit TkPragma (T.length t)
+                  | c == '[' && kind /= KindSource && annotationStart t -> emit TkPragma (bracketLen t)
+                  | c == '\\' && kind == KindStg && T.length t >= 2 && T.index t 1 `elem` ("rus" :: String) -> emit TkKeyword 2
+                  | c == '$' && T.length t >= 2 && identStart (T.index t 1) -> emit TkIdent (qualIdentLen t)
+                  | identStart c ->
+                      let n = qualIdentLen t
+                          w = T.take n t
+                          k
+                            | w `elem` kws = TkKeyword
+                            | maybe False (isUpper . fst) (T.uncons (lastSegment w)) = TkCon
+                            | otherwise = TkIdent
+                       in emit k n
+                  | symChar c ->
+                      let n = T.length (T.takeWhile symChar t)
+                          w = T.take n t
+                       in emit (if w `elem` kws then TkKeyword else TkOperator) n
+                  | otherwise -> emit TkOperator 1
     isLineComment t = case T.uncons (T.dropWhile (== '-') t) of
       Nothing -> True
       Just (x, _) -> not (symChar x)
@@ -237,27 +237,27 @@ tokenizeLine kind inComment0 line = go inComment0 0 line []
 -- | Length of a (possibly module-qualified) identifier at the start of the
 -- text, including GHC's @$w@-style prefixes and @#@ suffixes.
 qualIdentLen :: Text -> Int
-qualIdentLen t = go 0 t
+qualIdentLen = go 0
   where
     go n s =
-      let s1 = if "$" `T.isPrefixOf` s then T.drop 1 s else s
+      let s1 = fromMaybe s (T.stripPrefix "$" s)
           dollar = T.length s - T.length s1
           seg = T.takeWhile identChar s1
           n' = n + dollar + T.length seg
           rest = T.drop (T.length seg) s1
-       in case T.uncons rest of
-            Just ('.', more)
-              | not (T.null seg)
-              , isUpper (T.head seg)
+       in case (T.uncons seg, T.uncons rest) of
+            (Just (h, _), Just ('.', more))
+              | isUpper h
               , Just (x, _) <- T.uncons more
               , identStart x || x == '$' ->
                   go (n' + 1) more
             _ -> max 1 n'
 
 lastSegment :: Text -> Text
-lastSegment w = case T.splitOn "." (stripQualifier w) of
-  [] -> w
-  xs -> let l = last xs in if T.null l then w else T.dropWhile (== '$') l
+lastSegment w =
+  let stripped = stripQualifier w
+      (_, l) = T.breakOnEnd "." stripped
+   in T.dropWhile (== '$') (if T.null l then stripped else l)
 
 stringLen :: Text -> Int
 stringLen t = go 1 (T.drop 1 t)
@@ -269,13 +269,13 @@ stringLen t = go 1 (T.drop 1 t)
       Just (_, r) -> go (n + 1) r
 
 bracketLen :: Text -> Int
-bracketLen t = go 0 (0 :: Int) (T.unpack t)
+bracketLen = go 0 (0 :: Int)
   where
-    go n _ [] = n
-    go n d (x : xs)
-      | x == '[' = go (n + 1) (d + 1) xs
-      | x == ']' = if d <= 1 then n + 1 else go (n + 1) (d - 1) xs
-      | otherwise = go (n + 1) d xs
+    go n d s = case T.uncons s of
+      Nothing -> n
+      Just ('[', xs) -> go (n + 1) (d + 1) xs
+      Just (']', xs) -> if d <= 1 then n + 1 else go (n + 1) (d - 1) xs
+      Just (_, xs) -> go (n + 1) d xs
 
 -- ---------------------------------------------------------------------------
 -- Names
@@ -289,24 +289,26 @@ stripUnique w =
       base = T.dropEnd 1 pre
       hashes = T.takeWhileEnd (== '#') suf
       core = T.dropEnd (T.length hashes) suf
-   in if
-        | T.null pre || T.null base -> w
-        | T.length core < 2 || T.length core > 7 -> w
-        | not (isAlpha (T.head core)) -> w
-        | not (T.all isAlphaNum core) -> w
-        | T.any isDigit core || T.any isUpper (T.tail core) -> base <> hashes
-        | otherwise -> w
+   in case T.uncons core of
+        Just (c, cs)
+          | not (T.null pre)
+          , not (T.null base)
+          , T.length core >= 2 && T.length core <= 7
+          , isAlpha c
+          , T.all isAlphaNum core
+          , T.any isDigit core || T.any isUpper cs ->
+              base <> hashes
+        _ -> w
 
 -- | @GHC.Base.map@ to @map@, @Main.$wgo@ to @$wgo@.
 stripQualifier :: Text -> Text
-stripQualifier w = go w
+stripQualifier = go
   where
     go s =
       let seg = T.takeWhile identChar s
-       in case T.uncons (T.drop (T.length seg) s) of
-            Just ('.', rest)
-              | not (T.null seg)
-              , isUpper (T.head seg)
+       in case (T.uncons seg, T.uncons (T.drop (T.length seg) s)) of
+            (Just (h, _), Just ('.', rest))
+              | isUpper h
               , not (T.null rest) ->
                   go rest
             _ -> s
@@ -338,7 +340,7 @@ occurrences cf key =
 -- | Top-level bindings in a dump: blank-line separated blocks whose first
 -- real line starts with the binder.
 dumpBindings :: CodeKind -> V.Vector Text -> V.Vector [Token] -> [Binding]
-dumpBindings kind ls toks = go False (blocks 0)
+dumpBindings kind ls toks = catMaybes (snd (mapAccumL step False (blocks 0)))
   where
     n = V.length ls
     blank i = T.all isSpace (ls V.! i)
@@ -349,23 +351,20 @@ dumpBindings kind ls toks = go False (blocks 0)
       | otherwise =
           let j = until (\k -> k >= n || blank k) (+ 1) i
            in (i, j - 1) : blocks j
-    go _ [] = []
-    go inRec ((a, b) : rest) =
+    step inRec (a, b) =
       let opens = any (\i -> T.strip (ls V.! i) == "Rec {") [a .. b]
           closes = any (\i -> "end Rec }" `T.isPrefixOf` T.strip (ls V.! i)) [a .. b]
           recNow = inRec || opens
-          inRec' = (inRec || opens) && not closes
-       in case binderIn a b of
-            Just (i, name) -> mkBinding recNow name i a b : go inRec' rest
-            Nothing -> go inRec' rest
+          inRec' = recNow && not closes
+       in (inRec', (\(i, name) -> mkBinding recNow name i a b) <$> binderIn a b)
     binderIn a b =
       listToMaybe
         [ (i, tkText t)
         | i <- [a .. b]
         , let l = ls V.! i
-        , not (T.null l)
-        , not (isSpace (T.head l))
-        , not ("--" `T.isPrefixOf` l || "Rec {" `T.isPrefixOf` l || "end Rec" `T.isPrefixOf` l || "[" `T.isPrefixOf` l || "=" `T.isPrefixOf` l || "Result size" `T.isPrefixOf` l)
+        , Just (c, _) <- [T.uncons l]
+        , not (isSpace c)
+        , not (any (`T.isPrefixOf` l) ["--", "Rec {", "end Rec", "[", "=", "Result size"])
         , t : _ <- [filter ((/= TkSpace) . tkKind) (toks V.! i)]
         , tkKind t `elem` [TkIdent, TkCon]
         ]
@@ -391,7 +390,7 @@ dumpBindings kind ls toks = go False (blocks 0)
             , bdNotes =
                 Notes
                   { nInline = annotation "InlPrag=" header
-                  , nArity = annotation "Arity=" header >>= \x -> either (const Nothing) (Just . fst) (TR.decimal x)
+                  , nArity = annotation "Arity=" header >>= fmap fst . eitherToMaybe . TR.decimal
                   , nStrictness = annotation "Str=" header
                   , nCpr = annotation "Cpr=" header
                   , nSize = sizeLine
@@ -410,13 +409,14 @@ annotation key header = case T.breakOn key header of
   (_, rest) | T.null rest -> Nothing
   (_, rest) ->
     let v = T.drop (T.length key) rest
-        go _ [] acc = reverse acc
-        go d (c : cs) acc
-          | (c == ',' || c == ']') && d == (0 :: Int) = reverse acc
-          | c `elem` ("[({<" :: String) = go (d + 1) cs (c : acc)
-          | c `elem` ("])}>" :: String) = go (d - 1) cs (c : acc)
-          | otherwise = go d cs (c : acc)
-     in Just (T.strip (T.pack (go 0 (T.unpack v) [])))
+        go n d s = case T.uncons s of
+          Nothing -> n
+          Just (c, cs)
+            | (c == ',' || c == ']') && d == (0 :: Int) -> n
+            | c `elem` ("[({<" :: String) -> go (n + 1) (d + 1) cs
+            | c `elem` ("])}>" :: String) -> go (n + 1) (d - 1) cs
+            | otherwise -> go (n + 1) d cs
+     in Just (T.strip (T.take (go 0 0 v) v))
 
 -- | Top-level definitions in Haskell source: lines at column 0 that start
 -- with a lower-case identifier (or an operator section in parentheses).
@@ -443,11 +443,10 @@ sourceBindings ls = merge (mapMaybe def [0 .. n - 1])
           lastLine = case others of
             (j, _) : _ -> j - 1
             [] -> n - 1
-          endLine = trimEnd (max i (maybe i fst (lastMaybe same))) lastLine
+          endLine = trimEnd (max i (maybe i (fst . snd) (unsnoc same))) lastLine
        in Binding w w i endLine emptyNotes : merge others
     merge [] = []
     trimEnd lo hi = until (\k -> k <= lo || not (T.all isSpace (ls V.! k))) (subtract 1) hi
-    lastMaybe xs = if null xs then Nothing else Just (last xs)
 
 emptyNotes :: Notes
 emptyNotes = Notes Nothing Nothing Nothing Nothing Nothing False 0 [] [] 0
@@ -462,7 +461,7 @@ data ModuleArtifacts = ModuleArtifacts
   , maCore :: !(Maybe FilePath)
   , maStg :: !(Maybe FilePath)
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Walk a directory (skipping VCS and package-db noise, to a bounded depth)
 -- and pair each module's source with its Core and STG dumps. Dumps written
@@ -474,32 +473,27 @@ discoverArtifacts root = do
   let dumps k = [(dumpModuleName f, f) | f <- files, kindForPath f == Just k]
       cores = M.fromList (dumps KindCore)
       stgs = M.fromList (dumps KindStg)
-  sources <- fmap catMaybes . forM [f | f <- files, kindForPath f == Just KindSource] $ \f -> do
-    m <- sourceModuleName f
-    pure ((,f) <$> m)
+  sources <- mapMaybeM (\f -> fmap (,f) <$> sourceModuleName f) [f | f <- files, kindForPath f == Just KindSource]
   let srcMap = M.fromList sources
       -- A hierarchical -dumpdir names Foo/Bar.dump-simpl just "Bar".
       -- GHC names a Main module's dumps after its file (Loop.dump-simpl).
       byFile = M.fromList [(T.pack (takeBaseName f), f) | (_, f) <- sources]
-      findSrc m = case M.lookup m srcMap of
-        Just f -> Just f
-        Nothing -> case M.lookup m byFile of
-          Just f -> Just f
-          Nothing -> listToMaybe [f | (sm, f) <- M.toList srcMap, ("." <> m) `T.isSuffixOf` sm]
+      findSrc m =
+        M.lookup m srcMap
+          <|> M.lookup m byFile
+          <|> listToMaybe [f | (sm, f) <- M.toList srcMap, ("." <> m) `T.isSuffixOf` sm]
       mods = M.keys (M.unions [() <$ cores, () <$ stgs])
   pure [ModuleArtifacts m (findSrc m) (M.lookup m cores) (M.lookup m stgs) | m <- mods]
   where
     walk 0 _ = pure []
     walk d dir = do
-      r <- try (listDirectory dir)
+      r <- try @IOException (listDirectory dir)
       case r of
-        Left (_ :: IOException) -> pure []
+        Left _ -> pure []
         Right entries -> do
-          let paths = [dir </> e | e <- sortOn id entries, e `notElem` [".git", "node_modules"]]
-          dirs <- filterM doesDirectoryExist paths
-          let files = [p | p <- paths, p `notElem` dirs]
-          deeper <- concat <$> mapM (walk (d - 1)) dirs
-          pure (files ++ deeper)
+          let paths = [dir </> e | e <- sort entries, e `notElem` [".git", "node_modules"]]
+          (dirs, files) <- partitionM doesDirectoryExist paths
+          (files ++) <$> concatMapM (walk (d - 1)) dirs
 
 -- | The module a dump is of, from its file name: @Foo.Bar.dump-simpl@ is
 -- @Foo.Bar@. A build in another way puts the way in the name
@@ -507,29 +501,27 @@ discoverArtifacts root = do
 dumpModuleName :: FilePath -> Text
 dumpModuleName f =
   let b = takeFileName f
-      stem = fromMaybe b (listToMaybe (mapMaybe (\ext -> stripSuffix ext b) [".dump-simpl", ".dump-stg-final", ".dump-stg"]))
-      parts = T.splitOn "." (T.pack stem)
-   in case parts of
-        _ : _ : _ | isWay (last parts) -> T.intercalate "." (init parts)
+      stem = fromMaybe b (listToMaybe (mapMaybe (`stripSuffix` b) [".dump-simpl", ".dump-stg-final", ".dump-stg"]))
+   in case unsnoc (T.splitOn "." (T.pack stem)) of
+        Just (initParts@(_ : _), lastPart) | isWay lastPart -> T.intercalate "." initParts
         _ -> T.pack stem
   where
-    stripSuffix suf str
-      | suf `isSuffixOf` str = Just (take (length str - length suf) str)
-      | otherwise = Nothing
     isWay w = not (T.null w) && all (`elem` ["thr", "p", "dyn", "debug", "l"]) (T.splitOn "_" w)
 
 -- | The module a Haskell source file declares, or its base name for a
 -- @Main@ module without a header. 'Nothing' when it can't be read.
 sourceModuleName :: FilePath -> IO (Maybe Text)
 sourceModuleName f = do
-  r <- try (B.readFile f)
+  r <- try @IOException (B.readFile f)
   pure $ case r of
-    Left (_ :: IOException) -> Nothing
+    Left _ -> Nothing
     Right bs ->
       let ls = T.lines (TE.decodeUtf8With TE.lenientDecode (B.take 20000 bs))
-       in case [T.takeWhile (\c -> not (isSpace c) && c /= '(') (T.strip rest) | l <- ls, Just rest <- [T.stripPrefix "module " l]] of
-            m : _ -> Just m
-            [] -> Just (T.pack (takeBaseName f))
+       in Just $ fromMaybe (T.pack (takeBaseName f)) $ listToMaybe
+            [ T.takeWhile (\c -> not (isSpace c) && c /= '(') (T.strip rest)
+            | l <- ls
+            , Just rest <- [T.stripPrefix "module " l]
+            ]
 
 -- | The source file a dump was compiled from, as the compiler reported it
 -- in the first @src<file:...>@ note (STG built with @-finfo-table-map@ has

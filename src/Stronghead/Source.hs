@@ -28,6 +28,7 @@ module Stronghead.Source
   , resolveModule
   , resolvesTo
   , pathComponents
+  , shortFileName
   , findProjectRoot
   , sourceRoots
     -- * Editors
@@ -35,20 +36,29 @@ module Stronghead.Source
   ) where
 
 import Control.Exception (IOException, try)
-import Control.Monad (filterM)
+import Control.Monad (filterM, guard)
 import Data.Char (isSpace)
-import Data.List (isPrefixOf, sortOn)
+import Data.Containers.ListUtils (nubOrd)
+import Data.Either (fromRight)
+import Data.Foldable (asum)
+import Data.List (isPrefixOf, sortOn, unsnoc)
+import Data.List.Extra (wordsBy)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
+import Data.Void (Void)
+import System.Directory (doesDirectoryExist, listDirectory)
+import System.FilePath (isAbsolute, normalise, takeDirectory, takeDrive, takeExtension, (</>))
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
-import Stronghead.Format (tshow)
-import System.Directory (doesDirectoryExist, listDirectory)
-import System.FilePath (isAbsolute, normalise, takeDirectory, takeExtension, (</>))
+import Text.Megaparsec (Parsec, chunk, eof, optional, parseMaybe)
+import Text.Megaparsec.Char (char)
+import Text.Megaparsec.Char.Lexer qualified as L
+
+import Stronghead.Format (readDecimal, tshow)
 
 -- ---------------------------------------------------------------------------
 -- Spans
@@ -62,7 +72,7 @@ data SrcSpan = SrcSpan
   , ssEndLine :: !Int
   , ssEndCol :: !Int
   }
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | @file:12:3-20@, @file:12:3@, or @file:(12,3)-(14,5)@. The file may
 -- itself contain colons (@C:\\src\\Main.hs:7:5@).
@@ -73,29 +83,32 @@ parseSrcSpan t0 =
         (pre, rest)
           | not (T.null pre) -> do
               let file = T.dropEnd 2 pre
-              (l1, r1) <- num rest
-              (c1, r2) <- num =<< T.stripPrefix "," r1
-              r3 <- T.stripPrefix ")-(" r2
-              (l2, r4) <- num r3
-              (c2, r5) <- num =<< T.stripPrefix "," r4
-              if r5 == ")" && not (T.null file) then pure (SrcSpan file l1 c1 l2 c2) else Nothing
+              guard (not (T.null file))
+              (l1, c1, l2, c2) <- parseMaybe pMultiSpan rest
+              pure (SrcSpan file l1 c1 l2 c2)
         _ -> simple t
   where
-    num s = either (const Nothing) Just (TR.decimal s)
-    simple t =
-      -- Split from the right: the file may contain ':'.
-      case reverse (T.splitOn ":" t) of
-        colPart : linePart : fileParts@(_ : _) -> do
-          (l, lineRest) <- num linePart
-          (c1, rest) <- num colPart
-          c2 <- case T.stripPrefix "-" rest of
-            Just more -> case num more of
-              Just (c, "") -> Just c
-              _ -> Nothing
-            Nothing -> if T.null rest then Just c1 else Nothing
-          let file = T.intercalate ":" (reverse fileParts)
-          if T.null lineRest && not (T.null file) then pure (SrcSpan file l c1 l c2) else Nothing
-        _ -> Nothing
+    pMultiSpan :: Parsec Void Text (Int, Int, Int, Int)
+    pMultiSpan =
+      (,,,)
+        <$> (L.decimal <* char ',')
+        <*> (L.decimal <* chunk ")-(")
+        <*> (L.decimal <* char ',')
+        <*> (L.decimal <* char ')' <* eof)
+    pCols :: Parsec Void Text (Int, Int)
+    pCols = do
+      c1 <- L.decimal
+      c2 <- fromMaybe c1 <$> optional (char '-' *> L.decimal)
+      eof
+      pure (c1, c2)
+    simple t = case reverse (T.splitOn ":" t) of
+      colPart : linePart : fileParts@(_ : _) -> do
+        let file = T.intercalate ":" (reverse fileParts)
+        guard (not (T.null file))
+        l <- readDecimal linePart
+        (c1, c2) <- parseMaybe pCols colPart
+        pure (SrcSpan file l c1 l c2)
+      _ -> Nothing
 
 -- | The form GHC would print.
 renderSrcSpan :: SrcSpan -> Text
@@ -116,7 +129,7 @@ data SrcLoc
     -- ^ @<no location info>@, or nothing at all.
   | SrcUnhelpful !Text
     -- ^ Any other text, kept as printed (@<wired into compiler>@, ...).
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | Total: text that is not a span is kept as 'SrcUnhelpful'. IPE events
 -- join a missing file and span as a bare @:@, which is no location.
@@ -154,7 +167,7 @@ data SourceIndex = SourceIndex
   , siByName :: !(Map String [FilePath])
     -- ^ Files by their last path component.
   }
-  deriving (Show)
+  deriving stock (Show)
 
 -- | An index over the given files (as found under the roots).
 mkSourceIndex :: [FilePath] -> [FilePath] -> SourceIndex
@@ -162,7 +175,7 @@ mkSourceIndex roots files =
   SourceIndex
     { siRoots = roots
     , siFiles = unique
-    , siByName = M.fromListWith (++) [(last cs, [f]) | f <- S.toList unique, let cs = pathComponents f, not (null cs)]
+    , siByName = M.fromListWith (++) [(name, [f]) | f <- S.toList unique, Just (_, name) <- [unsnoc (pathComponents f)]]
     }
   where
     -- Overlapping roots find a file twice; once is not a tie.
@@ -172,27 +185,24 @@ mkSourceIndex roots files =
 -- directories. Stops after 20000 files so a root set to a home directory
 -- does not hang the caller.
 buildSourceIndex :: [FilePath] -> IO SourceIndex
-buildSourceIndex roots = do
-  files <- go 20000 (outermost roots)
-  pure (mkSourceIndex roots files)
+buildSourceIndex roots = mkSourceIndex roots <$> go 20000 (outermost roots)
   where
     go :: Int -> [FilePath] -> IO [FilePath]
     go _ [] = pure []
     go budget (d : rest)
       | budget <= 0 = pure []
       | otherwise = do
-          entries <- either (\(_ :: IOException) -> []) id <$> try (listDirectory d)
-          classified <- mapM (\e -> (e,) <$> doesDirectoryExist (d </> e)) entries
+          entries <- fromRight [] <$> try @IOException (listDirectory d)
+          classified <- traverse (\e -> (e,) <$> doesDirectoryExist (d </> e)) entries
           let here = [d </> e | (e, False) <- classified, takeExtension e `elem` sourceExtensions]
               dirs = [d </> e | (e, True) <- classified, not (skipDir e)]
-          more <- go (budget - length here) (rest ++ dirs)
-          pure (here ++ more)
-    skipDir e = take 1 e == "." || take 4 e == "dist" || e `elem` ["node_modules", "_build"]
+          (here ++) <$> go (budget - length here) (rest ++ dirs)
+    skipDir e = "." `isPrefixOf` e || "dist" `isPrefixOf` e || e `elem` ["node_modules", "_build"]
     -- A root inside another is walked with it.
     outermost rs =
-      let ns = S.toList (S.fromList (map normalise rs))
+      let ns = nubOrd (map normalise rs)
        in [r | r <- ns, not (any (\o -> o /= r && pathComponents o `isPrefixOf` pathComponents r && sameDrive o r) ns)]
-    sameDrive a b = take 2 a == take 2 b || not (isAbsolute a && isAbsolute b)
+    sameDrive a b = takeDrive a == takeDrive b || not (isAbsolute a && isAbsolute b)
 
 sourceExtensions :: [String]
 sourceExtensions = [".hs", ".lhs", ".hsc", ".hs-boot", ".chs"]
@@ -204,13 +214,13 @@ data Resolution
   | BySuffix !Int
     -- ^ The number of trailing path components that matched.
   | ByModule
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 data Resolved = Resolved
   { rsPath :: !FilePath
   , rsHow :: !Resolution
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Find a reported path among the indexed files: as an absolute path, then
 -- relative to each root, then by its longest matching tail of path
@@ -218,7 +228,7 @@ data Resolved = Resolved
 -- (@Data.Foo@ finds @.../Data/Foo.hs@).
 resolveSource :: SourceIndex -> Maybe Text -> Text -> Maybe Resolved
 resolveSource ix modu reported =
-  firstJust
+  asum
     [ absolute
     , listToMaybe [Resolved f ByRoot | r <- siRoots ix, let f = normalise (r </> path), S.member f (siFiles ix)]
     , bySuffix
@@ -230,25 +240,24 @@ resolveSource ix modu reported =
     absolute
       | isAbsolute path, S.member (normalise path) (siFiles ix) = Just (Resolved (normalise path) ByAbsolute)
       | otherwise = Nothing
-    bySuffix = case comps of
-      [] -> Nothing
-      _ -> do
-        candidates <- M.lookup (last comps) (siByName ix)
-        best candidates comps BySuffix
+    bySuffix = do
+      (_, name) <- unsnoc comps
+      candidates <- M.lookup name (siByName ix)
+      best candidates comps BySuffix
 
 -- | The file holding a module, by its dotted name.
 resolveModule :: SourceIndex -> Text -> Maybe Resolved
-resolveModule ix modu = case T.splitOn "." (T.strip modu) of
-  parts
-    | any T.null parts -> Nothing
-    | otherwise ->
-        let stem = map T.unpack parts
-         in firstJust
-              [ do
-                  candidates <- M.lookup (last stem <> ext) (siByName ix)
-                  best candidates (init stem ++ [last stem <> ext]) (const ByModule)
-              | ext <- sourceExtensions
-              ]
+resolveModule ix modu = do
+  let parts = T.splitOn "." (T.strip modu)
+  guard (not (any T.null parts))
+  (prefix, modBase) <- unsnoc (map T.unpack parts)
+  asum
+    [ do
+        let file = modBase <> ext
+        candidates <- M.lookup file (siByName ix)
+        best candidates (prefix ++ [file]) (const ByModule)
+    | ext <- sourceExtensions
+    ]
 
 -- | The candidate sharing the longest tail with @comps@. A tie for the
 -- longest is ambiguous (two @Main.hs@ files, say) and resolves to nothing:
@@ -281,15 +290,16 @@ resolvesTo ix path reported =
 -- drive.
 pathComponents :: FilePath -> [String]
 pathComponents p =
-  [c | c <- splitSeps (dropDrive p), not (null c), c /= "."]
+  [c | c <- wordsBy isSep (stripDrive p), c /= "."]
   where
-    splitSeps s = case break isSep s of
-      (a, []) -> [a]
-      (a, _ : more) -> a : splitSeps more
     isSep c = c == '/' || c == '\\'
-    dropDrive s = case s of
+    stripDrive = \case
       d : ':' : more | not (isSep d), not (isSpace d) -> more
-      _ -> s
+      s -> s
+
+-- | The last path component of a POSIX or Windows path.
+shortFileName :: Text -> Text
+shortFileName = T.takeWhileEnd (\c -> c /= '/' && c /= '\\')
 
 -- | The nearest directory at or above a path that holds a @.cabal@ file or
 -- a @cabal.project@: where a build of it ran. Gives up after eight levels.
@@ -300,8 +310,8 @@ findProjectRoot start = do
   where
     go 0 _ = pure Nothing
     go n d = do
-      entries <- either (\(_ :: IOException) -> []) id <$> try (listDirectory d)
-      if any (\e -> takeExtension e == ".cabal" || e == "cabal.project" || e == "stack.yaml") entries
+      entries <- fromRight [] <$> try @IOException (listDirectory d)
+      if any (\e -> takeExtension e == ".cabal" || e `elem` ["cabal.project", "stack.yaml"]) entries
         then pure (Just d)
         else
           let up = takeDirectory d
@@ -313,8 +323,8 @@ findProjectRoot start = do
 sourceRoots :: [FilePath] -> IO [FilePath]
 sourceRoots starts = do
   existing <- filterM doesDirectoryExist [normalise s | s <- starts, not (null s)]
-  projects <- mapM findProjectRoot existing
-  pure (S.toList (S.fromList (existing ++ [p | Just p <- projects])))
+  projects <- traverse findProjectRoot existing
+  pure (nubOrd (existing ++ catMaybes projects))
 
 -- ---------------------------------------------------------------------------
 -- Editors
@@ -327,6 +337,3 @@ editorCommand template file line col =
   T.replace "{file}" quoted . T.replace "{line}" (tshow line) . T.replace "{col}" (tshow (max 1 col)) $ template
   where
     quoted = if any isSpace file then "\"" <> T.pack file <> "\"" else T.pack file
-
-firstJust :: [Maybe a] -> Maybe a
-firstJust = listToMaybe . concatMap (maybe [] pure)

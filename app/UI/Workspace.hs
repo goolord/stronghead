@@ -78,14 +78,22 @@ module UI.Workspace
   ) where
 
 import Control.Monad (void, when)
+import Control.Monad.State.Strict (StateT, evalStateT, get, modify)
+import Data.Bifunctor (bimap, first)
 import Data.Char (isSpace)
+import Data.Containers.ListUtils (nubOrd)
 import Data.List (find)
+import Data.Void (Void)
+import Data.Word (Word64)
+import Numeric (showFFloat)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
-import Data.Word (Word64)
 import NanoUI
-import Numeric (showFFloat)
+import Text.Megaparsec (Parsec, between, choice, eof, errorBundlePretty, parse, takeWhile1P)
+import Text.Megaparsec.Char (char, hspace)
+
+import Stronghead.Format (readDouble, tshow)
 import UI.Common
 import UI.Link (Panel (..))
 
@@ -104,7 +112,7 @@ data PaneKind = PaneKind
   , pkPanel :: !(Maybe Panel)
   , pkTime :: !Bool
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 paneTlCaps, paneTlThreads, paneTlOverview, paneTlMarkers :: Word64
 paneTlCaps = 101
@@ -181,7 +189,7 @@ paneKindNamed :: Text -> Maybe PaneKind
 paneKindNamed k = find ((== k) . pkKey) paneKinds
 
 paneTitle :: Word64 -> Text
-paneTitle i = maybe ("pane " <> T.pack (show i)) pkTitle (paneKind i)
+paneTitle i = maybe ("pane " <> tshow i) pkTitle (paneKind i)
 
 -- | The Timeline's panes that draw its window: a time pane placed with one
 -- of them takes the same window.
@@ -226,7 +234,7 @@ removePane k = \case
 
 encodeTree :: GridNode -> Text
 encodeTree = \case
-  Pane i -> maybe ("pane." <> T.pack (show i)) pkKey (paneKind i)
+  Pane i -> maybe ("pane." <> tshow i) pkKey (paneKind i)
   Split _ ax r a b ->
     "(" <> (if ax == AxisV then "v" else "h") <> " " <> T.pack (showFFloat (Just 3) r "") <> " " <> encodeTree a <> " " <> encodeTree b <> ")"
 
@@ -235,40 +243,35 @@ encodeTree = \case
 -- passes nano-ui's 'validateGridTree'.
 decodeTree :: Text -> Either Text GridNode
 decodeTree src = do
-  (tree, rest, _) <- node (tokens src) 1000
-  case rest of
-    [] -> pure ()
-    t : _ -> Left ("unexpected " <> t)
+  tree <- first (T.pack . errorBundlePretty) (parse (evalStateT (hspace *> pNode <* eof) 1000) "" src)
   let ks = treeKinds tree
-  when (length ks /= length (dedupe ks)) (Left "a pane is named twice")
-  either (Left . T.pack) (const (Right tree)) (validateGridTree tree)
+  when (length ks /= length (nubOrd ks)) (Left "a pane is named twice")
+  bimap T.pack (const tree) (validateGridTree tree)
   where
-    tokens t = case T.uncons (T.dropWhile isSpace t) of
-      Nothing -> []
-      Just (c, rest)
-        | c == '(' || c == ')' -> T.singleton c : tokens rest
-        | otherwise ->
-            let (w, rest') = T.break (\x -> isSpace x || x == '(' || x == ')') (T.cons c rest)
-             in w : tokens rest'
-    node ts next = case ts of
-      "(" : ax : r : rest -> do
-        axis <- case ax of
-          "v" -> Right AxisV
-          "h" -> Right AxisH
-          _ -> Left ("unknown split " <> ax)
-        ratio <- case TR.double r of
-          Right (x, "") | x > 0 && x < 1 -> Right x
-          _ -> Left ("bad ratio " <> r)
-        (a, rest1, next1) <- node rest (next + 1)
-        (b, rest2, next2) <- node rest1 next1
-        case rest2 of
-          ")" : rest3 -> Right (Split next axis (realToFrac ratio) a b, rest3, next2)
-          _ -> Left "missing )"
-      w : rest | w /= "(" && w /= ")" -> case paneKindNamed w of
-        Just k -> Right (Pane (pkId k), rest, next)
-        Nothing -> Left ("unknown pane " <> w)
-      _ -> Left "unexpected end"
-    dedupe = foldr (\x acc -> if x `elem` acc then acc else x : acc) []
+    lexeme :: StateT Word64 (Parsec Void Text) a -> StateT Word64 (Parsec Void Text) a
+    lexeme p = p <* hspace
+    wordChar c = not (isSpace c) && c /= '(' && c /= ')'
+    pNode :: StateT Word64 (Parsec Void Text) GridNode
+    pNode =
+      choice
+        [ between (lexeme (char '(')) (lexeme (char ')')) do
+            splitId <- get <* modify (+ 1)
+            ax <- lexeme (takeWhile1P Nothing wordChar)
+            axis <- case ax of
+              "v" -> pure AxisV
+              "h" -> pure AxisH
+              _ -> fail ("unknown split " <> T.unpack ax)
+            rTxt <- lexeme (takeWhile1P Nothing wordChar)
+            ratio <- case readDouble rTxt of
+              Just x | x > 0 && x < 1 -> pure (realToFrac x)
+              _ -> fail ("bad ratio " <> T.unpack rTxt)
+            Split splitId axis ratio <$> pNode <*> pNode
+        , do
+            w <- lexeme (takeWhile1P Nothing wordChar)
+            case paneKindNamed w of
+              Just k -> pure (Pane (pkId k))
+              Nothing -> fail ("unknown pane " <> T.unpack w)
+        ]
 
 -- ---------------------------------------------------------------------------
 -- Presets
@@ -278,7 +281,7 @@ data Preset = Preset
   { prName :: !Text
   , prTree :: !GridNode
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Each panel's arrangement as it opens. The inspector sits with the
 -- heap's analysis and under Core & STG's bindings.
@@ -341,7 +344,7 @@ data Popped = Popped
   { poKind :: !Word64
   , poFrom :: !Text
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | What a panel needs to draw a workbench of mixed panes, given by the
 -- shell each frame.
@@ -388,7 +391,7 @@ workspace places popped bench draw = do
     here = wbName bench
     menu pid = do
       menuHeader (paneTitle pid)
-      moved <- fmap or . mapM (moveTo pid) $ [p | p <- places, wbName (bpBench p) /= here]
+      moved <- or <$> traverse (moveTo pid) [p | p <- places, wbName (bpBench p) /= here]
       menuSeparator
       out <- menuItem "Pop out"
       when out $ do

@@ -12,19 +12,22 @@ import Control.Exception (bracket)
 import Control.Monad ((<=<))
 import Control.Tracer (nullTracer)
 import Data.Bitraversable (bitraverse)
+import Data.Containers.ListUtils (nubOrd)
 import Data.List (sort)
 import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
+import Data.Word (Word64)
+import System.Directory (doesDirectoryExist, listDirectory)
+import System.FilePath ((</>))
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import GHC.Debug.Client
 import GHC.Debug.Client.Monad (debuggeeConnectWithTracer, debuggeeConnectWithTracerTCP, snapshotInitWithTracer)
-import Data.Word (Word64)
 import GHC.Debug.Types.Ptr (ClosurePtr (..), InfoTablePtr (..), mkClosurePtr)
+
 import Stronghead.Debug.Graph
-import System.Directory (doesDirectoryExist, listDirectory)
-import System.FilePath ((</>))
 
 -- | The roots, the closures reached from them, and whether the traversal
 -- stopped at its limit. A live target is paused for the walk and resumed
@@ -65,7 +68,7 @@ walk SnapshotOptions {..} = do
         | n >= soMaxClosures = pure (acc, not (Seq.null queue))
         | otherwise = do
             node <- decode soFollowSrt p
-            let new = S.toList (S.fromList [c | c <- cnChildren node, not (S.member c seen)])
+            let new = nubOrd [c | c <- cnChildren node, not (S.member c seen)]
                 seen' = foldr S.insert seen new
             go (rest <> Seq.fromList (map mkClosurePtr new)) seen' (n + 1) (node : acc)
   (nodes, truncated) <- go (Seq.fromList roots) (S.fromList rootIds) (0 :: Int) []

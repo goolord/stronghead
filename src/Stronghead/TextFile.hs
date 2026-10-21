@@ -8,13 +8,16 @@ module Stronghead.TextFile
   ) where
 
 import Control.Exception (IOException, try)
+import Data.Bifunctor (first)
+import System.Directory (createDirectoryIfMissing, renameFile)
+import System.FilePath (takeDirectory, (<.>))
+
 import Data.ByteString qualified as B
 import Data.Text (Text)
-import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
-import System.Directory (createDirectoryIfMissing, renameFile)
-import System.FilePath (takeDirectory)
+
+import Stronghead.Format (tshow)
 
 -- | A text file read as UTF-8. Bytes that are not UTF-8 are replaced rather
 -- than failing the read.
@@ -25,16 +28,15 @@ readTextFile path = TE.decodeUtf8With TE.lenientDecode <$> B.readFile path
 -- whole.
 writeTextFile :: FilePath -> Text -> IO ()
 writeTextFile path txt = do
-  B.writeFile (path <> ".tmp") (TE.encodeUtf8 txt)
-  renameFile (path <> ".tmp") path
+  let tmp = path <.> "tmp"
+  B.writeFile tmp (TE.encodeUtf8 txt)
+  renameFile tmp path
 
 -- | 'writeTextFile', creating the directory first, with a failure said as
 -- "Could not save @what@: …".
 saveTextFile :: Text -> FilePath -> Text -> IO (Either Text ())
-saveTextFile what path txt = do
-  r <- try $ do
-    createDirectoryIfMissing True (takeDirectory path)
-    writeTextFile path txt
-  pure $ case r of
-    Left (e :: IOException) -> Left ("Could not save " <> what <> ": " <> T.pack (show e))
-    Right () -> Right ()
+saveTextFile what path txt =
+  first (\(e :: IOException) -> "Could not save " <> what <> ": " <> tshow e)
+    <$> try do
+      createDirectoryIfMissing True (takeDirectory path)
+      writeTextFile path txt

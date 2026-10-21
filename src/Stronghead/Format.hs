@@ -1,5 +1,5 @@
--- | Human-readable rendering of the units every panel shows: nanosecond
--- timestamps, byte counts and rates.
+-- | Human-readable rendering and total parsing of the units every panel
+-- shows: nanosecond timestamps, byte counts, rates, decimals and hex.
 module Stronghead.Format
   ( fmtNs
   , fmtTick
@@ -10,19 +10,72 @@ module Stronghead.Format
   , fmtPct
   , fmtInt
   , fmtFixed
+  , fmtFixedTrim
+  , fmtHex
   , tshow
+  , readDecimal
+  , readSignedDecimal
+  , readHex
+  , readDouble
+  , readSignedDouble
+  , percentEncodeWhere
   ) where
+
+import Data.ByteString qualified as B
+import Data.Char (chr, intToDigit, toUpper)
+import Data.Word (Word64)
+import Numeric (showFFloat, showHex)
 
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word64)
-import Numeric (showFFloat)
+import Data.Text.Encoding qualified as TE
+import Data.Text.Read qualified as TR
 
 tshow :: Show a => a -> Text
 tshow = T.pack . show
 
 fmtFixed :: Int -> Double -> Text
 fmtFixed n x = T.pack (showFFloat (Just n) x "")
+
+-- | 'fmtFixed' with trailing zeroes (and a trailing decimal point) removed.
+fmtFixedTrim :: Int -> Double -> Text
+fmtFixedTrim n x =
+  let s = fmtFixed n x
+   in if T.elem '.' s then T.dropWhileEnd (== '.') (T.dropWhileEnd (== '0') s) else s
+
+fmtHex :: Integral a => a -> Text
+fmtHex a = "0x" <> T.pack (showHex (toInteger a) "")
+
+-- | Percent-encode UTF-8 bytes of characters that do not satisfy @keep@.
+percentEncodeWhere :: (Char -> Bool) -> Text -> Text
+percentEncodeWhere keep = T.pack . concatMap byte . B.unpack . TE.encodeUtf8
+  where
+    byte w
+      | keep c = [c]
+      | otherwise = ['%', hexDigit (w `div` 16), hexDigit (w `mod` 16)]
+      where
+        c = chr (fromIntegral w)
+    hexDigit = toUpper . intToDigit . fromIntegral
+
+readExact :: TR.Reader a -> Text -> Maybe a
+readExact r s = case r s of
+  Right (x, "") -> Just x
+  _ -> Nothing
+
+readDecimal :: Integral a => Text -> Maybe a
+readDecimal = readExact TR.decimal
+
+readSignedDecimal :: Integral a => Text -> Maybe a
+readSignedDecimal = readExact (TR.signed TR.decimal)
+
+readHex :: Integral a => Text -> Maybe a
+readHex s = T.stripPrefix "0x" s >>= readExact TR.hexadecimal
+
+readDouble :: Text -> Maybe Double
+readDouble = readExact TR.double
+
+readSignedDouble :: Text -> Maybe Double
+readSignedDouble = readExact (TR.signed TR.double)
 
 -- | A duration in nanoseconds, scaled to the largest unit that keeps it >= 1.
 fmtNs :: Double -> Text
@@ -47,13 +100,10 @@ nsUnit ns
 fmtTick :: Double -> Double -> Text
 fmtTick step ns
   | abs ns < 0.5 = "0"
-  | otherwise = trim (fmtFixed decimals (ns / scale)) <> " " <> unit
+  | otherwise = fmtFixedTrim decimals (ns / scale) <> " " <> unit
   where
     (scale, unit, _) = nsUnit ns
     decimals = max 0 (ceiling (negate (logBase 10 (max 1e-9 step / scale)) - 1e-9))
-    trim s
-      | T.elem '.' s = T.dropWhileEnd (== '.') (T.dropWhileEnd (== '0') s)
-      | otherwise = s
 
 fmtSec :: Double -> Text
 fmtSec s

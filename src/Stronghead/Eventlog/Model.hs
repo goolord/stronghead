@@ -73,18 +73,21 @@ module Stronghead.Eventlog.Model
 
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
+import Data.List (sort, sortOn, (!?))
+import Data.List.Extra (minimumOn)
 import Data.Map.Strict (Map)
-import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Ord (Down (..))
+import Data.Word (Word32, Word64, Word8)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Generic qualified as G
 import Data.Vector.Unboxed qualified as VU
-import Data.Word (Word32, Word64, Word8)
 import GHC.RTS.Events (ThreadStopStatus (..))
+
 import Stronghead.Clock (partitionPoint)
 import Stronghead.Format (tshow)
 import Stronghead.HeapProfile (HeapProfile (..))
@@ -180,7 +183,7 @@ data Track = Track
     -- ^ Extra data: for a black-hole block, the owning thread (0 if unknown).
   , trCum :: !(V.Vector (VU.Vector Double))
   }
-  deriving (Show)
+  deriving stock (Show)
 
 data SpanRec = SpanRec
   { srStart :: !Word64
@@ -190,7 +193,7 @@ data SpanRec = SpanRec
   , srStop :: !StopCode
   , srAux :: !Word32
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Build a track from spans sorted by start time.
 mkTrack :: [SpanRec] -> Track
@@ -267,7 +270,7 @@ pickSpan tr t tol = case spanIndexAt tr t of
         dist j = let s = trStart tr VU.! j; e = trEnd tr VU.! j in if t < s then s - t else if t > e then t - e else 0
      in case cands of
           [] -> Nothing
-          _ -> Just (snd (minimum [(dist j, j) | j <- cands]))
+          _ -> Just (minimumOn dist cands)
 
 -- | First index whose key is >= @x@ in a vector sorted by that key.
 lowerBoundBy :: (G.Vector v a) => (a -> Word64) -> v a -> Word64 -> Int
@@ -298,7 +301,7 @@ data ThreadInfo = ThreadInfo
     -- ^ When it was woken, and by which thread: the one running on the
     -- capability that posted the wakeup (0 when none was).
   }
-  deriving (Show)
+  deriving stock (Show)
 
 threadName :: ThreadInfo -> Text
 threadName ti = maybe ("thread " <> tshow (tiId ti)) (\l -> l <> " (" <> tshow (tiId ti) <> ")") (tiLabel ti)
@@ -312,7 +315,7 @@ data GCEvent = GCEvent
   , gcCopied :: !Word64
   , gcParThreads :: !Int
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Marker = Marker
   { mkTime :: !Word64
@@ -321,7 +324,7 @@ data Marker = Marker
   , mkIsMarker :: !Bool
     -- ^ 'traceMarker' as opposed to 'traceEvent'.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 type PointKind = Word8
 
@@ -383,7 +386,7 @@ data Timeline = Timeline
     -- first.
   , tlEventCount :: !Int
   }
-  deriving (Show)
+  deriving stock (Show)
 
 emptyTimeline :: Timeline
 emptyTimeline = Timeline 0 0 V.empty V.empty M.empty V.empty VU.empty VU.empty VU.empty V.empty Nothing [] emptyRunInfo IM.empty M.empty V.empty 0 V.empty IM.empty V.empty 0
@@ -396,7 +399,7 @@ data CostCentreInfo = CostCentreInfo
   , cciSrc :: !SrcLoc
   , cciCaf :: !Bool
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Summary = Summary
   { smDuration :: !Double
@@ -414,7 +417,7 @@ data Summary = Summary
   , smPeakHeap :: !Word64
   , smThreads :: !Int
   }
-  deriving (Show)
+  deriving stock (Show)
 
 summarize :: Timeline -> Summary
 summarize tl =
@@ -426,7 +429,7 @@ summarize tl =
     , smGCPauseMax = foldl' max 0 pauses
     , smMutatorFrac = frac kindRun
     , smGCFrac = frac kindGC
-    , smAllocated = if VU.null (tlAlloc tl) then 0 else snd (VU.last (tlAlloc tl))
+    , smAllocated = maybe 0 (snd . snd) (VU.unsnoc (tlAlloc tl))
     , smPeakLive = VU.foldl' (\m (_, v) -> max m v) 0 (tlLive tl)
     , smPeakHeap = VU.foldl' (\m (_, v) -> max m v) 0 (tlHeapSize tl)
     , smThreads = M.size (tlThreads tl)
@@ -491,7 +494,7 @@ data RangeStats = RangeStats
   , rsCensuses :: ![Int]
   , rsMarkers :: ![Int]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 rangeStats :: Timeline -> Word64 -> Word64 -> RangeStats
 rangeStats tl a b =
@@ -499,7 +502,7 @@ rangeStats tl a b =
     { rsCollections = map fst gcs
     , rsMajor = length [() | (_, g) <- gcs, gcGen g >= 1]
     , rsPauseTotal = sum [min b (gcEnd g) - max a (gcStart g) | (_, g) <- gcs]
-    , rsLongest = fst <$> foldr (\x m -> Just (maybe x (\y -> if pause x >= pause y then x else y) m)) Nothing gcs
+    , rsLongest = fst <$> listToMaybe (sortOn (Down . pause) gcs)
     , rsAllocated = do
         va <- seriesValueAt (tlAlloc tl) a
         vb <- seriesValueAt (tlAlloc tl) b
@@ -531,7 +534,7 @@ data ProfSample = ProfSample
   , psStack :: !(VU.Vector Word32)
     -- ^ Cost-centre ids, innermost (the top frame) first.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The sample's top frame.
 psTop :: ProfSample -> Maybe Int
@@ -547,17 +550,15 @@ data CodeRun = CodeRun
   , crFirst :: !Int
     -- ^ Index of its first sample in 'tlProfSamples', for the stack.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The median gap between one capability's consecutive samples, from
 -- samples sorted by time. The RTS samples every capability at each tick.
 samplePeriod :: [ProfSample] -> Word64
 samplePeriod samples =
   let byCap = IM.fromListWith (++) [(psCap s, [psTime s]) | s <- reverse samples]
-      gaps = sortOn id [b - a | ts <- IM.elems byCap, (a, b) <- zip ts (drop 1 ts), b > a]
-   in case gaps of
-        [] -> 0
-        _ -> gaps !! (length gaps `div` 2)
+      gaps = sort [b - a | ts <- IM.elems byCap, (a, b) <- zip ts (drop 1 ts), b > a]
+   in fromMaybe 0 (gaps !? (length gaps `div` 2))
 
 -- | Merge each capability's samples into runs of one top frame. A gap of
 -- more than a period and a half between samples ends a run; samples
@@ -588,7 +589,7 @@ data CodeProfile = CodeProfile
   , cpTop :: ![(Int, Int)]
     -- ^ Top-frame cost centre and its samples.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The top frames of the samples taken between two moments that @keep@
 -- keeps.
@@ -659,7 +660,7 @@ data TickyCounter = TickyCounter
     -- ^ Each sample: when it was taken, and the entries and allocation
     -- since the one before.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The counters with entries or allocation between two moments, and how
 -- much, most allocation first. A sample covers the time since the one

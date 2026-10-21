@@ -25,15 +25,18 @@ module Stronghead.HeapProfile
   , looksStructured
   ) where
 
-import Data.List (sortOn)
+import Control.Applicative ((<|>))
+import Data.Containers.ListUtils (nubOrd)
+import Data.List (sortOn, unsnoc)
 import Data.Map.Strict qualified as M
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+
+import Stronghead.Format (readDecimal, readDouble)
 import Stronghead.Run (RunInfo, emptyRunInfo, runFromHp)
 import Stronghead.Source (SrcLoc, renderSrcLoc)
 import Stronghead.TextFile (readTextFile)
@@ -46,7 +49,7 @@ data BandKind
   | KindData
     -- ^ Arrays, byte arrays, MUT_VARs and other primitive storage.
   | KindUnknown
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 data Band = Band
   { bandName :: !Text
@@ -60,7 +63,7 @@ data Band = Band
   , bandDetail :: !(Maybe Text)
     -- ^ 'bandProv' as one line of text.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | An info table's provenance, from the eventlog's IPE events (built with
 -- @-finfo-table-map@).
@@ -78,7 +81,7 @@ data InfoProv = InfoProv
   , ipModule :: !Text
   , ipSrc :: !SrcLoc
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | @table :: type  (label, Module file:line:col)@.
 infoProvDetail :: InfoProv -> Text
@@ -101,7 +104,7 @@ data HeapProfile = HeapProfile
   , hpRun :: !RunInfo
     -- ^ From a @.hp@ file's @JOB@ and @DATE@, or the eventlog's run.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Sample @i@'s time from the start of the run, as displays show it.
 hpOffset :: HeapProfile -> Int -> Double
@@ -134,7 +137,7 @@ fromSamples job breakdown start prov samples0 =
   where
     samples = sortOn fst samples0
     n = length samples
-    names = M.keys (M.fromList [(b, ()) | (_, s) <- samples, (b, _) <- s])
+    names = nubOrd [b | (_, s) <- samples, (b, _) <- s]
     columns :: M.Map Text (M.Map Int Double)
     columns =
       M.fromListWith
@@ -225,8 +228,8 @@ parseHp src
     bandLine line =
       let (name, val) = T.breakOnEnd "\t" line
        in if T.null name
-            then case T.words line of
-              ws@(_ : _ : _) -> Just (T.unwords (init ws), readD (last ws))
+            then case unsnoc (T.words line) of
+              Just (initWs@(_ : _), lastW) -> Just (T.unwords initWs, readD lastW)
               _ -> Nothing
             else Just (T.dropEnd 1 name, readD val)
     unquote = T.copy . T.dropAround (== '"') . T.strip
@@ -249,11 +252,9 @@ guessBreakdown job names
     closureTypes = any (`elem` names) ["ARR_WORDS", "STACK", "TSO", "BLACKHOLE", "MUT_ARR_PTRS_CLEAN"] || any ("THUNK_" `T.isPrefixOf`) names
 
 readD :: Text -> Double
-readD t = case TR.double (T.strip t) of
-  Right (d, _) -> d
-  Left _ -> case TR.decimal (T.strip t) :: Either String (Integer, Text) of
-    Right (i, _) -> fromIntegral i
-    Left _ -> 0
+readD t =
+  let s = T.strip t
+   in fromMaybe 0 (readDouble s <|> (fromIntegral @Integer <$> readDecimal s))
 
 -- ---------------------------------------------------------------------------
 -- Analyses
@@ -280,7 +281,7 @@ data Suspect = Suspect
     -- ^ Consecutive trailing samples it has been non-shrinking: each one is
     -- a census taken after a major GC it survived.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | How many samples the analyses look at: all of them, except a final
 -- census where the heap has collapsed to almost nothing, which is the RTS
@@ -291,7 +292,9 @@ analysedSamples hp =
   let tot = hpTotals hp
       n = VU.length tot
       peak = if n == 0 then 0 else VU.maximum tot
-   in if n >= 3 && VU.last tot < 0.05 * peak then n - 1 else n
+   in case VU.unsnoc tot of
+        Just (_, lastTot) | n >= 3 && lastTot < 0.05 * peak -> n - 1
+        _ -> n
 
 -- | Rank bands by how leak-like their residency curve is. A band qualifies
 -- when it grows over the run, rarely shrinks, and ends at least 1.5x where
@@ -310,11 +313,10 @@ leakSuspects hp =
       | otherwise = Just (Suspect i score growth mono slope trailing)
       where
         vs = VU.take n (bandValues b)
-        nz = VU.dropWhile (<= 0) vs
-        first = if VU.null nz then 0 else VU.head nz
-        lastV = VU.last vs
-        growth = if first <= 0 then 0 else lastV / first
-        steps = VU.zipWith (-) (VU.tail vs) vs
+        firstV = maybe 0 fst (VU.uncons (VU.dropWhile (<= 0) vs))
+        lastV = maybe 0 snd (VU.unsnoc vs)
+        growth = if firstV <= 0 then 0 else lastV / firstV
+        steps = VU.zipWith (-) (VU.drop 1 vs) vs
         mono = fromIntegral (VU.length (VU.filter (>= 0) steps)) / fromIntegral (max 1 (VU.length steps))
         slope = regressionSlope ts vs
         trailing = VU.length (VU.takeWhile (>= 0) (VU.reverse steps))
@@ -347,7 +349,7 @@ data RetainTree = RetainTree
   , rtBytes :: !Double
   , rtChildren :: ![RetainTree]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Whether the breakdown's band names carry structure 'retainTree' can use.
 looksStructured :: HeapProfile -> Bool
@@ -355,7 +357,7 @@ looksStructured hp =
   hpBreakdown hp == "retainer set" || V.any (T.any (== '/') . bandName) (hpBands hp)
 
 retainTree :: HeapProfile -> Int -> RetainTree
-retainTree hp i = toTree "heap" (foldl' insert M.empty paths)
+retainTree hp i = toTree "heap" (M.unionsWith (<>) [nodePath path v | (path, v) <- paths])
   where
     paths =
       [ (path, v)
@@ -364,15 +366,16 @@ retainTree hp i = toTree "heap" (foldl' insert M.empty paths)
       , v > 0
       , path <- bandPaths (hpBreakdown hp) (bandName b)
       ]
-    insert m (path, v) = insertPath path v m
-    insertPath [] _ m = m
-    insertPath (p : ps) v m =
-      M.alter (Just . maybe (Node v (insertPath ps v M.empty)) (\(Node w kids) -> Node (w + v) (insertPath ps v kids))) p m
+    nodePath [] _ = M.empty
+    nodePath (p : ps) v = M.singleton p (Node v (nodePath ps v))
     toTree name m =
       RetainTree name (sum [w | Node w _ <- M.elems m]) $
         sortOn (Down . rtBytes) [(toTree k kids) {rtBytes = w} | (k, Node w kids) <- M.toList m]
 
 data Node = Node !Double !(M.Map Text Node)
+
+instance Semigroup Node where
+  Node w1 k1 <> Node w2 k2 = Node (w1 + w2) (M.unionWith (<>) k1 k2)
 
 -- | The root-to-leaf paths a band name stands for. Heap-profile labels
 -- carry a @(n)@ id prefix, which is dropped.

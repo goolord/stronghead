@@ -55,7 +55,7 @@ partitionPoint p = go
 stepTime :: Int -> VU.Vector Word64 -> Word64 -> Maybe Word64
 stepTime dir ts t
   | dir >= 0 = VU.find (> t) ts
-  | otherwise = let before = VU.takeWhile (< t) ts in if VU.null before then Nothing else Just (VU.last before)
+  | otherwise = snd <$> VU.unsnoc (VU.takeWhile (< t) ts)
 
 -- | An artifact's clock, in seconds, against program time.
 data ClockMap = ClockMap
@@ -66,7 +66,7 @@ data ClockMap = ClockMap
     -- ^ Whether the map is exact at its points (and the seconds are program
     -- time between them), or a guess.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Seconds that are program time ('True'), or that stand in for it
 -- ('False', a @.hp@ file on its own).
@@ -81,7 +81,7 @@ pairedClock ps = ClockMap (VU.fromList ps) (not (null ps))
 toProgramNs :: ClockMap -> Double -> Double
 toProgramNs (ClockMap ps _) s = case VU.length ps of
   0 -> s * 1e9
-  1 -> let (s0, p0) = VU.head ps in p0 + (s - s0) * 1e9
+  1 -> let (s0, p0) = ps VU.! 0 in p0 + (s - s0) * 1e9
   n ->
     let i = max 1 (min (n - 1) (VU.length (VU.takeWhile ((<= s) . fst) ps)))
         (s0, p0) = ps VU.! (i - 1)
@@ -91,7 +91,7 @@ toProgramNs (ClockMap ps _) s = case VU.length ps of
 fromProgramNs :: ClockMap -> Double -> Double
 fromProgramNs (ClockMap ps _) p = case VU.length ps of
   0 -> p / 1e9
-  1 -> let (s0, p0) = VU.head ps in s0 + (p - p0) / 1e9
+  1 -> let (s0, p0) = ps VU.! 0 in s0 + (p - p0) / 1e9
   n ->
     let i = max 1 (min (n - 1) (VU.length (VU.takeWhile ((<= p) . snd) ps)))
         (s0, p0) = ps VU.! (i - 1)

@@ -19,11 +19,12 @@ module UI.Inspector
   ) where
 
 import Control.Monad (forM_, unless, void, when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
-import Data.List (nub)
 import Data.Maybe (isJust)
 import Data.Text qualified as T
 import NanoUI
+import Stronghead.Format (tshow)
 import Stronghead.Next (Step (..), StepDo (..), datumRecipe, datumTitle)
 import Stronghead.Ref (Ref (..), refTarget)
 import Stronghead.Source (renderSrcSpan)
@@ -130,7 +131,7 @@ inspectorBody env r = do
         [ (l, peek, related, actions)
         | l <- ls
         , let peek = lensPeek l r
-              related = nub [(lbl, x) | (lbl, x) <- lensRelated l r, shownBy x]
+              related = nubOrd [(lbl, x) | (lbl, x) <- lensRelated l r, shownBy x]
               actions = lensActions l r
         , lensShows l r || not (null related) || not (null actions) || isJust peek
         ]
@@ -162,7 +163,7 @@ nextStepsSection env steps = unless (null steps) $
     forM_ (zip [1 :: Int ..] steps) $ \(i, s) -> withKey i $
       columnWith (fillW . tight . gap 2) $ do
         rowWith (fillW . tight . gap 8) $ do
-          labelWith (alignMid . fontMuted . fontSizeScale 0.85 . fixedW 14) (T.pack (show i))
+          labelWith (alignMid . fontMuted . fontSizeScale 0.85 . fixedW 14) (tshow i)
           let run = stepRun env s
           scope $ case stepDo s of
             -- Missing data has nothing to click: what to add is below it.

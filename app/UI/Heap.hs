@@ -35,50 +35,55 @@ module UI.Heap
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, displayException, try)
 import Control.Monad (forM_, guard, join, unless, void, when)
+import Data.Either (fromRight)
+import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (for_)
 import Data.List (sortOn)
+import Data.List.Extra (dropEnd)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as S
+import Data.Word (Word64)
+import System.Directory (getFileSize)
+import System.FilePath (takeFileName)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
-import Data.Word (Word64)
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
+
 import Stronghead.Clock
 import Stronghead.Debug
+import Stronghead.Diff (BandChange (..), BandFigures (..), BandStatus (..), Baseline (..), changeFor, diffHeap, figuresTitle, fmtChange)
 import Stronghead.Dump (nameKey)
 import Stronghead.Eventlog.Model (Timeline (..))
 import Stronghead.Format
 import Stronghead.HeapProfile
 import Stronghead.Join
-import Stronghead.Diff (Baseline (..), BandChange (..), BandFigures (..), BandStatus (..), changeFor, diffHeap, figuresTitle, fmtChange)
 import Stronghead.Next (Fact (..))
 import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run (runFromSocket, runKey, runKeysMatch)
 import Stronghead.Source (parseSrcLoc, renderSrcSpan, srcLocSpan)
-import System.Directory (getFileSize)
-import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
 import UI.Link
 import UI.Workspace
 
 data HeapSource = FromEventlog | FromHpFile | FromGhcDebug
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Show, Enum, Bounded)
 
 -- | How to reach the program for a ghc-debug snapshot.
 data DbgConn = ConnSocket | ConnTcp | ConnFile
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Show, Enum, Bounded)
 
 data DbgTab = DbgSurvivors | DbgGraph | DbgBiggest
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Show, Enum, Bounded)
 
 -- | A snapshot to take: a counter (so the same target can be snapshotted
 -- again), the target and the options.
@@ -96,7 +101,7 @@ keepSnapshots :: Int
 keepSnapshots = 8
 
 data HeapTab = AtCursor | Leaks | Retention | CostCentres
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Show, Enum, Bounded)
 
 tabName :: HeapTab -> Text
 tabName = \case
@@ -287,8 +292,8 @@ watchSize :: FilePath -> (Maybe Integer -> IO ()) -> IO ()
 watchSize p report = go Nothing
   where
     go prev = do
-      r <- try (getFileSize p)
-      let now = Just (either (\(_ :: IOException) -> -1) id r)
+      r <- try @IOException (getFileSize p)
+      let now = Just (fromRight (-1) r)
       when (now /= prev) (report now)
       threadDelay 1000000
       go now
@@ -378,9 +383,7 @@ snapshotCount st = (\(History _ ss) -> length ss) <$> readVar (hsDbgHistory st)
 -- | The profile on show: the @.hp@ file's, or else the eventlog's.
 shownProfile :: HeapSource -> HeapLoaded -> Maybe HeapProfile -> Maybe HeapProfile
 shownProfile source loaded fromLog = case source of
-  FromHpFile -> case taskOutcome (hlHp loaded) of
-    Just (Right hp) -> Just hp
-    _ -> Nothing
+  FromHpFile -> taskOutcome (hlHp loaded) >>= eitherToMaybe
   _ -> fromLog
 
 -- | The profile's clock against program time. The eventlog's samples are
@@ -414,23 +417,23 @@ heapSync bus st loaded logTl following = do
     writeVar (hsFollowing st) following
     when following (writeVar (hsTracking st) True)
   let fromLog = logTl >>= tlHeapProfile
-  for_ (shownProfile source loaded fromLog) $ \hp -> unless (VU.null (hpTimes hp)) $ do
+  for_ (shownProfile source loaded fromLog) $ \hp -> do
     let clock = profileClock source hp fromLog
         offsets = hpOffsets hp
-        newest = VU.last offsets
         tracks = following && source == FromEventlog
-    tracking <- readVar (hsTracking st)
-    cur <- readVar (hsCursor st)
-    when (tracks && tracking && cur /= Just newest) (writeVar (hsCursor st) (Just newest))
-    tether
-      bus
-      (hsTether st)
-      (profileRun source hp fromLog clock)
-      (hsCursor st)
-      (\t -> Just (offsets VU.! nearestIndex (hpTimes hp) (fromProgramNs clock (fromIntegral t))))
-      (\o -> Just (round (max 0 (toProgramNs clock (hpTimes hp VU.! nearestIndex offsets o)))))
-    after <- readVar (hsCursor st)
-    when (tracks && tracking && after /= Just newest) (writeVar (hsTracking st) False)
+    for_ (VU.unsnoc offsets) $ \(_, newest) -> do
+      tracking <- readVar (hsTracking st)
+      cur <- readVar (hsCursor st)
+      when (tracks && tracking && cur /= Just newest) (writeVar (hsCursor st) (Just newest))
+      tether
+        bus
+        (hsTether st)
+        (profileRun source hp fromLog clock)
+        (hsCursor st)
+        (\t -> Just (offsets VU.! nearestIndex (hpTimes hp) (fromProgramNs clock (fromIntegral t))))
+        (\o -> Just (round (max 0 (toProgramNs clock (hpTimes hp VU.! nearestIndex offsets o)))))
+      after <- readVar (hsCursor st)
+      when (tracks && tracking && after /= Just newest) (writeVar (hsTracking st) False)
 
 -- | The chart's window on the profile's clock, in ns, and how to move it:
 -- its own, or the Timeline's when locked to it or placed with one of the
@@ -452,7 +455,7 @@ chartWindow bus st hp clock rk placed = do
   window <- readVar (busWindow bus)
   let -- A little room after the last census, so a cursor on it shows.
       lo = hpStart hp * 1e9
-      hi = let end = VU.last (hpTimes hp) * 1e9 in max (lo + 1e6) (end + 0.015 * (end - lo))
+      hi = let end = maybe (lo / 1e9) snd (VU.unsnoc (hpTimes hp)) * 1e9 in max (lo + 1e6) (end + 0.015 * (end - lo))
       fromProg p = fromProgramNs clock p * 1e9
       toProg x = toProgramNs clock (x / 1e9)
       lockable = maybe False (runKeysMatch rk . fst) window
@@ -501,7 +504,7 @@ profileView env bench st loaded logTl hp = do
   columnWith (padBottom 8 . tight . fillW) $
     readoutDelta
       [ ("censuses", tshow (VU.length times), Nothing)
-      , ("profiled", fmtSec (VU.last times), Nothing)
+      , ("profiled", fmtSec (maybe 0 snd (VU.unsnoc times)), Nothing)
       , ("peak total", fmtBytesD (peakOf hp), (\b -> fmtChange (peakOf b) (peakOf hp) <> " vs baseline") <$> base)
       , ("cursor at" <> approx, fmtSec (times VU.! cursorIx), Nothing)
       , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx), Nothing)
@@ -681,9 +684,9 @@ chartRefAt hp ls v r m@(V2 mx my)
     under = [l | (l, lo, hi) <- zip3 ls stackAt (drop 1 stackAt), bytes >= lo, bytes < hi]
 
 maxStack :: [Layer] -> Double
-maxStack ls = case ls of
+maxStack = \case
   [] -> 1
-  _ -> max 1 (VU.maximum (foldr1 (VU.zipWith (+)) (map lyValues ls)))
+  l : rest -> max 1 (VU.maximum (foldl' (VU.zipWith (+)) (lyValues l) (map lyValues rest)))
 
 drawChart :: Palette -> MonoMetrics -> HeapProfile -> [Layer] -> TimeView -> Int -> Axis -> Marks -> Rect -> Maybe (Float, Float, [Text]) -> CanvasM ()
 drawChart pal mm hp ls v cursorIx axis marks r hover = do
@@ -864,7 +867,7 @@ leakView env st hp = do
             streak = VU.length (VU.takeWhile (>= 0) (VU.reverse steps))
         linkText env (RBand (bandName b)) id (bandName b)
         flex
-        labelWith (fontMono . fixedW 100) (fmtBytesD (VU.last vs))
+        labelWith (fontMono . fixedW 100) (fmtBytesD (maybe 0 snd (VU.unsnoc vs)))
         labelWith ((if streak >= 5 then fontTone Danger else fontMuted) . fixedW 200) (tshow streak <> " censuses growing")
 
 -- | Where a band's closures come from, with the site and the binding as
@@ -1374,18 +1377,10 @@ heapLens st loaded fromLog = do
   totals <- readVar (hsCostTotals st)
   sources <- readVar (hsDbgSources st)
   survivors <- readVar (hsDbgSurvivors st)
-  let profile = case source of
-        FromHpFile -> case taskOutcome (hlHp loaded) of
-          Just (Right hp) -> Just hp
-          _ -> Nothing
-        _ -> fromLog
+  let profile = shownProfile source loaded fromLog
       fromEventlog = source /= FromHpFile
-      prof = case taskOutcome (hlProf loaded) of
-        Just (Right pf) -> Just pf
-        _ -> Nothing
-      latest = case reverse snaps of
-        s : _ -> Just s
-        [] -> Nothing
+      prof = taskOutcome (hlProf loaded) >>= eitherToMaybe
+      latest = listToMaybe (reverse snaps)
       -- A Unix socket is named after the program and its pid; TCP and
       -- snapshot files say nothing about the run.
       snapRun = case req of
@@ -1403,9 +1398,13 @@ heapLens st loaded fromLog = do
         (_, Just lp) | censusIn r i lp -> Just lp
         _ -> Nothing
       logCensus r i = source == FromHpFile && maybe False (censusIn r i) fromLog && not (maybe False (censusIn r i) profile)
-      instantIn r t = profile >>= \hp ->
+      instantIn r t = do
+        hp <- profile
+        (firstT, _) <- VU.uncons (hpTimes hp)
+        (_, lastT) <- VU.unsnoc (hpTimes hp)
         let s = fromIntegral t / 1e9
-         in if fromEventlog && runKeysMatch r (runKey (hpRun hp)) && not (VU.null (hpTimes hp)) && s >= VU.head (hpTimes hp) && s <= VU.last (hpTimes hp) then Just hp else Nothing
+        guard (fromEventlog && runKeysMatch r (runKey (hpRun hp)) && s >= firstT && s <= lastT)
+        pure hp
       ccs = maybe [] (map snd . flattenCC . pfRoots) prof
       costCentre m l = listToMaybe [c | c <- ccs, ccName c == l || ccModule c <> "." <> ccName c == l, T.null m || ccModule c == m]
       closure s a = if s == sn then latest >>= M.lookup a . snapNodes else Nothing
@@ -1469,9 +1468,8 @@ heapLens st loaded fromLog = do
         awayFromLiveGraph
         writeVar (hsTab st) CostCentres
         writeVar (hsCCFilter st) ""
-        modifyVar (hsCCOpen st) (S.union (S.fromList (map ccNo (dropLast path))))
+        modifyVar (hsCCOpen st) (S.union (S.fromList (map ccNo (dropEnd 1 path))))
         writeVar (hsCCSel st) (ccNo <$> listToMaybe (reverse path))
-      dropLast xs = take (length xs - 1) xs
       bandActions b bd =
         [ Action "Open its stack in the cost-centre tree" $ case ccPath b of
             Just path -> Right (openPath path)

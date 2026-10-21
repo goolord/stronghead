@@ -12,9 +12,11 @@ module UI.Pinboard
   ) where
 
 import Control.Monad (forM_, void, when)
+import Data.List (find)
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
+import Stronghead.Format (tshow)
 import Stronghead.Ref (Ref (..), refTarget)
 import Stronghead.Session (Pin (..), PinReport (..), ReportSection (..), pinMove, pinsMarkdown)
 import Stronghead.Source (renderSrcSpan)
@@ -27,7 +29,7 @@ pinboardPane env export ctx = do
   let bus = envBus env
   pins <- readVar (busPins bus)
   let header = do
-        paneMeta (T.pack (show (length pins)))
+        paneMeta (tshow (length pins))
         flex
         disabledWhen (null pins) $ do
           copy <- buttonWith' (alignMid . padXY 8 2 . tight) "Copy report"
@@ -54,11 +56,8 @@ pinboardPane env export ctx = do
               defaultTextInputConfig {ticPlaceholder = "Note", ticLayout = fillW defaultLayout}
               (zoomVar (noteOf (pinRef p)) (setNote (pinRef p)) (busPins bus))
   where
-    noteOf r ps = maybe "" pinNote (lookupPin r ps)
+    noteOf r = maybe "" pinNote . find ((== r) . pinRef)
     setNote r note = map (\q -> if pinRef q == r then q {pinNote = note} else q)
-    lookupPin r ps = case filter ((== r) . pinRef) ps of
-      q : _ -> Just q
-      [] -> Nothing
 
 -- | One pin as the report has it: every panel's facts as text.
 pinReport :: Env -> Pin -> PinReport

@@ -20,31 +20,36 @@ module UI.Core
   , coreLens
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM_, join, unless, void, when)
-import Data.Foldable (for_)
-import Data.IntMap.Strict qualified as IM
 import Data.Containers.ListUtils (nubOrd)
-import Data.List (nub, sortOn)
+import Data.Either.Extra (eitherToMaybe)
+import Data.Foldable (asum, for_)
+import Data.IntMap.Strict qualified as IM
+import Data.List (sort, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Vector qualified as V
+import Data.Set qualified as S
 import Data.Word (Word64)
-import NanoUI hiding (Binding)
-import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
-import Stronghead.Dump
-import Stronghead.Format (fmtBytesD, fmtFixed, tshow)
-import Stronghead.Next (Fact (..))
-import Stronghead.Join
-import Stronghead.Ref
-import Stronghead.Source (Resolved (..), SourceIndex (..), SrcSpan (..), buildSourceIndex, editorCommand, mkSourceIndex, resolveModule, resolveSource, resolvesTo, sourceRoots)
 import System.Directory (makeAbsolute)
 import System.FilePath (isAbsolute, normalise, takeFileName)
 import System.Process (spawnCommand)
+
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Vector qualified as V
+import NanoUI hiding (Binding)
+import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
+
+import Stronghead.Dump
+import Stronghead.Format (fmtBytesD, fmtFixed, tshow)
+import Stronghead.Join
+import Stronghead.Next (Fact (..))
+import Stronghead.Ref
+import Stronghead.Source (Resolved (..), SourceIndex (..), SrcSpan (..), buildSourceIndex, editorCommand, mkSourceIndex, resolveModule, resolveSource, resolvesTo, shortFileName, sourceRoots)
 import UI.Code
 import UI.Common
 import UI.Link
@@ -90,7 +95,7 @@ data CoreState = CoreState
 
 -- | The order of the binding list.
 data BindingSort = InFileOrder | ByTime | ByAlloc | ByHeap | ByEntries | ByTicky
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 newCoreState :: IO CoreState
 newCoreState = do
@@ -172,11 +177,11 @@ coreLoad st extra = do
   root <- readVar (csRoot st)
   arts <- traverse (\r -> useTask (csDiscover st) r (discoverArtifacts r)) root
   projectRoot <- T.unpack . T.strip <$> readVar (csProjectRoot st)
-  let starts = nub (filter (not . null) (projectRoot : maybe [] pure root ++ extra))
-  ix <- useTask (csIndex st) starts (buildSourceIndex =<< mapM makeAbsolute =<< sourceRoots starts)
+  let starts = nubOrd (filter (not . null) (projectRoot : maybe [] pure root ++ extra))
+  ix <- useTask (csIndex st) starts (buildSourceIndex =<< traverse makeAbsolute =<< sourceRoots starts)
   (s, c, g) <- readVar (csPaths st)
   let (ts, tc, tg) = csTasks st
-      load task kind = fmap (join) . traverse (\p -> useTask task p (loadCodeFile kind p))
+      load task kind = fmap join . traverse (\p -> useTask task p (loadCodeFile kind p))
       clArtifacts = join arts
       clIndex = fromMaybe (mkSourceIndex [] []) ix
   clSource <- load ts KindSource s
@@ -186,14 +191,9 @@ coreLoad st extra = do
   -- the path the STG's source notes give or else by module name.
   loadedModule <- readVar (csLoadedModule st)
   for_ loadedModule $ \a -> when (isNothing s) $ do
-    let stgFile = case clStg of
-          Just (Right cf) -> Just cf
-          _ -> Nothing
+    let stgFile = clStg >>= eitherToMaybe
         found =
-          listToMaybe
-            [ rsPath r
-            | Just r <- [stgFile >>= dumpSourcePath >>= resolveSource clIndex (Just (maModule a)), resolveModule clIndex (maModule a)]
-            ]
+          rsPath <$> ((stgFile >>= dumpSourcePath >>= resolveSource clIndex (Just (maModule a))) <|> resolveModule clIndex (maModule a))
     for_ found $ \f -> modifyVar (csPaths st) (\(_, c', g') -> (Just f, c', g'))
   -- The STG dump's closure sites, found once per dump.
   memo <- readVar (csSites st)
@@ -343,12 +343,9 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
     toolGroup $ checkboxWith alignMid "Hide uniques" (csHideUniques st)
     checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable st)
   root <- readVar (csRoot st)
-  let ok = \case
-        Just (Right cf) -> Just cf
-        _ -> Nothing
-      src = ok (clSource loaded)
-      core = ok (clCore loaded)
-      stg = ok (clStg loaded)
+  let src = clSource loaded >>= eitherToMaybe
+      core = clCore loaded >>= eitherToMaybe
+      stg = clStg loaded >>= eitherToMaybe
       errors = [T.pack e | Just (Left e) <- [clSource loaded, clCore loaded, clStg loaded]]
   scope $ unless (null errors) $
     columnWith (padBottom 8 . padXY 20 0 . tight . gap 2 . fillW) $ forM_ errors (labelWith (fontTone Danger))
@@ -382,12 +379,9 @@ intro =
 -- open. Without files each code pane says what to open.
 corePanes :: Env -> CoreState -> CoreLoaded -> [Word64] -> NanoUI PaneDraw
 corePanes env st loaded _ = do
-  let ok = \case
-        Just (Right cf) -> Just cf
-        _ -> Nothing
-      src = ok (clSource loaded)
-      core = ok (clCore loaded)
-      stg = ok (clStg loaded)
+  let src = clSource loaded >>= eitherToMaybe
+      core = clCore loaded >>= eitherToMaybe
+      stg = clStg loaded >>= eitherToMaybe
   hideU <- readVar (csHideUniques st)
   hideT <- readVar (csHideTypeable st)
   colouring <- readVar (csColouring st)
@@ -569,7 +563,7 @@ corePanes env st loaded _ = do
   -- The name under the pointer in any code pane last frame lights it up
   -- in all of them.
   let (hs0, hc0, hg0) = csHovers st
-  hoverNow <- listToMaybe . concatMap (maybe [] pure) <$> mapM readVar [hs0, hc0, hg0]
+  hoverNow <- asum <$> traverse readVar [hs0, hc0, hg0]
   when (hoverNow /= hot) (writeVar (csHot st) hoverNow)
   pure $ \pid ctx ->
     if
@@ -680,14 +674,14 @@ notesBar st e core r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
          in length (filter (`notElem` own) (occurrences cf (enKey e)))
   forM_ verdicts (labelWith (fontSizeScale 0.92))
   rowWith (tight . gap 6 . wrap . fillW) $ do
-    scope $ forM_ (sortOn id (concatMap (nBoxing . bdNotes) (enCore e))) $ \l -> withKey ("box" <> tshow l) $
+    scope $ forM_ (sort (concatMap (nBoxing . bdNotes) (enCore e))) $ \l -> withKey ("box" <> tshow l) $
       whenM (buttonWith tight ("box @" <> tshow (l + 1))) (scrollToLine vCore l)
-    scope $ forM_ (sortOn id (concatMap (nAllocs . bdNotes) (enStg e))) $ \l -> withKey ("let" <> tshow l) $
+    scope $ forM_ (sort (concatMap (nAllocs . bdNotes) (enStg e))) $ \l -> withKey ("let" <> tshow l) $
       whenM (buttonWith tight ("alloc @" <> tshow (l + 1))) (scrollToLine vStg l)
 
 -- | The module the loaded files are of.
 moduleOf :: Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Text
-moduleOf src core stg = maybe "" cfModule (listToMaybe (concatMap (maybe [] pure) [core, stg, src]))
+moduleOf src core stg = maybe "" cfModule (asum [core, stg, src])
 
 -- | Open a file in the editor Settings names, at a line.
 openInEditor :: CoreState -> Text -> FilePath -> Int -> Int -> NanoUI ()
@@ -713,12 +707,9 @@ openInEditor st template file line col = do
 coreLens :: CoreState -> CoreLoaded -> (Ref -> Maybe SrcSpan) -> [Annotation] -> NanoUI Lens
 coreLens st loaded spanOf anns = do
   editor <- T.strip <$> readVar (csEditor st)
-  let ok = \case
-        Just (Right cf) -> Just cf
-        _ -> Nothing
-      src = ok (clSource loaded)
-      core = ok (clCore loaded)
-      stg = ok (clStg loaded)
+  let src = clSource loaded >>= eitherToMaybe
+      core = clCore loaded >>= eitherToMaybe
+      stg = clStg loaded >>= eitherToMaybe
       arts = fromMaybe [] (clArtifacts loaded)
       ix = clIndex loaded
       es = entries False src core stg
@@ -727,10 +718,7 @@ coreLens st loaded spanOf anns = do
       -- sources, and the one loaded.
       sources = maybe [] (pure . cfPath) src ++ [f | a <- arts, Just f <- [maSource a]]
       local = mkSourceIndex [] sources
-      fileOf sp =
-        rsPath <$> case resolveSource local Nothing (ssFile sp) of
-          Just r -> Just r
-          Nothing -> resolveSource ix Nothing (ssFile sp)
+      fileOf sp = rsPath <$> (resolveSource local Nothing (ssFile sp) <|> resolveSource ix Nothing (ssFile sp))
       moduleFile m = rsPath <$> resolveModule ix m
       here m = T.null m || m == modName
       entry m k = if here m then listToMaybe [e | e <- es, enKey e == k] else Nothing
@@ -761,7 +749,7 @@ coreLens st loaded spanOf anns = do
               Nothing -> if isAbsolute (T.unpack (ssFile sp)) then Just (T.unpack (ssFile sp)) else Nothing
          in Action label $ case file of
               _ | T.null editor -> Left "set an editor command in Settings"
-              Nothing -> Left ("can't find " <> T.pack (takeFileName (T.unpack (ssFile sp))) <> "; set the project root in Settings")
+              Nothing -> Left ("can't find " <> shortFileName (ssFile sp) <> "; set the project root in Settings")
               Just f -> Right (openInEditor st editor f (ssLine sp) (ssCol sp))
       badgeNotes =
         [ Annotation (Just sp) Nothing (Just (modName, enKey e)) LaneNote 0 ShadeInk txt (Just (RBinding modName (enKey e)))
@@ -813,7 +801,7 @@ coreLens st loaded spanOf anns = do
           [Hit "binding" (enKey e) modName (HitRef (RBinding modName (enKey e))) | e <- es, not (isTypeableBinding (enKey e)), not (T.null (enKey e))]
             ++ [Hit "module" (maModule a) (maybe "" (T.pack . takeFileName) (maSource a)) (HitRef (RModule (maModule a))) | a <- arts]
             ++ [ Hit "file" (T.pack (takeFileName f)) (T.pack f) (HitRef (RSource (SrcSpan (T.pack f) 1 1 1 1)))
-               | f <- take 2000 (foldr (:) [] (siFiles ix))
+               | f <- take 2000 (S.toList (siFiles ix))
                ]
       , lensAnnotations = badgeNotes
       , lensSpan = \case

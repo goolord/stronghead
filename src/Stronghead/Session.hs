@@ -36,16 +36,17 @@ module Stronghead.Session
   , parseKeyValues
   ) where
 
-import Data.Char (chr, digitToInt, isSpace, ord)
+import Data.Char (chr, digitToInt, isSpace, toLower)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Word (Word64)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
-import Data.Word (Word64)
+
 import Stronghead.Diff (BaselinePaths (..), noBaselinePaths)
-import Stronghead.Format (tshow)
+import Stronghead.Format (readDecimal, tshow)
 import Stronghead.Ref (Ref (..), RunKey, parseRefTarget, refTarget)
 import Stronghead.Watch (Rule, decodeRule, defaultRules, encodeRule, setRules)
 
@@ -57,7 +58,7 @@ data Pin = Pin
   { pinRef :: !Ref
   , pinNote :: !Text
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Pin an entity at the end of the board, or take it off if it is there.
 pinToggle :: Ref -> [Pin] -> [Pin]
@@ -70,10 +71,10 @@ pinToggle r ps
 pinMove :: Int -> Int -> [Pin] -> [Pin]
 pinMove i by ps
   | i < 0 || i >= n || j == i = ps
-  | otherwise =
-      let p = ps !! i
-          rest = take i ps ++ drop (i + 1) ps
-       in take j rest ++ [p] ++ drop j rest
+  | (before, p : after) <- splitAt i ps =
+      let (pre, post) = splitAt j (before ++ after)
+       in pre ++ p : post
+  | otherwise = ps
   where
     n = length ps
     j = max 0 (min (n - 1) (i + by))
@@ -121,7 +122,7 @@ data Session = Session
   , sesBaseline :: !BaselinePaths
     -- ^ The baseline's artifacts, loaded again on open.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 emptySession :: Session
 emptySession =
@@ -266,7 +267,7 @@ decodeSession file
         [ (n, (i, v))
         | (k, v) <- M.toList kvs
         , Just i <- [T.stripPrefix (prefix <> ".") k]
-        , Right (n, "") <- [TR.decimal i :: Either String (Int, Text)]
+        , Just (n :: Int) <- [readDecimal i]
         ]
     numbered prefix = map snd (indexed prefix)
 
@@ -288,35 +289,41 @@ escapeValue v =
   let (lead, rest) = T.span isSpace v
       body = T.dropWhileEnd isSpace rest
       trail = T.drop (T.length body) rest
-   in T.pack (concatMap edge (T.unpack lead) ++ inner (T.unpack body) ++ concatMap edge (T.unpack trail))
+   in T.concatMap edge lead <> inner body <> T.concatMap edge trail
   where
-    inner = \case
-      '%' : rest@(a : b : _) | decodes a b -> "%25" ++ inner rest
-      '\n' : rest -> "%0a" ++ inner rest
-      '\r' : rest -> "%0d" ++ inner rest
-      c : rest -> c : inner rest
-      [] -> []
+    inner s = case T.uncons s of
+      Nothing -> ""
+      Just ('%', rest)
+        | Just (a, r1) <- T.uncons rest
+        , Just (b, _) <- T.uncons r1
+        , decodes a b ->
+            "%25" <> inner rest
+      Just ('\n', rest) -> "%0a" <> inner rest
+      Just ('\r', rest) -> "%0d" <> inner rest
+      Just (c, rest) -> T.cons c (inner rest)
     edge = \case
       ' ' -> "%20"
       '\t' -> "%09"
       '\n' -> "%0a"
       '\r' -> "%0d"
-      c -> [c]
+      c -> T.singleton c
 
 -- | Read back what 'escapeValue' wrote; any other @%@ is kept.
 unescapeValue :: Text -> Text
-unescapeValue = T.pack . go . T.unpack
+unescapeValue = go
   where
-    go = \case
-      '%' : a : b : rest | decodes a b -> chr (digitToInt a * 16 + digitToInt b) : go rest
-      c : rest -> c : go rest
-      [] -> []
+    go s = case T.uncons s of
+      Nothing -> ""
+      Just ('%', r1)
+        | Just (a, r2) <- T.uncons r1
+        , Just (b, rest) <- T.uncons r2
+        , decodes a b ->
+            T.cons (chr (digitToInt a * 16 + digitToInt b)) (go rest)
+      Just (c, rest) -> T.cons c (go rest)
 
 -- | The escapes a session file uses: @%25@, @%0a@, @%0d@, @%20@, @%09@.
 decodes :: Char -> Char -> Bool
-decodes a b = (a, toLowerHex b) `elem` [('2', '5'), ('0', 'a'), ('0', 'd'), ('2', '0'), ('0', '9')]
-  where
-    toLowerHex c = if c >= 'A' && c <= 'F' then chr (ord c + 32) else c
+decodes a b = (a, toLower b) `elem` [('2', '5'), ('0', 'a'), ('0', 'd'), ('2', '0'), ('0', '9')]
 
 -- ---------------------------------------------------------------------------
 -- Reports
@@ -329,7 +336,7 @@ data ReportSection = ReportSection
   , rsFacts :: ![(Text, Text)]
   , rsNotes :: ![Text]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | A pin as the report shows it.
 data PinReport = PinReport
@@ -339,7 +346,7 @@ data PinReport = PinReport
   , prSections :: ![ReportSection]
   , prNote :: !Text
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The pinboard as Markdown: a heading per pin, its reference as code
 -- (paste it into Go to… or @--goto@ to open it again), each panel's facts

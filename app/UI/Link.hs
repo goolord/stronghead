@@ -66,30 +66,32 @@ module UI.Link
   ) where
 
 import Control.Monad (forM_, unless, void, when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef
-import Data.List (nub)
 import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
+import Data.Word (Word64)
+import System.FilePath (takeFileName)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word64)
 import NanoUI
+
 import Stronghead.Debug.Graph (ThunkKey (..), fmtClosureId)
-import Stronghead.Format (fmtNs, tshow)
-import Stronghead.Ref
 import Stronghead.Diff (Baseline)
+import Stronghead.Format (fmtNs, tshow)
 import Stronghead.Join (Annotation)
 import Stronghead.Next
+import Stronghead.Ref
 import Stronghead.Session (Pin (..), pinToggle)
 import Stronghead.Source (SrcSpan, renderSrcSpan)
-import System.FilePath (takeFileName)
 import UI.Common
 
 -- ---------------------------------------------------------------------------
 -- Panels
 
 data Panel = PTimeline | PHeap | PCore | PDebugger | PLive
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 panelTitle :: Panel -> Text
 panelTitle = \case
@@ -156,17 +158,17 @@ data Moment = Moment
     -- ^ Its marker has turned up in the followed eventlog, which now draws
     -- it.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data MomentKind = MomentMark | MomentAction | MomentSnapshot | MomentPause
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | A place to come back to: a panel, and what was in focus there.
 data Location = Location
   { locPanel :: !Panel
   , locRef :: !(Maybe Ref)
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 newBus :: IO Bus
 newBus = do
@@ -495,7 +497,7 @@ refMenu :: Env -> Ref -> NanoUI ()
 refMenu env ref = do
   let ls = envLenses env
       shownBy r = any (`lensShows` r) ls
-      related = nub [(lbl, r) | l <- ls, (lbl, r) <- lensRelated l ref, shownBy r]
+      related = nubOrd [(lbl, r) | l <- ls, (lbl, r) <- lensRelated l ref, shownBy r]
   menuHeader (T.take 60 (refTitle env ref))
   forM_ [l | l <- ls, lensShows l ref] $ \l ->
     whenM (menuItem ("Show in " <> panelTitle (lensPanel l))) (showIn env l ref)
@@ -520,7 +522,7 @@ peek env ref =
         labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (panelTitle p)
         for_ (peekExact body) $ labelWith (alignBaseline . fontMuted . fontSizeScale 0.75) . T.takeWhile (/= ':')
       columnWith (fillW . tight . gap 2) (drawPeek False body)
-    let related = nub [(lbl, r) | l <- ls, (lbl, r) <- lensRelated l ref]
+    let related = nubOrd [(lbl, r) | l <- ls, (lbl, r) <- lensRelated l ref]
     scope $ unless (null related) $
       columnWith (padTop 4 . fillW . tight . gap 2) $
         forM_ (zip [0 :: Int ..] related) $ \(i, (lbl, r)) -> withKey i $ fact lbl (refTitle env r)
@@ -542,7 +544,7 @@ prose env inlines = do
 
 -- | What every panel knows about an entity, as facts for the engine.
 refFacts :: Env -> Ref -> [Fact]
-refFacts env r = nub (concatMap (`lensFacts` r) (envLenses env))
+refFacts env r = nubOrd (concatMap (`lensFacts` r) (envLenses env))
 
 -- | What to do next about an entity ("Stronghead.Next").
 stepsFor :: Env -> Ref -> [Step]

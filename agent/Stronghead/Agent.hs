@@ -32,12 +32,10 @@ module Stronghead.Agent
 import Control.Concurrent
 import Control.Exception (SomeException, bracket, catch, finally, mask_, try)
 import Control.Monad (forM, forever, unless)
-import Data.ByteString qualified as B
-import Data.ByteString.Builder (stringUtf8, toLazyByteString)
-import Data.ByteString.Char8 qualified as BC
-import Data.ByteString.Lazy qualified as BL
-import Data.Char (chr, isAlphaNum, isAscii, isDigit)
-import Data.List (intercalate)
+import Data.Char (chr, intToDigit, isAlphaNum, isAscii, isDigit, toUpper)
+import Data.Either (fromRight)
+import Data.Foldable (for_)
+import Data.List (dropWhileEnd, intercalate, unsnoc)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word8)
 import Debug.Trace (flushEventLog, traceMarkerIO)
@@ -51,11 +49,16 @@ import GHC.IO.Encoding (utf8)
 import GHC.Profiling (requestHeapCensus, startHeapProfTimer, stopHeapProfTimer)
 import GHC.RTS.Flags (DoHeapProfile (..), DoTrace (..), ProfFlags (..), TraceFlags (..), getProfFlags, getTraceFlags)
 import GHC.Stats
-import Network.Socket
-import Network.Socket.ByteString (recv, sendAll)
 import System.Environment (getExecutablePath, getProgName)
 import System.Mem (performMajorGC)
 import System.Posix.Internals (c_getpid)
+
+import Data.ByteString qualified as B
+import Data.ByteString.Builder (stringUtf8, toLazyByteString)
+import Data.ByteString.Char8 qualified as BC
+import Data.ByteString.Lazy qualified as BL
+import Network.Socket
+import Network.Socket.ByteString (recv, sendAll)
 #if defined(mingw32_HOST_OS)
 import Foreign.C.String (CWString, peekCWString)
 import Foreign.C.Types (CInt (..))
@@ -107,21 +110,24 @@ startAgent cfg = do
 
 serve :: AgentConfig -> IO ()
 serve cfg = do
-  addr : _ <-
+  addrs <-
     getAddrInfo
       (Just defaultHints {addrFlags = [AI_PASSIVE], addrSocketType = Stream})
       (Just (agentHost cfg))
       (Just (show (agentPort cfg)))
-  let accepting = fromMaybe (isLoopback (addrAddress addr)) (agentAcceptCommands cfg)
-  bracket (openSocket addr) close $ \sock -> do
-    setSocketOption sock ReuseAddr 1
-    bind sock (addrAddress addr)
-    listen sock 4
-    forever $ do
-      (conn, _) <- accept sock
-      mask_ $ do
-        t <- forkIO (client cfg accepting conn `catch` (\(_ :: SomeException) -> pure ()) `finally` close conn)
-        labelThread t "stronghead-agent-client"
+  for_ (listToMaybe addrs) \addr -> do
+    let accepting = fromMaybe (isLoopback (addrAddress addr)) (agentAcceptCommands cfg)
+    bracket (openSocket addr) close \sock -> do
+      setSocketOption sock ReuseAddr 1
+      bind sock (addrAddress addr)
+      listen sock 4
+      forever do
+        (conn, _) <- accept sock
+        mask_ do
+          t <- forkIO (client cfg accepting conn `catch` (\(_ :: SomeException) -> pure ()) `finally` close conn)
+          labelThread t "stronghead-agent-client"
+  where
+    listToMaybe = \case x : _ -> Just x; [] -> Nothing
 
 isLoopback :: SockAddr -> Bool
 isLoopback = \case
@@ -167,8 +173,8 @@ client cfg accepting conn = do
 -- how it was started, and what the RTS is writing.
 infoLine :: Bool -> IO String
 infoLine accepting = do
-  cwd <- either (\(_ :: SomeException) -> "") id <$> try currentDirectory
-  exe <- either (\(_ :: SomeException) -> "") id <$> try getExecutablePath
+  cwd <- fromRight "" <$> try @SomeException currentDirectory
+  exe <- fromRight "" <$> try @SomeException getExecutablePath
   args <- getFullArgs
   prof <- getProfFlags
   tr <- getTraceFlags
@@ -210,12 +216,11 @@ commands accepting send conn = loop B.empty
   where
     loop buf = do
       chunk <- recv conn 4096
-      unless (B.null chunk) $ do
-        let parts = BC.split '\n' (buf <> chunk)
-            rest = last parts
-        mapM_ (\l -> run =<< utf8String (BC.filter (/= '\r') l)) (init parts)
-        -- A line longer than any command is noise; drop it.
-        loop (if B.length rest > 65536 then B.empty else rest)
+      unless (B.null chunk) $
+        for_ (unsnoc (BC.split '\n' (buf <> chunk))) \(lines', rest) -> do
+          mapM_ (\l -> run =<< utf8String (BC.filter (/= '\r') l)) lines'
+          -- A line longer than any command is noise; drop it.
+          loop (if B.length rest > 65536 then B.empty else rest)
     run l = case break (== ' ') (dropWhile (== ' ') l) of
       (cid, more) | not (null cid), all isDigit cid -> do
         let (cmd, rest) = break (== ' ') (dropWhile (== ' ') more)
@@ -233,7 +238,7 @@ commands accepting send conn = loop B.empty
     -- timeline of a viewer following the eventlog.
     perform cmd rest = case (cmd, words rest) of
       ("mark", _) -> do
-        let text = reverse (dropWhile (== ' ') (reverse (dropWhile (== ' ') rest)))
+        let text = dropWhileEnd (== ' ') (dropWhile (== ' ') rest)
         traceMarkerIO (if null text then "mark" else text)
         flushEventLog
         pure (Right ())
@@ -315,10 +320,10 @@ percentEncode = concatMap byte . B.unpack . utf8Bytes
     byte :: Word8 -> String
     byte w
       | isAscii c && isAlphaNum c || c `elem` ("-_./:\\" :: String) = [c]
-      | otherwise = '%' : hexDigit (w `div` 16) : [hexDigit (w `mod` 16)]
+      | otherwise = ['%', hexDigit (w `div` 16), hexDigit (w `mod` 16)]
       where
         c = chr (fromIntegral w)
-    hexDigit d = "0123456789ABCDEF" !! fromIntegral d
+    hexDigit = toUpper . intToDigit . fromIntegral
 
 -- | The working directory, from the C library: @directory@ would be a
 -- dependency the agent promises not to have.

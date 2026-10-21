@@ -13,10 +13,12 @@ module Main (main) where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (unless, void, when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef
-import Data.List (nub)
+import Data.List ((!?))
 import Data.Map.Strict qualified as M
+import Data.Maybe (fromMaybe)
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -168,7 +170,7 @@ codeScene w cv point = do
           (placedNotes [(1, 1, ann)])
           defaultCodeConfig
             { ccLineCount = length src
-            , ccTokens = \l -> fst (tokenizeLine KindSource False (src !! l))
+            , ccTokens = \l -> fst (tokenizeLine KindSource False (fromMaybe "" (src !? l)))
             }
   ev <- annotatedCode env cv mm cfg (const Nothing)
   liftIO (writeIORef point (lanePoint mm cfg (respRect (ceResp ev)) 1 0))
@@ -617,7 +619,7 @@ main = do
   let _ = goB
 
   putStrLn "pane registry"
-  check "pane kinds are unique" (length (nub (map pkId paneKinds)) == length paneKinds && length (nub (map pkKey paneKinds)) == length paneKinds)
+  check "pane kinds are unique" (length (nubOrd (map pkId paneKinds)) == length paneKinds && length (nubOrd (map pkKey paneKinds)) == length paneKinds)
   let presets = map panelPreset [minBound .. maxBound] ++ [heapGraphPreset, heapCostsPreset] ++ map prTree userPresets
   check "every preset is a valid tree of known panes" (all (\t -> validateGridTree t == Right () && all (maybe False (const True) . paneKind) (treeKinds t)) presets)
   check "presets read back as written" (all (\t -> decodeTree (encodeTree t) == Right t) presets)

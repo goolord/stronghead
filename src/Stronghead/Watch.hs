@@ -44,20 +44,23 @@ module Stronghead.Watch
   , watchRun
   ) where
 
-import Data.List (sortOn)
+import Data.Bifunctor (second)
+import Data.List (find, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import Data.Set qualified as S
+import Data.Traversable (mapAccumL)
+import Data.Word (Word64)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
-import Data.Word (Word64)
+
 import Stronghead.Eventlog.Model
-import Stronghead.Format (fmtBytesD, fmtFixed, fmtNs, tshow)
+import Stronghead.Format (fmtBytesD, fmtFixed, fmtFixedTrim, fmtNs, readDecimal, readDouble, tshow)
 import Stronghead.HeapProfile (Band (..), HeapProfile (..))
 import Stronghead.Live (Frame (..), LiveThread (..), stat)
 
@@ -84,10 +87,10 @@ data Trigger
     -- ^ Percent of CPU time, for at least this many seconds.
   | BandGrowing !Int
     -- ^ Consecutive censuses.
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Response = RespMark | RespCensus | RespSnapshot | RespNotify
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 data Rule = Rule
   { ruTrigger :: !Trigger
@@ -98,7 +101,7 @@ data Rule = Rule
   , ruHysteresis :: !Double
     -- ^ A fraction, 0 to 1.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The built-in rules, all off.
 defaultRules :: [Rule]
@@ -133,11 +136,7 @@ responseName = \case
 
 -- | The built-in rules with any saved ones in place of their kind's.
 setRules :: [Rule] -> [Rule]
-setRules saved = [fromMaybe d (lookupKind d) | d <- defaultRules]
-  where
-    lookupKind d = case [r | r <- saved, triggerName (ruTrigger r) == triggerName (ruTrigger d)] of
-      r : _ -> Just r
-      [] -> Nothing
+setRules saved = [fromMaybe d (find (\r -> triggerName (ruTrigger r) == triggerName (ruTrigger d)) saved) | d <- defaultRules]
 
 -- | @live-up n=5 on=true responses=notify,mark cooldown=30 hysteresis=0.02@.
 encodeRule :: Rule -> Text
@@ -156,19 +155,17 @@ encodeRule r =
       BlockedOver ms -> ["ms=" <> num ms]
       GCOver p s -> ["percent=" <> num p, "seconds=" <> num s]
       BandGrowing n -> ["n=" <> tshow n]
-    num x = let t = fmtFixed 3 x in T.dropWhileEnd (== '.') (T.dropWhileEnd (== '0') t)
+    num = fmtFixedTrim 3
 
 -- | Read a rule back; a missing or unreadable parameter takes the built-in
 -- rule's value.
 decodeRule :: Text -> Maybe Rule
 decodeRule src = case T.words src of
   name : rest -> do
-    d <- case [r | r <- defaultRules, triggerName (ruTrigger r) == name] of
-      r : _ -> Just r
-      [] -> Nothing
+    d <- find (\r -> triggerName (ruTrigger r) == name) defaultRules
     let kv = M.fromList [(k, T.drop 1 v) | w <- rest, let (k, v) = T.breakOn "=" w, not (T.null v)]
-        dbl k def = fromMaybe def (M.lookup k kv >>= readD)
-        int k def = fromMaybe def (M.lookup k kv >>= readI)
+        dbl k def = fromMaybe def (M.lookup k kv >>= readDouble)
+        int k def = fromMaybe def (M.lookup k kv >>= readDecimal)
         trigger = case ruTrigger d of
           LiveUp n -> LiveUp (max 1 (int "n" n))
           BlockedOver ms -> BlockedOver (max 1 (dbl "ms" ms))
@@ -187,12 +184,6 @@ decodeRule src = case T.words src of
         }
   [] -> Nothing
   where
-    readD t = case TR.double t of
-      Right (x, "") -> Just x
-      _ -> Nothing
-    readI t = case TR.decimal t of
-      Right (x, "") -> Just x
-      _ -> Nothing
     clamp lo hi = max lo . min hi
 
 -- ---------------------------------------------------------------------------
@@ -205,7 +196,7 @@ data ThreadNow = ThreadNow
   , tnBlocked :: !(Maybe Text)
     -- ^ What it is blocked on; 'Nothing' when it isn't.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Something seen on a stream, at a program time.
 data Observation
@@ -221,7 +212,7 @@ data Observation
     -- CPU (0 to 1) collections took in it.
   | ObsCensus !Word64 ![(Text, Double)]
     -- ^ A heap census: each band's bytes.
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 obsTime :: Observation -> Word64
 obsTime = \case
@@ -304,7 +295,7 @@ data Subject
   | AboutThread !Int !Text
     -- ^ Thread id and label.
   | AboutBand !Text
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | A rule that fired.
 data Fired = Fired
@@ -316,7 +307,7 @@ data Fired = Fired
   , fiText :: !Text
   , fiResponses :: ![Response]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | What the rules remember between observations.
 data WatchState = WatchState
@@ -340,25 +331,19 @@ data WatchState = WatchState
     -- ^ Each band's bytes at the last census that counted, and its run of
     -- growing censuses.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 emptyWatchState :: WatchState
 emptyWatchState = WatchState M.empty S.empty Nothing 0 M.empty M.empty M.empty Nothing M.empty
 
 -- | Fold observations through the rules, oldest first.
 watchRun :: [Rule] -> [Observation] -> WatchState -> (WatchState, [Fired])
-watchRun rules obs st0 = go st0 [] obs
-  where
-    go st acc = \case
-      [] -> (st, reverse acc)
-      o : os -> let (st', fs) = watchStep rules o st in go st' (reverse fs ++ acc) os
+watchRun rules obs st0 = second concat (mapAccumL (flip (watchStep rules)) st0 obs)
 
 -- | One observation through every rule. A rule that is off still keeps
 -- track, so it fires on what it sees from the moment it is switched on.
 watchStep :: [Rule] -> Observation -> WatchState -> (WatchState, [Fired])
-watchStep rules o st0 = foldl' one (st0, []) (zip [0 ..] rules)
-  where
-    one (st, acc) (i, r) = let (st', fs) = applyRule i r o st in (st', acc ++ fs)
+watchStep rules o st0 = second concat (mapAccumL (\st (i, r) -> applyRule i r o st) st0 (zip [0 ..] rules))
 
 applyRule :: Int -> Rule -> Observation -> WatchState -> (WatchState, [Fired])
 applyRule i r o st = case (ruTrigger r, o) of
@@ -379,7 +364,7 @@ applyRule i r o st = case (ruTrigger r, o) of
           st
             { wsBlocked = M.restrictKeys (wsBlocked st) present
             , wsRunning = M.restrictKeys (wsRunning st) present
-            , wsDisarmed = S.filter (\(j, k) -> j /= i || maybe True (`S.member` present) (readKey k)) (wsDisarmed st)
+            , wsDisarmed = S.filter (\(j, k) -> j /= i || maybe True (`S.member` present) (readDecimal k)) (wsDisarmed st)
             }
         track s th = case tnBlocked th of
           Just _ -> s {wsBlocked = M.insertWith (\_ old -> old) (tnId th) t (wsBlocked s), wsRunning = M.delete (tnId th) (wsRunning s)}
@@ -391,10 +376,9 @@ applyRule i r o st = case (ruTrigger r, o) of
         -- The longest blocked first, so a cooldown keeps the worst.
         candidates =
           sortOn fst [(since, th) | th <- threads, contends th, let since = M.findWithDefault t (tnId th) (wsBlocked st2), t - min t since >= limit]
-        fire (s, acc) (since, th) =
-          let (s', fs) = fireIf True t (tshow (tnId th)) (AboutThread (tnId th) (tnLabel th)) (threadName' th <> " blocked on " <> fromMaybe "?" (tnBlocked th) <> " for " <> fmtNs (fromIntegral (t - since))) s
-           in (s', acc ++ fs)
-     in foldl' fire (st2, []) candidates
+        fire s (since, th) =
+          fireIf True t (tshow (tnId th)) (AboutThread (tnId th) (tnLabel th)) (threadName' th <> " blocked on " <> fromMaybe "?" (tnBlocked th) <> " for " <> fmtNs (fromIntegral (t - since))) s
+     in second concat (mapAccumL fire st2 candidates)
   (BlockedOver ms, ObsBlockedSpan a b th) ->
     let limit = round (ms * 1e6) :: Word64
         settle = round (ms * 1e6 * h) :: Word64
@@ -422,10 +406,9 @@ applyRule i r o st = case (ruTrigger r, o) of
               s' = (if cleared then rearm name else id) s {wsBands = M.insert name (v', run') (wsBands s)}
            in (s', if run' >= n && v >= 0.01 * total then (name, v, run') : ups else ups)
         (st1, growing) = foldl' track (st, []) bands
-        fire (s, acc) (name, v, run) =
-          let (s', fs) = fireIf True t name (AboutBand name) (name <> " grew for " <> tshow run <> " censuses in a row, to " <> fmtBytesD v) s
-           in (s', acc ++ fs)
-     in foldl' fire (st1, []) (sortOn (\(_, v, _) -> negate v) growing)
+        fire s (name, v, run) =
+          fireIf True t name (AboutBand name) (name <> " grew for " <> tshow run <> " censuses in a row, to " <> fmtBytesD v) s
+     in second concat (mapAccumL fire st1 (sortOn (\(_, v, _) -> negate v) growing))
   _ -> (st, [])
   where
     h = ruHysteresis r
@@ -439,9 +422,6 @@ applyRule i r o st = case (ruTrigger r, o) of
           , [Fired i t subj txt (ruResponses r)]
           )
       | otherwise = (s, [])
-    readKey k = case TR.decimal k of
-      Right (x, "") -> Just (x :: Int)
-      _ -> Nothing
     threadName' th = if T.null (tnLabel th) then "thread " <> tshow (tnId th) else tnLabel th
     -- A thread in a foreign call waits on the outside world, not on the
     -- program, and the agent's own threads (labelled @stronghead-@) wait

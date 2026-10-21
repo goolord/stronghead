@@ -42,17 +42,21 @@ module Stronghead.Diff
   , fmtChange
   ) where
 
-import Control.Monad (forM)
+import Control.Monad.Extra (concatMapM)
+import Data.Containers.ListUtils (nubOrd)
+import Data.Either.Extra (eitherToMaybe)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Set qualified as S
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+
 import Stronghead.Dump
 import Stronghead.Eventlog.Model (Summary)
 import Stronghead.Format (fmtFixed, tshow)
@@ -71,7 +75,7 @@ data BaselinePaths = BaselinePaths
   , blCostCentres :: !(Maybe FilePath)
   , blDumps :: !(Maybe FilePath)
   }
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 noBaselinePaths :: BaselinePaths
 noBaselinePaths = BaselinePaths Nothing Nothing Nothing Nothing
@@ -101,13 +105,13 @@ data BandFigures = BandFigures
   , bfKind :: !BandKind
   , bfProv :: !(Maybe InfoProv)
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data BandMatch = SameName | SameSource | Unmatched
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data BandStatus = BandGone | BandNew | BandShrank | BandGrew | BandSame
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | One band across the two profiles.
 data BandChange = BandChange
@@ -116,7 +120,7 @@ data BandChange = BandChange
   , bcMatch :: !BandMatch
   , bcStatus :: !BandStatus
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Every band's figures, in the profile's order (largest peak first).
 bandFigures :: HeapProfile -> [BandFigures]
@@ -199,7 +203,7 @@ data CostChange = CostChange
   , cgBase :: !(Maybe CostTotal)
   , cgCur :: !(Maybe CostTotal)
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Cost centres matched by module and label; biggest change in time plus
 -- allocation (inherited) first.
@@ -232,7 +236,7 @@ data BindingSummary = BindingSummary
   , bsSize :: !(Maybe Int)
     -- ^ Terms in its Core, from @-- RHS size@, summed over its pieces.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | A module's bindings from its Core and STG dumps, keyed as Core & STG
 -- keys them ('nameKey'), so a worker and its wrapper are one binding.
@@ -255,27 +259,26 @@ summariseModule m core stg =
         ss = find' stg k
   ]
   where
-    keys = M.keys (M.fromList [(bdKey b, ()) | Just cf <- [core, stg], b <- V.toList (cfBindings cf)])
+    keys = nubOrd [bdKey b | Just cf <- [core, stg], b <- V.toList (cfBindings cf)]
     find' mcf k = case mcf of
       Nothing -> []
       Just cf -> [cfBindings cf V.! i | i <- M.findWithDefault [] k (cfByKey cf)]
     -- "{terms: 12, types: 3, ...}"
     terms s = case T.breakOn "terms:" s of
-      (_, rest) | not (T.null rest) -> either (const Nothing) (Just . fst) (TR.decimal (T.stripStart (T.drop 6 rest)))
+      (_, rest) | not (T.null rest) -> fst <$> eitherToMaybe (TR.decimal (T.stripStart (T.drop 6 rest)))
       _ -> Nothing
 
 -- | Every module's bindings in a dump folder.
 loadBindingSummaries :: FilePath -> IO [BindingSummary]
 loadBindingSummaries root = do
   arts <- discoverArtifacts root
-  fmap concat . forM arts $ \a -> do
-    core <- traverse (loadCodeFile KindCore) (maCore a)
-    stg <- traverse (loadCodeFile KindStg) (maStg a)
-    pure (summariseModule (maModule a) (ok core) (ok stg))
-  where
-    ok = \case
-      Just (Right cf) -> Just cf
-      _ -> Nothing
+  concatMapM
+    ( \a -> do
+        core <- traverse (loadCodeFile KindCore) (maCore a)
+        stg <- traverse (loadCodeFile KindStg) (maStg a)
+        pure (summariseModule (maModule a) (core >>= eitherToMaybe) (stg >>= eitherToMaybe))
+    )
+    arts
 
 -- | One binding across the two folders, with what changed in words.
 data BindingChange = BindingChange
@@ -285,7 +288,7 @@ data BindingChange = BindingChange
   , bgCur :: !(Maybe BindingSummary)
   , bgChanges :: ![Text]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The bindings whose badges or size changed, or that appeared or went,
 -- by module and key.

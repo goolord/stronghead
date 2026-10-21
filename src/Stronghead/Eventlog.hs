@@ -25,30 +25,33 @@ module Stronghead.Eventlog
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, evaluate, try)
+import Control.Monad (when)
 import Data.Bits (testBit)
-import Data.ByteString qualified as B
+import Data.Foldable (for_)
+import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
-import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Ord (Down (..))
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Text.Read qualified as TR
-import Data.Vector qualified as V
-import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word32, Word64, Word8)
 import GHC.Clock (getMonotonicTime)
+import System.IO
+
+import Data.ByteString qualified as B
+import Data.Text (Text)
+import Data.Text qualified as T
+import Data.Vector qualified as V
+import Data.Vector.Unboxed qualified as VU
 import GHC.RTS.Events
 import GHC.RTS.Events.Incremental (Decoder (..), decodeEventLog)
+
 import Stronghead.Eventlog.Model
-import Stronghead.Format (tshow)
+import Stronghead.Format (readHex, tshow)
 import Stronghead.HeapProfile (HeapProfile (..), InfoProv (..), closureTypeKind, fromSamples)
 import Stronghead.Run
 import Stronghead.Source (parseSrcLoc)
-import System.IO
 
 -- ---------------------------------------------------------------------------
 -- Builder state
@@ -378,14 +381,7 @@ heapProfile b start = case hbDone h of
         {hpRun = bRun b}
   where
     h = bHeap b
-    ipe label = do
-      addr <- parseHex label
-      M.lookup addr (hbIPE h)
-
-parseHex :: Text -> Maybe Word64
-parseHex t = case TR.hexadecimal (fromMaybe t (T.stripPrefix "0x" t)) of
-  Right (n, rest) | T.null rest -> Just n
-  _ -> Nothing
+    ipe label = readHex label >>= (`M.lookup` hbIPE h)
 
 -- ---------------------------------------------------------------------------
 -- Streaming
@@ -407,9 +403,9 @@ data LoadProgress = LoadProgress
 -- returns; run it on a thread that can be cancelled.
 streamEventlog :: Bool -> FilePath -> (LoadProgress -> IO ()) -> IO ()
 streamEventlog follow path report = do
-  opened <- try (openBinaryFile path ReadMode)
+  opened <- try @IOException (openBinaryFile path ReadMode)
   case opened of
-    Left (e :: IOException) -> report (LoadProgress 0 0 Nothing (Just (T.pack (show e))) True False)
+    Left e -> report (LoadProgress 0 0 Nothing (Just (tshow e)) True False)
     Right h -> do
       lastSnap <- newIORef (0 :: Double, 0 :: Integer)
       let progress bytes total b done = do
@@ -449,14 +445,12 @@ streamEventlog follow path report = do
                     | otherwise -> do
                         now <- getMonotonicTime
                         (prevT, prevBytes) <- readIORef lastSnap
-                        when' (bytes /= prevBytes && now - prevT >= 1) $ do
+                        when (bytes /= prevBytes && now - prevT >= 1) do
                           report =<< progress bytes bytes b True
                           writeIORef lastSnap (now, bytes)
                         threadDelay 250000
                         loop dec b bytes nextSnap True
       loop decodeEventLog emptyBuilder 0 (4 * 1024 * 1024) False
-  where
-    when' c act = if c then act else pure ()
 
 -- | Evaluate everything a snapshot holds, so the thread that took it pays
 -- for building it rather than the UI thread that draws it.
@@ -470,9 +464,7 @@ forceTimeline tl = do
   V.mapM_ evaluate (tlCodeRuns tl)
   _ <- evaluate (IM.size (tlSampleCounts tl))
   mapM_ evaluate (tlThreads tl)
-  case tlHeapProfile tl of
-    Just hp -> evaluate hp >> V.mapM_ evaluate (hpBands hp)
-    Nothing -> pure ()
+  for_ (tlHeapProfile tl) \hp -> evaluate hp >> V.mapM_ evaluate (hpBands hp)
   pure tl
 
 -- | Read a whole eventlog.

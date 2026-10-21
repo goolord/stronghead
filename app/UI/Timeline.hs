@@ -24,44 +24,47 @@ import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.IORef
 import Data.IntMap.Strict qualified as IM
-import Data.List (sortOn)
+import Data.List (sortOn, unsnoc)
+import Data.List.Extra (minimumOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Ord (Down (..))
+import Data.Word (Word32, Word64)
+import System.FilePath (takeFileName)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
-import Data.Word (Word32, Word64)
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
+
 import Stronghead.Clock (stepTime)
+import Stronghead.Diff (Baseline (..), fmtChange)
 import Stronghead.Dump (nameKey)
 import Stronghead.Eventlog
 import Stronghead.Eventlog.Model
 import Stronghead.Format
 import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), TickyName (..), parseTickyName, tickyBinder, tickyTopLevel, tickyUnique)
-import Stronghead.Diff (Baseline (..), fmtChange)
 import Stronghead.Next (Fact (..))
 import Stronghead.Ref
 import Stronghead.Run (runKey, runKeysMatch)
 import Stronghead.Source (renderSrcLoc, renderSrcSpan, srcLocSpan)
-import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
 import UI.Link
 import UI.Workspace
 
 data TrackRef = OnCap !Int | OnThread !Word32
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Sel
   = SelSpan !TrackRef !Int
   | SelGC !Int
   | SelRange !Word64 !Word64
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data TimelineState = TimelineState
   { tsPath :: !(Var (Maybe FilePath))
@@ -492,7 +495,7 @@ censusNear tl t tol =
       d c = if c > t then c - t else t - c
    in case [(d c, j) | (j, c) <- zip [0 ..] (VU.toList cs), d c <= tol] of
         [] -> Nothing
-        near -> Just (snd (minimum near))
+        near -> Just (snd (minimumOn fst near))
 
 pickGC :: Timeline -> Word64 -> Word64 -> Maybe Int
 pickGC tl t tol =
@@ -562,7 +565,7 @@ hoverInfo tl v rows m@(V2 mx my)
             ]
     memDetails =
       let win = round (viewWidth v / 50)
-       in catMaybes'
+       in catMaybes
             [ ("live " <>) . fmtBytes <$> seriesValueAt (tlLive tl) tw
             , ("heap " <>) . fmtBytes <$> seriesValueAt (tlHeapSize tl) tw
             , ("allocating " <>) . fmtRate <$> seriesRateBetween (tlAlloc tl) (if tw > win then tw - win else 0) (tw + win)
@@ -576,9 +579,6 @@ hoverInfo tl v rows m@(V2 mx my)
       , let d = if mkTime mk > tw then mkTime mk - tw else tw - mkTime mk
       , d <= tol * 2
       ]
-
-catMaybes' :: [Maybe a] -> [a]
-catMaybes' = mapMaybe id
 
 genText :: Int -> Text
 genText g
@@ -754,7 +754,7 @@ groupRuns :: Eq b => [(Float, b)] -> [(Float, Float, b)]
 groupRuns [] = []
 groupRuns ((p, b) : rest) =
   let (same, others) = span ((== b) . snd) rest
-      end = if null same then p else fst (last same)
+      end = maybe p (fst . snd) (unsnoc same)
    in (p, end, b) : groupRuns others
 
 outlineSpan :: Palette -> TimeView -> Rect -> Track -> Int -> CanvasM ()
@@ -831,7 +831,9 @@ drawMemStrip pal v r@(Rect x y w h) tl = do
             vis = takeWhile (\(t, _) -> fromIntegral t <= tvEnd v) (VU.toList (VU.drop i0 s))
             extra = take 1 (VU.toList (VU.drop (i0 + length vis) s))
          in downsample w [(timeToX v x w (fromIntegral t), b) | (t, b) <- vis ++ extra]
-      steps ps = concat [[V2 xa (py b), V2 xb (py b)] | ((xa, b), (xb, _)) <- zip ps (drop 1 ps ++ [(x + w, snd (last ps))])]
+      steps ps = case unsnoc ps of
+        Nothing -> []
+        Just (_, (_, lastB)) -> concat [[V2 xa (py b), V2 xb (py b)] | ((xa, b), (xb, _)) <- zip ps (drop 1 ps ++ [(x + w, lastB)])]
   withClip r $ do
     case pts (tlHeapSize tl) of
       ps@(_ : _) ->
@@ -868,12 +870,11 @@ drawTooltip pal mm (Rect rx ry rw rh) hx hy ls = do
       tx = if hx + 14 + tw > rx + rw then hx - 14 - tw else hx + 14
       ty = max ry (min (ry + rh - th') (hy + 14))
   drawRoundedRect (Rect (tx + 2) (ty + 3) tw th') 6 (alpha 0.25 colorBlack)
-  drawRoundedRect (Rect tx ty tw th') 6 (alpha 0.96 (pTrackBg pal `over` colorFrom pal))
+  drawRoundedRect (Rect tx ty tw th') 6 (alpha 0.96 (colorFrom pal))
   drawStrokeRoundedRect (Rect tx ty tw th') 6 1 (pGrid pal)
   forM_ (zip [0 :: Int ..] ls) $ \(i, l) ->
     drawTextWith (mmFont mm) (V2 (tx + 8) (ty + 5 + (fromIntegral i + 0.5) * (mmLineH mm + 2))) AlignStart AlignMiddle l (if i == 0 then pMuted pal else pText pal)
   where
-    over _ c = c
     colorFrom p = if colorLuminance (pText p) > 0.5 then colorRGB 30 32 36 else colorRGB 252 252 250
 
 -- ---------------------------------------------------------------------------

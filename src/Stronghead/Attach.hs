@@ -19,17 +19,21 @@ module Stronghead.Attach
   ) where
 
 import Control.Exception (SomeException, try)
+import Data.Either (fromRight)
 import Data.Maybe (fromMaybe, listToMaybe)
-import Data.Text (Text)
-import Data.Text qualified as T
-import Stronghead.Dump (discoverArtifacts)
-import Stronghead.Live (AgentInfo (..))
-import Stronghead.Run (RunInfo (..), programName, runFromSocket, splitRtsArgs)
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.FilePath (isAbsolute, (<.>), (</>))
 
+import Data.Text (Text)
+import Data.Text qualified as T
+
+import Stronghead.Dump (discoverArtifacts)
+import Stronghead.Format (tshow)
+import Stronghead.Live (AgentInfo (..))
+import Stronghead.Run (RunInfo (..), programName, runFromSocket, splitRtsArgs)
+
 data AttachKind = AttachEventlog | AttachHeapProfile | AttachGhcDebug | AttachSources | AttachDumps
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 attachKindName :: AttachKind -> Text
 attachKindName = \case
@@ -47,7 +51,7 @@ data AttachStep = AttachStep
     -- ^ Set only when it was found.
   , asNote :: !Text
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The value of an RTS option given as @-<flag><value>@ on the command
 -- line (the last one wins, as in the RTS).
@@ -65,9 +69,7 @@ eventlogPathFor prog info
 
 -- | Where the program writes its heap profile, if it takes one.
 hpPathFor :: Text -> AgentInfo -> Maybe FilePath
-hpPathFor prog info = case aiHeapProfile info of
-  Nothing -> Nothing
-  Just _ -> Just (inCwd info (stem prog info <.> "hp"))
+hpPathFor prog info = inCwd info (stem prog info <.> "hp") <$ aiHeapProfile info
 
 stem :: Text -> AgentInfo -> FilePath
 stem prog info = T.unpack (fromMaybe prog (rtsOption "-po" (aiArgs info)))
@@ -122,10 +124,10 @@ probeAttach hello pid info debugBuilt sockets = do
     if not debugBuilt
       then pure (AttachStep AttachGhcDebug Nothing "Skipped: this build of Stronghead has no ghc-debug support (cabal build -f ghc-debug)")
       else do
-        socks <- either (\(_ :: SomeException) -> []) id <$> try sockets
-        pure $ case socketFor prog pid socks of
+        socks <- fromRight [] <$> try @SomeException sockets
+        pure case socketFor prog pid socks of
           Just s -> AttachStep AttachGhcDebug (Just s) ("Snapshots go to " <> T.pack s)
-          Nothing -> AttachStep AttachGhcDebug Nothing ("Skipped: no ghc-debug socket for pid " <> T.pack (show pid) <> ". Link ghc-debug-stub and wrap main in withGhcDebug (Unix only)")
+          Nothing -> AttachStep AttachGhcDebug Nothing ("Skipped: no ghc-debug socket for pid " <> tshow pid <> ". Link ghc-debug-stub and wrap main in withGhcDebug (Unix only)")
   let sources
         | null cwd = AttachStep AttachSources Nothing "Skipped: the agent didn't say where the program runs"
         | cwdThere = AttachStep AttachSources (Just cwd) ("Sources are looked up under " <> T.pack cwd)
@@ -134,9 +136,9 @@ probeAttach hello pid info debugBuilt sockets = do
     if not cwdThere
       then pure (AttachStep AttachDumps Nothing "Skipped: no working directory to search")
       else do
-        arts <- either (\(_ :: SomeException) -> []) id <$> try (discoverArtifacts cwd)
+        arts <- fromRight [] <$> try @SomeException (discoverArtifacts cwd)
         pure $
           if null arts
             then AttachStep AttachDumps Nothing ("Skipped: no dumps under " <> T.pack cwd <> ". Build with -ddump-simpl -ddump-stg-final -ddump-to-file")
-            else AttachStep AttachDumps (Just cwd) (T.pack (show (length arts)) <> " modules' dumps under " <> T.pack cwd)
+            else AttachStep AttachDumps (Just cwd) (tshow (length arts) <> " modules' dumps under " <> T.pack cwd)
   pure [eventlog, hp, debug, sources, dumps]

@@ -39,20 +39,23 @@ module UI.Live
 
 import Control.Concurrent (forkIO)
 import Control.Monad (forM_, unless, void, when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_, toList)
 import Data.IORef
-import Data.List (sortOn)
+import Data.List (sortOn, unsnoc)
 import Data.Map.Strict qualified as M
 import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Sequence (Seq (..), (|>))
 import Data.Sequence qualified as Seq
-import Data.Text (Text)
-import Data.Text qualified as T
-import Data.Text.Read qualified as TR
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word64)
 import GHC.Clock (getMonotonicTime)
+import System.FilePath (takeFileName)
+
+import Data.Text (Text)
+import Data.Text qualified as T
 import NanoUI
+
 import Stronghead.Attach (AttachStep (..), attachKindName, probeAttach)
 import Stronghead.Debug (DebugTarget, ghcDebugEnabled, listSockets, pauseTarget)
 import Stronghead.Eventlog.Model (Timeline (..))
@@ -60,7 +63,6 @@ import Stronghead.Format
 import Stronghead.Live
 import Stronghead.Ref
 import Stronghead.Run (RunInfo (..), runFromHello, runKey, runKeysMatch, wallToProgram)
-import System.FilePath (takeFileName)
 import UI.Clock
 import UI.Common
 import UI.Link
@@ -112,10 +114,10 @@ data Sent = Sent
   , snRun :: !RunKey
   , snCommand :: !Command
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data PauseState = Running | Pausing | Paused | Resuming | PauseFailed !Text
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data LiveData = LiveData
   { ldHello :: !(Maybe (Text, Int, Int))
@@ -170,7 +172,7 @@ liveLoad st = do
   host <- readVar (lvHost st)
   port <- readVar (lvPort st)
   attempt <- readVar (lvAttempt st)
-  let portN = either (const 4777) fst (TR.decimal port)
+  let portN = fromMaybe 4777 (readDecimal port)
   scope $
     if want
       then
@@ -367,7 +369,7 @@ dashboard env bench st d logTl = do
   let frames = ldFrames d
       rs = rates frames
       lastF = Seq.index frames (Seq.length frames - 1)
-      latest = if null rs then Nothing else Just (last rs)
+      latest = snd <$> unsnoc rs
       statsOn = stat "rts_stats" lastF > 0
   scope $ when (not statsOn) $
     columnWith (padBottom 8 . padXY 8 0 . tight . fillW) $
@@ -576,7 +578,7 @@ data DebugHooks = DebugHooks
   }
 
 data ActionGroup = GroupAgent | GroupDebug
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Something Stronghead can do to the program, with why it can't now.
 data RemoteAction = RemoteAction
@@ -842,7 +844,7 @@ threadPeek :: LiveThread -> [Maybe Text] -> Double -> Peek
 threadPeek lt hist secs =
   let seen = catMaybes hist
       share g = fromIntegral (length (filter (== g) seen)) / fromIntegral (max 1 (length seen)) :: Double
-      groups = M.keys (M.fromList [(g, ()) | g <- seen])
+      groups = nubOrd seen
    in Peek
         { peekFacts =
             [("now", ltStatus lt)]

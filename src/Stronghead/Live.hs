@@ -60,25 +60,29 @@ module Stronghead.Live
   , percentDecode
   ) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
+import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, readTQueue, writeTQueue)
 import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forever)
+import Data.Bifunctor (first)
 import Data.ByteString qualified as B
 import Data.ByteString.Char8 qualified as BC
-import Data.Char (chr, digitToInt, isAlphaNum, isAscii, isHexDigit)
-import Data.List (sort)
+import Data.Char (digitToInt, isAlphaNum, isAscii, isHexDigit)
+import Data.List (sort, unsnoc, (!?))
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
+import Data.Maybe (fromMaybe)
+import Data.Word (Word64)
+import GHC.Clock (getMonotonicTime)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Text.Encoding.Error qualified as TE
-import Data.Text.Read qualified as TR
-import Data.Word (Word64)
-import GHC.Clock (getMonotonicTime)
 import Network.Socket
 import Network.Socket.ByteString (recv, sendAll)
+
+import Stronghead.Format (percentEncodeWhere, readDecimal, readSignedDecimal, readSignedDouble, tshow)
 
 data LiveThread = LiveThread
   { ltId :: !Int
@@ -87,7 +91,7 @@ data LiveThread = LiveThread
   , ltCap :: !(Maybe Int)
     -- ^ The capability it last ran on, from a v2 agent's @C@ line.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Frame = Frame
   { frTime :: !Double
@@ -100,7 +104,7 @@ data Frame = Frame
   , frStats :: !(Map Text Double)
   , frThreads :: ![LiveThread]
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 stat :: Text -> Frame -> Double
 stat k f = M.findWithDefault 0 k (frStats f)
@@ -119,7 +123,7 @@ data AgentInfo = AgentInfo
   , aiCommands :: !Bool
     -- ^ Whether the agent takes commands.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | What a client may ask of the program.
 data Command
@@ -128,27 +132,27 @@ data Command
   | CmdCensus
   | CmdHeapProfiling !Bool
   | CmdFlush
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Reply
   = ReplyOk !(Maybe Word64)
     -- ^ With the program time just after the command ran, under @+RTS -T@.
   | ReplyError !Text
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Where to put commands for one connection's sender.
-newtype Outbox = Outbox (Chan Text)
-  deriving (Eq)
+newtype Outbox = Outbox (TQueue Text)
+  deriving newtype (Eq)
 
 instance Show Outbox where
   show _ = "<outbox>"
 
 newOutbox :: IO Outbox
-newOutbox = Outbox <$> newChan
+newOutbox = Outbox <$> newTQueueIO
 
 -- | The next command line queued, waiting for one.
 readOutbox :: Outbox -> IO Text
-readOutbox (Outbox ch) = readChan ch
+readOutbox (Outbox q) = atomically (readTQueue q)
 
 data LiveEvent
   = LiveHello !Text !Int !Int
@@ -159,7 +163,7 @@ data LiveEvent
   | LiveFrame !Frame
   | LiveReply !Int !Reply
   | LiveClosed !Text
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data Line
   = LHello !Text !Int !Int
@@ -170,7 +174,7 @@ data Line
   | LReply !Int !Reply
   | LEnd
   | LUnknown
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 parseLine :: Text -> Line
 parseLine l = case T.words l of
@@ -179,16 +183,13 @@ parseLine l = case T.words l of
   "S" : kvs -> LStats (M.fromList [(k, dbl v) | (k, v) <- pairs kvs])
   "T" : tid : status : lbl -> LThread (LiveThread (int tid) status (T.unwords lbl) Nothing)
   ["C", tid, cap] -> LCap (int tid) (int cap)
-  "A" : rid : "ok" : rest -> LReply (int rid) (ReplyOk (lookup "t" (pairs rest) >>= nat))
+  "A" : rid : "ok" : rest -> LReply (int rid) (ReplyOk (lookup "t" (pairs rest) >>= readDecimal))
   "A" : rid : "error" : rest -> LReply (int rid) (ReplyError (T.unwords rest))
   ["E"] -> LEnd
   _ -> LUnknown
   where
-    int t = either (const 0) fst (TR.signed TR.decimal t)
-    dbl t = either (const 0) fst (TR.signed TR.double t)
-    nat t = case TR.decimal t of
-      Right (n, "") -> Just n
-      _ -> Nothing
+    int = fromMaybe 0 . readSignedDecimal
+    dbl = fromMaybe 0 . readSignedDouble
     pairs kvs = [(k, T.drop 1 v) | kv <- kvs, let (k, v) = T.breakOn "=" kv, not (T.null v)]
 
 parseInfo :: [(Text, Text)] -> AgentInfo
@@ -209,12 +210,12 @@ parseInfo kvs =
     }
   where
     field k = maybe "" percentDecode (lookup k kvs)
-    int t = either (const 0) fst (TR.decimal t)
+    int = fromMaybe 0 . readDecimal
 
 -- | A command line for the agent.
 renderCommand :: Int -> Command -> Text
 renderCommand i c =
-  T.pack (show i) <> " " <> case c of
+  tshow i <> " " <> case c of
     -- One line: a newline in the text would end the command.
     CmdMark t -> "mark " <> oneLine t
     CmdGC -> "gc"
@@ -237,23 +238,23 @@ oneLine = T.map (\ch -> if ch == '\n' || ch == '\r' then ' ' else ch)
 
 -- | Queue a command; the connection's sender writes it.
 sendCommand :: Outbox -> Int -> Command -> IO ()
-sendCommand (Outbox ch) i c = writeChan ch (renderCommand i c)
+sendCommand (Outbox q) i c = atomically (writeTQueue q (renderCommand i c))
 
 -- | Connect and deliver events until the connection drops. Blocks; run it
 -- on a background thread.
 connectLive :: String -> Int -> (LiveEvent -> IO ()) -> IO ()
 connectLive host port emit = do
-  r <- try $ do
+  r <- try @SomeException do
     addrs <- getAddrInfo (Just defaultHints {addrSocketType = Stream}) (Just host) (Just (show port))
     case addrs of
       [] -> fail ("cannot resolve " <> host)
       addr : _ ->
-        bracket (openSocket addr) close $ \sock -> do
+        bracket (openSocket addr) close \sock -> do
           connect sock (addrAddress addr)
           connected <- getMonotonicTime
           box <- newOutbox
           let sender = forever (readOutbox box >>= \l -> sendAll sock (TE.encodeUtf8 (l <> "\n")))
-          bracket (forkIO sender) killThread $ \_ -> do
+          withAsync sender \_ -> do
             emit (LiveConnected box)
             let loop buf stats threads = do
                   chunk <- recv sock 65536
@@ -278,9 +279,7 @@ connectLive host port emit = do
                     handle more M.empty []
                   LUnknown -> handle more s ts
             loop B.empty M.empty []
-  emit . LiveClosed $ case r of
-    Left (e :: SomeException) -> T.pack (show e)
-    Right () -> "connection closed by the program"
+  emit (LiveClosed (either tshow (const "connection closed by the program") r))
   where
     -- The C line follows its thread's T line, so it is almost always the
     -- newest.
@@ -311,33 +310,29 @@ frameGaps :: [Frame] -> [(Word64, Word64)]
 frameGaps xs =
   let steps = zip xs (drop 1 xs)
       spacing = sort [frTime b - frTime a | (a, b) <- steps]
-      usual = if null spacing then 0.25 else spacing !! (length spacing `div` 2)
+      usual = fromMaybe 0.25 (spacing !? (length spacing `div` 2))
       limit = max 1.5 (3 * usual)
    in [(frProgramNs a, frProgramNs b) | (a, b) <- steps, frTime b - frTime a > limit, frProgramNs b > frProgramNs a]
 
 splitLines :: B.ByteString -> ([B.ByteString], B.ByteString)
 splitLines bs =
-  let parts = BC.split '\n' bs
-   in (map (BC.filter (/= '\r')) (init parts), last parts)
+  maybe ([], B.empty) (first (map (BC.filter (/= '\r')))) (unsnoc (BC.split '\n' bs))
 
 -- | Percent-encode the UTF-8 bytes of everything but ASCII letters, digits
 -- and @-_./:\\@, as the agent does.
 percentEncode :: Text -> Text
-percentEncode = T.pack . concatMap byte . B.unpack . TE.encodeUtf8
-  where
-    byte w
-      | isAscii c && isAlphaNum c || c `elem` ("-_./:\\" :: String) = [c]
-      | otherwise = '%' : hexDigit (w `div` 16) : [hexDigit (w `mod` 16)]
-      where
-        c = chr (fromIntegral w)
-    hexDigit d = "0123456789ABCDEF" !! fromIntegral d
+percentEncode = percentEncodeWhere (\c -> isAscii c && isAlphaNum c || c `elem` ("-_./:\\" :: String))
 
 -- | Undo 'percentEncode'. A malformed escape is kept as it is, and bytes
 -- that aren't UTF-8 are replaced.
 percentDecode :: Text -> Text
-percentDecode = TE.decodeUtf8With TE.lenientDecode . B.pack . go . T.unpack
+percentDecode = TE.decodeUtf8With TE.lenientDecode . B.pack . go
   where
-    go = \case
-      [] -> []
-      '%' : a : b : rest | isHexDigit a, isHexDigit b -> fromIntegral (digitToInt a * 16 + digitToInt b) : go rest
-      c : rest -> B.unpack (TE.encodeUtf8 (T.singleton c)) ++ go rest
+    go s = case T.uncons s of
+      Nothing -> []
+      Just ('%', r1)
+        | Just (a, r2) <- T.uncons r1
+        , Just (b, rest) <- T.uncons r2
+        , isHexDigit a && isHexDigit b ->
+            fromIntegral (digitToInt a * 16 + digitToInt b) : go rest
+      Just (c, rest) -> B.unpack (TE.encodeUtf8 (T.singleton c)) ++ go rest

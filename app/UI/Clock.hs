@@ -32,6 +32,7 @@ module UI.Clock
   , tether
   ) where
 
+import Control.Monad.Extra (anyM)
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.IORef
@@ -190,7 +191,7 @@ lowerBound p v = partitionPoint (p . (v V.!)) 0 (V.length v)
 -- | What a plain drag does on a time view: move the cursor, or what the
 -- view does with it (pan, say).
 data Scrub = ScrubDrag | ScrubNone
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The gestures every time view shares: Shift+drag selects a range and
 -- Shift+click clears it; with 'ScrubDrag', a plain press or drag moves the
@@ -225,7 +226,7 @@ timeGestures env ax resp scrub = do
 -- | @[@ and @]@ this frame: -1, 1 or 0, and whether Shift was held.
 stepKeys :: NanoUI (Int, Bool)
 stepKeys = do
-  let pressed = fmap or . mapM shortcut
+  let pressed = anyM shortcut
   back <- pressed [K.key '[']
   fwd <- pressed [K.key ']']
   backS <- pressed [K.shift <> K.key '[']

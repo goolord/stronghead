@@ -33,26 +33,38 @@ module Stronghead.Ghci
   , haskellString
   ) where
 
-import Control.Concurrent
-import Control.Exception (SomeException, try)
-import Control.Monad (forM_, void)
+import Control.Applicative ((<|>))
+import Control.Concurrent (MVar, forkIO, newMVar, threadDelay, withMVar)
+import Control.Concurrent.Async (async)
+import Control.Concurrent.STM (TQueue, TVar, atomically, newTQueueIO, newTVarIO, readTQueue, readTVarIO, writeTQueue, writeTVar)
+import Control.Exception (SomeException)
+import Control.Exception qualified as E
+import Control.Monad (forM_, guard, void)
+import Data.Bifunctor (first)
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, isUpper)
-import Data.IORef
+import Data.Either (fromRight)
+import Data.Either.Extra (eitherToMaybe)
 import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Void (Void)
+import System.IO
+import System.Process
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Text.Read qualified as TR
+import Text.Megaparsec (Parsec, anySingle, between, choice, chunk, eof, many, optional, parse, satisfy, sepBy, sepBy1, takeWhile1P, try)
+import Text.Megaparsec.Char (char, hspace)
+
+import Stronghead.Format (tshow)
 import Stronghead.Source (SrcSpan, parseSrcSpan)
-import System.IO
-import System.Process
 
 data Ghci = Ghci
   { ghIn :: !Handle
   , ghProc :: !ProcessHandle
-  , ghLines :: !(Chan (Maybe Text))
+  , ghLines :: !(TQueue (Maybe Text))
   , ghLock :: !(MVar ())
-  , ghAlive :: !(IORef Bool)
+  , ghAlive :: !(TVar Bool)
   }
 
 marker :: Text
@@ -61,8 +73,8 @@ marker = "<<stronghead-ghci>>"
 -- | Start GHCi with a shell command in a working directory. Returns the
 -- session and everything it printed while loading.
 startGhci :: FilePath -> String -> IO (Either Text (Ghci, Text))
-startGhci cwd' cmd = do
-  r <- try $ do
+startGhci cwd' cmd =
+  first (tshow @SomeException) <$> E.try do
     (readEnd, writeEnd) <- createPipe
     (Just hin, _, _, ph) <-
       createProcess
@@ -72,17 +84,17 @@ startGhci cwd' cmd = do
           , std_out = UseHandle writeEnd
           , std_err = UseHandle writeEnd
           }
-    forM_ [hin, readEnd] $ \h -> do
+    forM_ [hin, readEnd] \h -> do
       hSetEncoding h utf8
       hSetBuffering h LineBuffering
-    ghLines <- newChan
-    ghAlive <- newIORef True
-    void . forkIO $ do
+    ghLines <- newTQueueIO
+    ghAlive <- newTVarIO True
+    void $ forkIO do
       let loop = do
-            next <- try (TIO.hGetLine readEnd)
+            next <- E.try @SomeException (TIO.hGetLine readEnd)
             case next of
-              Left (_ :: SomeException) -> writeIORef ghAlive False >> writeChan ghLines Nothing
-              Right l -> writeChan ghLines (Just (T.dropWhileEnd (== '\r') l)) >> loop
+              Left _ -> atomically (writeTVar ghAlive False >> writeTQueue ghLines Nothing)
+              Right l -> atomically (writeTQueue ghLines (Just (T.dropWhileEnd (== '\r') l))) >> loop
       loop
     ghLock <- newMVar ()
     let ghIn = hin
@@ -93,9 +105,6 @@ startGhci cwd' cmd = do
     startup <- collect g
     _ <- ghciCommand g (":set prompt-cont " <> haskellString "")
     pure (g, startup)
-  pure $ case r of
-    Left (e :: SomeException) -> Left (T.pack (show e))
-    Right ok -> Right ok
 
 sendLine :: Ghci -> Text -> IO ()
 sendLine g l = TIO.hPutStrLn (ghIn g) l >> hFlush (ghIn g)
@@ -105,7 +114,7 @@ collect :: Ghci -> IO Text
 collect g = go []
   where
     go acc =
-      readChan (ghLines g) >>= \case
+      atomically (readTQueue (ghLines g)) >>= \case
         Nothing -> pure (T.unlines (reverse ("<ghci exited>" : acc)))
         Just l
           | marker `T.isSuffixOf` l ->
@@ -119,31 +128,28 @@ collect g = go []
 
 -- | Run one command and return its output. Commands are serialised.
 ghciCommand :: Ghci -> Text -> IO Text
-ghciCommand g cmd = withMVar (ghLock g) $ \_ -> do
-  alive <- readIORef (ghAlive g)
+ghciCommand g cmd = withMVar (ghLock g) \_ -> do
+  alive <- readTVarIO (ghAlive g)
   if not alive
     then pure "<ghci is not running>"
     else do
-      r <- try (sendLine g cmd)
-      case r of
-        Left (e :: SomeException) -> pure (T.pack (show e))
-        Right () -> collect g
+      r <- E.try @SomeException (sendLine g cmd)
+      either (pure . tshow) (const (collect g)) r
 
 ghciAlive :: Ghci -> IO Bool
-ghciAlive = readIORef . ghAlive
+ghciAlive = readTVarIO . ghAlive
 
 stopGhci :: Ghci -> IO ()
 stopGhci g = do
-  _ <- try @SomeException (sendLine g ":quit")
-  _ <- try @SomeException (hClose (ghIn g))
-  _ <- forkIO $ do
+  _ <- E.try @SomeException (sendLine g ":quit")
+  _ <- E.try @SomeException (hClose (ghIn g))
+  void $ async do
     threadDelay 500000
-    void (try @SomeException (terminateProcess (ghProc g)))
-  pure ()
+    void (E.try @SomeException (terminateProcess (ghProc g)))
 
 -- | Render text as a Haskell string literal.
 haskellString :: Text -> Text
-haskellString = T.pack . show . T.unpack
+haskellString = tshow . T.unpack
 
 -- ---------------------------------------------------------------------------
 -- Parsing
@@ -152,7 +158,7 @@ data StopInfo = StopInfo
   { stName :: !Text
   , stSpan :: !(Maybe SrcSpan)
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The last "Stopped in NAME, LOC" in some output.
 parseStop :: Text -> Maybe StopInfo
@@ -171,12 +177,12 @@ parseStop out =
 -- | One step of @:history@: @-1  : go (Main.hs:5:8-21)@ is step -1, in
 -- @go@, at that span.
 parseHistory :: Text -> [(Int, Text, SrcSpan)]
-parseHistory out = mapMaybe historyLine (T.lines out)
+parseHistory = mapMaybe historyLine . T.lines
 
 historyLine :: Text -> Maybe (Int, Text, SrcSpan)
 historyLine l = do
   rest <- T.stripPrefix "-" (T.strip l)
-  (n, after) <- either (const Nothing) Just (TR.decimal rest)
+  (n, after) <- eitherToMaybe (TR.decimal rest)
   body <- T.stripPrefix ":" (T.stripStart after)
   let (name, loc) = T.breakOn " (" (T.strip body)
   sp <- parseSrcSpan =<< T.stripSuffix ")" (T.drop 2 loc)
@@ -198,28 +204,32 @@ data GhciBinding = GhciBinding
   , gbValue :: !(Maybe Text)
     -- ^ 'Nothing' when GHCi printed no value at all.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
+
+-- | Join indented continuation lines onto the line they continue.
+joinIndented :: [Text] -> [Text]
+joinIndented (a : b : rest)
+  | Just (c, _) <- T.uncons b, isSpace c = joinIndented ((a <> " " <> T.strip b) : rest)
+  | otherwise = a : joinIndented (b : rest)
+joinIndented xs = xs
 
 -- | Parse @name :: type = value@ lines (from @:show bindings@ or the
 -- bindings GHCi lists when it stops). Indented lines continue the previous
 -- binding.
 parseBindings :: Text -> [GhciBinding]
-parseBindings out = mapMaybe one (joinContinuations (T.lines out))
+parseBindings = mapMaybe one . joinIndented . T.lines
   where
-    joinContinuations (a : b : rest)
-      | not (T.null b) && isSpace (T.head b) = joinContinuations ((a <> " " <> T.strip b) : rest)
-      | otherwise = a : joinContinuations (b : rest)
-    joinContinuations xs = xs
     one l =
       let (name, rest) = T.breakOn " :: " l
-       in if T.null rest || T.any isSpace (T.strip name) || T.null (T.strip name) || "Stopped" `T.isPrefixOf` name
+          name' = T.strip name
+       in if T.null rest || T.any isSpace name' || T.null name' || "Stopped" `T.isPrefixOf` name
             then Nothing
             else
               let afterTy = T.drop 4 rest
                   (ty, val) = T.breakOn " = " afterTy
                in Just
                     GhciBinding
-                      { gbName = T.strip name
+                      { gbName = name'
                       , gbType = T.strip ty
                       , gbValue = if T.null val then Nothing else Just (T.strip (T.drop 3 val))
                       }
@@ -249,139 +259,140 @@ data Value
   | VTuple ![Value]
   | VAtom !Text
     -- ^ A literal, a variable, @<function>@, or text that didn't parse.
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
-data VTok = VOpen !Char | VClose !Char | VComma | VWord !Text | VOp !Text
-  deriving (Eq, Show)
+type Parser = Parsec Void Text
 
--- | Tokens with their start and end offsets, for slicing types out.
-lexValue :: Text -> [(Int, Int, VTok)]
-lexValue t0 = go 0 (T.unpack t0)
-  where
-    go _ [] = []
-    go i s@(c : cs)
-      | isSpace c = go (i + 1) cs
-      | c `elem` ("([{" :: String) = (i, i + 1, VOpen c) : go (i + 1) cs
-      | c `elem` (")]}" :: String) = (i, i + 1, VClose c) : go (i + 1) cs
-      | c == ',' = (i, i + 1, VComma) : go (i + 1) cs
-      | c == '"' || c == '\'' = emit (c : quoted c cs)
-      -- "<function>", "<unevaluated>" and the like are one atom.
-      | c == '<', (w, '>' : _) <- span isAlpha cs, not (null w) = emit ('<' : w ++ ">")
-      | isAlphaNum c || c == '_' = emit (word s)
-      | isOpChar c = (i, i + length op, VOp (T.pack op)) : go (i + length op) (drop (length op) s)
-      | otherwise = emit [c]
-      where
-        op = takeWhile isOpChar s
-        emit tok = (i, i + length tok, VWord (T.pack tok)) : go (i + length tok) (drop (length tok) s)
-    quoted q = loop
-      where
-        loop ('\\' : x : r) = '\\' : x : loop r
-        loop (x : r)
-          | x == q = [x]
-          | otherwise = x : loop r
-        loop [] = []
-    -- Names (qualified ones too), and numbers such as 1.0e-2.
-    word s =
-      let w = takeWhile (\x -> isAlphaNum x || x `elem` ("_'#." :: String)) s
-          w' = reverse (dropWhile (== '.') (reverse w))
-          rest = drop (length w') s
-       in case (w', rest) of
-            (d : _, '-' : e : _) | isDigit d, "e" `isSuffixOfS` w', isDigit e -> w' ++ "-" ++ takeWhile isDigit (drop 1 rest)
-            _ -> w'
-    isSuffixOfS suf x = reverse suf == take (length suf) (reverse x)
-    isOpChar x = x `elem` ("!#$%&*+./<=>?@\\^|-~:" :: String)
+lexeme :: Parser a -> Parser a
+lexeme p = p <* hspace
+
+sym :: Text -> Parser Text
+sym = lexeme . chunk
+
+isOpChar :: Char -> Bool
+isOpChar x = x `elem` ("!#$%&*+./<=>?@\\^|-~:" :: String)
 
 -- | Parse a value. Whatever doesn't parse is kept whole as a 'VAtom'.
 parseValue :: Text -> Value
-parseValue t = case pExpr t (lexValue t) of
-  Just (v, []) -> v
-  _ -> VAtom (T.strip t)
+parseValue t = fromRight (VAtom (T.strip t)) (parse (hspace *> pExpr <* eof) "" t)
 
-type VToks = [(Int, Int, VTok)]
-
-pExpr :: Text -> VToks -> Maybe (Value, VToks)
-pExpr src ts = do
-  (l, rest) <- pApp src ts
-  case rest of
-    (_, _, VOp op) : rest'
-      | op `notElem` ["::", "="] -> do
-          (r, rest'') <- pExpr src rest'
-          pure (infixOf op l r, rest'')
-    _ -> pure (l, rest)
+pExpr :: Parser Value
+pExpr = do
+  l <- pApp
+  optional (try pInfixOp) >>= \case
+    Nothing -> pure l
+    Just op -> infixOf op l <$> pExpr
   where
-    infixOf ":" l r = case r of
-      VList xs t -> VList (l : xs) t
-      _ -> VList [l] (Just r)
+    infixOf ":" l (VList xs r) = VList (l : xs) r
+    infixOf ":" l r = VList [l] (Just r)
     infixOf op l r = VCon op [l, r]
+    pInfixOp = do
+      op <- lexeme (takeWhile1P Nothing isOpChar)
+      guard (op `notElem` ["::", "="])
+      pure op
 
-pApp :: Text -> VToks -> Maybe (Value, VToks)
-pApp src ts = do
-  (h, rest) <- pAtom src ts
-  let (args, rest') = many' rest
-  pure $ case (h, args) of
-    (_, []) -> (h, rest')
-    (VAtom c, _) -> (VCon c args, rest')
-    _ -> (VCon (renderValue h) args, rest')
-  where
-    many' r = case pAtom src r of
-      Just (v, r') -> let (vs, r'') = many' r' in (v : vs, r'')
-      Nothing -> ([], r)
+pApp :: Parser Value
+pApp = do
+  h <- pAtom
+  args <- many pAtom
+  pure case (h, args) of
+    (_, []) -> h
+    (VAtom c, _) -> VCon c args
+    _ -> VCon (renderValue h) args
 
-pAtom :: Text -> VToks -> Maybe (Value, VToks)
-pAtom src = \case
-  (_, _, VOpen '(') : (_, _, VClose ')') : rest -> Just (VAtom "()", rest)
-  (_, _, VOpen '(') : (_, _, VOp op) : (_, _, VClose ')') : rest -> Just (VAtom ("(" <> op <> ")"), rest)
-  (_, _, VOpen '(') : rest -> do
-    (v, rest1) <- pExpr src rest
-    case rest1 of
-      (_, _, VClose ')') : r -> Just (v, r)
-      (_, e, VOp "::") : r -> do
-        (s, r') <- closing (0 :: Int) r
-        let ty = T.strip (T.take (s - e) (T.drop e src))
-        Just (case v of VThunk n _ -> VThunk n (Just ty); _ -> v, r')
-      (_, _, VComma) : r -> do
-        (vs, r') <- commaList ')' r
-        Just (VTuple (v : vs), r')
-      _ -> Nothing
-  (_, _, VOpen '[') : (_, _, VClose ']') : rest -> Just (VList [] Nothing, rest)
-  (_, _, VOpen '[') : rest -> do
-    (vs, r) <- commaList ']' rest
-    Just (VList vs Nothing, r)
-  (_, _, VWord w) : rest
-    | w == "_" || isThunkName w -> Just (VThunk w Nothing, rest)
-    | isConName w, (_, _, VOpen '{') : r <- rest -> do
-        (fs, r') <- fields r
-        Just (VRecord w fs, r')
-    | otherwise -> Just (VAtom w, rest)
-  (_, _, VOp "-") : (_, _, VWord n) : rest | Just (d, _) <- T.uncons n, isDigit d -> Just (VAtom ("-" <> n), rest)
-  _ -> Nothing
+pAtom :: Parser Value
+pAtom =
+  choice
+    [ try (VAtom "()" <$ (sym "(" *> sym ")"))
+    , try ((\op -> VAtom ("(" <> op <> ")")) <$> between (sym "(") (sym ")") (lexeme (takeWhile1P Nothing isOpChar)))
+    , pParens
+    , VList <$> between (sym "[") (sym "]") (pExpr `sepBy` sym ",") <*> pure Nothing
+    , pQuoted '"'
+    , pQuoted '\''
+    , pAngleAtom
+    , try pNegNumber
+    , pWordAtom
+    ]
+
+pParens :: Parser Value
+pParens = do
+  _ <- sym "("
+  v <- pExpr
+  choice
+    [ v <$ sym ")"
+    , do
+        _ <- sym "::"
+        ty <- T.strip <$> pBalancedType
+        _ <- sym ")"
+        pure case v of
+          VThunk n _ -> VThunk n (Just ty)
+          _ -> v
+    , do
+        _ <- sym ","
+        vs <- pExpr `sepBy1` sym ","
+        _ <- sym ")"
+        pure (VTuple (v : vs))
+    ]
+
+pBalancedType :: Parser Text
+pBalancedType = T.concat <$> many piece
   where
-    commaList close ts = do
-      (v, r) <- pExpr src ts
-      case r of
-        (_, _, VComma) : r' -> do
-          (vs, r'') <- commaList close r'
-          Just (v : vs, r'')
-        (_, _, VClose c) : r' | c == close -> Just ([v], r')
-        _ -> Nothing
-    fields = \case
-      (_, _, VClose '}') : r -> Just ([], r)
-      (_, _, VWord f) : (_, _, VOp "=") : r -> do
-        (v, r') <- pExpr src r
-        case r' of
-          (_, _, VComma) : r'' -> do
-            (fs, r''') <- fields r''
-            Just ((f, v) : fs, r''')
-          (_, _, VClose '}') : r'' -> Just ([(f, v)], r'')
-          _ -> Nothing
-      _ -> Nothing
-    -- The offset of the bracket closing a type annotation, and what follows.
-    closing d = \case
-      (s, _, VClose ')') : r | d == 0 -> Just (s, r)
-      (_, _, VOpen _) : r -> closing (d + 1) r
-      (_, _, VClose _) : r -> closing (d - 1) r
-      _ : r -> closing d r
-      [] -> Nothing
+    piece =
+      choice
+        [ (\inner -> "(" <> inner <> ")") <$> between (char '(') (char ')') pBalancedType
+        , (\inner -> "[" <> inner <> "]") <$> between (char '[') (char ']') pBalancedType
+        , (\inner -> "{" <> inner <> "}") <$> between (char '{') (char '}') pBalancedType
+        , takeWhile1P Nothing (`notElem` ("()[]{}" :: String))
+        ]
+
+pQuoted :: Char -> Parser Value
+pQuoted q = lexeme $ fmap (VAtom . T.pack) do
+  _ <- char q
+  body <- many (try ((\a b -> [a, b]) <$> char '\\' <*> anySingle) <|> ((: []) <$> satisfy (/= q)))
+  _ <- char q
+  pure (q : concat body ++ [q])
+
+-- | "<function>", "<unevaluated>" and the like are one atom.
+pAngleAtom :: Parser Value
+pAngleAtom = try $ lexeme do
+  _ <- char '<'
+  w <- takeWhile1P Nothing isAlpha
+  _ <- char '>'
+  pure (VAtom ("<" <> w <> ">"))
+
+pNegNumber :: Parser Value
+pNegNumber = do
+  _ <- sym "-"
+  w <- pWord
+  guard (maybe False (isDigit . fst) (T.uncons w))
+  pure (VAtom ("-" <> w))
+
+-- | Names (qualified ones too), and numbers such as @1.0e-2@.
+pWord :: Parser Text
+pWord = lexeme do
+  firstSeg <- seg
+  moreSegs <- many (try (T.cons <$> char '.' <*> seg))
+  let base = T.concat (firstSeg : moreSegs)
+  expSuffix <-
+    if maybe False (isDigit . fst) (T.uncons base) && ("e" `T.isSuffixOf` base || "E" `T.isSuffixOf` base)
+      then optional (try (T.cons <$> char '-' <*> takeWhile1P Nothing isDigit))
+      else pure Nothing
+  pure ( maybe base (base <>) expSuffix )
+  where
+    seg = takeWhile1P Nothing (\x -> isAlphaNum x || x `elem` ("_'#" :: String))
+
+pWordAtom :: Parser Value
+pWordAtom = do
+  w <- pWord
+  if
+    | w == "_" || isThunkName w -> pure (VThunk w Nothing)
+    | isConName w ->
+        optional (between (sym "{") (sym "}") (pField `sepBy` sym ",")) >>= \case
+          Just fs -> pure (VRecord w fs)
+          Nothing -> pure (VAtom w)
+    | otherwise -> pure (VAtom w)
+  where
+    pField = (,) <$> pWord <* sym "=" <*> pExpr
 
 isThunkName :: Text -> Bool
 isThunkName w = case T.stripPrefix "_t" w of
@@ -397,18 +408,14 @@ isConName w = case T.uncons (snd (T.breakOnEnd "." w)) of
 -- lines continue the one before.
 parsePrint :: Text -> [(Text, Value)]
 parsePrint out =
-  [ (T.strip name, parseValue (T.drop 3 rest))
-  | l <- joinLines (T.lines out)
+  [ (name', parseValue (T.drop 3 rest))
+  | l <- joinIndented (T.lines out)
   , let (name, rest) = T.breakOn " = " l
+        name' = T.strip name
   , not (T.null rest)
-  , not (T.null (T.strip name))
-  , not (T.any isSpace (T.strip name))
+  , not (T.null name')
+  , not (T.any isSpace name')
   ]
-  where
-    joinLines (a : b : rest)
-      | not (T.null b) && isSpace (T.head b) = joinLines ((a <> " " <> T.strip b) : rest)
-      | otherwise = a : joinLines (b : rest)
-    joinLines xs = xs
 
 -- | A value in Haskell syntax, thunks by name.
 renderValue :: Value -> Text

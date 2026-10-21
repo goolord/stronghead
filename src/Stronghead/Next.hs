@@ -43,13 +43,15 @@ module Stronghead.Next
 
 import Data.List (find)
 import Data.Maybe (isJust, isNothing, listToMaybe)
+import Data.Word (Word64)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word64)
+
 import Stronghead.Dump (nameKey)
 import Stronghead.Format (fmtBytes, fmtBytesD, fmtFixed, fmtInt, fmtNs, fmtPct, tshow)
 import Stronghead.Ref (Ref (..))
-import Stronghead.Source (SrcSpan (..), renderSrcSpan)
+import Stronghead.Source (SrcSpan (..), renderSrcSpan, shortFileName)
 
 -- ---------------------------------------------------------------------------
 -- Data sources
@@ -68,7 +70,7 @@ data Datum
   | DLiveStats
   | DLiveGraph
   | DDebugger
-  deriving (Eq, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 datumTitle :: Datum -> Text
 datumTitle = \case
@@ -135,7 +137,7 @@ data Have = Have
     -- ^ A ghc-debug target can be snapshotted.
   , haveSnapshots :: !Int
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 haveNothing :: Have
 haveNothing = Have False False False False False False False False False 0
@@ -189,7 +191,7 @@ data Fact
     -- ^ For a range: the last census inside it.
   | FactTopSuspect !Ref
     -- ^ The leading leak suspect of the profile on show.
-  deriving (Eq, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- ---------------------------------------------------------------------------
 -- Steps
@@ -203,7 +205,7 @@ data Step = Step
   , stepStrong :: !Bool
     -- ^ Worth showing in a peek: the evidence points this way.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 data StepDo
   = StepGo !Ref
@@ -215,7 +217,7 @@ data StepDo
     -- ^ The data the step needs isn't loaded: how to get it.
   | StepTry !Text
     -- ^ A flag to try on the next run.
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | The first strong step, for a peek.
 strongStep :: [Step] -> Maybe Step
@@ -416,5 +418,5 @@ pressureSteps have ref facts =
 -- | @Main.hs:82@.
 shortSpan :: SrcSpan -> Text
 shortSpan sp =
-  let file = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') (ssFile sp)
+  let file = shortFileName (ssFile sp)
    in if T.null file then renderSrcSpan sp else file <> ":" <> tshow (ssLine sp)

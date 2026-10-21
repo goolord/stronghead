@@ -34,11 +34,17 @@ module Stronghead.Run
   , groupRuns
   ) where
 
-import Data.Char (isDigit, toLower)
+import Control.Applicative ((<|>))
+import Data.Bifunctor (first, second)
+import Data.Char (isDigit)
 import Data.Maybe (fromMaybe)
+import Data.Word (Word64)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Word (Word64)
+
+import Stronghead.Format (readDecimal, tshow)
+import Stronghead.Source (shortFileName)
 
 data RunInfo = RunInfo
   { riProgram :: !(Maybe Text)
@@ -55,26 +61,29 @@ data RunInfo = RunInfo
     -- ^ The start date a @.hp@ or @.prof@ file prints: local time, to the
     -- minute (@Mon Oct 19 21:49 2026@).
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
+
+instance Semigroup RunInfo where
+  a <> b =
+    RunInfo
+      { riProgram = riProgram a <|> riProgram b
+      , riPid = riPid a <|> riPid b
+      , riArgs = if null (riArgs a) then riArgs b else riArgs a
+      , riRtsFlags = if null (riRtsFlags a) then riRtsFlags b else riRtsFlags a
+      , riRts = riRts a <|> riRts b
+      , riWallClock = riWallClock a <|> riWallClock b
+      , riStarted = riStarted a <|> riStarted b
+      }
+
+instance Monoid RunInfo where
+  mempty = RunInfo Nothing Nothing [] [] Nothing Nothing Nothing
 
 emptyRunInfo :: RunInfo
-emptyRunInfo = RunInfo Nothing Nothing [] [] Nothing Nothing Nothing
+emptyRunInfo = mempty
 
 -- | Combine what two sources know about one run, preferring the first.
 mergeRunInfo :: RunInfo -> RunInfo -> RunInfo
-mergeRunInfo a b =
-  RunInfo
-    { riProgram = or' riProgram
-    , riPid = or' riPid
-    , riArgs = if null (riArgs a) then riArgs b else riArgs a
-    , riRtsFlags = if null (riRtsFlags a) then riRtsFlags b else riRtsFlags a
-    , riRts = or' riRts
-    , riWallClock = or' riWallClock
-    , riStarted = or' riStarted
-    }
-  where
-    or' :: (RunInfo -> Maybe x) -> Maybe x
-    or' f = maybe (f b) Just (f a)
+mergeRunInfo = (<>)
 
 -- | A moment both clocks saw: the eventlog's @WallClockTime@ event, posted
 -- at program time 'waProgramNs' with the Unix time 'waUnixNs'.
@@ -82,13 +91,11 @@ data WallAnchor = WallAnchor
   { waProgramNs :: !Word64
   , waUnixNs :: !Word64
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Unix time, in nanoseconds, at program time zero.
 runStartWall :: RunInfo -> Maybe Word64
-runStartWall ri = do
-  WallAnchor p u <- riWallClock ri
-  pure (u - min u p)
+runStartWall ri = (\(WallAnchor p u) -> u - min u p) <$> riWallClock ri
 
 programToWall :: WallAnchor -> Word64 -> Word64
 programToWall (WallAnchor p u) t = u - min u p + t
@@ -102,10 +109,10 @@ wallToProgram (WallAnchor p u) w
 -- | How time-keyed references name a run: @program:pid@, with @?@ for
 -- whichever part is unknown.
 newtype RunKey = RunKey Text
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 runKey :: RunInfo -> RunKey
-runKey ri = RunKey (fromMaybe "?" (riProgram ri) <> ":" <> maybe "?" (T.pack . show) (riPid ri))
+runKey ri = RunKey (fromMaybe "?" (riProgram ri) <> ":" <> maybe "?" tshow (riPid ri))
 
 -- | Whether time-keyed references from two runs may be joined: the same
 -- key, the same program where one side does not know the pid, or a side
@@ -120,7 +127,7 @@ runKeysMatch a b
           (pb, ib) = parts b
        in pa /= "?" && pa == pb && (ia == "?" || ib == "?")
   where
-    parts (RunKey k) = let (p, i) = T.breakOnEnd ":" k in (T.dropEnd 1 p, i)
+    parts (RunKey k) = first (T.dropEnd 1) (T.breakOnEnd ":" k)
     unknown k = parts k == ("?", "?")
 
 -- ---------------------------------------------------------------------------
@@ -130,8 +137,8 @@ runKeysMatch a b
 -- @C:\\bin\\prog.exe@, @./prog@ and @prog@ are all @prog@.
 programName :: Text -> Maybe Text
 programName t =
-  let base = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') (T.strip t)
-      stripped = if T.map toLower (T.takeEnd 4 base) == ".exe" then T.dropEnd 4 base else base
+  let base = shortFileName (T.strip t)
+      stripped = if ".exe" `T.isSuffixOf` T.toLower base then T.dropEnd 4 base else base
    in if T.null stripped then Nothing else Just stripped
 
 -- | Separate a command line's RTS options from the program's arguments.
@@ -145,8 +152,7 @@ splitRtsArgs = go False
     go _ ("+RTS" : rest) = go True rest
     go _ ("-RTS" : rest) = go False rest
     go inRts (a : rest) =
-      let (as, rs) = go inRts rest
-       in if inRts then (as, a : rs) else (a : as, rs)
+      (if inRts then second (a :) else first (a :)) (go inRts rest)
 
 -- | From a full command line, program first: the eventlog's
 -- @ProgramArgs@, or a @.hp@ file's @JOB@.
@@ -163,19 +169,18 @@ runFromHello prog pid = emptyRunInfo {riProgram = programName prog, riPid = Just
 
 -- | From a ghc-debug socket path, named @<pid>-<prog>@.
 runFromSocket :: Text -> Maybe RunInfo
-runFromSocket path =
-  let name = T.takeWhileEnd (\c -> c /= '/' && c /= '\\') path
-      (pid, rest) = T.span isDigit name
-   in case T.stripPrefix "-" rest of
-        Just prog
-          | not (T.null pid) ->
-              Just emptyRunInfo {riProgram = programName prog, riPid = Just (read (T.unpack pid))}
-        _ -> Nothing
+runFromSocket path = do
+  let name = shortFileName path
+      (pidTxt, rest) = T.span isDigit name
+  prog <- T.stripPrefix "-" rest
+  pid <- readDecimal pidTxt
+  pure emptyRunInfo {riProgram = programName prog, riPid = Just pid}
 
 -- | From a @.hp@ file's @JOB@ and @DATE@ values (without their quotes).
 runFromHp :: Text -> Text -> RunInfo
 runFromHp job date =
-  (runFromArgs (T.words job)) {riStarted = if T.null (T.strip date) then Nothing else Just (T.strip date)}
+  let d = T.strip date
+   in (runFromArgs (T.words job)) {riStarted = if T.null d then Nothing else Just d}
 
 -- | From a @.prof@ file's header lines (blank lines removed): the date
 -- before "Time and Allocation Profiling Report", then the command line.
@@ -200,7 +205,7 @@ data RunMatch
     -- approximate, and the match can be undone.
   | DifferentRuns
     -- ^ Joined only by code.
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | Two sources that both print a start date (a @.hp@ and a @.prof@) and
 -- disagree are different runs: one run stamps both with the same minute.

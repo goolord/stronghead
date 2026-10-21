@@ -76,11 +76,14 @@ import Data.Bits (xor)
 import Data.Char (isDigit, ord)
 import Data.Either (isLeft)
 import Data.Foldable (for_)
+import Data.List (unsnoc)
+import System.FilePath (takeFileName)
+
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Vector qualified as V
 import NanoUI
 import NanoUI.Path qualified as P
-import System.FilePath (takeFileName)
 
 -- ---------------------------------------------------------------------------
 -- Theme
@@ -218,23 +221,24 @@ palette th =
 -- by name hash after that.
 bandColor :: Int -> Text -> Color
 bandColor i name
-  | i < length cats = cats !! i
-  | otherwise = cats !! (T.foldl' (\h c -> (h * 31) `xor` ord c) 7 name `mod` length cats)
+  | i >= 0 && i < V.length cats = cats V.! i
+  | otherwise = cats V.! (T.foldl' (\h c -> (h * 31) `xor` ord c) 7 name `mod` V.length cats)
   where
     cats =
-      [ colorRGB 66 133 244
-      , colorRGB 234 67 53
-      , colorRGB 251 188 4
-      , colorRGB 52 168 83
-      , colorRGB 171 71 188
-      , colorRGB 0 172 193
-      , colorRGB 255 112 67
-      , colorRGB 158 157 36
-      , colorRGB 92 107 192
-      , colorRGB 240 98 146
-      , colorRGB 0 137 123
-      , colorRGB 121 85 72
-      ]
+      V.fromList
+        [ colorRGB 66 133 244
+        , colorRGB 234 67 53
+        , colorRGB 251 188 4
+        , colorRGB 52 168 83
+        , colorRGB 171 71 188
+        , colorRGB 0 172 193
+        , colorRGB 255 112 67
+        , colorRGB 158 157 36
+        , colorRGB 92 107 192
+        , colorRGB 240 98 146
+        , colorRGB 0 137 123
+        , colorRGB 121 85 72
+        ]
 
 -- | 'withAlpha' with the opacity first, for composing.
 alpha :: Float -> Color -> Color
@@ -245,7 +249,7 @@ alpha a c = withAlpha c a
 
 -- | The visible time window, in nanoseconds.
 data TimeView = TimeView {tvStart :: !Double, tvEnd :: !Double}
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 viewWidth :: TimeView -> Double
 viewWidth v = max 1 (tvEnd v - tvStart v)
@@ -608,12 +612,9 @@ drawLineChart pal font r@(Rect x y w h) (x0, x1) fmtY series = do
     one px py s = case csPoints s of
       pts@(_ : _ : _) -> do
         let ps = [V2 (px t) (py v) | (t, v) <- pts]
-        if csFill s
-          then
-            let V2 fx _ = case ps of { p : _ -> p; [] -> V2 x y }
-                V2 lx _ = last ps
-             in drawPath (P.polygon (V2 fx (y + h - 4) : ps ++ [V2 lx (y + h - 4)])) (alpha 0.22 (csColor s))
-          else pure ()
+        when (csFill s) $
+          for_ ((,) <$> (case ps of p : _ -> Just p; [] -> Nothing) <*> (snd <$> unsnoc ps)) \(V2 fx _, V2 lx _) ->
+            drawPath (P.polygon (V2 fx (y + h - 4) : ps ++ [V2 lx (y + h - 4)])) (alpha 0.22 (csColor s))
         drawStrokePathWith (P.stroke 1.5) {P.strokeJoin = P.RoundJoin} (P.polyline ps) (P.Solid (csColor s))
       _ -> pure ()
 

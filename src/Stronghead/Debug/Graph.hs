@@ -39,7 +39,10 @@ module Stronghead.Debug.Graph
   , survivorIds
   ) where
 
+import Control.Monad (guard)
+import Data.Containers.ListUtils (nubOrd)
 import Data.List (sortOn)
+import Data.List.Extra (dropEnd)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (listToMaybe, mapMaybe)
@@ -47,11 +50,12 @@ import Data.Ord (Down (..))
 import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
+import Data.Word (Word16, Word32, Word64)
+
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
-import Data.Word (Word16, Word32, Word64)
-import Numeric (showHex)
+
+import Stronghead.Format (fmtHex, readDecimal, tshow)
 
 -- | A process to snapshot: one running ghc-debug-stub, listening on a Unix
 -- socket ('GHC.Debug.Stub.withGhcDebug') or TCP ('withGhcDebugTCP'), or a
@@ -60,12 +64,12 @@ data DebugTarget
   = DebugUnix FilePath
   | DebugTCP String Word16
   | DebugSnapshotFile FilePath
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 targetText :: DebugTarget -> Text
 targetText = \case
   DebugUnix p -> T.pack p
-  DebugTCP h p -> T.pack h <> ":" <> T.pack (show p)
+  DebugTCP h p -> T.pack h <> ":" <> tshow p
   DebugSnapshotFile p -> T.pack p
 
 -- | @host:port@, @[v6]:port@ or a bare @port@ (meaning 127.0.0.1).
@@ -73,14 +77,16 @@ parseHostPort :: Text -> Maybe (String, Word16)
 parseHostPort raw =
   case T.breakOnEnd ":" (T.strip raw) of
     ("", p) -> ("127.0.0.1",) <$> port p
-    (h, p) ->
+    (h, p) -> do
       let host = T.dropEnd 1 h
           host' = if "[" `T.isPrefixOf` host && "]" `T.isSuffixOf` host then T.drop 1 (T.dropEnd 1 host) else host
-       in if T.null host' then Nothing else (T.unpack host',) <$> port p
+      guard (not (T.null host'))
+      (T.unpack host',) <$> port p
   where
-    port p = case TR.decimal p of
-      Right (n, "") | n > 0 && n < (65536 :: Integer) -> Just (fromIntegral n)
-      _ -> Nothing
+    port p = do
+      n :: Integer <- readDecimal p
+      guard (n > 0 && n < 65536)
+      pure (fromIntegral n)
 
 data SnapshotOptions = SnapshotOptions
   { soMaxClosures :: Int
@@ -89,7 +95,7 @@ data SnapshotOptions = SnapshotOptions
     -- ^ Follow static reference tables: functions and stack frames keep the
     -- CAFs their code refers to alive this way.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 defaultSnapshotOptions :: SnapshotOptions
 defaultSnapshotOptions = SnapshotOptions {soMaxClosures = 200000, soFollowSrt = True}
@@ -100,7 +106,7 @@ defaultSnapshotOptions = SnapshotOptions {soMaxClosures = 200000, soFollowSrt = 
 type ClosureId = Word64
 
 fmtClosureId :: ClosureId -> Text
-fmtClosureId i = T.pack ("0x" <> showHex i "")
+fmtClosureId = fmtHex
 
 data NodeKind
   = NThunk
@@ -117,7 +123,7 @@ data NodeKind
     -- ^ TSO and STACK.
   | NWeak
   | NOther
-  deriving (Eq, Ord, Show, Enum, Bounded)
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 -- | Classify a closure type as the RTS names it (@THUNK_2_0@, @IND_STATIC@).
 kindOfClosureType :: Text -> NodeKind
@@ -153,7 +159,7 @@ data ClosureNode = ClosureNode
   , cnFrames :: [StackFrame]
     -- ^ For a STACK, its frames, the top (most recent) first.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | One frame of a thread's stack: the code it returns to.
 data StackFrame = StackFrame
@@ -169,7 +175,7 @@ data StackFrame = StackFrame
   , sfPointers :: [ClosureId]
     -- ^ The closures the frame keeps alive.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | What a frame is doing, in words.
 frameTitle :: StackFrame -> Text
@@ -210,15 +216,16 @@ threadStack snap tso = case M.lookup tso nodes of
 
 -- | The thread a TSO is: ghc-debug names it @thread N@.
 threadOf :: ClosureNode -> Maybe Word32
-threadOf n = case T.stripPrefix "thread " (cnName n) of
-  Just t | cnType n == "TSO", Right (tid, "") <- TR.decimal t -> Just tid
-  _ -> Nothing
+threadOf n = do
+  guard (cnType n == "TSO")
+  t <- T.stripPrefix "thread " (cnName n)
+  readDecimal t
 
 data RootKind
   = RootThread
   | RootOther
     -- ^ Stable pointers, stable names and the other miscellaneous roots.
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 -- | A CAF: a top-level thunk, evaluated (@IND_STATIC@) or not
 -- (@THUNK_STATIC@).
@@ -253,7 +260,7 @@ data HeapSnapshot = HeapSnapshot
 mkSnapshot :: Text -> Bool -> [ClosureId] -> [ClosureNode] -> HeapSnapshot
 mkSnapshot snapLabel snapTruncated roots nodes =
   let snapNodes = M.fromList [(cnId n, n) | n <- nodes]
-      snapRoots = uniq (filter (`M.member` snapNodes) roots)
+      snapRoots = nubOrd (filter (`M.member` snapNodes) roots)
       (snapParent, order) = bfs snapNodes snapRoots
       snapHeld = held snapNodes snapParent order
       snapThunkKeys = thunkKeys snapNodes snapParent order
@@ -268,10 +275,6 @@ mkSnapshot snapLabel snapTruncated roots nodes =
       snapRootsByHeld = forceList (byHeld snapRoots)
    in HeapSnapshot {..}
   where
-    uniq = go S.empty
-      where
-        go _ [] = []
-        go seen (x : xs) = if S.member x seen then go seen xs else x : go (S.insert x seen) xs
     forceList xs = foldr seq () xs `seq` xs
 
 -- | Breadth-first from the roots: each closure's first retainer, and the
@@ -281,15 +284,10 @@ bfs nodes roots = go (Seq.fromList roots) (S.fromList roots) M.empty []
   where
     go Empty _ parent acc = (parent, reverse acc)
     go (x :<| queue) seen parent acc =
-      let kids = [k | k <- maybe [] cnChildren (M.lookup x nodes), M.member k nodes, not (S.member k seen)]
-          kids' = S.toList (S.fromList kids)
-          seen' = foldl' (flip S.insert) seen kids'
-          parent' = foldl' (\m k -> M.insert k x m) parent kids'
-       in go (foldl' (:|>) queue (dedupe kids)) seen' parent' (x : acc)
-    dedupe = go' S.empty
-      where
-        go' _ [] = []
-        go' s (k : ks) = if S.member k s then go' s ks else k : go' (S.insert k s) ks
+      let kids = nubOrd [k | k <- maybe [] cnChildren (M.lookup x nodes), M.member k nodes, not (S.member k seen)]
+          seen' = foldl' (flip S.insert) seen kids
+          parent' = foldl' (\m k -> M.insert k x m) parent kids
+       in go (foldl' (:|>) queue kids) seen' parent' (x : acc)
 
 -- | Subtree sizes in the breadth-first tree, children before parents.
 held :: Map ClosureId ClosureNode -> Map ClosureId ClosureId -> [ClosureId] -> Map ClosureId Int
@@ -317,13 +315,11 @@ retainerPath snap = go S.empty []
 
 -- | What a path hangs from: the CAF nearest the closure, or the root.
 anchorOf :: [ClosureNode] -> Maybe ClosureNode
-anchorOf path = case filter isCAF (reverse (dropLast path)) of
+anchorOf path = case filter isCAF (reverse (dropEnd 1 path)) of
   c : _ -> Just c
   [] -> case path of
     r : _ : _ -> Just r
     _ -> Nothing
-  where
-    dropLast = reverse . drop 1 . reverse
 
 -- | A short name: kind and name, with the source span when known.
 nodeTitle :: ClosureNode -> Text
@@ -357,7 +353,7 @@ describePath = \case
             Just a
               | cnId a /= cnId holder -> ", rooted at " <> (if isCAF a then "" else "root ") <> nodeTitle a
             _ -> ""
-       in nodeTitle target <> " held by " <> nodeTitle holder <> rooted <> " (" <> T.pack (show (length holders)) <> " steps from the roots)"
+       in nodeTitle target <> " held by " <> nodeTitle holder <> rooted <> " (" <> tshow (length holders) <> " steps from the roots)"
 
 -- ---------------------------------------------------------------------------
 -- Thunks across snapshots
@@ -371,7 +367,7 @@ data ThunkKey = ThunkKey
   , tkSource :: Maybe Text
   , tkPath :: [Text]
   }
-  deriving (Eq, Ord, Show)
+  deriving stock (Eq, Ord, Show)
 
 data ThunkGroup = ThunkGroup
   { tgCount :: Int
@@ -379,7 +375,10 @@ data ThunkGroup = ThunkGroup
   , tgSample :: [ClosureId]
     -- ^ A few members, to browse to.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
+
+instance Semigroup ThunkGroup where
+  ThunkGroup a b xs <> ThunkGroup c d ys = ThunkGroup (a + c) (b + d) (take 8 (xs ++ ys))
 
 -- | Where each reachable closure's path stands, for keying the thunks below
 -- it: the anchor (nearest CAF, else the root) and the last few distinct
@@ -412,11 +411,7 @@ thunkKeys nodes parent order = snd (foldl' step (M.empty, M.empty) order)
 
 thunkGroups :: Map ClosureId ClosureNode -> Map ClosureId ThunkKey -> Map ThunkKey ThunkGroup
 thunkGroups nodes keys =
-  M.fromListWith
-    merge
-    [(k, ThunkGroup 1 (maybe 0 cnSize (M.lookup i nodes)) [i]) | (i, k) <- M.toList keys]
-  where
-    merge (ThunkGroup a b xs) (ThunkGroup c d ys) = ThunkGroup (a + c) (b + d) (take 8 (xs ++ ys))
+  M.fromListWith (<>) [(k, ThunkGroup 1 (maybe 0 cnSize (M.lookup i nodes)) [i]) | (i, k) <- M.toList keys]
 
 data Survivor = Survivor
   { svKey :: ThunkKey
@@ -430,7 +425,7 @@ data Survivor = Survivor
   , svSample :: [ClosureId]
     -- ^ Members in the latest snapshot.
   }
-  deriving (Eq, Show)
+  deriving stock (Eq, Show)
 
 -- | Thunk groups of the latest snapshot that were also present in the one
 -- before (and possibly earlier), worst first. Snapshots are given oldest

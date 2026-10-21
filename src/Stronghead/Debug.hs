@@ -18,6 +18,7 @@ module Stronghead.Debug
 import Stronghead.Debug.Graph
 #ifdef GHC_DEBUG
 import Control.Exception (SomeException, displayException, evaluate, try)
+import Data.Bifunctor (first)
 import Data.Text qualified as T
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
 import Stronghead.Debug.Client qualified as Client
@@ -41,23 +42,17 @@ listSockets :: IO [FilePath]
 #ifdef GHC_DEBUG
 ghcDebugEnabled = True
 
-takeSnapshot opts target = do
-  r <- try $ do
+takeSnapshot opts target =
+  first (displayException @SomeException) <$> try do
     (roots, nodes, truncated) <- Client.walkTarget opts target
     now <- getZonedTime
     let stamp = T.pack (formatTime defaultTimeLocale "%H:%M:%S" now)
     -- Every field is strict, so this runs the analyses here rather than in
     -- the first frame that looks at them.
     evaluate (mkSnapshot (targetText target <> " at " <> stamp) truncated roots nodes)
-  pure $ case r of
-    Left (e :: SomeException) -> Left (displayException e)
-    Right s -> Right s
 
-pauseTarget target = do
-  r <- try (Client.holdPaused target)
-  pure $ case r of
-    Left (e :: SomeException) -> Left (displayException e)
-    Right resume -> Right resume
+pauseTarget target =
+  first (displayException @SomeException) <$> try (Client.holdPaused target)
 
 listSockets = Client.listSockets
 #else

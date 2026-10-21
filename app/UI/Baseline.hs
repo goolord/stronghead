@@ -24,12 +24,17 @@ module UI.Baseline
 
 import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM_, unless, void, when)
+import Data.Either (fromRight)
+import Data.Either.Extra (eitherToMaybe)
 import Data.IORef
 import Data.Maybe (isJust, isNothing)
+import System.FilePath (takeFileName)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector.Unboxed qualified as VU
 import NanoUI
+
 import Stronghead.Diff
 import Stronghead.Eventlog (loadEventlog)
 import Stronghead.Eventlog.Model (Timeline (..), summarize)
@@ -39,7 +44,6 @@ import Stronghead.Join (CostTotal (..), costTotals)
 import Stronghead.Prof (ProfFile (..), loadProf)
 import Stronghead.Ref
 import Stronghead.Source (renderSrcSpan)
-import System.FilePath (takeFileName)
 import UI.Common
 import UI.Link
 import UI.Workspace
@@ -107,17 +111,17 @@ baselineLoad st curRoot = do
       Just (d', bs) | d' == d -> Just bs
       _ -> Nothing
     bindingsOf d = do
-      r <- try (loadBindingSummaries d >>= \bs -> length bs `seq` pure bs)
-      pure (d, either (\(_ :: SomeException) -> []) id r)
+      r <- try @SomeException (loadBindingSummaries d >>= \bs -> length bs `seq` pure bs)
+      pure (d, fromRight [] r)
 
 -- | A baseline from its artifacts' paths. What can't be read is left out.
 loadBaseline :: BaselinePaths -> IO Baseline
 loadBaseline p = do
-  tl <- attempt (blEventlog p) (fmap (either (const Nothing) Just) . loadEventlog)
+  tl <- attempt (blEventlog p) (fmap eitherToMaybe . loadEventlog)
   hp <- case blHeapProfile p of
-    Just f -> attempt (Just f) (fmap (either (const Nothing) Just) . loadHp)
+    Just f -> attempt (Just f) (fmap eitherToMaybe . loadHp)
     Nothing -> pure (tl >>= tlHeapProfile)
-  prof <- attempt (blCostCentres p) (fmap (either (const Nothing) Just) . loadProf)
+  prof <- attempt (blCostCentres p) (fmap eitherToMaybe . loadProf)
   binds <- attempt (blDumps p) (fmap Just . loadBindingSummaries)
   pure
     Baseline
@@ -131,7 +135,7 @@ loadBaseline p = do
     attempt :: Maybe FilePath -> (FilePath -> IO (Maybe a)) -> IO (Maybe a)
     attempt mf load = case mf of
       Nothing -> pure Nothing
-      Just f -> either (\(_ :: SomeException) -> Nothing) id <$> try (load f >>= evaluate)
+      Just f -> fromRight Nothing <$> try @SomeException (load f >>= evaluate)
 
 -- | Keep what is loaded now as the baseline.
 markBaseline :: BaselineState -> Baseline -> NanoUI ()

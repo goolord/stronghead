@@ -21,26 +21,30 @@ module UI.Debugger
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Monad (forM, forM_, unless, void, when)
+import Control.Monad (forM_, unless, void, when)
+import Control.Monad.Extra (concatMapM)
+import Data.Char (isDigit)
+import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (for_)
 import Data.IORef
-import Data.Char (isDigit)
 import Data.Map.Strict qualified as M
-import Data.Set qualified as S
 import Data.Maybe (fromMaybe, isJust)
+import Data.Set qualified as S
+import Data.Word (Word64)
+import System.Directory (makeAbsolute)
+import System.FilePath (isAbsolute, makeRelative, normalise, takeDirectory, takeFileName, (</>))
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import Data.Word (Word64)
 import NanoUI
+
 import Stronghead.Dump (CodeFile (..), CodeKind (..), lineTokens, loadCodeFile, nameKey)
 import Stronghead.Format (tshow)
 import Stronghead.Ghci
 import Stronghead.Join (Annotation (..), Lane (..), Mark (..), Shade (..))
 import Stronghead.Ref
-import Stronghead.Source (Resolved (..), SourceIndex, SrcSpan (..), findProjectRoot, mkSourceIndex, renderSrcSpan, resolveModule, resolveSource)
-import System.Directory (makeAbsolute)
-import System.FilePath (isAbsolute, makeRelative, normalise, takeDirectory, takeFileName, (</>))
+import Stronghead.Source (Resolved (..), SourceIndex, SrcSpan (..), findProjectRoot, mkSourceIndex, renderSrcSpan, resolveModule, resolveSource, shortFileName)
 import UI.Code
 import UI.Common
 import UI.Link
@@ -156,10 +160,14 @@ refreshLocals st g = do
   b <- ghciCommand g ":show bindings"
   let bs = [x | x <- parseBindings b, not (isThunkBinding (gbName x))]
   writeVarIO (dsBindings st) bs
-  vals <- forM (take 24 bs) $ \x -> do
-    out <- ghciCommand g (":print " <> gbName x)
-    pure [(gbName x, v) | (n, v) <- parsePrint out, n == gbName x]
-  writeVarIO (dsValues st) (M.fromList (concat vals))
+  vals <-
+    concatMapM
+      ( \x -> do
+          out <- ghciCommand g (":print " <> gbName x)
+          pure [(gbName x, v) | (n, v) <- parsePrint out, n == gbName x]
+      )
+      (take 24 bs)
+  writeVarIO (dsValues st) (M.fromList vals)
 
 isThunkBinding :: Text -> Bool
 isThunkBinding n = case T.stripPrefix "_t" n of
@@ -307,12 +315,10 @@ sourcePane env st ix ctx source stop send = do
   mm <- monoMetrics 0.9
   th <- uiTheme
   let pal = palette th
-      cf = case source of
-        Just (Right c) -> Just c
-        _ -> Nothing
+      cf = source >>= eitherToMaybe
       here = stop >>= stSpan
       fileBreaks = M.fromList [(l, n) | ((f, l), n) <- M.toList breaks, Just f == path]
-      candidates = maybe mempty (\c -> M.fromList [(l, ()) | l <- candidateLines (V.toList (cfLines c))]) cf
+      candidates = maybe S.empty (S.fromList . candidateLines . V.toList . cfLines) cf
       -- What the other panels say about this file; the debugger's own
       -- marks are drawn from its state.
       others = concat [lensAnnotations l | l <- envLenses env, lensPanel l /= PDebugger]
@@ -325,7 +331,7 @@ sourcePane env st ix ctx source stop send = do
           labelWith (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) "Stopped in"
           linkText env (stopBinding (stName s)) (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) (stName s)
           for_ (stSpan s) $ \sp ->
-            linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (T.pack (takeFileName (T.unpack (ssFile sp))) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
+            linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (shortFileName (ssFile sp) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
   ev <- paneWith tight ctx "Source" header $ do
     scope $ case source of
       Just (Left e) -> columnWith (padXY 12 6) $ labelWith (fontTone Danger) (T.pack e)
@@ -351,7 +357,7 @@ sourcePane env st ix ctx source stop send = do
                 if
                   | M.member (l + 1) fileBreaks -> Just MarkBreakpoint
                   | fmap ssLine here == Just (l + 1) -> Just MarkCurrent
-                  | M.member (l + 1) candidates -> Just MarkCandidate
+                  | S.member (l + 1) candidates -> Just MarkCandidate
                   | otherwise -> Nothing
             , ccEmpty = "Start a session and load a module to see its source."
             }
@@ -533,9 +539,7 @@ debugLens st source ix spanOf = do
   breaks <- readVar (dsBreaks st)
   dir <- readVar (dsDir st)
   wake <- askWake
-  let cf = case source of
-        Just (Right c) -> Just c
-        _ -> Nothing
+  let cf = source >>= eitherToMaybe
       inLoaded sp = maybe False (\p -> isJust (resolveSource (mkSourceIndex [] [p]) Nothing (ssFile sp))) path
       send cmds = liftIO (runCommands st wake cmds)
       startThen file cmds = liftIO (startOn st wake file cmds)
@@ -549,7 +553,7 @@ debugLens st source ix spanOf = do
         | busy = Action verb (Left "GHCi is busy")
         | running, inLoaded sp, Just c <- cf = Action (verb <> " (GHCi)") (Right (send [":break " <> cfModule c <> " " <> tshow (ssLine sp)]))
         | otherwise = case fileOf sp of
-            Nothing -> Action verb (Left ("can't find " <> name (T.unpack (ssFile sp)) <> "; set the project root in Settings"))
+            Nothing -> Action verb (Left ("can't find " <> shortFileName (ssFile sp) <> "; set the project root in Settings"))
             Just f
               | running -> Action ("Load " <> name f <> " in GHCi and " <> T.toLower verb) (Right (send [":load " <> T.pack (relativeTo f), ":break " <> tshow (ssLine sp)]))
               | otherwise -> Action ("Start GHCi on " <> name f <> " and " <> T.toLower verb) (Right (startThen f [":break " <> tshow (ssLine sp)]))

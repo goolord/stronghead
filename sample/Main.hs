@@ -26,6 +26,7 @@ import Control.Exception (evaluate)
 import Control.Monad
 import Data.IORef
 import Data.Map.Strict qualified as M
+import Data.Maybe (fromMaybe, listToMaybe)
 import Debug.Trace (traceEventIO, traceMarkerIO)
 import GHC.Clock (getMonotonicTime)
 import GHC.Conc (labelThread)
@@ -36,13 +37,12 @@ import GHC.Debug.Stub (withGhcDebug, withGhcDebugTCP)
 import System.Environment (lookupEnv)
 #endif
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import Text.Read (readMaybe)
 
 main :: IO ()
 main = withDebugStub $ withAgent defaultAgentConfig $ do
   args <- getArgs
-  let seconds = case args of
-        s : _ | [(n, "")] <- reads s -> n
-        _ -> 8 :: Int
+  let seconds = fromMaybe (8 :: Int) (listToMaybe args >>= readMaybe)
   hSetBuffering stdout LineBuffering
   me <- myThreadId
   labelThread me "main"

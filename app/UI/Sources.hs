@@ -17,12 +17,15 @@ module UI.Sources
   ) where
 
 import Control.Monad (forM_, unless, void, when)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
-import Data.List (nub)
-import Data.Maybe (fromMaybe, isNothing, listToMaybe)
+import Data.List ((!?))
+import Data.Maybe (fromMaybe, isNothing, listToMaybe, mapMaybe)
+
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
+
 import Stronghead.Format (tshow)
 import Stronghead.Next (Datum (..), datumAdds, datumRecipe, datumTitle)
 import Stronghead.Run
@@ -58,14 +61,15 @@ sourcesPopover env open anchor sources link unlink =
         labelWith (fontMedium . fontSizeScale 1.05) "Data sources"
         let timed = [s | s <- sources, srcRun s /= emptyRunInfo]
             codeOnly = [s | s <- sources, srcRun s == emptyRunInfo]
-            runs = [[timed !! i | (i, _) <- g] | g <- groupRuns (map srcRun timed)]
-            matches = [[m | (_, m) <- g] | g <- groupRuns (map srcRun timed)]
-            have = nub (concatMap srcData sources)
+            grouped = groupRuns (map srcRun timed)
+            runs = [mapMaybe (\(i, _) -> timed !? i) g | g <- grouped]
+            matches = [map snd g | g <- grouped]
+            have = nubOrd (concatMap srcData sources)
         scope $ when (null runs) $
           labelWith (fillW . fontMuted) "No run yet: open an eventlog, a heap or cost-centre profile, or connect to a running program in Live."
         forM_ (zip3 [0 :: Int ..] runs matches) $ \(ri, members, ms) -> withKey ri $ do
-          let info = foldr1 mergeRunInfo (map srcRun members)
-              mine = nub (concatMap srcData members)
+          let info = foldMap srcRun members
+              mine = nubOrd (concatMap srcData members)
               probable = ProbablySameRun `elem` ms
           columnWith (fillW . gap 4 . padTop 4 . tight) $ do
             rowWith (fillW . tight . gap 8) $ do
@@ -73,7 +77,7 @@ sourcesPopover env open anchor sources link unlink =
               scope $ when probable $ badge Muted "matched by program name: no pid on one side, times approximate"
               flex
               scope $ when (ri > 0) $ for_ (listToMaybe runs) $ \firstRun ->
-                let target = foldr1 mergeRunInfo (map srcRun firstRun)
+                let target = foldMap srcRun firstRun
                  in whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Same run as " <> runTitle target)) (link members target)
             forM_ (zip [0 :: Int ..] members) $ \(si, s) -> withKey si (sourceRow env s unlink)
             missing (filter (`notElem` mine) [DTimeline, DHeapCensus, DHeapSource, DCostCentres, DLive, DLiveStats, DLiveGraph]) (riProgram info)
