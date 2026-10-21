@@ -10,7 +10,7 @@ module Main (main) where
 
 import Control.Monad (when)
 import Data.Maybe (fromMaybe, isNothing)
-import System.Environment (lookupEnv)
+import System.Environment (getArgs, lookupEnv)
 import System.IO (stderr)
 import Text.Read (readMaybe)
 
@@ -21,12 +21,21 @@ import NanoUI
 import NanoUI.Backend.Sdl (NanoUIFont (..), SdlOptions (..), askSdlEnv, defaultSdlOptions, runSdlApp, saveScreenshot)
 import Options.Applicative qualified as Opt
 
+import Demo (demoMain)
 import UI.Common (strongheadTheme)
 import UI.Settings
 import UI.Shell
 
 main :: IO ()
 main = do
+  args <- getArgs
+  case args of
+    -- The demo video: a scripted tour recorded against the real sample.
+    "--demo" : dir : _ -> demoMain dir
+    _ -> mainWindowed
+
+mainWindowed :: IO ()
+mainWindowed = do
   capture <- lookupEnv "STRONGHEAD_CAPTURE"
   opts <- Opt.execParser (optionsInfo (isNothing capture))
   settings <- loadSettings

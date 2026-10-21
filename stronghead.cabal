@@ -116,6 +116,7 @@ executable stronghead
     hs-source-dirs:   app
     main-is:          Main.hs
     other-modules:
+        Demo
         UI.Baseline
         UI.Clock
         UI.Code
@@ -136,6 +137,7 @@ executable stronghead
         UI.Workspace
     build-depends:
         base >=4.20 && <4.23,
+        bytestring >=0.11 && <0.13,
         containers >=0.6 && <0.9,
         directory ^>=1.3,
         extra >=1.7 && <1.9,
