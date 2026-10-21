@@ -169,6 +169,7 @@ test-suite stronghead-ui-test
     hs-source-dirs:   test-ui app
     main-is:          Main.hs
     other-modules:
+        UI.Baseline
         UI.Clock
         UI.Code
         UI.Common
@@ -179,6 +180,7 @@ test-suite stronghead-ui-test
         UI.Palette
         UI.Pinboard
         UI.Sources
+        UI.Watchers
         UI.Workspace
     build-depends:
         base >=4.20 && <4.23,

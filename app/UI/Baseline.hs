@@ -219,13 +219,13 @@ heapDiff env st mbase mcur = case (mbase, mcur) of
     forM_ (zip [0 :: Int ..] (take 300 shown)) $ \(i, c) -> withKey i $
       rowWith (padXY 8 1 . tight . gap 8 . fillW) $ do
         let name = maybe "" bfName (maybe (bcBase c) Just (bcCur c))
-            title = maybe name figuresTitle (maybe (bcBase c) Just (bcCur c))
+            title = shortBand (maybe name figuresTitle (maybe (bcBase c) Just (bcCur c)))
         columnWith (fillW . tight) $ case (bcCur c, bcBase c >>= bandSite) of
-          (Just _, _) -> linkText env (RBand name) (fontSizeScale 0.92) (clip 40 title)
+          (Just _, _) -> linkText env (RBand name) (fontSizeScale 0.92) (clip 24 title)
           (Nothing, Just sp) -> rowWith (tight . gap 6) $ do
-            labelWith (fontSizeScale 0.92) (clip 28 title)
+            labelWith (fontSizeScale 0.92) (clip 18 title)
             linkText env (RSource sp) (fontMuted . fontSizeScale 0.85) (renderSrcSpan sp)
-          (Nothing, Nothing) -> labelWith (fontSizeScale 0.92) (clip 40 title)
+          (Nothing, Nothing) -> labelWith (fontSizeScale 0.92) (clip 24 title)
         cell (fixedW 90 . fontMuted . fontSizeScale 0.85) $ case bcMatch c of
           SameName -> "by name"
           SameSource -> "by source"
@@ -304,3 +304,13 @@ baselineStatus st loaded = do
 -- | Text cut to @n@ characters, with an ellipsis when it was longer.
 clip :: Int -> Text -> Text
 clip n t = if T.length t > n then T.take (n - 1) t <> "…" else t
+
+-- | A closure-type band named @pkg:Module.Con@ by its constructor and
+-- module, which fit the column: @Integer.IS@.
+shortBand :: Text -> Text
+shortBand t = case T.breakOn ":" t of
+  (pkg, rest)
+    | not (T.null pkg), not (T.null rest), not (T.any (== ' ') t) ->
+        let parts = T.splitOn "." (T.drop 1 rest)
+         in T.intercalate "." (drop (length parts - 2) parts)
+  _ -> t

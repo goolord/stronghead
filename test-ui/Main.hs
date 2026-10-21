@@ -35,7 +35,11 @@ import Stronghead.Ref
 import Stronghead.Run (RunInfo (..), emptyRunInfo, runFromHello, runKey)
 import Stronghead.Session (Pin (..))
 import Stronghead.Source (SrcSpan (..))
+import Stronghead.Watch
+import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
+import Stronghead.HeapProfile (fromSamples)
 import System.Exit (exitFailure)
+import UI.Baseline
 import UI.Clock
 import UI.Code
 import UI.Common (TimeView (..), Workbench (..), floatingPane, monoMetrics, newWorkbench, pane)
@@ -46,6 +50,7 @@ import UI.Live
 import UI.Palette
 import UI.Pinboard
 import UI.Sources
+import UI.Watchers
 import UI.Workspace
 
 -- | The world's lenses, for scenes that draw something other than 'view'.
@@ -539,6 +544,51 @@ main = do
   wakeB <- findSpan "Go to the thread that woke it" nspans
   nclick wakeB
   check "a step's button follows the link" . elem "timeline thread/prog:1/3" =<< logged
+
+  putStrLn "watchers"
+  wctx <- newContext
+  watchers <- newWatchers
+  marks <- newIORef []
+  writeVarIO (wrRules watchers) (setRules [Rule (BlockedOver 500) True [RespNotify, RespMark] 0 0.5])
+  let wthread b = LiveThread 7 (if b then "BlockedOnMVar" else "running") "worker-7" Nothing
+      wframe i = Frame (fromIntegral i * 0.25) (fromIntegral i * 250000000) True M.empty [wthread True]
+      wdata = LiveData (Just ("prog", 1, 1)) Nothing Nothing (Seq.fromList [wframe i | i <- [0 .. 4 :: Int]]) M.empty Nothing
+      whooks = WatchHooks (Right (\t -> liftIO (modifyIORef' marks (t :)))) (Left "no census here") (Left "no ghc-debug target")
+      wscene = do
+        watchTick watchers whooks (Just wdata) Nothing False
+        void (columnWith (fixedWH 700 900) (watchersPane (worldEnv w PLive) watchers "watching prog" floatingPane))
+  warmup2 wctx iinp wscene >>= \_ -> pure ()
+  _ <- evalUi wctx iinp wscene
+  fired <- readVarIO (wrFired watchers)
+  check "a rule fires on the agent's frames, about the thread" (map (fiSubject . feFired) fired == [AboutThread 7 "worker-7"])
+  check "once, however many frames see it again" (length fired == 1)
+  check "its mark goes through the agent" . (== ["watch: worker-7 blocked on MVar for 500.00 ms"]) =<< readIORef marks
+  check "and says what it did" (map feDone fired == [["marked"]])
+  check "it is news for the status bar" . (== 1) =<< readVarIO (wrUnseen watchers)
+  wspans <- collectTextSpans wctx
+  check "the pane lists what fired, and the rules" (hasText "worker-7 blocked on MVar" wspans && hasText "A thread blocked longer than 500 ms" wspans && hasText "Live bytes up across 5 major collections" wspans)
+
+  putStrLn "baseline"
+  bctx <- newContext
+  bstate <- newBaselineState
+  let beforeHp = fromSamples "" "closure type" 0 (const Nothing) [(t, [("THUNK_2_0", t * 4e6), ("ARR_WORDS", 1e6)]) | t <- [1 .. 5]]
+      afterHp = fromSamples "" "closure type" 0 (const Nothing) [(t, [("THUNK_2_0", 64), ("ARR_WORDS", 1e6)]) | t <- [1 .. 5]]
+      bpaths = noBaselinePaths {blEventlog = Just "before.eventlog"}
+      bscene = do
+        loaded <- baselineLoad bstate Nothing
+        let env = (worldEnv w PHeap) {envBaseline = boBaseline loaded}
+            now = DiffNow (Just afterHp) Nothing (Right (markBaseline bstate (Baseline bpaths Nothing (Just beforeHp) Nothing Nothing)))
+        void (columnWith (fixedWH 900 500) (maybe (pure ()) id (diffPanes env bstate loaded now paneDiffHeap floatingPane)))
+  warmup2 bctx iinp bscene >>= \_ -> pure ()
+  check "without a baseline the diff says how to make one" . hasText "Mark a run as the baseline" =<< collectTextSpans bctx
+  markB <- findSpan "Mark as baseline" =<< collectTextSpans bctx
+  let bclick pos = let (p, r) = clickPair iinp pos in mapM_ (\i -> evalUi bctx i bscene) [p, r, iinp, iinp]
+  bclick markB
+  check "marking keeps the run's paths" . (== bpaths) =<< readVarIO (bvPaths bstate)
+  bspans <- collectTextSpans bctx
+  check "the diff names the baseline" (hasText "against before.eventlog" bspans)
+  check "the leaking band shows as gone" (hasText "THUNK_2_0" bspans && hasText "gone" bspans)
+  check "an unchanged band is left out until asked for" (not (hasText "ARR_WORDS" bspans))
 
   putStrLn "pinboard"
   pctx' <- newContext

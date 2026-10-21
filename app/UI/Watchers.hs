@@ -21,7 +21,8 @@ module UI.Watchers
 import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_, toList)
 import Data.IORef
-import Data.List (nub, sort)
+import Data.List (insertBy, nub, sort)
+import Data.Ord (Down (..), comparing)
 import Data.Maybe (isJust)
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
@@ -172,12 +173,13 @@ respond w hooks rules rk newest f = do
   done <-
     if stale
       then pure ["from the eventlog's history: listed only"]
-      else fmap concat . mapM id $
+      else fmap concat . sequence $
         [ attempt "marked" (fmap ($ ("watch: " <> T.take 60 (fiText f))) (whMark hooks)) | RespMark `elem` fiResponses f ]
           ++ [attempt "census taken" (whCensus hooks) | RespCensus `elem` fiResponses f]
           ++ [attempt "snapshot taken" (whSnapshot hooks) | RespSnapshot `elem` fiResponses f]
   let ev = FiredEvent f rk title done
-  modifyVar (wrFired w) (take 200 . (ev :))
+  -- Newest first by program time: the eventlog lags the frames.
+  modifyVar (wrFired w) (take 200 . insertBy (comparing (Down . fiAt . feFired)) ev)
   when (RespNotify `elem` fiResponses f && not stale) $ do
     modifyVar (wrUnseen w) (+ 1)
     now <- uiTime
@@ -210,8 +212,9 @@ firedList env evs =
           flex
           labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (T.intercalate "; " (feDone ev))
 
--- | The Watchers pane: each built-in rule with its switch, its limits,
--- its responses, its cooldown and hysteresis; then what has fired.
+-- | The Watchers pane: what has fired, newest first; then each built-in
+-- rule with its switch, its limits, its responses, its cooldown and
+-- hysteresis.
 watchersPane :: Env -> Watchers -> Text -> PaneCtx -> NanoUI ()
 watchersPane env w watching ctx = do
   rules <- readVar (wrRules w)
@@ -223,14 +226,15 @@ watchersPane env w watching ctx = do
   paneWith tight ctx "Watchers" header $
     paneScroll (grow . tight) $
       columnWith (padAll 10 . fillW . tight . gap 8) $ do
-        hint "Rules on the agent's frames and the followed eventlog. Each is off until switched on, and is saved with the session."
-        forM_ (zip [0 :: Int ..] rules) $ \(i, r) -> withKey (triggerName (ruTrigger r)) $
-          ruleEditor (ruleVar i) r
-        separator
         rowWith (fillW . tight . gap 8) $ do
           labelWith (fontMedium . fontSizeScale 0.92) "Fired"
-          paneMeta (tshow (length evs))
-        firedList env evs
+          paneMeta (tshow (length evs) <> if length evs > 30 then ", the newest 30 here" else "")
+        firedList env (take 30 evs)
+        separator
+        labelWith (fontMedium . fontSizeScale 0.92) "Rules"
+        hint "On the agent's frames and the followed eventlog. Each is off until switched on, and is saved with the session."
+        forM_ (zip [0 :: Int ..] rules) $ \(i, r) -> withKey (triggerName (ruTrigger r)) $
+          ruleEditor (ruleVar i) r
   where
     ruleVar i = zoomVar (\rs -> rs !! i) (\r rs -> take i rs ++ [r] ++ drop (i + 1) rs) (wrRules w)
 

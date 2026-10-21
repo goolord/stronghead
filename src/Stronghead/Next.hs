@@ -404,7 +404,7 @@ pressureSteps have ref facts =
               then
                 [ Step
                     "Try a bigger nursery"
-                    (fmtBytes a <> " allocated, live grew by " <> fmtBytesD (max 0 grew) <> ": most of it dies young, so the cost is collecting, not a leak")
+                    (fmtBytes a <> " allocated, live grew by " <> fmtBytesD (max 0 grew) <> ": most of it dies young, so the time goes on collecting it, and a bigger nursery collects less often")
                     (StepTry "+RTS -A64m -RTS")
                     heavy
                 ]

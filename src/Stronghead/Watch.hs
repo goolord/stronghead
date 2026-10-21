@@ -261,7 +261,7 @@ timelineObservations tl since upto =
     inside t = t > since && t <= upto
     gcs =
       [ ObsMajorGC (gcEnd g) (maybe 0 fromIntegral (seriesValueAt (tlLive tl) (gcEnd g)))
-      | g <- V.toList (tlGCs tl)
+      | g <- V.toList (V.drop (lowerBoundBy gcEnd (tlGCs tl) (since + 1)) (tlGCs tl))
       , gcGen g >= 1
       , inside (gcEnd g)
       ]
