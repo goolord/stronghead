@@ -8,14 +8,12 @@ module Stronghead.Prof
   , flattenCC
   ) where
 
-import Data.ByteString qualified as B
 import Data.Char (isSpace)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
-import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
 import Stronghead.Source (SrcLoc, parseSrcLoc)
+import Stronghead.TextFile (readTextFile)
 
 data CostCentre = CostCentre
   { ccName :: !Text
@@ -43,7 +41,7 @@ data ProfFile = ProfFile
   deriving (Eq, Show)
 
 loadProf :: FilePath -> IO (Either String ProfFile)
-loadProf path = parseProf . TE.decodeUtf8With TE.lenientDecode <$> B.readFile path
+loadProf path = parseProf <$> readTextFile path
 
 -- | Parse a @.prof@ file's call tree: the table whose header has a @no.@
 -- column. Nesting is given by indentation.
@@ -56,7 +54,7 @@ parseProf src =
           rows = [r | l <- rest, not (T.all isSpace l), Just r <- [row hasSrc l]]
        in Right
             ProfFile
-              { pfHeader = take 12 (filter (not . T.null . T.strip) before)
+              { pfHeader = map T.copy (take 12 (filter (not . T.null . T.strip) before))
               , pfRoots = build rows
               }
   where
@@ -80,7 +78,8 @@ row hasSrc l =
         no : entries : it : ia : hT : hA : _ ->
           Just
             ( depth
-            , CostCentre name modu srcLoc (parseSrcLoc srcLoc) (readI no) (readI entries) (readD it) (readD ia) (readD hT) (readD hA) []
+            , let src = T.copy srcLoc -- copies, not slices that keep the whole file
+               in CostCentre (T.copy name) (T.copy modu) src (parseSrcLoc src) (readI no) (readI entries) (readD it) (readD ia) (readD hT) (readD hA) []
             )
         _ -> Nothing
   where

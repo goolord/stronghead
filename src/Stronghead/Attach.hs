@@ -19,7 +19,7 @@ module Stronghead.Attach
   ) where
 
 import Control.Exception (SomeException, try)
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Stronghead.Dump (discoverArtifacts)
@@ -70,7 +70,7 @@ hpPathFor prog info = case aiHeapProfile info of
   Just _ -> Just (inCwd info (stem prog info <.> "hp"))
 
 stem :: Text -> AgentInfo -> FilePath
-stem prog info = T.unpack (maybe prog id (rtsOption "-po" (aiArgs info)))
+stem prog info = T.unpack (fromMaybe prog (rtsOption "-po" (aiArgs info)))
 
 inCwd :: AgentInfo -> FilePath -> FilePath
 inCwd info f
@@ -94,7 +94,7 @@ socketFor prog pid socks =
 probeAttach :: Text -> Int -> AgentInfo -> Bool -> IO [FilePath] -> IO [AttachStep]
 probeAttach hello pid info debugBuilt sockets = do
   -- The RTS names its files after the program without @.exe@.
-  let prog = maybe hello id (programName hello)
+  let prog = fromMaybe hello (programName hello)
       cwd = T.unpack (aiCwd info)
       file kind found missing = \case
         Nothing -> pure (AttachStep kind Nothing missing)

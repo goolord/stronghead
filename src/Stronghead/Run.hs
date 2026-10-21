@@ -35,6 +35,7 @@ module Stronghead.Run
   ) where
 
 import Data.Char (isDigit, toLower)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
@@ -104,7 +105,7 @@ newtype RunKey = RunKey Text
   deriving (Eq, Ord, Show)
 
 runKey :: RunInfo -> RunKey
-runKey ri = RunKey (maybe "?" id (riProgram ri) <> ":" <> maybe "?" (T.pack . show) (riPid ri))
+runKey ri = RunKey (fromMaybe "?" (riProgram ri) <> ":" <> maybe "?" (T.pack . show) (riPid ri))
 
 -- | Whether time-keyed references from two runs may be joined: the same
 -- key, the same program where one side does not know the pid, or a side

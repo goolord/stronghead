@@ -178,10 +178,12 @@ diffPanes env st loaded now pid ctx
             markButton
             scope $ unless (paths == noBaselinePaths) $
               whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear") (clearBaseline st)
-          markButton = do
-            resp <- disabledWhen (either (const True) (const False) (dnMark now)) (buttonWith' (alignMid . padXY 8 2 . tight) (if paths == noBaselinePaths then "Mark as baseline" else "Mark again"))
-            tooltip resp (either id (const "Keep what is loaded now as the baseline; what you open next is compared with it") (dnMark now))
-            when (respClicked resp) (either (const (pure ())) id (dnMark now))
+          markButton =
+            actionButton
+              (alignMid . padXY 8 2 . tight)
+              (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
+              (Just "Keep what is loaded now as the baseline; what you open next is compared with it")
+              (dnMark now)
       paneWith tight ctx title header $
         paneScroll (grow . tight) $
           columnWith (padAll 10 . fillW . tight . gap 4) $

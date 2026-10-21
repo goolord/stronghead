@@ -361,14 +361,16 @@ workspace :: [BenchPlace] -> Var [Popped] -> Workbench -> PaneDraw -> NanoUI ()
 workspace places popped bench draw = do
   th <- uiTheme
   out <- readVar popped
-  columnWith (fillW . grow . padXY 8 0 . padTop 8 . padBottom 8) $
+  columnWith (fillW . grow . padTop 8 . padBottom 8 . padXY 8 0) $
     void $
       paneGrid
         defaultPaneGridConfig
           { pgLayout = fillW . fillH
-          , pgSpacing = 6
+          -- The gutter between panes (the spacing and the grab margin on
+          -- each side) is the 8 px the grid keeps from the window's edge.
+          , pgSpacing = 2
           , pgMinSize = 120
-          , pgLeeway = 4
+          , pgLeeway = 3
           , pgFocusable = False
           , pgTree = ControlledTree tree
           , pgDividerColor = Just (inkGround (ink th))

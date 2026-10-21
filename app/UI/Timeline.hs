@@ -240,9 +240,7 @@ costCentreRef tl i = (\c -> RCostCentre (cciModule c) (cciLabel c)) <$> IM.looku
 
 timelineView :: Env -> Bench -> TimelineState -> Maybe LoadProgress -> NanoUI ()
 timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
-  useFileDialog (tsDialog st) $ \case
-    p : _ -> openEventlog st p False
-    [] -> pure ()
+  useFileDialog (tsDialog st) . firstPath $ \p -> openEventlog st p False
   path <- readVar (tsPath st)
   let loaded = mprog >>= lpTimeline
   toolStrip $ do
@@ -256,7 +254,8 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
       let lo = fromIntegral (tlStart tl)
           hi = fromIntegral (tlEnd tl)
           v = maybe (TimeView lo hi) (clampView lo hi) mv
-      toolLabel ("Showing " <> fmtNs (tvStart v - lo) <> " to " <> fmtNs (tvEnd v - lo))
+      let at t = if t - lo < 0.5 then "0" else fmtNs (t - lo)
+      toolLabel ("Showing " <> at (tvStart v) <> " to " <> at (tvEnd v))
       disabledWhen (isNothing mv) $ whenM (toolButton "Fit to log") (writeVar (tsView st) Nothing)
   mixed <- bnMixed bench (tsPanes st)
   let drawn = scope (bnDraw bench (tsPanes st) (timelinePanes env st mprog))
@@ -293,7 +292,7 @@ body env bench st tl mprog = do
       [ ("duration", fmtSec (smDuration summary), vs smDuration)
       , ("mutator", fmtPct (smMutatorFrac summary), vs smMutatorFrac)
       , ("GC time", fmtPct (smGCFrac summary), vs smGCFrac)
-      , ("collections, major", fmtInt (smGCCount summary) <> ", " <> fmtInt (smMajorGCs summary), vs (fromIntegral . smGCCount))
+      , ("collections, " <> fmtInt (smMajorGCs summary) <> " major", fmtInt (smGCCount summary), vs (fromIntegral . smGCCount))
       , ("longest pause", fmtNs (smGCPauseMax summary), vs smGCPauseMax)
       , ("allocated", fmtBytes (smAllocated summary), vs (fromIntegral . smAllocated))
       , ("allocation rate", fmtRate (rate summary), vs rate)
@@ -376,14 +375,11 @@ navigate st tl v resp plotX plotW wheelZooms pan = do
       ctrlHeld = modCtrl (inputModifiers inp)
   (wx, wy) <- useWheelDeltaOn resp
   when ((wheelZooms || ctrlHeld) && wy /= 0) $
-    setView (zoomAround (0.8 ** realToFrac wy) (xToTime v plotX plotW (v2X mouse)) v)
-  when (wx /= 0) $
-    setView (TimeView (tvStart v - realToFrac wx * viewWidth v * 0.1) (tvEnd v - realToFrac wx * viewWidth v * 0.1))
+    setView (zoomAround (wheelZoom wy) (xToTime v plotX plotW (v2X mouse)) v)
+  when (wx /= 0) $ setView (wheelPan wx v)
   drag <- useDrag2DOn resp
   let dx = v2X (dragDelta drag)
-  when (pan && dragActive drag && dx /= 0) $ do
-    let dt = realToFrac dx / realToFrac plotW * viewWidth v
-    setView (TimeView (tvStart v - dt) (tvEnd v - dt))
+  when (pan && dragActive drag && dx /= 0) $ setView (dragPan plotW dx v)
   when (respHovered resp && pressedIn MouseLeft inp) $ do
     writeVar (tsPressAt st) (Just mouse)
     when (pan && inputMouseClicks inp >= 2) (writeVar (tsView st) Nothing)
@@ -556,7 +552,7 @@ hoverInfo tl v rows m@(V2 mx my)
                         ++ [ tshow n <> " events here: migrations, steals, wakeups" | let n = pointsNear i, n > 0 ]
     pointsNear i =
       let ps = tlCapPoints tl V.! i
-       in VU.length (VU.filter (\(pt, _, _) -> pt + tol >= tw && pt <= tw + tol) ps)
+       in VU.length (pointsIn (if tw > tol then tw - tol else 0) (tw + tol) ps)
     gcDetails = case pickGC tl tw tol of
       Nothing -> ["no collection here"]
       Just i ->
@@ -622,7 +618,7 @@ drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
     forM_ (markersIn tl v) $ \mk -> do
       let mx = timeToX v px pw (fromIntegral (mkTime mk))
       if mkIsMarker mk
-        then drawStroke (V2 mx (rectY (rRuler rows) + 12)) (V2 mx capsBottom) 1 (alpha 0.55 (pMarker pal))
+        then drawStroke (V2 mx (rectY (rRuler rows) + rectH (rRuler rows))) (V2 mx capsBottom) 1 (alpha 0.55 (pMarker pal))
         else drawStroke (V2 mx (rectY (rRuler rows) + 18)) (V2 mx (rectY (rRuler rows) + rulerH)) 1 (alpha 0.6 (pMuted pal))
   let Rect _ gy _ _ = rGC rows
       Rect _ my' _ _ = rMem rows
@@ -649,19 +645,18 @@ drawRuler :: Palette -> MonoMetrics -> Timeline -> TimeView -> Rect -> CanvasM (
 drawRuler pal mm tl v (Rect px py pw ph) = do
   let step = niceStep (viewWidth v * 110 / realToFrac pw)
       origin = fromIntegral (tlStart tl)
-      firstTick = fromIntegral (ceiling ((tvStart v - origin) / step) :: Integer) * step + origin
-      ticks = takeWhile (<= tvEnd v) [firstTick, firstTick + step ..]
   drawRect (Rect px (py + ph - 1) pw 1) (pGrid pal)
-  forM_ (take 200 ticks) $ \t -> do
-    let tx = timeToX v px pw t
-        txt = fmtNs (t - origin)
+  forM_ (take 200 (axisTicks step (tvStart v - origin) (tvEnd v - origin))) $ \o -> do
+    let tx = timeToX v px pw (o + origin)
+        txt = fmtTick step o
     drawStroke (V2 tx (py + ph - 7)) (V2 tx (py + ph)) 1 (pMuted pal)
     -- A label that would run past the plot is left off rather than cut.
     when (tx + 4 + fromIntegral (T.length txt) * mmCharW mm <= px + pw) $
       drawTextWith (mmFont mm) (V2 (tx + 4) (py + 11)) AlignStart AlignMiddle txt (pMuted pal)
   forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
     let mx = timeToX v px pw (fromIntegral (mkTime mk))
-    drawPath (P.polygon [V2 mx (py + 12), V2 (mx + 6) (py + 16), V2 mx (py + 20)]) (pMarker pal)
+    -- On the baseline, under the tick labels.
+    drawPath (P.polygon [V2 (mx - 4) (py + ph - 8), V2 (mx + 4) (py + ph - 8), V2 mx (py + ph)]) (pMarker pal)
 
 -- | The label gutter down the left of a canvas, ruled off from the plot.
 drawGutter :: Palette -> Rect -> CanvasM ()
@@ -773,8 +768,7 @@ outlineSpan pal v (Rect x y w h) tr i
 
 drawPoints :: Palette -> TimeView -> Rect -> VU.Vector (Word64, Word8', Word32) -> CanvasM ()
 drawPoints pal v r@(Rect x y w _) ps = do
-  let t0 = floorW (tvStart v)
-      inView = VU.filter (\(t, _, _) -> t >= t0 && fromIntegral t <= tvEnd v) ps
+  let inView = pointsIn (floorW (tvStart v)) (floorW (tvEnd v)) ps
   when (VU.length inView <= 600) $ withClip r $
     VU.forM_ inView $ \(t, k, _) -> do
       let px = timeToX v x w (fromIntegral t)
@@ -785,6 +779,14 @@ drawPoints pal v r@(Rect x y w _) ps = do
       drawPath (P.polygon [V2 (px - 3) y, V2 (px + 3) y, V2 px (y + 5)]) c
 
 type Word8' = SpanKind
+
+-- | A capability's points at @[lo, hi]@ ns; they are sorted by time.
+pointsIn :: Word64 -> Word64 -> VU.Vector (Word64, Word8', Word32) -> VU.Vector (Word64, Word8', Word32)
+pointsIn lo hi ps =
+  let at = lowerBoundBy (\(t, _, _) -> t) ps
+      i0 = at lo
+      i1 = if hi == maxBound then VU.length ps else at (hi + 1)
+   in VU.slice i0 (max 0 (i1 - i0)) ps
 
 drawGCStrip :: Palette -> TimeView -> Rect -> Timeline -> Maybe Sel -> CanvasM ()
 drawGCStrip pal v r@(Rect x y w h) tl sel = do
@@ -825,7 +827,7 @@ drawMemStrip pal v r@(Rect x y w h) tl = do
   let peak = fromIntegral (max 1 (max (VU.foldl' (\m (_, b) -> max m b) 0 (tlHeapSize tl)) (VU.foldl' (\m (_, b) -> max m b) 0 (tlLive tl)))) :: Double
       py b = y + h - 2 - realToFrac (fromIntegral b / peak) * (h - 6)
       pts s =
-        let i0 = max 0 (lowerBoundBy fst (V.convert s) (floorW (tvStart v)) - 1)
+        let i0 = max 0 (lowerBoundBy fst s (floorW (tvStart v)) - 1)
             vis = takeWhile (\(t, _) -> fromIntegral t <= tvEnd v) (VU.toList (VU.drop i0 s))
             extra = take 1 (VU.toList (VU.drop (i0 + length vis) s))
          in downsample w [(timeToX v x w (fromIntegral t), b) | (t, b) <- vis ++ extra]
@@ -972,7 +974,7 @@ threadsSection env st pal mm tl v sel marks = do
     inp <- askInput
     (_, wy) <- useWheelDeltaOn resp
     unless (modCtrl (inputModifiers inp)) $
-      when (wy /= 0) $ writeVar (tsThreadScroll st) (max 0 (min maxScroll (scrollY - wy * threadRowH * 3)))
+      when (wy /= 0) $ writeVar (tsThreadScroll st) (max 0 (min maxScroll (scrollY + wy * threadRowH * 3)))
     brushing <- timeGestures env (linearAxis rk v (plotX r) (plotW r)) resp ScrubNone
     navigate st tl v resp (plotX r) (plotW r) False (not brushing)
     canvasLinks env resp (\(V2 _ my) -> RThread rk . tiId <$> listToMaybe (drop (rowAt r my) threads))
@@ -1218,22 +1220,23 @@ overview env st tl v = do
     _ -> pure ()
   sectionTitle "Longest GC pauses"
   let gcs = take 8 (sortOn (\(_, g) -> Down (gcEnd g - gcStart g)) (zip [0 :: Int ..] (V.toList (tlGCs tl))))
-  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
-    colHeader (fixedW 72 . alignEnd) "pause"
-    colHeader fillW "collection"
-    colHeader (fixedW 84 . alignEnd) "at"
-  forM_ gcs $ \(i, g) -> withKey i $ do
-    picked <- linkRow env (RCollection rk i) False id $ do
-      numCell 72 id (fmtNs (fromIntegral (gcEnd g - gcStart g)))
-      cell (fillW . fontMuted) (if gcGen g >= 1 then "major" else "minor")
-      numCell 84 fontMuted (fmtNs (fromIntegral (gcStart g - tlStart tl)))
-    when picked $ do
-      writeVar (tsSel st) (Just (SelGC i))
-      zoomTo st tl (gcStart g) (gcEnd g)
+  tableRows $ do
+    rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+      colHeader (fixedW 72 . alignEnd) "pause"
+      colHeader fillW "collection"
+      colHeader (fixedW 84 . alignEnd) "at"
+    forM_ gcs $ \(i, g) -> withKey i $ do
+      picked <- linkRow env (RCollection rk i) False id $ do
+        numCell 72 id (fmtNs (fromIntegral (gcEnd g - gcStart g)))
+        cell (fillW . fontMuted) (if gcGen g >= 1 then "major" else "minor")
+        numCell 84 fontMuted (fmtNs (fromIntegral (gcStart g - tlStart tl)))
+      when picked $ do
+        writeVar (tsSel st) (Just (SelGC i))
+        zoomTo st tl (gcStart g) (gcEnd g)
   sectionTitle "Most blocked threads"
   let blockedTime ti = sum [ns | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c]
       worst = take 8 (sortOn (Down . blockedTime) (filter ((> 0) . blockedTime) (M.elems (tlThreads tl))))
-  forM_ worst $ \ti -> withKey (tiId ti) $ do
+  tableRows $ forM_ worst $ \ti -> withKey (tiId ti) $ do
     let top = listToMaybe (sortOn (Down . snd) [(c, ns) | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c])
     picked <- linkRow env (RThread rk (tiId ti)) False id $ do
       columnWith (tight . gap 0 . fillW . alignMid) $ do
@@ -1242,7 +1245,7 @@ overview env st tl v = do
       numCell 72 id (fmtNs (fromIntegral (blockedTime ti)))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
   sectionTitle "Busiest threads"
-  forM_ (take 6 (sortOn (Down . tiRunTime) (M.elems (tlThreads tl)))) $ \ti -> withKey (tiId ti) $ do
+  tableRows $ forM_ (take 6 (sortOn (Down . tiRunTime) (M.elems (tlThreads tl)))) $ \ti -> withKey (tiId ti) $ do
     picked <- linkRow env (RThread rk (tiId ti)) False id $ do
       cell fillW (threadName ti)
       numCell 72 id (fmtNs (fromIntegral (tiRunTime ti)))
@@ -1366,7 +1369,7 @@ markersHeader :: TimelineState -> Timeline -> NanoUI ()
 markersHeader st tl = do
   paneMeta (fmtInt (V.length (V.filter mkIsMarker (tlMarkers tl))))
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fixedW 110 . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fixedW 90 . padXY 0 0) defaultLayout}
     (tsMarkerFilter st)
   flex
   checkboxWith alignMid "Events" (tsMarkerEvents st)

@@ -17,13 +17,23 @@ module UI.Common
   , timeToX
   , xToTime
   , zoomAround
+  , wheelZoom
+  , panBy
+  , wheelPan
+  , dragPan
   , clampView
   , niceStep
+  , axisTicks
     -- * Frame
   , toolStrip
   , toolLabel
   , toolButton
   , toolGroup
+  , quiet
+  , quietButton
+  , quietButton'
+  , actionButton
+  , firstPath
   , Workbench (..)
   , newWorkbench
   , PaneCtx (..)
@@ -42,7 +52,7 @@ module UI.Common
   , numCell
   , colHeader
   , selectableRow
-  , statTile
+  , tableRows
   , fact
   , factMono
   , sectionTitle
@@ -61,9 +71,10 @@ module UI.Common
   , fitText
   ) where
 
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.Bits (xor)
-import Data.Char (ord)
+import Data.Char (isDigit, ord)
+import Data.Either (isLeft)
 import Data.Foldable (for_)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -250,6 +261,28 @@ xToTime v x0 w x = tvStart v + realToFrac ((x - x0) / max 1 w) * viewWidth v
 zoomAround :: Double -> Double -> TimeView -> TimeView
 zoomAround factor t (TimeView a b) = TimeView (t - (t - a) * factor) (t + (b - t) * factor)
 
+-- | The zoom factor for a wheel delta from 'useWheelDeltaOn'. nano-ui
+-- reports the wheel the way its scroll areas apply it, +y for a notch
+-- towards the user (scrolling down), +x for scrolling right; so a canvas
+-- that pans or scrolls adds the delta, and the wheel turned away from the
+-- user zooms in.
+wheelZoom :: Float -> Double
+wheelZoom wy = 1.25 ** realToFrac wy
+
+-- | Slide a view by @dt@ ns.
+panBy :: Double -> TimeView -> TimeView
+panBy dt (TimeView a b) = TimeView (a + dt) (b + dt)
+
+-- | A horizontal wheel delta from 'useWheelDeltaOn' as a pan: a tenth of
+-- the view a notch.
+wheelPan :: Float -> TimeView -> TimeView
+wheelPan wx v = panBy (realToFrac wx * viewWidth v * 0.1) v
+
+-- | A drag of @dx@ pixels across a plot @w@ wide, as the pan that keeps
+-- the time under the pointer.
+dragPan :: Float -> Float -> TimeView -> TimeView
+dragPan w dx v = panBy (negate (realToFrac dx / realToFrac w * viewWidth v)) v
+
 -- | Keep a view inside @[lo, hi]@ and no narrower than 1 µs.
 clampView :: Double -> Double -> TimeView -> TimeView
 clampView lo hi (TimeView a b)
@@ -267,6 +300,12 @@ niceStep target
       let e = 10 ** fromIntegral (floor (logBase 10 target) :: Int)
           m = target / e
        in e * (if m < 1.5 then 1 else if m < 3.5 then 2 else if m < 7.5 then 5 else 10)
+
+-- | The multiples of @step@ in @[lo, hi]@.
+axisTicks :: Double -> Double -> Double -> [Double]
+axisTicks step lo hi = takeWhile (<= hi) [first, first + step ..]
+  where
+    first = fromIntegral (ceiling (lo / step) :: Integer) * step
 
 -- ---------------------------------------------------------------------------
 -- Widgets
@@ -300,13 +339,10 @@ selectableRow selected f body = do
       panelWith (asRow . fillW . padXY 8 2 . gap 8 . f) body
   pure (respClicked area)
 
--- | A value over its name, for a few numbers on their own; a run's vital
--- numbers belong in one 'readout'.
-statTile :: Text -> Text -> NanoUI ()
-statTile name value =
-  columnWith (padRight 14 . tight . gap 0) $ do
-    labelWith (fontMono . fontSizeScale 1.12) value
-    labelWith (fontMuted . fontSizeScale 0.8) name
+-- | A table's rows, stacked with no gap: each row's own padding is the
+-- rhythm, whatever gap the pane body around them uses.
+tableRows :: NanoUI a -> NanoUI a
+tableRows = columnWith (tight . gap 0 . fillW)
 
 -- | A heading inside a pane's body.
 sectionTitle :: Text -> NanoUI ()
@@ -355,6 +391,37 @@ toolGroup :: NanoUI a -> NanoUI a
 toolGroup body = do
   vrule 22
   rowWith (tight . gap 6 . alignMid) body
+
+-- | Chrome that stays out of the way: a button with no surface until the
+-- pointer is on it, for the header's commands and the panes' menus.
+quiet :: Theme -> Theme
+quiet th =
+  let t = inkText (ink th)
+   in buttonStyle (background colorTransparent . borderWidth 0 . hoverBackground (alpha 0.08 t) . pressBackground (alpha 0.14 t)) th
+
+quietButton :: Text -> NanoUI Bool
+quietButton = styled quiet . buttonWith alignMid
+
+-- | A 'quietButton' with a tooltip, giving its response for a popover to
+-- anchor on.
+quietButton' :: Text -> Text -> NanoUI Response
+quietButton' label tip = do
+  resp <- styled quiet (buttonWith' alignMid label)
+  tooltip resp tip
+  pure resp
+
+-- | A button for something that may not be possible now: disabled with
+-- the reason as its tooltip when it is 'Left', else with @tip@ if any.
+actionButton :: (Layout -> Layout) -> Text -> Maybe Text -> Either Text (NanoUI ()) -> NanoUI ()
+actionButton f label tip run = do
+  resp <- disabledWhen (isLeft run) (buttonWith' f label)
+  for_ (either Just (const tip) run) (tooltip resp)
+  when (respClicked resp) (sequence_ run)
+
+-- | Act on the first path a file dialog picked, if it picked any: for
+-- @useFileDialog@.
+firstPath :: (FilePath -> NanoUI ()) -> [FilePath] -> NanoUI ()
+firstPath f = mapM_ f . take 1
 
 -- | The split tree of a panel's panes, kept in the panel's state so the
 -- arrangement survives switching panels. Pane ids name pane kinds
@@ -415,7 +482,8 @@ paneWith bodyLayout ctx title trailing body = do
 paneMenu :: NanoUI Bool -> NanoUI ()
 paneMenu items = do
   open <- useVar False
-  resp <- buttonWith' (alignMid . padXY 6 0 . tight) "⋯"
+  th <- uiTheme
+  resp <- styled (quiet . buttonStyle (foreground (inkMuted (ink th)))) (buttonWith' (alignMid . padXY 6 0 . tight) "⋯")
   tooltip resp "Move, pop out or close this pane; drag the header to rearrange"
   when (respClicked resp) (modifyVar open not)
   _ <- popupWith open (defaultPopupConfig (AnchorRect (respRect resp))) (fixedW 240) $
@@ -437,14 +505,29 @@ readout items = readoutDelta [(name, value, Nothing) | (name, value) <- items]
 -- when there is one.
 readoutDelta :: [(Text, Text, Maybe Text)] -> NanoUI ()
 readoutDelta items =
-  rowWith (padXY 20 0 . padTop 10 . tight . gap 0 . fillW . wrap . lineGap 8) $
+  rowWith (padTop 14 . padXY 20 0 . tight . gap 0 . fillW . wrap . lineGap 8) $
     forM_ (zip [0 :: Int ..] items) $ \(i, (name, value, delta)) -> withKey i $
       rowWith (tight . gap 0) $ do
-        scope $ when (i > 0) (vrule 30)
+        scope $ when (i > 0) (vrule 34)
         columnWith (padLeft (if i > 0 then 14 else 0) . padRight 14 . tight . gap 0) $ do
-          labelWith (fontMono . fontSizeScale 1.12) value
+          let (number, unit) = splitUnit value
+          rowWith (tight . gap 3) $ do
+            cell (fontMono . fontSizeScale 1.3) number
+            scope $ unless (T.null unit) (cell (fontMuted . fontSizeScale 0.9) unit)
           labelWith (fontMuted . fontSizeScale 0.8) name
           scope $ for_ delta $ labelWith (fontMuted . fontMono . fontSizeScale 0.75)
+
+-- | A reading's number and its unit ("5.084 s", "16.5%"), so the unit can
+-- be set smaller and muted beside the figures.
+splitUnit :: Text -> (Text, Text)
+splitUnit t
+  | Just n <- T.stripSuffix "%" t = (n, "%")
+  | (a, u) <- T.breakOnEnd " " t
+  , not (T.null a)
+  , not (T.null u)
+  , not (T.any isDigit u) =
+      (T.dropEnd 1 a, u)
+  | otherwise = (t, "")
 
 -- | What a pane says before it has anything to show: a title, what to do,
 -- and the commands to do it with.

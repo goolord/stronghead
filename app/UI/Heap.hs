@@ -19,6 +19,7 @@ module UI.Heap
   , heapPanes
   , openHp
   , openProf
+  , taskOutcome
   , HeapLoaded (..)
   , heapLens
     -- * For attaching and remote actions
@@ -33,7 +34,7 @@ module UI.Heap
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, displayException, try)
-import Control.Monad (forM_, join, unless, void, when)
+import Control.Monad (forM_, guard, join, unless, void, when)
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
@@ -43,7 +44,6 @@ import Data.Set (Set)
 import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word64)
@@ -260,7 +260,7 @@ heapLoad st = do
     _ -> pure Nothing
   hlProf <- traverse (\p -> useTaskStatus (hsProfTask st) p (loadProf p)) prof
   totals <- readVar (hsCostTotals st)
-  case (prof, done hlProf) of
+  case (prof, taskOutcome hlProf) of
     (Just p, Just (Right pf)) | fmap fst totals /= Just p -> writeVar (hsCostTotals st) (Just (p, costTotals (pfRoots pf)))
     _ -> pure ()
   hlSnap <- traverse (\r@(_, target, opts) -> useTaskStatus (hsDbgTask st) r (takeSnapshot opts target)) req
@@ -293,8 +293,9 @@ watchSize p report = go Nothing
       threadDelay 1000000
       go now
 
-done :: Maybe (TaskStatus (Either String a)) -> Maybe (Either String a)
-done = \case
+-- | What a load came to, once it has come to anything.
+taskOutcome :: Maybe (TaskStatus (Either String a)) -> Maybe (Either String a)
+taskOutcome = \case
   Just (TaskDone r) -> Just r
   Just (TaskRunning (Just r)) -> Just r
   Just (TaskFailed e _) -> Just (Left (show e))
@@ -303,15 +304,11 @@ done = \case
 heapView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
 heapView env bench st loaded logTl = columnWith (tight . gap 0 . grow) $ do
   let fromLog = logTl >>= tlHeapProfile
-  useFileDialog (hsHpDialog st) $ \case
-    p : _ -> openHp st p
-    [] -> pure ()
-  useFileDialog (hsProfDialog st) $ \case
-    p : _ -> openProf st p
-    [] -> pure ()
+  useFileDialog (hsHpDialog st) (firstPath (openHp st))
+  useFileDialog (hsProfDialog st) (firstPath (openProf st))
   source <- readVar (hsSource st)
   hpPath <- readVar (hsHpPath st)
-  let hpResult = done (hlHp loaded)
+  let hpResult = taskOutcome (hlHp loaded)
   toolStrip $ do
     toolLabel "Source"
     rowWith (alignMid . tight) $
@@ -381,7 +378,7 @@ snapshotCount st = (\(History _ ss) -> length ss) <$> readVar (hsDbgHistory st)
 -- | The profile on show: the @.hp@ file's, or else the eventlog's.
 shownProfile :: HeapSource -> HeapLoaded -> Maybe HeapProfile -> Maybe HeapProfile
 shownProfile source loaded fromLog = case source of
-  FromHpFile -> case done (hlHp loaded) of
+  FromHpFile -> case taskOutcome (hlHp loaded) of
     Just (Right hp) -> Just hp
     _ -> Nothing
   _ -> fromLog
@@ -503,8 +500,7 @@ profileView env bench st loaded logTl hp = do
       suspects = length (leakSuspects hp)
   columnWith (padBottom 8 . tight . fillW) $
     readoutDelta
-      [ ("breakdown", hpBreakdown hp, Nothing)
-      , ("censuses", tshow (VU.length times), Nothing)
+      [ ("censuses", tshow (VU.length times), Nothing)
       , ("profiled", fmtSec (VU.last times), Nothing)
       , ("peak total", fmtBytesD (peakOf hp), (\b -> fmtChange (peakOf b) (peakOf hp) <> " vs baseline") <$> base)
       , ("cursor at" <> approx, fmtSec (times VU.! cursorIx), Nothing)
@@ -523,7 +519,7 @@ heapPanes env st loaded logTl site = do
   source <- readVar (hsSource st)
   let fromLog = logTl >>= tlHeapProfile
       costs pid ctx
-        | pid == paneHeapCosts = Just (pane ctx "Cost centres" (pure ()) (costCentreTree env st (done (hlProf loaded))))
+        | pid == paneHeapCosts = Just (pane ctx "Cost centres" (pure ()) (costCentreTree env st (taskOutcome (hlProf loaded))))
         | otherwise = Nothing
   profileDraw <- case shownProfile source loaded fromLog of
     Just hp | not (VU.null (hpTimes hp)) -> profilePanes env st loaded logTl hp site
@@ -591,7 +587,7 @@ profilePanes env st loaded logTl hp site = do
             prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
             let plot0 = chartPlot prev
                 hoverLines = do
-                  guard' (rectContains plot0 mouse)
+                  guard (rectContains plot0 mouse)
                   let i = nearestIndex (hpTimes hp) (xToTime v (rectX plot0) (rectW plot0) (v2X mouse) / 1e9)
                       stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
                       ymax = maxStack ls
@@ -616,18 +612,17 @@ profilePanes env st loaded logTl hp site = do
                   | otherwise = panning && heldIn MouseLeft inp
             when (panNow /= panning) (writeVar (hsPanning st) panNow)
             (wx, wy) <- useWheelDeltaOn resp
-            when (wy /= 0) $ setView (zoomAround (0.8 ** realToFrac wy) (xToTime v px pw (v2X mouse)) v)
-            when (wx /= 0) $ let d = realToFrac wx * viewWidth v * 0.1 in setView (TimeView (tvStart v - d) (tvEnd v - d))
+            when (wy /= 0) $ setView (zoomAround (wheelZoom wy) (xToTime v px pw (v2X mouse)) v)
+            when (wx /= 0) $ setView (wheelPan wx v)
             drag <- useDrag2DOn resp
             let dx = v2X (dragDelta drag)
-            when (panNow && dragActive drag && dx /= 0) $
-              let d = realToFrac dx / realToFrac pw * viewWidth v in setView (TimeView (tvStart v - d) (tvEnd v - d))
+            when (panNow && dragActive drag && dx /= 0) $ setView (dragPan pw dx v)
             when (respHovered resp && pressedIn MouseLeft inp && inputMouseClicks inp >= 2 && onAxis) fitView
             when (dragActive drag && not panNow && not brushing && not (modCtrl mods) && not (modShift mods)) $ do
               let i = nearestIndex (hpTimes hp) (xToTime v px pw (v2X (dragPosition drag)) / 1e9)
               when (cursorT /= Just (times VU.! i)) $ writeVar (hsCursor st) (Just (times VU.! i))
       | pid == paneHeapBands ->
-          Just (paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)))) (legend env st hp hidden solo))
+          Just (paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)) <> ", by " <> hpBreakdown hp)) (legend env st hp hidden solo))
       | pid == paneHeapAnalysis -> Just $ do
           let actions = do
                 flex
@@ -637,10 +632,8 @@ profilePanes env st loaded logTl hp site = do
             AtCursor -> atCursor env st hp cursorIx
             Leaks -> leakView env st hp
             Retention -> retentionView env st hp cursorIx
-            CostCentres -> costCentreTree env st (done (hlProf loaded))
+            CostCentres -> costCentreTree env st (taskOutcome (hlProf loaded))
       | otherwise -> Nothing
-  where
-    guard' c = if c then Just () else Nothing
 
 -- | @[@ and @]@ move the cursor to the previous or next census; the chart
 -- follows it when it leaves the window.
@@ -709,10 +702,9 @@ drawChart pal mm hp ls v cursorIx axis marks r hover = do
   let o0 = tvStart v / 1e9 - hpStart hp
       o1 = tvEnd v / 1e9 - hpStart hp
       tstep = niceStep ((o1 - o0) / 8)
-      firstTick = fromIntegral (ceiling (o0 / tstep) :: Integer) * tstep
   drawRect (Rect px (py + ph) pw 22) (alpha 0.025 (pText pal))
-  forM_ (take 100 (takeWhile (<= o1) [firstTick, firstTick + tstep ..])) $ \o ->
-    drawTextWith font (V2 (sx (o + hpStart hp)) (py + ph + 12)) AlignCenter AlignMiddle (fmtSec o) (pMuted pal)
+  forM_ (take 100 (axisTicks tstep o0 o1)) $ \o ->
+    drawTextWith font (V2 (sx (o + hpStart hp)) (py + ph + 12)) AlignCenter AlignMiddle (fmtTick (tstep * 1e9) (o * 1e9)) (pMuted pal)
   -- Stacked bands, bottom up.
   let n = VU.length times
       xs = [sx (times VU.! i) | i <- [0 .. n - 1]]
@@ -746,7 +738,6 @@ drawChart pal mm hp ls v cursorIx axis marks r hover = do
 
 legend :: Env -> HeapState -> HeapProfile -> Set Text -> Maybe Text -> NanoUI ()
 legend env st hp hidden solo = do
-    labelWith (padXY 6 2 . fontMuted . fontSizeScale 0.85 . fillW) "Click a swatch to hide a band, a name to show it alone"
     paneScroll (grow . tight) $ columnWith (tight . fillW . gap 1) $
       forM_ (zip [0 :: Int ..] (V.toList (hpBands hp))) $ \(i, b) -> withKey (bandName b) $ do
         let name = bandName b
@@ -755,6 +746,7 @@ legend env st hp hidden solo = do
         rowWith (padLeft 6 . tight . gap 4 . fillW) $ do
           sw <- canvas (fixedWH 12 12 . alignMid) $ \r ->
             if isHidden then drawStrokeRoundedRect r 3 1.5 c else drawRoundedRect r 3 c
+          tooltip sw (if isHidden then "Show this band; click a name to show it alone" else "Hide this band; click a name to show it alone")
           when (respClicked sw) $ writeVar (hsHidden st) (if isHidden then S.delete name hidden else S.insert name hidden)
           picked <- linkRow env (RBand name) (solo == Just name) id $ do
             cell (fillW . fontSizeScale 0.9 . (if isHidden then fontMuted else id)) (T.take 60 (bandTitle b))
@@ -1020,9 +1012,7 @@ ghcDebugView env bench st loaded logTl
         ]
         ["cabal build -f ghc-debug"]
   | otherwise = do
-      useFileDialog (hsDbgFileDialog st) $ \case
-        p : _ -> writeVar (hsDbgFile st) (Just p)
-        [] -> pure ()
+      useFileDialog (hsDbgFileDialog st) (firstPath (writeVar (hsDbgFile st) . Just))
       conn <- readVar (hsDbgConn st)
       file <- readVar (hsDbgFile st)
       sockets <- readVar (hsDbgSockets st)
@@ -1385,12 +1375,12 @@ heapLens st loaded fromLog = do
   sources <- readVar (hsDbgSources st)
   survivors <- readVar (hsDbgSurvivors st)
   let profile = case source of
-        FromHpFile -> case done (hlHp loaded) of
+        FromHpFile -> case taskOutcome (hlHp loaded) of
           Just (Right hp) -> Just hp
           _ -> Nothing
         _ -> fromLog
       fromEventlog = source /= FromHpFile
-      prof = case done (hlProf loaded) of
+      prof = case taskOutcome (hlProf loaded) of
         Just (Right pf) -> Just pf
         _ -> Nothing
       latest = case reverse snaps of
@@ -1422,9 +1412,7 @@ heapLens st loaded fromLog = do
       group k = latest >>= M.lookup k . snapThunks
       tso t = latest >>= \snap ->
         listToMaybe [n | i <- snapRoots snap, Just n <- [M.lookup i (snapNodes snap)], cnType n == "TSO", cnName n == "thread " <> tshow t]
-      threadOf n = case T.stripPrefix "thread " (cnName n) of
-        Just t | cnType n == "TSO", Right (tid, "") <- TR.decimal t -> Just (RThread snapRun tid)
-        _ -> Nothing
+      threadRef = fmap (RThread snapRun) . threadOf
       sourceOf = (>>= srcLocSpan . parseSrcLoc)
       rangeIn r a b = if b > a then instantIn r a >> instantIn r b else Nothing
       nearestOffset hp t = hpOffset hp (nearestIndex (hpTimes hp) (fromIntegral t / 1e9))
@@ -1507,7 +1495,7 @@ heapLens st loaded fromLog = do
       survivorsOf bd = case latest of
         Just snap -> [s | s <- survivors, not (null (snd (matchBand bd (mapMaybe (`M.lookup` snapNodes snap) (svSample s)))))]
         Nothing -> []
-      holderOf i = latest >>= \snap -> anchorOf (retainerPath snap i) >>= \a -> Just (fromMaybe (RClosure sn (cnId a)) (threadOf a))
+      holderOf i = latest >>= \snap -> anchorOf (retainerPath snap i) >>= \a -> Just (fromMaybe (RClosure sn (cnId a)) (threadRef a))
       costTotal m l = listToMaybe [t | t <- maybe [] snd totals, ctName t == l || ctModule t <> "." <> ctName t == l, T.null m || ctModule t == m]
   pure
     (lens PHeap)
@@ -1571,7 +1559,7 @@ heapLens st loaded fromLog = do
                 ++ [("Go to binding " <> ccName c, RBinding (ccModule c) (nameKey (ccName c))) | not (T.null (ccModule c))]
             Nothing -> []
           RClosure s a -> case closure s a of
-            Just n -> [("Go to source", RSource sp) | Just sp <- [sourceOf (cnSource n)]] ++ [("Go to thread", r) | Just r <- [threadOf n]]
+            Just n -> [("Go to source", RSource sp) | Just sp <- [sourceOf (cnSource n)]] ++ [("Go to thread", r) | Just r <- [threadRef n]]
             Nothing -> []
           RThunkGroup k -> [("Go to source", RSource sp) | Just sp <- [sourceOf (tkSource k)]]
           _ -> []

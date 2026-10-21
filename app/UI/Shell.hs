@@ -29,12 +29,14 @@ module UI.Shell
   , saveLastSession
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.Char (intToDigit)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isSuffixOf, nub)
 import Data.Map.Strict qualified as M
+import Data.Either (isRight)
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Sequence qualified as Seq
 import Data.Word (Word64)
@@ -58,10 +60,10 @@ import Stronghead.Prof (ProfFile (..))
 import Stronghead.Ref (Ref (..), RunKey, parseRefTarget)
 import Stronghead.Run (RunInfo (..), emptyRunInfo, mergeRunInfo, runFromArgs, runFromHello, runFromProfHeader, runFromSocket, runKey)
 import Stronghead.Session (Session (..), decodeSession, encodeSession, sessionExtension)
+import Stronghead.TextFile (readTextFile, saveTextFile)
 import Control.Exception (IOException, try)
-import Data.Text.IO qualified as T
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute, renameFile)
+import System.Directory (doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.FilePath (takeDirectory, takeExtension, takeFileName, (</>))
 import UI.Baseline
 import UI.Clock (confirmMoments)
@@ -120,6 +122,10 @@ data App = App
     -- ^ The window's latest restored geometry, saved on quit.
   , appSaved :: !(IORef Settings)
     -- ^ What the settings file holds, so it is written only on a change.
+  , appSettingsPath :: !FilePath
+    -- ^ Where it is, for the Settings dialog to say.
+  , appPersist :: !Bool
+    -- ^ 'optPersist'.
   , appBus :: !Bus
   , appPalette :: !CommandPalette
   , appGoto :: !(Var (Maybe Ref))
@@ -169,10 +175,13 @@ data Options = Options
     -- ^ An entity to open, by its reference.
   , optMark :: !(Maybe T.Text)
     -- ^ A mark to send the connected program, once it can take one.
+  , optPersist :: !Bool
+    -- ^ Whether settings changed while running are saved as they change
+    -- (off for screenshot runs, which leave the settings file alone).
   }
 
 defaultOptions :: Options
-defaultOptions = Options [] Nothing Nothing Nothing Nothing Nothing Nothing
+defaultOptions = Options [] Nothing Nothing Nothing Nothing Nothing Nothing True
 
 -- | The app, starting from saved settings; the command line wins over them.
 newApp :: Settings -> Options -> IO App
@@ -219,6 +228,8 @@ newApp settings Options {..} = do
   appPlaceWindow <- newVar (if cfgRestoreWindow settings then cfgWindow settings else Nothing)
   appWindowSeen <- newIORef (cfgWindow settings)
   appSaved <- newIORef settings
+  appSettingsPath <- settingsPath
+  let appPersist = optPersist
   appBus <- newBus
   appPalette <- newPalette
   appGoto <- newVar (optGoto >>= parseRefTarget)
@@ -281,7 +292,7 @@ saveAppSettings app = saveSettings =<< currentSettings app
 -- | Save whenever a setting changes. The window's geometry changes on every
 -- frame of a drag, so it alone waits for 'saveAppSettings' on quit.
 persistSettings :: App -> NanoUI ()
-persistSettings app = do
+persistSettings app = when (appPersist app) $ do
   now <- liftIO (currentSettings app)
   saved <- liftIO (readIORef (appSaved app))
   when (now {cfgWindow = Nothing} /= saved {cfgWindow = Nothing}) $ do
@@ -351,12 +362,8 @@ appView app = do
   forM_ (inputDrops inp) $ \d ->
     when (dropEventType d == DropFile) (openAny app (T.unpack (dropEventData d)))
   useFileDialog (appOpen app) (mapM_ (openAny app))
-  useFileDialog (appSessionSave app) $ \case
-    p : _ -> saveSessionAs app p
-    [] -> pure ()
-  useFileDialog (appSessionOpen app) $ \case
-    p : _ -> openSession app p
-    [] -> pure ()
+  useFileDialog (appSessionSave app) (firstPath (saveSessionAs app))
+  useFileDialog (appSessionOpen app) (firstPath (openSession app))
 
   -- Loaders run every frame so background work survives tab switches.
   timeline0 <- timelineLoad (appTimeline app)
@@ -378,9 +385,10 @@ appView app = do
       live = fmap (linkLive links) live0
       logTl = timeline >>= lpTimeline
       logProfile = logTl >>= tlHeapProfile
+      following = maybe False lpFollowing timeline
       bus = appBus app
   timelineSync bus (appTimeline app) timeline
-  heapSync bus (appHeap app) heap logTl (maybe False lpFollowing timeline)
+  heapSync bus (appHeap app) heap logTl following
   -- One Connect wires the program: its eventlog, heap profile, ghc-debug
   -- socket, sources and dumps.
   attach <- liveAttach (appLive app) live0
@@ -401,26 +409,20 @@ appView app = do
   baseline <- baselineLoad (appBaseline app) dumpRoot
   heapShown <- heapOnShow (appHeap app) heap logProfile
   snapshots <- snapshotCount (appHeap app)
-  let isRight' = \case
-        Just (Right _) -> True
-        _ -> False
+  let isRight' = maybe False isRight
       have =
         Have
           { haveTimeline = isJust logTl
           , haveHeapCensus = maybe False (not . VU.null . hpTimes) heapShown
           , haveHeapSource = maybe False ((== "info table") . hpBreakdown) heapShown
-          , haveCostCentres = isRight' (hlProf heap >>= taskResult)
+          , haveCostCentres = isRight' (taskOutcome (hlProf heap))
           , haveSamples = maybe False (not . V.null . tlProfSamples) logTl
           , haveTicky = maybe False (not . V.null . tlTicky) logTl
           , haveDumps = any isRight' [clCore core, clStg core]
           , haveAgent = isNothing (commandsWhy live)
-          , haveLiveGraph = either (const False) (const True) (dhSnapshot hooks)
+          , haveLiveGraph = isRight (dhSnapshot hooks)
           , haveSnapshots = snapshots
           }
-      taskResult = \case
-        TaskDone r -> Just r
-        TaskRunning r -> r
-        _ -> Nothing
   -- What marking the baseline now would keep.
   logPath <- readVar (tsPath (appTimeline app))
   heapSource <- readVar (hsSource (appHeap app))
@@ -450,7 +452,6 @@ appView app = do
           , whCensus = remoteRun "Census now"
           , whSnapshot = remoteRun "Snapshot"
           }
-      following = maybe False lpFollowing timeline
   watchTick (appWatchers app) watchHooks live logTl following
 
   active <- readVar (appTab app)
@@ -470,9 +471,7 @@ appView app = do
           }
   navShortcuts app env
   inspectorSync env (appInspector app)
-  useFileDialog (appExport app) $ \case
-    p : _ -> exportPins app env p
-    [] -> pure ()
+  useFileDialog (appExport app) (firstPath (exportPins app env))
   -- Every provider of panes, for whichever workbench holds them.
   let providers p site = case p of
         PTimeline -> timelinePanes env (appTimeline app) timeline site
@@ -515,28 +514,29 @@ appView app = do
   let i = ink th
   columnWith (tight . grow . gap 0) $ do
     styled (panelStyle (background (inkGround i) . borderWidth 0 . cornerRadius 0)) $
-      panelWith (asRow . fillW . fixedH 46 . padLeft 20 . padRight 8 . padTop 0 . padBottom 0 . gap 18) $ do
+      -- As tall as the tabs and a margin above them, so the wordmark, the
+      -- tabs' labels and the commands share one centre line and the active
+      -- tab still opens onto the toolbar below.
+      panelWith (asRow . fillW . padLeft 20 . padRight 8 . padTop 8 . padBottom 0 . gap 18) . themed th $ do
         labelWith (alignMid . fontSemiBold . fontSizeScale 1.08) "Stronghead"
-        themed th $ history env
-        themed th $ navBar (appTab app)
+        history env
+        navBar (appTab app)
         flex
         -- The file on show, when there is room beside the buttons.
         winW <- windowWidth
-        scope $ when (winW >= 1640) (themed th (document app active))
-        themed th $ do
-          resp <- buttonWith' alignMid "Sources"
-          tooltip resp "What each run has, and how to add the rest"
+        scope $ when (winW >= 1640) (document app active)
+        do
+          resp <- quietButton' "Sources" "What each run has, and how to add the rest"
           when (respClicked resp) (modifyVar (appSourcesOpen app) not)
           sources <- sourcesOf app timeline0 heap0 core live0 links
           sourcesPopover env (appSourcesOpen app) (respRect resp) sources (linkRuns app) (unlinkRun app)
-        themed th $ do
-          resp <- buttonWith' alignMid "Workspace"
-          tooltip resp "Add a pane to this panel, use another arrangement, save or open the session"
+        do
+          resp <- quietButton' "Workspace" "Add a pane to this panel, use another arrangement, save or open the session"
           when (respClicked resp) (modifyVar (appPanesOpen app) not)
           panesPopover app active (respRect resp)
-        themed th $ whenM (toolButton "Go to…") (openPalette (appPalette app))
-        themed th $ whenM (toolButton "Settings") (writeVar (appSettingsOpen app) True)
-        themed th $ whenM (toolButton "Open…") (askOpen app)
+        whenM (respClicked <$> quietButton' "Go to…" "Find a thread, binding, cost centre, band or command (Ctrl+K)") (openPalette (appPalette app))
+        whenM (respClicked <$> quietButton' "Settings" "Theme, scale, defaults and the editor command (Ctrl+,)") (writeVar (appSettingsOpen app) True)
+        whenM (quietButton "Open…") (askOpen app)
     columnWith (tight . grow . gap 0) . withKey (fromEnum active) $ case active of
       PTimeline -> timelineView env bench (appTimeline app) timeline
       PHeap -> heapView env bench (appHeap app) heap logTl
@@ -571,7 +571,7 @@ history :: Env -> NanoUI ()
 history env = rowWith (alignMid . tight . gap 2) $ do
   let bus = envBus env
       step label locs go = do
-        resp <- disabledWhen (null locs) (buttonWith' (alignMid . padXY 8 2 . tight) label)
+        resp <- disabledWhen (null locs) (styled quiet (buttonWith' (alignMid . padXY 8 2 . tight) label))
         for_ (take 1 locs) $ \loc -> tooltip resp (describe loc)
         when (respClicked resp) (go env)
       describe (Location p r) = panelTitle p <> maybe "" ((": " <>) . refTitle env) r
@@ -689,10 +689,10 @@ panesPopover app active anchor = do
         rowWith (fillW . tight . gap 6 . wrap . lineGap 6) $
           forM_ presets $ \pr -> withKey (prName pr) $ do
             whenM (buttonWith (padXY 8 2 . tight) (prName pr)) (useArrangement app active (prTree pr) >> close)
-        rowWith (fillW . tight . gap 8 . padTop 4) $ do
+        rowWith (fillW . gap 8 . padTop 4 . tight) $ do
           textInputConfigured defaultTextInputConfig {ticPlaceholder = "name for this arrangement", ticLayout = (alignMid . fillW) defaultLayout} (appPresetName app)
           name <- T.strip <$> readVar (appPresetName app)
-          disabledWhen (T.null name || maybe True (const False) tree) $
+          disabledWhen (T.null name || isNothing tree) $
             whenM (buttonWith (alignMid . padXY 8 2 . tight) "Save as a preset") $ for_ tree $ \t -> do
               modifyVar (appPresets app) (\ps -> filter ((/= name) . prName) ps ++ [Preset name t])
               writeVar (appPresetName app) ""
@@ -721,7 +721,7 @@ poppedWindows app shellPanes providers = do
       Nothing -> pure shellPanes
     (resp, _) <- window' always (paneTitle k) $
       columnWith (fixedWH 720 460 . tight) $
-        maybe (hint "Nothing draws this pane.") id (draw k floatingPane)
+        fromMaybe (hint "Nothing draws this pane.") (draw k floatingPane)
     when (respClicked resp) $ do
       modifyVar (appPopped app) (filter ((/= k) . poKind))
       for_ [wb | wb <- allBenches app, wbName wb == poFrom po] $ \wb -> modifyVar (wbTree wb) (Just . addPane k)
@@ -739,11 +739,9 @@ exportPins app env path0 = do
   pins <- readVar (busPins (appBus app))
   stamp <- liftIO (formatTime defaultTimeLocale "%Y-%m-%d %H:%M" <$> getZonedTime)
   let report = pinsReport env ["Exported from Stronghead on " <> T.pack stamp <> "."] pins
-  r <- liftIO . try $ do
-    T.writeFile (path <> ".tmp") report
-    renameFile (path <> ".tmp") path
+  r <- liftIO (saveTextFile "the report" path report)
   writeVar (appMessage app) $ case r of
-    Left (e :: IOException) -> "Could not save the report: " <> T.pack (show e)
+    Left e -> e
     Right () -> "Saved the pins to " <> T.pack (takeFileName path)
 
 -- ---------------------------------------------------------------------------
@@ -825,18 +823,11 @@ currentSession app = do
 
 -- | Write a session, replacing the file only once the new one is whole.
 writeSession :: FilePath -> Session -> IO (Either T.Text ())
-writeSession path s = do
-  r <- try $ do
-    createDirectoryIfMissing True (takeDirectory path)
-    T.writeFile (path <> ".tmp") (encodeSession s)
-    renameFile (path <> ".tmp") path
-  pure $ case r of
-    Left (e :: IOException) -> Left ("Could not save the session: " <> T.pack (show e))
-    Right () -> Right ()
+writeSession path s = saveTextFile "the session" path (encodeSession s)
 
 readSession :: FilePath -> IO (Either T.Text Session)
 readSession path = do
-  r <- try (T.readFile path)
+  r <- try (readTextFile path)
   pure $ case r of
     Left (e :: IOException) -> Left ("Could not read the session: " <> T.pack (show e))
     Right txt -> decodeSession txt
@@ -953,14 +944,12 @@ document app active = scope $ case active of
       FromGhcDebug -> labelWith (alignMid . fontMuted . fontSizeScale 0.92) "ghc-debug live graph"
   PCore -> do
     (s, c, g) <- readVar (csPaths (appCore app))
-    pathLabel (c `orElse` g `orElse` s)
+    pathLabel (c <|> g <|> s)
   PDebugger -> pathLabel =<< readVar (dsSourcePath (appDebug app))
   PLive -> do
     host <- readVar (lvHost (appLive app))
     port <- readVar (lvPort (appLive app))
     labelWith (alignMid . fontMono . fontSizeScale 0.92) (host <> ":" <> port)
-  where
-    orElse a b = maybe b Just a
 
 -- | The connection centre on the left: every live source (the followed
 -- eventlog, the agent, the ghc-debug target, GHCi) opens its panel on a
@@ -1134,7 +1123,7 @@ linkLive links d
   where
     one (p, pid, caps) =
       let ri = linkRun links (runFromHello p pid)
-       in (maybe p id (riProgram ri), maybe pid id (riPid ri), caps)
+       in (fromMaybe p (riProgram ri), fromMaybe pid (riPid ri), caps)
 
 linkRuns :: App -> [Source] -> RunInfo -> NanoUI ()
 linkRuns app members target =
@@ -1161,10 +1150,7 @@ sourcesOf app timeline heap core live links = do
         let key = runKey ri
          in Source kind detail (linkRun links ri) key (M.member key links) panel ds
       bySource hp = if hpBreakdown hp == "info table" then [DHeapCensus, DHeapSource] else [DHeapCensus]
-      ok = \case
-        Just (TaskDone (Right x)) -> Just x
-        Just (TaskRunning (Just (Right x))) -> Just x
-        _ -> Nothing
+      ok = (>>= either (const Nothing) Just) . taskOutcome
   pure $
     concat
       [ [ source "Eventlog" (maybe "" T.pack logPath) (tlRun t) PTimeline (DTimeline : maybe [] bySource (tlHeapProfile t))
@@ -1177,12 +1163,12 @@ sourcesOf app timeline heap core live links = do
             (host <> ":" <> port)
             (mergeRunInfo (runFromHello p pid) (maybe emptyRunInfo (runFromArgs . aiArgs) (ldInfo d)))
             PLive
-            (DLive : [DLiveStats | Just f <- [Seq.lookup (Seq.length (ldFrames d) - 1) (ldFrames d)], frProgramExact f])
+            (DLive : [DLiveStats | Just f <- [latestFrame d], frProgramExact f])
         | Just d <- [live]
         , isNothing (ldClosed d)
         , Just (p, pid, _) <- [ldHello d]
         ]
-      , [ source "ghc-debug" (targetName t) (case t of DebugUnix p -> maybe emptyRunInfo id (runFromSocket (T.pack p)); _ -> emptyRunInfo) PHeap [DLiveGraph]
+      , [ source "ghc-debug" (targetName t) (case t of DebugUnix p -> fromMaybe emptyRunInfo (runFromSocket (T.pack p)); _ -> emptyRunInfo) PHeap [DLiveGraph]
         | Just t <- [target]
         ]
       , [ source "Dumps" (T.pack r <> maybe "" (\as -> ", " <> tshow (length as) <> " modules") (clArtifacts core)) emptyRunInfo PCore [DDumps]
@@ -1194,7 +1180,7 @@ sourcesOf app timeline heap core live links = do
 -- | The panels, as folder tabs along the bottom of the title bar.
 navBar :: Var Panel -> NanoUI ()
 navBar v =
-  rowWith (alignBottom . tight) $
+  rowWith (alignMid . tight) $
     boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v
 
 -- ---------------------------------------------------------------------------
@@ -1223,7 +1209,6 @@ settingsModal :: App -> NanoUI ()
 settingsModal app = do
   zoom <- currentZoom
   scale <- readVar (appScale app)
-  path <- liftIO settingsPath
   let auto = if scale == ScaleAuto then Just zoom else Nothing
       chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
       headOr = \case k : _ -> k; [] -> mempty
@@ -1268,7 +1253,7 @@ settingsModal app = do
       settingRow "Editor command" $ inputHint "code -g {file}:{line}:{col}" fillW (csEditor core)
       settingNote "Run by \"Open in editor\" on any source line; {file}, {line} and {col} are filled in."
       columnWith (padTop 12 . fillW . tight . gap 8) $ do
-        labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack path)
+        labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack (appSettingsPath app))
         fillRow $ do
           flex
           whenM (toolButton "Reset to defaults") (resetSettings app)

@@ -21,6 +21,7 @@ module UI.Inspector
 import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.List (nub)
+import Data.Maybe (isJust)
 import Data.Text qualified as T
 import NanoUI
 import Stronghead.Next (Step (..), StepDo (..), datumRecipe, datumTitle)
@@ -131,13 +132,13 @@ inspectorBody env r = do
         , let peek = lensPeek l r
               related = nub [(lbl, x) | (lbl, x) <- lensRelated l r, shownBy x]
               actions = lensActions l r
-        , lensShows l r || not (null related) || not (null actions) || maybe False (const True) peek
+        , lensShows l r || not (null related) || not (null actions) || isJust peek
         ]
   scope $
     if null sections
       then hint "No panel has this loaded now. Open the artifact it comes from, or connect to the program."
       else forM_ sections $ \(l, peek, related, actions) -> withKey (fromEnum (lensPanel l)) $
-        columnWith (fillW . tight . gap 4 . padTop 6) $ do
+        columnWith (fillW . gap 4 . padTop 6 . tight) $ do
           labelWith (fontMedium . fontSizeScale 0.92) (panelTitle (lensPanel l))
           for_ (peek >>= peekExact) $ labelWith (fontMuted . fontSizeScale 0.82 . fillW)
           for_ peek $ columnWith (fillW . tight . gap 2) . drawPeek False
@@ -148,17 +149,15 @@ inspectorBody env r = do
           rowWith (fillW . tight . gap 6 . wrap . lineGap 6) $ do
             scope $ when (lensShows l r) $
               whenM (buttonWith (padXY 8 2 . tight) ("Show in " <> panelTitle (lensPanel l))) (showIn env l r)
-            forM_ (zip [0 :: Int ..] actions) $ \(i, a) -> withKey i $ do
-              resp <- disabledWhen (either (const True) (const False) (actRun a)) (buttonWith' (padXY 8 2 . tight) (actLabel a))
-              for_ (either Just (const Nothing) (actRun a)) (tooltip resp)
-              when (respClicked resp) (either (const (pure ())) id (actRun a))
+            forM_ (zip [0 :: Int ..] actions) $ \(i, a) -> withKey i $
+              actionButton (padXY 8 2 . tight) (actLabel a) Nothing (actRun a)
 
 -- | What to do next, in order: each step a button that follows it (its
 -- reason under it, or why it can't run as its tooltip), the entity it
 -- leads to as a link, and for missing data the lines that add it.
 nextStepsSection :: Env -> [Step] -> NanoUI ()
 nextStepsSection env steps = unless (null steps) $
-  columnWith (fillW . tight . gap 4 . padTop 6) $ do
+  columnWith (fillW . gap 4 . padTop 6 . tight) $ do
     labelWith (fontMedium . fontSizeScale 0.92) "Next steps"
     forM_ (zip [1 :: Int ..] steps) $ \(i, s) -> withKey i $
       columnWith (fillW . tight . gap 2) $ do
@@ -168,10 +167,7 @@ nextStepsSection env steps = unless (null steps) $
           scope $ case stepDo s of
             -- Missing data has nothing to click: what to add is below it.
             StepLoad _ -> labelWith (alignMid . fontMedium . fontSizeScale 0.9) (stepTitle s)
-            _ -> do
-              resp <- disabledWhen (either (const True) (const False) run) (buttonWith' (alignMid . padXY 8 2 . tight) (stepTitle s))
-              for_ (either Just (const Nothing) run) (tooltip resp)
-              when (respClicked resp) (either (const (pure ())) id run)
+            _ -> actionButton (alignMid . padXY 8 2 . tight) (stepTitle s) Nothing run
           scope $ case stepDo s of
             StepGo x -> linkText env x (alignMid . fontSizeScale 0.9) (T.take 60 (refTitle env x))
             StepTry flag -> do

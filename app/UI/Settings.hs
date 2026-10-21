@@ -26,11 +26,11 @@ import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.IO qualified as T
 import NanoUI (Appearance (..), Size (..))
 import Stronghead.Format (tshow)
-import System.Directory (XdgDirectory (..), createDirectoryIfMissing, doesFileExist, getXdgDirectory, renameFile)
-import System.FilePath (takeDirectory, (</>))
+import Stronghead.TextFile (readTextFile, saveTextFile)
+import System.Directory (XdgDirectory (..), doesFileExist, getXdgDirectory)
+import System.FilePath ((</>))
 import Text.Read (readMaybe)
 import UI.Code (Colouring (..))
 
@@ -171,20 +171,13 @@ loadSettings = do
   exists <- doesFileExist path
   if not exists
     then pure defaultSettings
-    else either (const defaultSettings) decode <$> (try (T.readFile path) :: IO (Either IOException Text))
+    else either (const defaultSettings) decode <$> (try (readTextFile path) :: IO (Either IOException Text))
 
 -- | Write the settings, replacing the file only once the new one is whole.
 saveSettings :: Settings -> IO (Either Text ())
 saveSettings s = do
   path <- settingsPath
-  r <- try $ do
-    createDirectoryIfMissing True (takeDirectory path)
-    let tmp = path <> ".tmp"
-    T.writeFile tmp (encode s)
-    renameFile tmp path
-  pure $ case r of
-    Left (e :: IOException) -> Left ("Could not save settings: " <> T.pack (show e))
-    Right () -> Right ()
+  saveTextFile "settings" path (encode s)
 
 encode :: Settings -> Text
 encode Settings {..} =

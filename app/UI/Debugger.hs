@@ -259,19 +259,22 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
       whenM (toolButton "Step into") (send [":step " <> expr])
       whenM (toolButton "Trace") (send [":trace " <> expr])
       whenM (toolButton "Run") (send [expr])
-    disabledWhen (not running || busy || isNothing' stop) $ do
+    -- Continue and Abandon take their colour only when they can act.
+    let stepping = running && not busy && isJust stop
+        whenStepping f = if stepping then f else id
+    disabledWhen (not stepping) $ do
       toolGroup $ do
         whenM (toolButton "Step") (send [":step"])
         whenM (toolButton "Step over") (send [":steplocal"])
         whenM (toolButton "Step out") (send [":stepout"])
         whenM (toolButton "Step module") (send [":stepmodule"])
-        whenM (styled success (toolButton "Continue")) (send [":continue"])
+        whenM (styled (whenStepping success) (toolButton "Continue")) (send [":continue"])
       toolGroup $ do
         whenM (toolButton "Back") (send [":back"])
         whenM (toolButton "Forward") (send [":forward"])
         whenM (toolButton "History") (send [":history"])
       flex
-      whenM (styled destructive (toolButton "Abandon")) (send [":abandon"])
+      whenM (styled (whenStepping destructive) (toolButton "Abandon")) (send [":abandon"])
   bnDraw bench (dsPanes st) (debugPanes env st ix source)
 
 -- | The Debugger's panes, for whichever workbench holds them: the source
@@ -289,9 +292,6 @@ debugPanes env st ix source _ = do
       | pid == paneDbgBreaks -> Just (breaksPane env st ctx send)
       | pid == paneDbgConsole -> Just (consolePane env st ctx send)
       | otherwise -> Nothing
-
-isNothing' :: Maybe a -> Bool
-isNothing' = maybe True (const False)
 
 -- | A stop's binding: @Main.go@ is @go@ in @Main@.
 stopBinding :: Text -> Ref

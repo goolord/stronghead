@@ -14,7 +14,6 @@ module Stronghead.Source
     SrcSpan (..)
   , parseSrcSpan
   , renderSrcSpan
-  , spanContainsLine
   , SrcLoc (..)
   , parseSrcLoc
   , renderSrcLoc
@@ -28,7 +27,6 @@ module Stronghead.Source
   , resolveSource
   , resolveModule
   , resolvesTo
-  , locateSource
   , pathComponents
   , findProjectRoot
   , sourceRoots
@@ -48,7 +46,8 @@ import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
-import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
+import Stronghead.Format (tshow)
+import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath (isAbsolute, normalise, takeDirectory, takeExtension, (</>))
 
 -- ---------------------------------------------------------------------------
@@ -101,12 +100,9 @@ parseSrcSpan t0 =
 -- | The form GHC would print.
 renderSrcSpan :: SrcSpan -> Text
 renderSrcSpan (SrcSpan f l c el ec)
-  | l == el && c == ec = f <> ":" <> showT l <> ":" <> showT c
-  | l == el = f <> ":" <> showT l <> ":" <> showT c <> "-" <> showT ec
-  | otherwise = f <> ":(" <> showT l <> "," <> showT c <> ")-(" <> showT el <> "," <> showT ec <> ")"
-
-spanContainsLine :: SrcSpan -> Int -> Bool
-spanContainsLine s l = l >= ssLine s && l <= ssEndLine s
+  | l == el && c == ec = f <> ":" <> tshow l <> ":" <> tshow c
+  | l == el = f <> ":" <> tshow l <> ":" <> tshow c <> "-" <> tshow ec
+  | otherwise = f <> ":(" <> tshow l <> "," <> tshow c <> ")-(" <> tshow el <> "," <> tshow ec <> ")"
 
 -- | A location as GHC reports it: a span, or one of the placeholders it
 -- prints for code that has none.
@@ -145,9 +141,6 @@ srcLocSpan :: SrcLoc -> Maybe SrcSpan
 srcLocSpan = \case
   SrcAt s -> Just s
   _ -> Nothing
-
-showT :: Int -> Text
-showT = T.pack . show
 
 -- ---------------------------------------------------------------------------
 -- The source index
@@ -283,19 +276,6 @@ resolvesTo ix path reported =
       ix' = if S.member file (siFiles ix) then ix else mkSourceIndex [] [file]
    in fmap rsPath (resolveSource ix' Nothing reported) == Just file
 
--- | 'resolveSource', but an absolute path outside the roots is accepted if
--- the file exists.
-locateSource :: SourceIndex -> Maybe Text -> Text -> IO (Maybe Resolved)
-locateSource ix modu reported = case resolveSource ix modu reported of
-  Just r -> pure (Just r)
-  Nothing
-    | isAbsolute path -> do
-        ok <- doesFileExist path
-        pure (if ok then Just (Resolved (normalise path) ByAbsolute) else Nothing)
-    | otherwise -> pure Nothing
-  where
-    path = T.unpack (T.strip reported)
-
 -- | A path's components, splitting on both separators so a Windows path
 -- reported by one tool matches a POSIX one from another. Drops @.@ and the
 -- drive.
@@ -344,7 +324,7 @@ sourceRoots starts = do
 -- (@code -g {file}:{line}:{col}@).
 editorCommand :: Text -> FilePath -> Int -> Int -> Text
 editorCommand template file line col =
-  T.replace "{file}" quoted . T.replace "{line}" (showT line) . T.replace "{col}" (showT (max 1 col)) $ template
+  T.replace "{file}" quoted . T.replace "{line}" (tshow line) . T.replace "{col}" (tshow (max 1 col)) $ template
   where
     quoted = if any isSpace file then "\"" <> T.pack file <> "\"" else T.pack file
 

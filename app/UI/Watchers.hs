@@ -97,7 +97,7 @@ watchTick :: Watchers -> WatchHooks -> Maybe LiveData -> Maybe Timeline -> Bool 
 watchTick w hooks live logTl following = do
   rules <- readVar (wrRules w)
   let frames = case live of
-        Just d | Nothing <- ldClosed d, not (Seq.null (ldFrames d)) -> Just (liveRun d, toList (ldFrames d))
+        Just d | Nothing <- ldClosed d, not (Seq.null (ldFrames d)) -> Just (liveRun d, ldFrames d)
         _ -> Nothing
       followed = if following then logTl else Nothing
       run = case (frames, followed) of
@@ -117,7 +117,8 @@ watchTick w hooks live logTl following = do
       Just (_, fs) -> liftIO $ do
         seen <- readIORef (wrFrameSeen w)
         prev <- readIORef (wrLastFrame w)
-        let new = [f | f <- fs, frProgramNs f > seen]
+        -- Frames arrive in program order, so the new ones are a suffix.
+        let new = toList (Seq.takeWhileR ((> seen) . frProgramNs) fs)
             obs = concat (zipWith frameObservations (prev : map Just new) new)
         case reverse new of
           f : _ -> writeIORef (wrFrameSeen w) (frProgramNs f) >> writeIORef (wrLastFrame w) (Just f)
@@ -199,12 +200,12 @@ firedList env evs =
   if null evs
     then hint "Nothing has fired yet."
     else forM_ (zip [0 :: Int ..] evs) $ \(i, ev) -> withKey i $
-      columnWith (fillW . tight . gap 2 . padTop 4) $ do
+      columnWith (fillW . gap 2 . padTop 4 . tight) $ do
         let f = feFired ev
         rowWith (fillW . tight . gap 8) $ do
           linkText env (RInstant (feRun ev) (fiAt f)) (alignBaseline . fontMono . fontSizeScale 0.85) (fmtNs (fromIntegral (fiAt f)))
           labelWith (alignBaseline . fillW . fontSizeScale 0.9) (fiText f)
-        rowWith (fillW . tight . gap 8 . padLeft 12) $ do
+        rowWith (fillW . gap 8 . padLeft 12 . tight) $ do
           labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (feTitle ev)
           case fiSubject f of
             AboutRun -> pure ()

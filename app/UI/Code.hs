@@ -433,9 +433,9 @@ codeView cv mm cfg = do
   inp <- askInput
   (wx, wy) <- useWheelDeltaOn resp
   let shiftHeld = modShift (inputModifiers inp)
-  when (wy /= 0 && not shiftHeld) $ writeVar (cvScroll cv) (max 0 (min maxScroll (scroll - wy * 3)))
-  when (wy /= 0 && shiftHeld) $ writeVar (cvHScroll cv) (max 0 (hscroll - wy * 6))
-  when (wx /= 0) $ writeVar (cvHScroll cv) (max 0 (hscroll - wx * 6))
+  when (wy /= 0 && not shiftHeld) $ writeVar (cvScroll cv) (max 0 (min maxScroll (scroll + wy * 3)))
+  when (wy /= 0 && shiftHeld) $ writeVar (cvHScroll cv) (max 0 (hscroll + wy * 6))
+  when (wx /= 0) $ writeVar (cvHScroll cv) (max 0 (hscroll + wx * 6))
   let r = respRect resp
       inGutter = v2X mouse <= rectX r + gutterW
       clickedLine = if respClicked resp then Just (lineAt r (v2Y mouse)) else Nothing

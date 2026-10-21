@@ -45,6 +45,7 @@ import Data.Text qualified as T
 import Data.Text.Read qualified as TR
 import Data.Word (Word64)
 import Stronghead.Diff (BaselinePaths (..), noBaselinePaths)
+import Stronghead.Format (tshow)
 import Stronghead.Ref (Ref (..), RunKey, parseRefTarget, refTarget)
 import Stronghead.Watch (Rule, decodeRule, defaultRules, encodeRule, setRules)
 
@@ -185,12 +186,12 @@ encodeSession Session {..} =
            , ("ghci-file", sesGhciFile)
            , ("ghci-running", bool sesGhciRunning)
            ]
-        ++ concat [[(key i, refTarget (pinRef p))] ++ [(key i <> ".note", pinNote p) | not (T.null (pinNote p))] | (i, p) <- zip [1 :: Int ..] sesPins, let key n = "pin." <> tshow' n]
+        ++ concat [[(key i, refTarget (pinRef p))] ++ [(key i <> ".note", pinNote p) | not (T.null (pinNote p))] | (i, p) <- zip [1 :: Int ..] sesPins, let key n = "pin." <> tshow n]
         ++ [("cursor", refTarget (RInstant r t)) | Just (r, t) <- [sesCursor]]
         ++ [("range", refTarget (RRange r a b)) | Just (r, a, b) <- [sesRange]]
         ++ [("focus", refTarget r) | Just r <- [sesFocus]]
         ++ [("layout." <> name, tree) | (name, tree) <- sesLayouts]
-        ++ concat [[("preset." <> tshow' i, name), ("preset." <> tshow' i <> ".layout", tree)] | (i, (name, tree)) <- zip [1 :: Int ..] sesPresets]
+        ++ concat [[("preset." <> tshow i, name), ("preset." <> tshow i <> ".layout", tree)] | (i, (name, tree)) <- zip [1 :: Int ..] sesPresets]
         ++ numbered "popped" sesPopped
         ++ numbered "watch" (map encodeRule sesWatchers)
         ++ opt "baseline.eventlog" (blEventlog sesBaseline)
@@ -198,7 +199,7 @@ encodeSession Session {..} =
         ++ opt "baseline.cost-centres" (blCostCentres sesBaseline)
         ++ opt "baseline.dumps" (blDumps sesBaseline)
     opt k = maybe [] (\p -> [(k, T.pack p)])
-    numbered k vs = [(k <> "." <> tshow' i, v) | (i, v) <- zip [1 :: Int ..] vs]
+    numbered k vs = [(k <> "." <> tshow i, v) | (i, v) <- zip [1 :: Int ..] vs]
     bool b = if b then "true" else "false"
 
 -- | The session a file describes. 'Left' only when it isn't a session file
@@ -317,9 +318,6 @@ decodes a b = (a, toLowerHex b) `elem` [('2', '5'), ('0', 'a'), ('0', 'd'), ('2'
   where
     toLowerHex c = if c >= 'A' && c <= 'F' then chr (ord c + 32) else c
 
-tshow' :: Int -> Text
-tshow' = T.pack . show
-
 -- ---------------------------------------------------------------------------
 -- Reports
 
@@ -354,7 +352,7 @@ pinsMarkdown title intro pins =
       ++ (if null pins then ["No pins.", ""] else concat (zipWith pin [1 :: Int ..] pins))
   where
     pin i p =
-      ["## " <> tshow' i <> ". " <> md (prTitle p), "", "`" <> prTarget p <> "`", ""]
+      ["## " <> tshow i <> ". " <> md (prTitle p), "", "`" <> prTarget p <> "`", ""]
         ++ concatMap section (prSections p)
         ++ (if any (not . emptySection) (prSections p) then [""] else [])
         ++ ( if T.null (T.strip (prNote p))

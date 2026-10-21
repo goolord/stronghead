@@ -69,7 +69,7 @@ import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef
 import Data.List (nub)
-import Data.Maybe (listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
@@ -297,7 +297,7 @@ data Env = Env
 
 -- | The best name any panel has for it.
 refTitle :: Env -> Ref -> Text
-refTitle env ref = maybe (describeRef ref) id (listToMaybe (mapMaybe (`lensTitle` ref) (envLenses env)))
+refTitle env ref = fromMaybe (describeRef ref) (listToMaybe (mapMaybe (`lensTitle` ref) (envLenses env)))
 
 -- | A name for a ref from the ref alone.
 describeRef :: Ref -> Text
@@ -516,7 +516,7 @@ peek env ref =
     labelWith (fontMedium . fillW) (refTitle env ref)
     let ls = envLenses env
     forM_ [(lensPanel l, body) | l <- ls, Just body <- [lensPeek l ref]] $ \(p, body) -> withKey (fromEnum p) $ do
-      rowWith (fillW . tight . gap 6 . padTop 4) $ do
+      rowWith (fillW . gap 6 . padTop 4 . tight) $ do
         labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (panelTitle p)
         for_ (peekExact body) $ labelWith (alignBaseline . fontMuted . fontSizeScale 0.75) . T.takeWhile (/= ':')
       columnWith (fillW . tight . gap 2) (drawPeek False body)

@@ -11,6 +11,7 @@ import Data.IORef
 import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict qualified as M
 import Data.Text (Text)
+import Data.Either (isLeft)
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -28,6 +29,7 @@ import Stronghead.Diff
 import Stronghead.Dump
 import Stronghead.Eventlog (emptyBuilder, feedEvent, snapshot)
 import Stronghead.Eventlog.Model
+import Stronghead.Format (fmtTick)
 import Stronghead.Fuzzy
 import Stronghead.Ghci
 import Stronghead.HeapProfile
@@ -38,6 +40,7 @@ import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run
 import Stronghead.Session
+import Stronghead.TextFile (readTextFile, writeTextFile)
 import Stronghead.Source
 import Stronghead.Watch
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
@@ -50,6 +53,12 @@ main = do
   let check name ok = do
         putStrLn ((if ok then "  ok   " else "  FAIL ") <> name)
         unless ok (modifyIORef' failures (+ 1))
+
+  putStrLn "axis ticks"
+  check "the origin is 0" (fmtTick 5e8 0 == "0")
+  check "whole seconds drop their decimals" (fmtTick 1e9 2e9 == "2 s")
+  check "half-second steps keep one decimal" (map (fmtTick 5e8) [5e8, 1e9, 1.5e9] == ["500 ms", "1 s", "1.5 s"])
+  check "fine steps keep what they need" (fmtTick 2e7 1.02e9 == "1.02 s" && fmtTick 5e2 2.5e3 == "2.5 µs")
 
   putStrLn "heap profiles"
   case parseHp hpText of
@@ -567,7 +576,7 @@ main = do
       && T.isInfixOf "pin.3 = source/sample%2FMain.hs/82/1/82/40" (encodeSession session)
   check "a reference written by hand reads as it is" $
     fmap (map pinRef . sesPins) (decodeSession "version = 1\npin.1 = source/sample%2FMain.hs/82/1/82/1\n") == Right [RSource (SrcSpan "sample/Main.hs" 82 1 82 1)]
-  check "a file without a version is not a session" (either (const True) (const False) (decodeSession "panel = heap\n"))
+  check "a file without a version is not a session" (isLeft (decodeSession "panel = heap\n"))
   check "unknown keys and bad values are skipped" $
     decodeSession "version = 1\nwhatever = 3\npin.1 = nope/1\npin.2 = band/x\nfollow = maybe\ncursor = band/y\n"
       == Right emptySession {sesPins = [Pin (RBand "x") ""]}
@@ -766,6 +775,15 @@ main = do
     [(bsWorker s, bsBoxes s > 0) | s <- summaries, bsKey s == "go"] == [(True, True)] && "main" `elem` map bsKey summaries
   check "changes against the baseline, in readouts" $
     fmtChange 100 18 == "−82%" && fmtChange 100 112 == "+12%" && fmtChange 0 0 == "±0%" && fmtChange 0 5 == "new" && fmtChange 100 100.04 == "±0%" && relChange 0 1 == Nothing
+
+  putStrLn "text files"
+  do
+    tmpDir <- getTemporaryDirectory
+    let path = tmpDir <> "/stronghead-utf8-test.stronghead"
+        txt = "focus = binding/Main/go\ntitle = worker\8230 2.5 \181s\n"
+    writeTextFile path txt
+    back <- readTextFile path
+    check "non-ASCII text round-trips as UTF-8, whatever the code page" (back == txt)
 
   putStrLn "sessions: watchers and baseline"
   let watched =

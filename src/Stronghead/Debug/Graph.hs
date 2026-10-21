@@ -23,7 +23,6 @@ module Stronghead.Debug.Graph
   , threadStack
   , threadOf
   , RootKind (..)
-  , rootKindOf
   , HeapSnapshot (..)
   , mkSnapshot
   , isCAF
@@ -220,9 +219,6 @@ data RootKind
   | RootOther
     -- ^ Stable pointers, stable names and the other miscellaneous roots.
   deriving (Eq, Ord, Show)
-
-rootKindOf :: ClosureNode -> RootKind
-rootKindOf n = if cnKind n == NThread then RootThread else RootOther
 
 -- | A CAF: a top-level thunk, evaluated (@IND_STATIC@) or not
 -- (@THUNK_STATIC@).

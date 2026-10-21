@@ -14,7 +14,6 @@ module Stronghead.Join
     sameFile
   , spanWithin
   , spanOverlaps
-  , spanStartsIn
     -- * Annotations
   , Lane (..)
   , laneName
@@ -97,10 +96,6 @@ spanOverlaps :: SrcSpan -> SrcSpan -> Bool
 spanOverlaps a b =
   (ssLine a, ssCol a) <= (ssEndLine b, ssEndCol b)
     && (ssLine b, ssCol b) <= (ssEndLine a, ssEndCol a)
-
--- | The span starts on one of the lines (1-based, inclusive).
-spanStartsIn :: SrcSpan -> Int -> Int -> Bool
-spanStartsIn sp lo hi = ssLine sp >= lo && ssLine sp <= hi
 
 -- ---------------------------------------------------------------------------
 -- Annotations

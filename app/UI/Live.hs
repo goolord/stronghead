@@ -24,6 +24,7 @@ module UI.Live
   , liveView
   , livePanes
   , LiveData (..)
+  , latestFrame
   , liveRun
   , liveLens
     -- * Acting on the program
@@ -42,8 +43,8 @@ import Data.Foldable (for_, toList)
 import Data.IORef
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
-import Data.Sequence (Seq, (|>))
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
+import Data.Sequence (Seq (..), (|>))
 import Data.Sequence qualified as Seq
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -126,6 +127,11 @@ data LiveData = LiveData
   , ldReplies :: !(M.Map Int Reply)
   , ldClosed :: !(Maybe Text)
   }
+
+latestFrame :: LiveData -> Maybe Frame
+latestFrame d = case ldFrames d of
+  _ :|> f -> Just f
+  _ -> Nothing
 
 newLiveState :: IO LiveState
 newLiveState = do
@@ -318,10 +324,8 @@ actionStrip st remote = toolStrip $ do
   toolLabel "Program"
   forM_ (zip [0 :: Int ..] (groupsOf remote)) $ \(gi, grp) -> withKey gi $ do
     scope $ when (gi > 0) (toolGroup (pure ()))
-    forM_ grp $ \a -> withKey (raLabel a) $ do
-      resp <- disabledWhen (isLeftE (raRun a)) (buttonWith' alignMid (raLabel a))
-      tooltip resp (either id (const (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a))
-      when (respClicked resp) (either (const (pure ())) id (raRun a))
+    forM_ grp $ \a -> withKey (raLabel a) $
+      actionButton alignMid (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
   flex
   msg <- readVar (lvMessage st)
   scope $ unless (T.null msg) $ do
@@ -329,7 +333,6 @@ actionStrip st remote = toolStrip $ do
     whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
   where
     groupsOf as = filter (not . null) [[a | a <- as, raGroup a == g] | g <- [GroupAgent, GroupDebug]]
-    isLeftE = either (const True) (const False)
 
 -- | What Connect found, or how to upgrade an old agent.
 attachReport :: LiveState -> LiveData -> NanoUI ()
@@ -339,14 +342,14 @@ attachReport st d = do
   let oldAgent = isNothing (ldInfo d) && not (Seq.null (ldFrames d))
   if
     | oldAgent ->
-        columnWith (padXY 8 0 . padTop 8 . tight . fillW) $
+        columnWith (padTop 8 . padXY 8 0 . tight . fillW) $
           callout (themeWarning th) $
             columnWith (fillW . tight . gap 4) $ do
               labelWith (fontMedium . fillW) "This program's agent is an old one (protocol v1)"
               labelWith (fillW . fontSizeScale 0.92) "It streams statistics and threads, but doesn't say where the program runs or take commands, so Connect can't follow its eventlog or send marks. Rebuild the program against the current stronghead:agent; nothing else changes."
               codeBlock ["cabal build <your-program>      (picks up the new stronghead:agent)"]
     | Just (_, steps) <- attached ->
-        columnWith (padXY 20 0 . padTop 8 . padBottom 2 . tight . fillW) $
+        columnWith (padTop 8 . padBottom 2 . padXY 20 0 . tight . fillW) $
           rowWith (fillW . tight . gap 18 . wrap . lineGap 4) $ do
             labelWith (fontMuted . fontSizeScale 0.85) "Connect found"
             forM_ steps $ \s -> withKey (attachKindName (asKind s)) $ do
@@ -367,7 +370,7 @@ dashboard env bench st d logTl = do
       latest = if null rs then Nothing else Just (last rs)
       statsOn = stat "rts_stats" lastF > 0
   scope $ when (not statsOn) $
-    columnWith (padXY 8 0 . padBottom 8 . tight . fillW) $
+    columnWith (padBottom 8 . padXY 8 0 . tight . fillW) $
       callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
   columnWith (padBottom 8 . tight . fillW) $
     readout $
@@ -413,7 +416,7 @@ livePanes env st mdata logTl site = case mdata of
         shared = case window of
           Just (r, w) | placed, onClock, runKeysMatch r rk -> Just (tvStart w / 1e9, max (tvStart w / 1e9 + 1e-3) (tvEnd w / 1e9))
           _ -> Nothing
-        span' = maybe recent id shared
+        span' = fromMaybe recent shared
         holes = frameGaps (toList frames)
     mm <- monoMetrics 0.8
     marks <- if onClock then marksFor env rk logTl else pure (Marks Nothing Nothing [] [])
@@ -666,7 +669,7 @@ sendTo bus st mdata lbl cmd kind = for_ mdata $ \d -> for_ (ldOutbox d) $ \box -
 
 -- | The program time now, from the latest frame and how long ago it came.
 estimateNow :: LiveData -> IO (Maybe Word64)
-estimateNow d = case Seq.lookup (Seq.length (ldFrames d) - 1) (ldFrames d) of
+estimateNow d = case latestFrame d of
   Nothing -> pure Nothing
   Just f -> do
     now <- getMonotonicTime
@@ -773,7 +776,7 @@ sendMark bus st mdata txt = do
 liveLens :: LiveState -> Maybe LiveData -> [Moment] -> [RemoteAction] -> Lens
 liveLens st mdata moments remote = case mdata of
   Just d
-    | Just lastF <- Seq.lookup (Seq.length (ldFrames d) - 1) (ldFrames d) ->
+    | Just lastF <- latestFrame d ->
         let rk = liveRun d
             thread r t = if runKeysMatch r rk then listToMaybe [lt | lt <- frThreads lastF, ltId lt == fromIntegral t] else Nothing
             history = statusHistory (ldFrames d)
@@ -813,7 +816,7 @@ liveLens st mdata moments remote = case mdata of
 
 actionHits :: LiveState -> [RemoteAction] -> [Hit]
 actionHits st remote =
-  [ Hit "program" (raLabel a) (either id (const (maybe "" id (raKey a))) (raRun a)) (HitRun (either (writeVar (lvMessage st)) id (raRun a)))
+  [ Hit "program" (raLabel a) (either id (const (fromMaybe "" (raKey a))) (raRun a)) (HitRun (either (writeVar (lvMessage st)) id (raRun a)))
   | a <- remote
   ]
 

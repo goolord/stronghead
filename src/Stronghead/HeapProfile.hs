@@ -9,7 +9,6 @@ module Stronghead.HeapProfile
   , InfoProv (..)
   , infoProvDetail
   , fromSamples
-  , emptyProfile
   , hpOffset
   , hpOffsets
   , parseHp
@@ -20,27 +19,24 @@ module Stronghead.HeapProfile
   , Suspect (..)
   , leakSuspects
   , analysedSamples
-  , sampleIndexAt
   , bandDelta
   , RetainTree (..)
   , retainTree
   , looksStructured
   ) where
 
-import Data.ByteString qualified as B
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (mapMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
-import Data.Text.Encoding.Error qualified as TE
 import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Stronghead.Run (RunInfo, emptyRunInfo, runFromHp)
 import Stronghead.Source (SrcLoc, renderSrcLoc)
+import Stronghead.TextFile (readTextFile)
 
 -- | What a band's closures are, as far as the breakdown lets us tell.
 data BandKind
@@ -107,9 +103,6 @@ data HeapProfile = HeapProfile
   }
   deriving (Eq, Show)
 
-emptyProfile :: HeapProfile
-emptyProfile = HeapProfile "" "" VU.empty 0 V.empty VU.empty emptyRunInfo
-
 -- | Sample @i@'s time from the start of the run, as displays show it.
 hpOffset :: HeapProfile -> Int -> Double
 hpOffset hp i = hpTimes hp VU.! i - hpStart hp
@@ -149,7 +142,7 @@ fromSamples job breakdown start prov samples0 =
         [(b, M.singleton i v) | (i, (_, s)) <- zip [0 ..] samples, (b, v) <- s]
     bands =
       [ Band
-          { bandName = name
+          { bandName = T.copy name -- not a slice that keeps the whole file
           , bandValues = vals
           , bandPeak = if VU.null vals then 0 else VU.maximum vals
           , bandKind = maybe (classifyBand name) ipKind p
@@ -198,7 +191,7 @@ closureTypeKind t
 -- .hp files
 
 loadHp :: FilePath -> IO (Either String HeapProfile)
-loadHp path = parseHp . TE.decodeUtf8With TE.lenientDecode <$> B.readFile path
+loadHp path = parseHp <$> readTextFile path
 
 data HpAcc = HpAcc
   { accJob :: !Text
@@ -236,7 +229,7 @@ parseHp src
               ws@(_ : _ : _) -> Just (T.unwords (init ws), readD (last ws))
               _ -> Nothing
             else Just (T.dropEnd 1 name, readD val)
-    unquote = T.dropAround (== '"') . T.strip
+    unquote = T.copy . T.dropAround (== '"') . T.strip
 
 -- | The breakdown from the RTS flags in the JOB line or, when the program
 -- set its flags another way (-with-rtsopts, GHCRTS), from the band names.
@@ -264,17 +257,6 @@ readD t = case TR.double (T.strip t) of
 
 -- ---------------------------------------------------------------------------
 -- Analyses
-
--- | The last sample at or before @t@ seconds.
-sampleIndexAt :: HeapProfile -> Double -> Int
-sampleIndexAt hp t =
-  let ts = hpTimes hp
-      go lo hi
-        | lo >= hi = lo
-        | otherwise =
-            let mid = (lo + hi + 1) `div` 2
-             in if ts VU.! mid <= t then go mid hi else go lo (mid - 1)
-   in if VU.null ts then 0 else go 0 (VU.length ts - 1)
 
 -- | Residency change of a band from the previous sample to sample @i@.
 bandDelta :: Band -> Int -> Double

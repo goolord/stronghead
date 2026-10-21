@@ -47,6 +47,7 @@ import Data.List (sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
+import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Read qualified as TR
@@ -158,17 +159,17 @@ diffHeap base cur =
     pairs = [(c, pick c) | c <- cs]
     -- A baseline band matched twice (two current bands with one source)
     -- counts for the first only.
-    claimed = foldl' (\acc (_, m) -> maybe acc (\(b, _) -> bfName b : acc) m) [] pairs
+    claimed = S.fromList [bfName b | (_, Just (b, _)) <- pairs]
     matched =
-      snd $
+      reverse . snd $
         foldl'
           ( \(used, acc) (c, m) -> case m of
-              Just (b, how) | bfName b `notElem` used -> (bfName b : used, acc ++ [BandChange (Just b) (Just c) how (status (Just b) (Just c))])
-              _ -> (used, acc ++ [BandChange Nothing (Just c) Unmatched BandNew])
+              Just (b, how) | bfName b `S.notMember` used -> (S.insert (bfName b) used, BandChange (Just b) (Just c) how (status (Just b) (Just c)) : acc)
+              _ -> (used, BandChange Nothing (Just c) Unmatched BandNew : acc)
           )
-          ([], [])
+          (S.empty, [])
           pairs
-    gone = [BandChange (Just b) Nothing Unmatched BandGone | b <- bs, bfName b `notElem` claimed]
+    gone = [BandChange (Just b) Nothing Unmatched BandGone | b <- bs, bfName b `S.notMember` claimed]
     magnitude ch = abs (maybe 0 bfPeak (bcCur ch) - maybe 0 bfPeak (bcBase ch))
 
 -- | Gone when it holds less than a hundredth of what it held (the sample's

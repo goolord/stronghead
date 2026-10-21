@@ -22,7 +22,7 @@
 module Main (main) where
 
 import Control.Monad (when)
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import NanoUI
@@ -38,9 +38,9 @@ main :: IO ()
 main = do
   args <- getArgs
   settings <- loadSettings
-  app <- newApp settings (parseArgs args defaultOptions)
   capture <- lookupEnv "STRONGHEAD_CAPTURE"
-  delay <- maybe 3 (\s -> maybe 3 id (readMaybe s)) <$> lookupEnv "STRONGHEAD_CAPTURE_DELAY"
+  app <- newApp settings (parseArgs args defaultOptions {optPersist = isNothing capture})
+  delay <- maybe 3 (\s -> fromMaybe 3 (readMaybe s)) <$> lookupEnv "STRONGHEAD_CAPTURE_DELAY"
   started <- newVar (Nothing :: Maybe Double)
   let window = if cfgRestoreWindow settings then cfgWindow settings else Nothing
   runSdlApp

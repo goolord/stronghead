@@ -19,7 +19,7 @@ module UI.Sources
 import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.List (nub)
-import Data.Maybe (isNothing, listToMaybe)
+import Data.Maybe (fromMaybe, isNothing, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
@@ -67,7 +67,7 @@ sourcesPopover env open anchor sources link unlink =
           let info = foldr1 mergeRunInfo (map srcRun members)
               mine = nub (concatMap srcData members)
               probable = ProbablySameRun `elem` ms
-          columnWith (fillW . tight . gap 4 . padTop 4) $ do
+          columnWith (fillW . gap 4 . padTop 4 . tight) $ do
             rowWith (fillW . tight . gap 8) $ do
               labelWith (alignMid . fontMedium) (runTitle info)
               scope $ when probable $ badge Muted "matched by program name: no pid on one side, times approximate"
@@ -78,23 +78,23 @@ sourcesPopover env open anchor sources link unlink =
             forM_ (zip [0 :: Int ..] members) $ \(si, s) -> withKey si (sourceRow env s unlink)
             missing (filter (`notElem` mine) [DTimeline, DHeapCensus, DHeapSource, DCostCentres, DLive, DLiveStats, DLiveGraph]) (riProgram info)
         scope $ unless (null codeOnly) $
-          columnWith (fillW . tight . gap 4 . padTop 4) $ do
+          columnWith (fillW . gap 4 . padTop 4 . tight) $ do
             labelWith (alignMid . fontMedium) "Not tied to a run (joined by code)"
             forM_ (zip [0 :: Int ..] codeOnly) $ \(si, s) -> withKey si (sourceRow env s unlink)
         let missingCode = filter (`notElem` have) [DDumps, DDebugger]
         scope $ unless (null missingCode) $ missing missingCode Nothing
-        columnWith (fillW . tight . gap 4 . padTop 6) $ do
+        columnWith (fillW . gap 4 . padTop 6 . tight) $ do
           labelWith (fontMedium . fontSizeScale 0.92) "Everything at once"
-          let prog = maybe "<your-program>" id (listToMaybe [p | s <- timed, Just p <- [riProgram (srcRun s)]])
+          let prog = fromMaybe "<your-program>" (listToMaybe [p | s <- timed, Just p <- [riProgram (srcRun s)]])
           recipe "build" ("cabal build " <> prog <> " --ghc-options=\"-finfo-table-map -fdistinct-constructor-tables -ddump-simpl -ddump-stg-final -ddump-to-file\"")
           recipe "run" (prog <> " +RTS -l -hi -i0.1 -T -RTS")
 
 runTitle :: RunInfo -> Text
-runTitle ri = maybe "an unknown program" id (riProgram ri) <> maybe "" (\p -> ", pid " <> tshow p) (riPid ri)
+runTitle ri = fromMaybe "an unknown program" (riProgram ri) <> maybe "" (\p -> ", pid " <> tshow p) (riPid ri)
 
 sourceRow :: Env -> Source -> (RunKey -> NanoUI ()) -> NanoUI ()
 sourceRow env s unlink =
-  rowWith (fillW . tight . gap 8 . padLeft 12) $ do
+  rowWith (fillW . gap 8 . padLeft 12 . tight) $ do
     (_, area) <- withCursorShape UiCursorPointer $ mouseArea tight $ labelWith (alignBaseline . fixedW 130) (srcKind s)
     when (respClicked area) (envSwitch env (srcPanel s))
     tooltip area ("Open " <> panelTitle (srcPanel s))
@@ -106,7 +106,7 @@ sourceRow env s unlink =
 -- | What a run lacks, each with what it would add and how to get it.
 missing :: [Datum] -> Maybe Text -> NanoUI ()
 missing ds prog = scope $ unless (null ds) $
-  columnWith (fillW . tight . gap 6 . padLeft 12 . padTop 2) $ do
+  columnWith (fillW . gap 6 . padLeft 12 . padTop 2 . tight) $ do
     labelWith (fontMuted . fontSizeScale 0.85) "Missing"
     forM_ ds $ \d -> withKey (fromEnum d) $
       columnWith (fillW . tight . gap 2) $ do
@@ -118,7 +118,7 @@ missing ds prog = scope $ unless (null ds) $
 -- | A line to copy, after what it is for.
 recipe :: Text -> Text -> NanoUI ()
 recipe what t =
-  rowWith (fillW . tight . gap 6 . padLeft 12) $ do
+  rowWith (fillW . gap 6 . padLeft 12 . tight) $ do
     labelWith (alignMid . fixedW 40 . fontMuted . fontSizeScale 0.82) what
     columnWith (alignMid . fillW . tight) $ labelWith (fillW . fontMono . fontSizeScale 0.82) t
     whenM (buttonWith (alignMid . padXY 6 0 . tight) "Copy") (void (setClipboard t))

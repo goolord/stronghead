@@ -42,7 +42,7 @@ module Stronghead.Next
   ) where
 
 import Data.List (find)
-import Data.Maybe (listToMaybe)
+import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word64)
@@ -241,7 +241,7 @@ leakSteps have ref facts =
   provenance ++ (if suspect then snapshots ++ held ++ breakStep else [])
   where
     leak = listToMaybe [(s, n) | FactLeak s n <- facts]
-    suspect = maybe False (const True) leak
+    suspect = isJust leak
     strong = maybe False ((>= 0.6) . fst) leak
     thunks = FactThunks `elem` facts
     site = listToMaybe [sp | FactAllocated sp <- facts]
@@ -256,19 +256,19 @@ leakSteps have ref facts =
       [ Step "Go to where they are allocated" (what <> " allocated at " <> shortSpan sp <> growing) (StepGo (RSource sp)) strong
       | Just sp <- [site]
       ]
-        ++ [ Step "Open the binding in Core & STG" ("its STG lets show what " <> k <> " allocates; its badges show boxing") (StepGo (RBinding m k)) (strong && maybe True (const False) site)
+        ++ [ Step "Open the binding in Core & STG" ("its STG lets show what " <> k <> " allocates; its badges show boxing") (StepGo (RBinding m k)) (strong && isNothing site)
            | Just (m, k) <- [binding]
            ]
         ++ [ Step "Profile by info table" "an -hi profile names the source line and binding that allocate each band" (StepLoad DHeapSource) strong
-           | maybe True (const False) site
-           , maybe True (const False) binding
+           | isNothing site
+           , isNothing binding
            , not (haveHeapSource have)
            ]
     snapshots = case surviving of
       Just (g, n) -> [Step "Open the surviving group" ("its thunks have survived " <> tshow n <> " snapshots: nothing forces them") (StepGo g) True]
       Nothing
         | haveLiveGraph have ->
-            [Step "Snapshot twice, 2 s apart" "thunks that survive both snapshots are the ones nothing forces, and the live graph shows what holds them" (StepAct ref "snapshot twice") (not (maybe False (const True) site) && strong)]
+            [Step "Snapshot twice, 2 s apart" "thunks that survive both snapshots are the ones nothing forces, and the live graph shows what holds them" (StepAct ref "snapshot twice") (not (isJust site) && strong)]
         | otherwise -> [Step "Snapshot the running program" "two ghc-debug snapshots show which thunks survive and the path that holds them" (StepLoad DLiveGraph) False]
     held = [Step "Go to what holds them" "the end of the retainer path: the root that keeps them alive" (StepGo r) True | Just r <- [holder]]
     breakStep =
@@ -299,11 +299,11 @@ contentionSteps have facts = blockedSteps ++ ranSteps ++ bindingStep
     blockedSteps = case blocked of
       Nothing -> []
       Just (r, d, why) ->
-        Step "Show its longest blocked span" (fmtNs (fromIntegral d) <> " blocked on " <> why) (StepGo r) (long && maybe True (const False) owner && maybe True (const False) waker)
+        Step "Show its longest blocked span" (fmtNs (fromIntegral d) <> " blocked on " <> why) (StepGo r) (long && isNothing owner && isNothing waker)
           : [Step "Go to the black hole's owner" "it was evaluating the thunk this thread waited for" (StepGo o) long | Just o <- [owner]]
-          ++ [Step "Go to the thread that woke it" "it posted the wakeup that ended the span: it held what this thread waited for" (StepGo w) (long && maybe True (const False) owner) | Just w <- [waker]]
+          ++ [Step "Go to the thread that woke it" "it posted the wakeup that ended the span: it held what this thread waited for" (StepGo w) (long && isNothing owner) | Just w <- [waker]]
     ranSteps = case ran of
-      Just (cc, n) -> [Step "See what it ran" ("on top of its stack in " <> fmtInt n <> " cost-centre samples") (StepGo cc) (maybe True (const False) blocked)]
+      Just (cc, n) -> [Step "See what it ran" ("on top of its stack in " <> fmtInt n <> " cost-centre samples") (StepGo cc) (isNothing blocked)]
       Nothing
         | not (haveSamples have) -> [Step "Sample what it runs" "a profiled build run with -p -l records the code each thread ran" (StepLoad DSamples) False]
         | otherwise -> []
@@ -326,7 +326,7 @@ hotSteps have m l facts = costStep ++ bindingStep
       Nothing -> ""
     costStep =
       [ Step "Profile time and allocation" "a .prof gives each cost centre its share of time and allocation" (StepLoad DCostCentres) False
-      | maybe True (const False) cost
+      | isNothing cost
       , not (haveCostCentres have)
       ]
     bindingStep

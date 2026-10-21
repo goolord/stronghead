@@ -43,6 +43,7 @@ import Data.Text.Read qualified as TR
 import Data.Vector qualified as V
 import System.Directory (doesDirectoryExist, listDirectory)
 import Stronghead.Source (SrcSpan (..), parseSrcLoc, srcLocSpan)
+import Stronghead.TextFile (readTextFile)
 import System.FilePath (takeBaseName, takeExtension, takeFileName, (</>))
 
 data CodeKind = KindSource | KindCore | KindStg
@@ -112,10 +113,10 @@ data CodeFile = CodeFile
 
 loadCodeFile :: CodeKind -> FilePath -> IO (Either String CodeFile)
 loadCodeFile kind path = do
-  r <- try (B.readFile path)
+  r <- try (readTextFile path)
   pure $ case r of
     Left (e :: IOException) -> Left (show e)
-    Right bytes -> Right (parseCodeFile kind path (TE.decodeUtf8With TE.lenientDecode bytes))
+    Right txt -> Right (parseCodeFile kind path txt)
 
 kindForPath :: FilePath -> Maybe CodeKind
 kindForPath p

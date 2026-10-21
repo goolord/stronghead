@@ -69,6 +69,7 @@ library
         Stronghead.Diff
         Stronghead.Fuzzy
         Stronghead.Format
+        Stronghead.TextFile
         Stronghead.Debug
         Stronghead.Debug.Graph
     build-depends:

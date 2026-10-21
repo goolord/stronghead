@@ -26,6 +26,7 @@ import Data.Text.Read qualified as TR
 import Data.Word (Word32, Word64)
 import Numeric (showHex)
 import Stronghead.Debug.Graph (ClosureId, ThunkKey (..))
+import Stronghead.Format (tshow)
 import Stronghead.Run (RunKey (..))
 import Stronghead.Source (SrcSpan (..))
 
@@ -56,26 +57,24 @@ data Ref
 -- | @thread/stronghead-sample:4242/12@.
 refTarget :: Ref -> Text
 refTarget ref = T.intercalate "/" $ case ref of
-  RThread r t -> ["thread", run r, num t]
-  RInstant r t -> ["instant", run r, num t]
-  RRange r a b -> ["range", run r, num a, num b]
-  RCollection r i -> ["collection", run r, num i]
-  RCensus r i -> ["census", run r, num i]
-  RMarker r i -> ["marker", run r, num i]
-  RSource (SrcSpan f l c el ec) -> ["source", escape f, num l, num c, num el, num ec]
+  RThread r t -> ["thread", run r, tshow t]
+  RInstant r t -> ["instant", run r, tshow t]
+  RRange r a b -> ["range", run r, tshow a, tshow b]
+  RCollection r i -> ["collection", run r, tshow i]
+  RCensus r i -> ["census", run r, tshow i]
+  RMarker r i -> ["marker", run r, tshow i]
+  RSource (SrcSpan f l c el ec) -> ["source", escape f, tshow l, tshow c, tshow el, tshow ec]
   RBinding m k -> ["binding", escape m, escape k]
   RCostCentre m l -> ["cc", escape m, escape l]
   RBand b -> ["band", escape b]
   RInfoTable a -> ["info", hex a]
-  RClosure sn a -> ["closure", num sn, hex a]
+  RClosure sn a -> ["closure", tshow sn, hex a]
   -- "~" never comes out of 'escape', so it can stand for a missing source.
   RThunkGroup (ThunkKey name src path) -> ["thunks", escape name, maybe "~" escape src] ++ map escape path
-  RBreakpoint f l -> ["break", escape (T.pack f), num l]
+  RBreakpoint f l -> ["break", escape (T.pack f), tshow l]
   RModule m -> ["module", escape m]
   where
     run (RunKey k) = escape k
-    num :: (Show a) => a -> Text
-    num = T.pack . show
     hex a = T.pack ("0x" <> showHex a "")
 
 parseRefTarget :: Text -> Maybe Ref

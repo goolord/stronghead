@@ -2,6 +2,7 @@
 -- timestamps, byte counts and rates.
 module Stronghead.Format
   ( fmtNs
+  , fmtTick
   , fmtSec
   , fmtBytes
   , fmtBytesD
@@ -25,13 +26,34 @@ fmtFixed n x = T.pack (showFFloat (Just n) x "")
 
 -- | A duration in nanoseconds, scaled to the largest unit that keeps it >= 1.
 fmtNs :: Double -> Text
-fmtNs ns
-  | a >= 1e9 = fmtFixed 3 (ns / 1e9) <> " s"
-  | a >= 1e6 = fmtFixed 2 (ns / 1e6) <> " ms"
-  | a >= 1e3 = fmtFixed 1 (ns / 1e3) <> " µs"
-  | otherwise = fmtFixed 0 ns <> " ns"
+fmtNs ns = fmtFixed decimals (ns / scale) <> " " <> unit
+  where
+    (scale, unit, decimals) = nsUnit ns
+
+-- | The unit 'fmtNs' shows a duration in: its size in ns, its name, and
+-- how many decimals it takes.
+nsUnit :: Double -> (Double, Text, Int)
+nsUnit ns
+  | a >= 1e9 = (1e9, "s", 3)
+  | a >= 1e6 = (1e6, "ms", 2)
+  | a >= 1e3 = (1e3, "µs", 1)
+  | otherwise = (1, "ns", 0)
   where
     a = abs ns
+
+-- | A tick on a time axis whose ticks are @step@ ns apart: in the unit
+-- 'fmtNs' picks for the tick, with only the decimals the step needs, so a
+-- ruler reads 0, 500 ms, 1 s, 1.5 s rather than 1.000 s.
+fmtTick :: Double -> Double -> Text
+fmtTick step ns
+  | abs ns < 0.5 = "0"
+  | otherwise = trim (fmtFixed decimals (ns / scale)) <> " " <> unit
+  where
+    (scale, unit, _) = nsUnit ns
+    decimals = max 0 (ceiling (negate (logBase 10 (max 1e-9 step / scale)) - 1e-9))
+    trim s
+      | T.elem '.' s = T.dropWhileEnd (== '.') (T.dropWhileEnd (== '0') s)
+      | otherwise = s
 
 fmtSec :: Double -> Text
 fmtSec s

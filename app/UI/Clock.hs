@@ -40,6 +40,7 @@ import Data.Word (Word64)
 import NanoUI
 import NanoUI.Shortcut qualified as K
 import Data.List (sortOn)
+import Stronghead.Clock (partitionPoint)
 import Stronghead.Eventlog.Model (Marker (..), Timeline (..))
 import Stronghead.Ref
 import Stronghead.Run (runKey, runKeysMatch)
@@ -181,13 +182,7 @@ confirmMoments bus = \case
 
 -- | The first index whose element satisfies a monotone predicate.
 lowerBound :: (a -> Bool) -> V.Vector a -> Int
-lowerBound p v = go 0 (V.length v)
-  where
-    go lo hi
-      | lo >= hi = lo
-      | otherwise =
-          let mid = (lo + hi) `div` 2
-           in if p (v V.! mid) then go lo mid else go (mid + 1) hi
+lowerBound p v = partitionPoint (p . (v V.!)) 0 (V.length v)
 
 -- ---------------------------------------------------------------------------
 -- Gestures

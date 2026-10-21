@@ -12,6 +12,7 @@ module Stronghead.Clock
   ( -- * Samples
     nearestIndex
   , stepTime
+  , partitionPoint
     -- * Clocks
   , ClockMap (..)
   , secondsClock
@@ -31,19 +32,23 @@ nearestIndex :: VU.Vector Double -> Double -> Int
 nearestIndex ts t
   | VU.null ts = 0
   | otherwise =
-      let i = lowerBound 0 (VU.length ts)
+      let i = partitionPoint (\j -> ts VU.! j >= t) 0 (VU.length ts)
           dist j = abs (ts VU.! j - t)
        in case [j | j <- [i - 1, i], j >= 0, j < VU.length ts] of
             [a, b] -> if dist b < dist a then b else a
             [a] -> a
             _ -> 0
+
+-- | The first index in @[lo, hi)@ at which a predicate holds, for one that
+-- is false and then true along the range; @hi@ when it never holds.
+partitionPoint :: (Int -> Bool) -> Int -> Int -> Int
+partitionPoint p = go
   where
-    -- The first index whose sample is >= t.
-    lowerBound lo hi
+    go lo hi
       | lo >= hi = lo
       | otherwise =
           let mid = (lo + hi) `div` 2
-           in if ts VU.! mid < t then lowerBound (mid + 1) hi else lowerBound lo mid
+           in if p mid then go lo mid else go (mid + 1) hi
 
 -- | The next moment after @t@ (a positive direction) or the last before it
 -- (a negative one), from an ascending vector.

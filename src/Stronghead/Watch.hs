@@ -133,7 +133,7 @@ responseName = \case
 
 -- | The built-in rules with any saved ones in place of their kind's.
 setRules :: [Rule] -> [Rule]
-setRules saved = [maybe d id (lookupKind d) | d <- defaultRules]
+setRules saved = [fromMaybe d (lookupKind d) | d <- defaultRules]
   where
     lookupKind d = case [r | r <- saved, triggerName (ruTrigger r) == triggerName (ruTrigger d)] of
       r : _ -> Just r
@@ -167,8 +167,8 @@ decodeRule src = case T.words src of
       r : _ -> Just r
       [] -> Nothing
     let kv = M.fromList [(k, T.drop 1 v) | w <- rest, let (k, v) = T.breakOn "=" w, not (T.null v)]
-        dbl k def = maybe def id (M.lookup k kv >>= readD)
-        int k def = maybe def id (M.lookup k kv >>= readI)
+        dbl k def = fromMaybe def (M.lookup k kv >>= readD)
+        int k def = fromMaybe def (M.lookup k kv >>= readI)
         trigger = case ruTrigger d of
           LiveUp n -> LiveUp (max 1 (int "n" n))
           BlockedOver ms -> BlockedOver (max 1 (dbl "ms" ms))

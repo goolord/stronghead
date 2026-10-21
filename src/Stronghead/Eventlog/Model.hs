@@ -19,7 +19,6 @@ module Stronghead.Eventlog.Model
   , stopName
   , stopIsBlocked
   , Track (..)
-  , emptyTrack
   , mkTrack
   , trackLength
   , trackSpan
@@ -41,7 +40,6 @@ module Stronghead.Eventlog.Model
   , pointMigrate
   , pointSteal
   , pointWakeup
-  , pointName
   , Series
   , seriesValueAt
   , seriesRateBetween
@@ -83,9 +81,11 @@ import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
+import Data.Vector.Generic qualified as G
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word32, Word64, Word8)
 import GHC.RTS.Events (ThreadStopStatus (..))
+import Stronghead.Clock (partitionPoint)
 import Stronghead.Format (tshow)
 import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Run (RunInfo, emptyRunInfo)
@@ -192,9 +192,6 @@ data SpanRec = SpanRec
   }
   deriving (Eq, Show)
 
-emptyTrack :: Track
-emptyTrack = mkTrack []
-
 -- | Build a track from spans sorted by start time.
 mkTrack :: [SpanRec] -> Track
 mkTrack spans =
@@ -228,14 +225,7 @@ trackSpan t i =
 -- | The number of spans starting at or before @t@ (so the index of the last
 -- such span plus one).
 countStartingBy :: Track -> Word64 -> Int
-countStartingBy tr t = go 0 (trackLength tr)
-  where
-    starts = trStart tr
-    go lo hi
-      | lo >= hi = lo
-      | otherwise =
-          let mid = (lo + hi) `div` 2
-           in if starts VU.! mid <= t then go (mid + 1) hi else go lo mid
+countStartingBy tr t = partitionPoint (\i -> trStart tr VU.! i > t) 0 (trackLength tr)
 
 -- | Total time of kind @k@ within @[0, t]@.
 cumAt :: Track -> Int -> Word64 -> Double
@@ -280,14 +270,8 @@ pickSpan tr t tol = case spanIndexAt tr t of
           _ -> Just (snd (minimum [(dist j, j) | j <- cands]))
 
 -- | First index whose key is >= @x@ in a vector sorted by that key.
-lowerBoundBy :: (a -> Word64) -> V.Vector a -> Word64 -> Int
-lowerBoundBy key vec x = go 0 (V.length vec)
-  where
-    go lo hi
-      | lo >= hi = lo
-      | otherwise =
-          let mid = (lo + hi) `div` 2
-           in if key (vec V.! mid) < x then go (mid + 1) hi else go lo mid
+lowerBoundBy :: (G.Vector v a) => (a -> Word64) -> v a -> Word64 -> Int
+lowerBoundBy key vec x = partitionPoint (\i -> key (vec G.! i) >= x) 0 (G.length vec)
 
 -- | Index of the first span that ends at or after @t@: where drawing a view
 -- starting at @t@ begins.
@@ -346,27 +330,13 @@ pointMigrate = 0
 pointSteal = 1
 pointWakeup = 2
 
-pointName :: PointKind -> Text
-pointName = \case
-  0 -> "thread migrated away"
-  1 -> "spark stolen"
-  2 -> "woke a thread on another capability"
-  _ -> "event"
-
 -- | @(time, value)@ samples sorted by time.
 type Series = VU.Vector (Word64, Word64)
 
 seriesValueAt :: Series -> Word64 -> Maybe Word64
-seriesValueAt s t
-  | VU.null s = Nothing
-  | otherwise =
-      let go lo hi
-            | lo >= hi = lo
-            | otherwise =
-                let mid = (lo + hi + 1) `div` 2
-                 in if fst (s VU.! mid) <= t then go mid hi else go lo (mid - 1)
-          i = go 0 (VU.length s - 1)
-       in if fst (s VU.! i) <= t then Just (snd (s VU.! i)) else Nothing
+seriesValueAt s t =
+  let i = partitionPoint (\j -> fst (s VU.! j) > t) 0 (VU.length s) - 1
+   in if i >= 0 then Just (snd (s VU.! i)) else Nothing
 
 -- | Average rate of a cumulative counter between two times, per second.
 seriesRateBetween :: Series -> Word64 -> Word64 -> Maybe Double

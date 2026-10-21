@@ -22,9 +22,10 @@ module UI.Core
 
 import Control.Concurrent (forkIO)
 import Control.Exception (SomeException, try)
-import Control.Monad (forM_, unless, void, when)
+import Control.Monad (forM_, join, unless, void, when)
 import Data.Foldable (for_)
 import Data.IntMap.Strict qualified as IM
+import Data.Containers.ListUtils (nubOrd)
 import Data.List (nub, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
@@ -175,8 +176,8 @@ coreLoad st extra = do
   ix <- useTask (csIndex st) starts (buildSourceIndex =<< mapM makeAbsolute =<< sourceRoots starts)
   (s, c, g) <- readVar (csPaths st)
   let (ts, tc, tg) = csTasks st
-      load task kind = fmap (maybe Nothing id) . traverse (\p -> useTask task p (loadCodeFile kind p))
-      clArtifacts = maybe Nothing id arts
+      load task kind = fmap (join) . traverse (\p -> useTask task p (loadCodeFile kind p))
+      clArtifacts = join arts
       clIndex = fromMaybe (mkSourceIndex [] []) ix
   clSource <- load ts KindSource s
   clCore <- load tc KindCore c
@@ -217,7 +218,7 @@ data Entry = Entry
 entries :: Bool -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> [Entry]
 entries hideTypeable src core stg =
   [ Entry k (find' core k) (find' stg k) (find' src k)
-  | k <- nub (keys core ++ keys stg ++ keys src)
+  | k <- nubOrd (keys core ++ keys stg ++ keys src)
   , not (hideTypeable && (isTypeableBinding k || T.null k))
   ]
   where
@@ -305,9 +306,7 @@ badgeText e haveCore =
 
 coreView :: Env -> Bench -> CoreState -> CoreLoaded -> NanoUI ()
 coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
-  useFileDialog (csDirDialog st) $ \case
-    p : _ -> openDumpDir st p
-    [] -> pure ()
+  useFileDialog (csDirDialog st) (firstPath (openDumpDir st))
   useFileDialog (csFileDialog st) (mapM_ (openCodeFile st))
   let arts = fromMaybe [] (clArtifacts loaded)
   toolStrip $ do
@@ -352,7 +351,7 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
       stg = ok (clStg loaded)
       errors = [T.pack e | Just (Left e) <- [clSource loaded, clCore loaded, clStg loaded]]
   scope $ unless (null errors) $
-    columnWith (padXY 20 0 . padBottom 8 . tight . gap 2 . fillW) $ forM_ errors (labelWith (fontTone Danger))
+    columnWith (padBottom 8 . padXY 20 0 . tight . gap 2 . fillW) $ forM_ errors (labelWith (fontTone Danger))
   mixed <- bnMixed bench (csPanes st)
   if
     | mixed -> scope (bnDraw bench (csPanes st) (corePanes env st loaded))
