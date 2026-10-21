@@ -2,6 +2,14 @@
 
 Draft of 2026-10-20, written against `f76f071`.
 
+**Status.** All eight phases, P0 to P7, are implemented: every item of the
+[catalogue](#feature-catalogue) has shipped in some form, and the spikes are
+answered (V6 aside, which needs Linux or WSL). What each phase left out, and
+why, is in the "Deferred from P*n*" entries under [Progress](#progress); the
+largest gaps are the ghc-debug features never run against a real target on
+this Windows machine, peeks on canvases, and scrolling revealed list rows
+into view.
+
 Stronghead today is five good viewers in one window. This plan makes them one
 instrument aimed at one program. Every noun on screen is the same object in
 every panel: a thread, a collection, a census, a heap band, a closure, a
@@ -1078,6 +1086,158 @@ how far C1 can trust each clock. Then P1a.
     pane menu and the panes, not the popover. Screenshot runs can't click,
     so the menus are checked by the tests only.
   - **Notes** are one-line inputs; a long note scrolls.
+- **P7** is in place, G1–G3:
+  - **Next steps** (G1). `Stronghead.Next` is a pure engine: from the facts
+    the lenses know about the focus and what is loaded (`Have`), it proposes
+    steps, each a title, a one-line reason, what to do and whether it is
+    strong. Lenses gained `lensFacts`, in the engine's terms:
+    - Heap: a band's leak score and censuses survived, thunks, allocation
+      site and binding (from `-hi`), the surviving group whose thunks match
+      it (`matchBand`) and what holds it (the retainer path's anchor, a
+      thread when it is a TSO); a cost centre's inherited share from the
+      `.prof`; a range's top suspect.
+    - Timeline: a thread's longest blocked span (as a range), its waker
+      (`wokenBy`), the black hole's owner, its most sampled cost centre; a
+      range's paused share, allocation, live bytes at either end, top ticky
+      allocator, most sampled cost centre and last census; a binding's
+      ticky totals.
+    - Core: a binding's badges (W/W, boxing sites, STG lets) and the band
+      its lets hold most of at the cursor (from the heap lens's
+      annotations).
+  - The flows follow the plan: leak (site, binding, snapshot twice or the
+    surviving group, its holder, break where allocated), contention (the
+    blocked span, the owner or the waker, what it ran, its binding), hot
+    path (binding; lets with ticky; the heap they hold; break on entry)
+    and GC pressure (Analyse range, top allocator, census at the end, and
+    `+RTS -A64m` when live grew by under 5% of what was allocated). A
+    step is `StepGo` (a ref, followed by `goTo`), `StepAct` (the first
+    panel action, or palette command, whose label contains the text),
+    `StepLoad` (a `Datum`: the kinds of data and their recipes moved from
+    `UI.Sources` into `Stronghead.Next`, which the popover now imports) or
+    `StepTry` (a flag, copied). So no step has a code path of its own.
+  - The inspector lists the steps under the entity's name as buttons, the
+    target as a link, the reason under each, and a missing datum's build
+    and run lines with **Copy**. A peek shows the first strong step in a
+    line: a suspect scoring 0.6 or more, a block of 10 ms or more with a
+    known waker or owner, a cost centre with 10% of time or allocation, a
+    range paused 15% of the time.
+  - **Watchers** (G2). `Stronghead.Watch` holds the four built-in rules
+    (off by default), their text form for sessions, the observations the
+    streams give (`frameObservations` from consecutive agent frames: the
+    threads, the GC share of CPU between them, a major collection when the
+    last collection was one; `timelineObservations` from a followed
+    eventlog after a given time: major collections with live bytes after
+    them, ended blocked spans, censuses, and the GC share of each whole
+    second) and `watchStep`, a pure fold. Each rule has a cooldown (program
+    time) and a hysteresis whose meaning depends on the rule (a dip in live
+    bytes or a band smaller than `h` neither breaks nor extends a run; a
+    thread must run `h` of the limit before its next block counts; the GC
+    share must fall below `(1 - h)` of the limit). A rule disarms per
+    subject (a thread, a band) until it clears.
+  - `UI.Watchers` feeds them every frame with what is new since the last:
+    frames give threads and the GC share, the followed eventlog major
+    collections and censuses (and blocked spans and the GC share when no
+    agent is connected). Responses go through Live's paths: **mark** by
+    `sendMark`, **census** and **snapshot** by Live's remote actions, each
+    fired event saying what was done or why not. **Notify** counts on a
+    status-bar badge, whose click opens the list, and shows a callout over
+    it for eight seconds. The **Watchers** pane (`watchers`, a shell pane)
+    lists what fired, each with its instant and its thread or band as
+    links, then each rule's switch, limits, responses, cooldown and
+    hysteresis. Rules are saved in sessions as `watch.N = live-up n=5
+    on=true responses=notify,mark cooldown=30 hysteresis=0.02`.
+  - **Baselines** (G3). `Stronghead.Diff` holds `BaselinePaths` and
+    `Baseline` (the summary, heap profile, cost totals and binding
+    summaries), `diffHeap` (by name, then by provenance key: module, label,
+    span, kind and type, since `-hi` addresses change between builds; gone
+    below a hundredth of the old peak, shrank or grew past a fifth),
+    `diffCosts` (by module and label), `summariseModule` and
+    `loadBindingSummaries` (worker, boxing sites, lets, Core size per
+    `nameKey`) with `diffBindings`, and `fmtChange` for the readouts.
+  - `UI.Baseline`: **Mark as baseline** (palette, every diff pane) keeps
+    what is loaded at that moment, in memory and by its paths; a session
+    keeps the paths (`baseline.eventlog`, `baseline.heap-profile`,
+    `baseline.cost-centres`, `baseline.dumps`) and loads them again in a
+    `useTask`. The **Heap diff**, **Cost-centre diff** and **Binding diff**
+    panes (`diff.heap`, `diff.costs`, `diff.bindings`) list changes as
+    links; a gone band links to its allocation site when it had one. The
+    Timeline's readout shows each figure's change, the heap's its peak and
+    suspects, and the leak suspects a line each for the baseline's band
+    and a **Since the baseline** list of the baseline's suspects. The
+    status bar names the baseline, with a menu to clear it. A **Before and
+    after** preset puts the heap chart beside the three diffs.
+  - Tests: `stronghead-test` covers each flow's steps, their order and
+    strength, the missing-data steps; every rule on synthetic streams
+    (firing, staying off, cooldown, hysteresis re-arming, per-thread
+    stretches, foreign calls left out, eventlog spans, the GC share's
+    duration), the frame and eventlog observations, the rules' text
+    round trip; the heap diff (gone, by source, the same, new, order,
+    scores, growth), the cost and binding diffs, the readout format; and
+    sessions with watchers and a baseline. `stronghead-ui-test` drives the
+    inspector's steps (listed, reasons, recipes, a button that follows its
+    link), a watcher firing on frames through `watchTick` (once, its mark
+    sent through the hook, the badge counting it, the pane listing it) and
+    the heap diff (marking, naming the baseline, the leaking band gone).
+  - Checked by hand with screenshots, on the sample:
+    - an `-hi` investigation build's eventlog and dumps, focus on the top
+      suspect (the `main` thunk at `Main.hs:82`): the inspector's next
+      steps are its allocation site, `Main.main` in Core & STG, how to
+      snapshot (ghc-debug, missing on Windows) and Break where allocated;
+      on a `-hT` run the first step is to profile by info table;
+    - a worker thread of a `-hT` run: its 82 ms block on an MVar, the
+      thread that woke it, and how to sample what it ran; a 7 s range:
+      Analyse range (68% paused), ticky, the census at its end, and
+      `-A64m` (5.6 GiB allocated, live up 53 MiB);
+    - the sample running 90 s with `+RTS -l -hT -i0.1 -T`, connected
+      through a session that switches on three watchers: within 20 s the
+      pane listed a worker blocked on an MVar, `THUNK_2_0` growing for 5
+      censuses and live bytes up across 3 major collections (marked through
+      the agent), with the badge and the callout;
+    - the sample before and after the `modifyIORef'` fix (built into its
+      own builddir from a temporary edit, then reverted), the first as
+      the baseline: the heap diff shows `THUNK_2_0` gone (38.1 MiB to
+      64 B) and the `Integer` `IS` band with it, the readout's peak total
+      −75%.
+  - Found on the way: the fixed sample still keeps 64 bytes of
+    `THUNK_2_0`, so "gone" is a hundredth of the old peak, not zero. The
+    blocked-thread rule first fired on the IO manager and the agent's
+    threads, which sit in foreign calls; they are left out. Frames carry
+    only the last collection's details, so with an eventlog followed the
+    major collections come from it. `useTask` hands back the previous
+    key's result while a new key loads, so the baseline's and the dump
+    folders' loads carry their key and are checked.
+- **Deferred from P7:**
+  - **What the waker ran during the span.** The contention flow's "what it
+    ran" is the thread's whole CPU profile: a step on the waker doesn't
+    know which blocked span the investigation came from. The span
+    inspector's **What ran during this slice?** (P6) has the slice's.
+  - **Top allocators from samples** (the P6 deferral stands): only ticky
+    counts allocation; samples give "what ran", labelled as time.
+  - **Snapshot twice and the survivor steps end to end.** They need a
+    ghc-debug target, which this machine can't run (V6); the steps are
+    tested on facts, and **Snapshot twice** resolves to Live's palette
+    command.
+  - **Steps for collections, markers, instants and modules.** The engine
+    has no flow for them.
+  - **User-defined watcher rules.** The four built-in rules, one of each,
+    are configurable; there are no new kinds, per-thread filters (beyond
+    leaving out foreign calls and the agent) or rules on ticky or samples.
+  - **Watching history.** Rules run while Stronghead runs; when a followed
+    eventlog is first read from its start, firings more than five seconds
+    older than the newest observation are listed without acting. The fired
+    list belongs to the run and is not saved with the session.
+  - **A baseline overwritten in place.** Marking keeps the loaded data for
+    the rest of the session, but a session reopens the baseline from its
+    paths: an eventlog written again to the same file reopens as the new
+    run. Write the second run elsewhere (`-ol`, `-po`).
+  - **Deltas everywhere.** The Timeline's and the heap's readouts and the
+    leak suspects show them; Live's readout, the cost-centre tree and Core
+    & STG's runtime columns don't (the diff panes have the numbers).
+  - **Bindings with one key.** The binding diff matches by module and
+    `nameKey`, so a worker and its wrapper, or two local bindings that
+    strip to one name, are one row.
+  - **Peeks on canvases** (from P1) still have no peek, so neither do their
+    strong steps; list rows and links show them.
 
 ## Verification spikes
 

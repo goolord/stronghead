@@ -97,6 +97,83 @@ has shown, apart from the window's history, and focus the entity again; with
 analysis and under Core & STG's bindings by default, and can be added to any
 panel.
 
+## Next steps
+
+Under the name, the inspector says what to look at or do next, each step a
+button with a one-line reason. The suggestions follow four investigations:
+
+- **A leak.** On a leak suspect: where its closures are allocated (the
+  source line, then the binding in Core & STG), then **Snapshot twice, 2 s
+  apart**, then the group of thunks that survives both and what holds it,
+  then **Break where allocated**.
+- **Contention.** On a thread: its longest blocked span, then the thread
+  that woke it from it or the black hole's owner, then what that thread ran
+  (its cost-centre samples), then the binding.
+- **A hot path.** On a cost centre: its binding in Core & STG, whose badges
+  say whether it was unboxed; on the binding, its STG `let`s and ticky
+  counters, then the heap those lets hold, then **Break on entry**.
+- **GC pressure.** On a range: **Analyse range** (the share of it spent in
+  collections), the top allocator by ticky, the census at its end, and,
+  when little of what was allocated survives, a bigger nursery
+  (`+RTS -A64m`, to copy) rather than a leak hunt.
+
+Every step is a link or an action the panels already offer, so following it
+is what a click or a menu item does. Where the data a step needs isn't
+loaded, the step says so, with the build and run flags that add it (the
+same recipes as the data sources popover). When one step stands out (a
+high leak score, a long block with a known waker, a hot cost centre, a
+range that is mostly collection), a peek shows it in a line too.
+
+The suggestions are worked out from what each panel knows about the entity
+(its leak score, its provenance, the wakeup that ended a span, the optimiser's
+badges, ticky counts) by a pure engine, `Stronghead.Next`.
+
+## Watchers
+
+The **Watchers** pane (add it from **Workspace**) holds rules on a running
+program's streams: the agent's frames and the followed eventlog.
+
+- **Live bytes up across N major collections in a row.**
+- **A thread blocked longer than X ms.** Threads in a foreign call and the
+  agent's own threads are left out.
+- **GC above P% of CPU for T seconds.**
+- **A heap band growing for N censuses in a row.**
+
+Each is off until switched on. When a rule fires it can **mark** the
+program's timeline (through the agent, so the mark is on every time axis),
+take a **census**, take a ghc-debug **snapshot**, and **notify**: a badge in
+the status bar, a callout over it, and an entry in the pane's list of what
+fired, with the moment and the thread or band as links. Each rule has a
+**cooldown**, the program time before it fires again, and a **hysteresis**,
+how far its measure must fall back before it counts as cleared (a small dip
+in live bytes doesn't restart the count; a thread must run for a while
+before its next block is a new one). Rules are saved with the session.
+
+## Baselines and diffs
+
+**Mark as baseline** (in Go to…, or the button on any diff pane) keeps what
+is loaded now: the eventlog's summary, the heap profile on show, the
+`.prof`'s cost centres and the dump folder's bindings. What you open next is
+the current run, compared with the baseline:
+
+- The Timeline's and the heap panel's readouts show each figure's change
+  ("−75% vs baseline"); the leak suspects say what each band held in the
+  baseline, and list the baseline's suspects with what became of them
+  (gone, much smaller, still there).
+- **Heap diff** matches bands by name, or by where they are allocated when
+  an `-hi` band's address changed with the build: peak and growth before
+  and after, and the bands that are gone or new.
+- **Cost-centre diff** lists each cost centre's inherited time and
+  allocation before and after.
+- **Binding diff** lists the bindings of two dump folders whose badges
+  (worker/wrapper, boxing sites, lets) or size changed, and those that
+  appeared or went.
+
+Every entry is a link. A session keeps the baseline by its artifacts'
+paths, and loads them again when it opens; the status bar names it, and its
+menu clears it. The **Before and after** arrangement puts the heap chart
+beside the three diffs.
+
 ## Pinboard
 
 **Pin** is on every entity's right-click menu and in the inspector. The
@@ -117,7 +194,8 @@ charts, the ghc-debug socket, the dump folder and module or the files open
 in Core & STG, the agent's address and whether it is connected, the GHCi
 command, directory and file and whether a session runs, the pins and their
 notes, the shared cursor and range, the focus, every panel's arrangement of
-panes, the presets, the panes popped out, and the panel in front.
+panes, the presets, the panes popped out, the panel in front, the watchers'
+rules and the baseline's artifacts.
 
 **Save session…** and **Open session…** are in the header's **Workspace**
 popover and in Go to… (Ctrl+K). A `.stronghead` file also opens from the
@@ -140,8 +218,8 @@ Every pane of every panel is registered by kind, and any panel can hold any
 of them: the Timeline's capabilities, threads, overview and markers; the
 heap chart, bands, analysis, live graph and cost centres; Core & STG's
 bindings, notes, source, Core and STG; the Debugger's source, locals,
-console and breakpoints; Live's charts and threads; and the inspector and
-the pinboard.
+console and breakpoints; Live's charts and threads; and the inspector, the
+pinboard, the watchers and the three diffs.
 
 - **Workspace** in the header adds a pane to the panel in front, beside the
   others. Drag a pane by its header to place it: the middle of another pane
@@ -158,9 +236,11 @@ the pinboard.
   Live's charts, when they are on the program clock.
 - **Arrangements** in the popover put back any panel's own panes, or a
   preset across panels: **Leak hunt** (heap chart, bands, live graph,
-  source and inspector) and **Latency** (capabilities with their code
-  tracks, threads and inspector). **Save as a preset** names the current
-  arrangement; presets are saved with the session.
+  source and inspector), **Latency** (capabilities with their code
+  tracks, threads and inspector) and **Before and after** (the heap chart
+  and bands beside the heap, cost-centre and binding diffs). **Save as a
+  preset** names the current arrangement; presets are saved with the
+  session.
 
 ## Panels
 
@@ -486,7 +566,15 @@ cabal run stronghead -- stronghead-sample.eventlog
 While it runs, `cabal run stronghead -- --connect 127.0.0.1:4777` (or
 Connect in Live) attaches: the Timeline follows its eventlog, the heap panel
 its heap profile, and **M** marks all of them. Run it with `-T` for the
-charts: `+RTS -l -hT -i0.1 -T -RTS`.
+charts: `+RTS -l -hT -i0.1 -T -RTS`. Switch on a watcher or two in the
+**Watchers** pane and they fire within seconds: the leaky accumulator keeps
+the live bytes climbing.
+
+To see the leak go, open the first run's eventlog and **Mark as baseline**.
+Change `modifyIORef` to `modifyIORef'` on line 82, run it again writing
+another eventlog (`+RTS -l -hT -i0.1 -olafter.eventlog -RTS`), and open
+that with the **Before and after** arrangement: the heap diff shows
+`THUNK_2_0` gone, and the heap readout's peak a quarter of what it was.
 
 ## Building
 
@@ -520,8 +608,11 @@ backend; see [Live closure graph](#live-closure-graph-ghc-debug).
 | `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots, thread stacks |
 | `src/Stronghead/Debug/Client.hs` | ghc-debug-client traversal (built only with the flag) |
 | `src/Stronghead/Session.hs` | Pins, the session file, the pinboard's Markdown report |
+| `src/Stronghead/Next.hs` | The next-steps engine, and the kinds of data with their build and run recipes |
+| `src/Stronghead/Watch.hs` | Watcher rules, their streams' observations and their evaluation |
+| `src/Stronghead/Diff.hs` | Baselines, and the heap, cost-centre and binding diffs |
 | `agent/Stronghead/Agent.hs` | The drop-in agent |
-| `app/UI/*.hs` | The nano-ui panels; `UI.Workspace` is the pane registry, `UI.Inspector` and `UI.Pinboard` the shell's own panes |
+| `app/UI/*.hs` | The nano-ui panels; `UI.Workspace` is the pane registry, `UI.Inspector`, `UI.Pinboard`, `UI.Watchers` and `UI.Baseline` the shell's own panes |
 | `sample/Main.hs` | The deliberately leaky sample program |
 
 ## Limits
