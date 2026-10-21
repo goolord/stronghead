@@ -1,17 +1,4 @@
--- | The links between panels.
---
--- Every panel reads and writes one 'Bus': the entity in focus, the one
--- under the pointer, the navigation history, and the moment and range in
--- program time that every time view of a run marks. Every panel also offers a
--- 'Lens': what it can show, what it knows and what it can do for an entity
--- named by a 'Ref'. The widgets here make any entity on screen a link:
--- resting the pointer on it peeks at what every panel knows, right-clicking
--- it lists every panel's actions, Ctrl+click goes to it, and Alt+Left comes
--- back.
---
--- Lenses are rebuilt every frame from what the loaders returned, so they
--- always see current data and never need invalidating. Their fields are
--- lazy: a peek, a menu or the palette forces only what it shows.
+-- | Cross-panel state ('Bus'), per-panel queries ('Lens'), and link widgets.
 module UI.Link
   ( -- * Panels
     Panel (..)

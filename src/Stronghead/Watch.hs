@@ -1,22 +1,14 @@
--- | Watchers: rules on a running program's streams that act when
--- something goes wrong while nobody is looking.
+-- | Threshold rules evaluated over live agent frames and tailed eventlogs.
 --
--- The streams are the agent's frames and a followed eventlog, turned into
--- 'Observation's ('frameObservations', 'timelineObservations'). Four rules
--- are built in, each off until it is switched on:
+-- Built-in triggers:
 --
--- * live bytes up across N consecutive major collections;
--- * a thread blocked longer than X ms;
--- * GC taking more than P% of the CPU for T seconds;
--- * a heap band growing for N censuses.
+-- * live bytes increasing across @N@ consecutive major GCs;
+-- * a thread blocked longer than @X@ ms;
+-- * GC exceeding @P@% of CPU time for @T@ seconds;
+-- * a heap band growing across @N@ consecutive censuses.
 --
--- A rule that fires asks for its 'Response's: a mark on the program's
--- timeline (through the agent), a census, a ghc-debug snapshot, and a
--- notification. Each rule has a cooldown, the program time that must pass
--- before it fires again, and a hysteresis, how far its measure must fall
--- back before it counts as having cleared (see 'Trigger'). Evaluation is a
--- pure fold over observations ('watchStep'), so it is tested on synthetic
--- streams.
+-- Each rule configures a cooldown, hysteresis, and responses (timeline
+-- marker, heap census, @ghc-debug@ snapshot, notification).
 module Stronghead.Watch
   ( -- * Rules
     Trigger (..)

@@ -1,486 +1,97 @@
 # Stronghead
 
-A live debugger and profiler GUI for GHC programs, built on
-[nano-ui](https://github.com/goolord/nano-ui). It goes after the opaque parts
-of running Haskell: what the capabilities and threads are doing, where GC time
-goes, which thunks are piling up, what the optimiser did to a function, and
-what is and isn't evaluated at a breakpoint.
+A GUI profiler and debugger for GHC programs, built on [nano-ui](https://github.com/goolord/nano-ui). It combines an eventlog timeline, heap profiler, Core/STG viewer, GHCi debugger, and live RTS monitor.
+
+## Usage
 
 ```sh
 cabal run stronghead -- [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventlog]
                         [--debug MODULE.hs] [--goto REF] [--mark TEXT] [FILE|DIR ...]
 ```
 
-Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`,
-`.dump-stg-final`, `.hs`, and `.stronghead` for a [session](#sessions)); a
-directory is searched for Core/STG dumps. Files can also be opened from the
-header or dropped on the window. `--goto` opens an
-entity by the reference **Copy reference** gives
-(`source/sample%2FMain.hs/82/1/82/1` is line 82 of the sample), once a panel
-has loaded it. `--mark` sends a connected program a mark once its agent
-has streamed a couple of seconds, for scripts and screenshots.
+Files are routed by extension (`.eventlog`, `.hp`, `.prof`, `.dump-simpl`, `.dump-stg-final`, `.hs`, `.stronghead`). Passing a directory searches it for Core and STG dumps. Files can also be opened from the header bar or dragged onto the window.
 
-**Settings** (the header button, or Ctrl+,) holds the theme (system, light,
-dark), the interface scale (follow the display's DPI scaling, or 75–300%;
-Ctrl+= / Ctrl+- step it, Ctrl+0 goes back to following the display), which
-panel to open on, the defaults for the Live agent address, the GHCi
-command and the Core view, the **project root** sources are looked up under,
-and the **editor command** that "Open in editor" runs
-(`code -g {file}:{line}:{col}`, say). They are saved as they change, with the window's
-size and position on quit, to `settings.conf` in the user config directory
-(`%APPDATA%\stronghead` on Windows, `~/.config/stronghead` elsewhere). The
-command line wins over them. **Reopen the last session on start** (off by
-default) brings back the session saved on quit; see [Sessions](#sessions).
+- `--tab NAME`: open on `timeline`, `heap`, `core`, `debugger`, or `live`.
+- `--connect HOST:PORT`: connect to a running program's `Stronghead.Agent` socket.
+- `--follow FILE.eventlog`: tail an eventlog as it is written.
+- `--debug MODULE.hs`: start a GHCi session on a module.
+- `--goto REF`: jump to an entity reference (for example `source/sample%2FMain.hs/82/1/82/1`).
+- `--mark TEXT`: send an eventlog marker to a connected program after connecting.
 
-## Links between panels
-
-Threads, collections, markers, heap bands, censuses, cost centres, closures,
-thunk groups, bindings and source lines are links wherever they appear, and
-the same entity in every panel.
-
-- **Resting the pointer** on one peeks at what every panel knows about it.
-  Rows for the same entity in other panels are washed faintly.
-- **Right-click** lists every panel that can show it ("Show in Timeline"),
-  what goes with it ("Go to allocation site", "Go to thread"), and the
-  panels' actions ("Break here (GHCi)"). Actions that can't run yet say why.
-- **Ctrl+click** goes to it in its home panel. **Alt+←** / **Alt+→**, the
-  mouse's back and forward buttons, or the arrows in the header retrace your
-  steps.
-- **Ctrl+K** searches everything loaded: threads, bindings, cost centres,
-  bands, closures, markers, and commands.
-- **Ctrl+1** to **Ctrl+5** switch panels. A click focuses an entity, and the
-  status bar shows the focus; **Esc** clears it.
-- Each panel's facts in a peek say how that panel matched the entity:
-  **exact** (the same thread id in the same run, an info table through the
-  IPE map), **by name** (a binding by module and name, a `-hT` band by its
-  closure type) or **approximate** (a `.hp` file's clock).
-
-Time-keyed links (a thread, a census, an instant) join artifacts from the
-same run, matched by program name and pid. Code-keyed links (a binding, a
-source line) join across runs.
-
-### One clock
-
-The Timeline, the heap chart and Live's charts share one cursor and one
-range in program time, for every view of the same run.
-
-- **Moving the cursor anywhere moves it everywhere.** Click the Timeline or
-  drag its ruler, drag the heap chart, or click or drag a Live chart. The
-  heap chart snaps it to the nearest census. **[** and **]** step it through
-  collections on the Timeline (with Shift, censuses) and censuses on the
-  heap chart.
-- **Shift+drag** on any of them selects a range, and every other view of the
-  run shades it; Shift+click clears it. **Analyse range** in the Timeline's
-  inspector, or on a range's right-click menu, lists the collections and
-  pauses, allocation, the threads that ran, heap growth, censuses and
-  markers inside it, all as links.
-- `traceMarkerIO` markers show on every time axis of the run, and so do
-  the marks, actions and snapshots Stronghead sends a connected program
-  ([Live](#live)).
-- A `.hp` file keeps its own clock, which is not elapsed time. When an
-  eventlog of the same run is loaded, its censuses are paired with the
-  eventlog's by their totals and put on program time; otherwise the heap
-  chart says its times are approximate.
-
-## Inspector
-
-The **Inspector** pane shows everything Stronghead knows about the focus:
-the long form of a peek. Its name and reference, where it is in the source,
-and then a section for each panel that knows it: how that panel matched it,
-its facts, what goes with it (as links) and the panel's actions (as
-buttons, disabled with the reason when they can't run). **Pin**, **Go to**
-and **Copy reference** sit under the name.
-
-It follows the focus as it changes. Its **←** and **→** step through what it
-has shown, apart from the window's history, and focus the entity again; with
-**Follow** off it holds on to what it shows. It sits beside the heap's
-analysis and under Core & STG's bindings by default, and can be added to any
-panel.
-
-## Next steps
-
-Under the name, the inspector says what to look at or do next, each step a
-button with a one-line reason. The suggestions follow four investigations:
-
-- **A leak.** On a leak suspect: where its closures are allocated (the
-  source line, then the binding in Core & STG), then **Snapshot twice, 2 s
-  apart**, then the group of thunks that survives both and what holds it,
-  then **Break where allocated**.
-- **Contention.** On a thread: its longest blocked span, then the thread
-  that woke it from it or the black hole's owner, then what that thread ran
-  (its cost-centre samples), then the binding.
-- **A hot path.** On a cost centre: its binding in Core & STG, whose badges
-  say whether it was unboxed; on the binding, its STG `let`s and ticky
-  counters, then the heap those lets hold, then **Break on entry**.
-- **GC pressure.** On a range: **Analyse range** (the share of it spent in
-  collections), the top allocator by ticky, the census at its end, and,
-  when little of what was allocated survives, a bigger nursery
-  (`+RTS -A64m`, to copy) rather than a leak hunt.
-
-Every step is a link or an action the panels already offer, so following it
-is what a click or a menu item does. Where the data a step needs isn't
-loaded, the step says so, with the build and run flags that add it (the
-same recipes as the data sources popover). When one step stands out (a
-high leak score, a long block with a known waker, a hot cost centre, a
-range that is mostly collection), a peek shows it in a line too.
-
-The suggestions are worked out from what each panel knows about the entity
-(its leak score, its provenance, the wakeup that ended a span, the optimiser's
-badges, ticky counts) by a pure engine, `Stronghead.Next`.
-
-## Watchers
-
-The **Watchers** pane (add it from **Workspace**) holds rules on a running
-program's streams: the agent's frames and the followed eventlog.
-
-- **Live bytes up across N major collections in a row.**
-- **A thread blocked longer than X ms.** Threads in a foreign call and the
-  agent's own threads are left out.
-- **GC above P% of CPU for T seconds.**
-- **A heap band growing for N censuses in a row.**
-
-Each is off until switched on. When a rule fires it can **mark** the
-program's timeline (through the agent, so the mark is on every time axis),
-take a **census**, take a ghc-debug **snapshot**, and **notify**: a badge in
-the status bar, a callout over it, and an entry in the pane's list of what
-fired, with the moment and the thread or band as links. Each rule has a
-**cooldown**, the program time before it fires again, and a **hysteresis**,
-how far its measure must fall back before it counts as cleared (a small dip
-in live bytes doesn't restart the count; a thread must run for a while
-before its next block is a new one). Rules are saved with the session.
-
-## Baselines and diffs
-
-**Mark as baseline** (in Go to…, or the button on any diff pane) keeps what
-is loaded now: the eventlog's summary, the heap profile on show, the
-`.prof`'s cost centres and the dump folder's bindings. What you open next is
-the current run, compared with the baseline:
-
-- The Timeline's and the heap panel's readouts show each figure's change
-  ("−75% vs baseline"); the leak suspects say what each band held in the
-  baseline, and list the baseline's suspects with what became of them
-  (gone, much smaller, still there).
-- **Heap diff** matches bands by name, or by where they are allocated when
-  an `-hi` band's address changed with the build: peak and growth before
-  and after, and the bands that are gone or new.
-- **Cost-centre diff** lists each cost centre's inherited time and
-  allocation before and after.
-- **Binding diff** lists the bindings of two dump folders whose badges
-  (worker/wrapper, boxing sites, lets) or size changed, and those that
-  appeared or went.
-
-Every entry is a link. A session keeps the baseline by its artifacts'
-paths, and loads them again when it opens; the status bar names it, and its
-menu clears it. The **Before and after** arrangement puts the heap chart
-beside the three diffs.
-
-## Pinboard
-
-**Pin** is on every entity's right-click menu and in the inspector. The
-**Pinboard** pane lists the pins by name, each with a note; the arrows
-reorder them, **×** unpins, and a click on a pin's name goes to it.
-
-**Copy report** puts the board on the clipboard as Markdown, and
-**Export…** saves it: a heading per pin, its reference as code (paste it
-into Go to… or `--goto` to open it again), every panel's facts about it as
-text, with how each matched, and the note as a quote. Pins are saved with
-the session.
-
-## Sessions
-
-A session is where an investigation stands: the eventlog (and whether it
-is followed), the heap and cost-centre profiles and what the heap panel
-charts, the ghc-debug socket, the dump folder and module or the files open
-in Core & STG, the agent's address and whether it is connected, the GHCi
-command, directory and file and whether a session runs, the pins and their
-notes, the shared cursor and range, the focus, every panel's arrangement of
-panes, the presets, the panes popped out, the panel in front, the watchers'
-rules and the baseline's artifacts.
-
-**Save session…** and **Open session…** are in the header's **Workspace**
-popover and in Go to… (Ctrl+K). A `.stronghead` file also opens from the
-command line or by dropping it on the window. Stronghead saves the session
-on quit to `last.stronghead` beside `settings.conf`, and reopens it on
-start when Settings says to (unless the command line opens something).
-
-The file is `key = value` lines like `settings.conf`, written whole or not
-at all. Lists are numbered (`pin.1`, `pin.1.note`); arrangements are trees
-of pane names (`layout.heap = (h 0.5 heap.chart inspector)`, where `v` puts
-two panes side by side and `h` stacks them). Only line breaks, spaces at
-either end and a `%` that would read as an escape are escaped, so paths
-and references stay readable and the file can be written by hand.
-Unknown keys are skipped, and an arrangement that doesn't read is left as
-it was, with a message.
-
-## Workspaces
-
-Every pane of every panel is registered by kind, and any panel can hold any
-of them: the Timeline's capabilities, threads, overview and markers; the
-heap chart, bands, analysis, live graph and cost centres; Core & STG's
-bindings, notes, source, Core and STG; the Debugger's source, locals,
-console and breakpoints; Live's charts and threads; and the inspector, the
-pinboard, the watchers and the three diffs.
-
-- **Workspace** in the header adds a pane to the panel in front, beside the
-  others. Drag a pane by its header to place it: the middle of another pane
-  swaps them, an edge splits it. Double-click a header to maximise.
-- Each pane's **⋯** menu moves it to another panel, pops it out into a
-  floating window (closing the window puts it back), or closes it. A pane
-  is drawn once: a panel that still holds a popped-out pane says where it
-  went.
-- A pane draws from its panel's loaded data whichever panel it is in, so a
-  heap chart under the Timeline, or Core's source pane beside the leak
-  suspects, is live.
-- Time panes placed with the Timeline's capabilities or threads take the
-  Timeline's window: the heap chart (as **Lock to Timeline** does) and
-  Live's charts, when they are on the program clock.
-- **Arrangements** in the popover put back any panel's own panes, or a
-  preset across panels: **Leak hunt** (heap chart, bands, live graph,
-  source and inspector), **Latency** (capabilities with their code
-  tracks, threads and inspector) and **Before and after** (the heap chart
-  and bands beside the heap, cost-centre and binding diffs). **Save as a
-  preset** names the current arrangement; presets are saved with the
-  session.
+Settings (`Ctrl+,`) are saved to `%APPDATA%\stronghead\settings.conf` on Windows and `~/.config/stronghead/settings.conf` elsewhere. Command-line flags override saved settings.
 
 ## Panels
 
-### Timeline (eventlog)
+### Timeline
 
-A ThreadScope replacement. The eventlog is read with `ghc-events`' incremental
-decoder, so the same code loads a finished multi-gigabyte log (progressively,
-with a progress bar) and **follows a log the program is still writing**.
+Reads `.eventlog` files incrementally with `ghc-events`, supporting both completed logs and files still being written.
 
-- One track per capability: green while running Haskell code, yellow in GC, a
-  red tick where a thread stopped because it blocked. Markers show thread
-  migrations, spark steals and cross-capability wakeups.
-- A GC pressure strip (pause per collection, log-scaled; minor vs. major) and a
-  heap strip (heap size and live bytes).
-- One row per Haskell thread: running, **blocked** (red, with the reason: MVar,
-  STM, black hole and its owner, foreign call, throwTo ...) and runnable.
-- `traceMarkerIO` markers run through every track; `traceEventIO` messages are
-  ticks on the ruler. The **Markers** pane lists them, with a filter, as
-  links that move the cursor.
-- Ticks on the heap strip mark the heap censuses. A collection's inspector
-  links to the heap after it, and a census offers the collection it
-  followed.
-- Click any slice for the inspector: thread, label, duration, why it stopped,
-  the process allocation rate during the slice, the thread's whole history
-  (time running, time off-CPU by reason, capabilities). A blocked span says
-  **who woke it**: the thread running on the capability that posted the
-  wakeup. With nothing selected the inspector lists the longest GC pauses
-  and the most-blocked threads, the cursor and the selected range.
-- **Code on the timeline.** A profiled build (`-prof -fprof-auto`) run with
-  `+RTS -p -l` posts a cost-centre sample for every capability at each
-  profiler tick. Each capability gets a **code track** of the sampled top
-  frames, merged into runs and shaded ink per cost centre (collections in
-  the GC colour, idle time left empty); hover names the frame, its source
-  and its callers, and a click focuses the cost centre everywhere. A sample
-  belongs to the thread running on its capability, so the slice inspector
-  answers **What ran during this slice?**, a thread's inspector shows its
-  **CPU profile**, and **Analyse range** lists the top cost centres. Every
-  list says plainly when there are too few samples to trust: on Windows the
-  profiler's timer ticks about every 15 ms, not the 1 ms it asks for.
-- **Ticky.** A ticky build (`-ticky`) run with `+RTS -lT` writes each
-  closure's entries and allocation. The overview lists the counters,
-  **Analyse range** the top allocators in the range, and Core & STG puts
-  them on bindings and `let`s.
+- **Capabilities and threads**: per-capability tracks (running, GC, blocked ticks, migrations, spark steals, wakeups) and per-thread rows with blocking reasons (MVar, STM, black hole owner, foreign call, `throwTo`).
+- **GC and heap strips**: pause durations (minor vs. major), heap size, live bytes, and heap census ticks.
+- **Markers**: `traceMarkerIO` and `traceEventIO` events, searchable in the **Markers** pane.
+- **Cost-centre samples**: for profiled builds (`-prof -fprof-auto`, `+RTS -p -l`), draws a sampled call-stack track under each capability and shows per-slice and per-thread CPU profiles.
+- **Ticky counters**: for ticky builds (`-ticky`, `+RTS -lT`), shows closure entry counts and allocations across the overview, selected time ranges, and Core/STG views.
 
-Wheel zooms around the pointer, drag pans, double-click fits. A click also
-moves the shared cursor; drag the ruler to scrub it, and Shift+drag to select
-a range. Each track keeps prefix sums of time per span kind, so a zoomed-out
-pixel column is two binary searches however many spans it covers.
+Scroll to zoom, drag to pan, double-click to fit, drag the ruler to move the cursor, and `Shift+drag` to select a time range. `[` and `]` step between collections (`Shift+[` and `Shift+]` step between censuses).
 
-### Heap & leaks
+### Heap
 
-Heap profiles from either the eventlog's heap samples (`+RTS -l -hT`, `-hi`,
-...) or a `.hp` file, plus `.prof` cost-centre profiles.
+Displays heap profiles from eventlogs (`+RTS -l -hT`, `-hi`, `-hc`, `-hr`) or `.hp` files, and cost-centre trees from `.prof` files.
 
-- Stacked residency bands over time, with a legend to hide or solo bands and a
-  census cursor, which is the shared cursor snapped to a census. Drag the
-  chart to move it, wheel to zoom, drag the time axis below the chart to pan
-  (double-click it to fit), and Shift+drag to select a range. **Lock to
-  Timeline** shows the Timeline's window and pans and zooms it. While an
-  eventlog is followed, the cursor stays on the newest census until you move
-  it. A `.hp` file is read again as it grows.
-- **At cursor**: every band at a census, sortable by size or by change since
-  the previous census.
-- **Leak suspects**: bands ranked by how leak-like their curve is (steady
-  growth, never shrinking, growth factor, rate), each with a plain-language
-  diagnosis.
-- **Thunk accumulator sentinel**: thunk bands and how many consecutive censuses
-  (each one after a major GC) they have survived without shrinking: thunks
-  that are never forced.
-- **Retention tree**: for `-hc` profiles, cost-centre stacks rooted at `MAIN`
-  or a CAF and read down to the allocation site; for `-hr`, what retains each
-  band.
-- **Cost centres**: the `.prof` call tree with individual and inherited
-  time/allocation.
-- Bands from an info-table profile (`-hi`) are named by their provenance
-  ("thunk in main (Main.hs:82)") rather than an address. A `-hc` band's menu
-  opens its stack in the `.prof` tree; any band's **Find in live graph**
-  lists the snapshot's closures with its closure type, name or source, and
-  an `-hi` band's closures exactly, by info-table address, when the
-  snapshot is of the same run.
-- **Live graph (ghc-debug)**: exact retainer paths from the running program's
-  closure graph, below.
+- **Residency chart**: stacked bands over time with a census cursor.
+- **At cursor**: band sizes and deltas at the selected census.
+- **Leak suspects**: bands ranked by sustained growth, plus thunk bands that survive consecutive major GCs without shrinking.
+- **Retention and cost centres**: `-hc` and `-hr` retention trees, and `.prof` call trees with individual and inherited time and allocation.
+- **Info-table profiles (`-hi`)**: bands are labeled with their source location and closure description when compiled with `-finfo-table-map`.
 
-#### Live closure graph (ghc-debug)
+#### Live closure graph (`ghc-debug`)
 
-Optional, behind the `ghc-debug` cabal flag (off by default). A heap profile
-says what *kind* of closure keeps growing; [ghc-debug](https://gitlab.haskell.org/ghc/ghc-debug)
-says which closure holds it. With **Source: Live graph (ghc-debug)**, **Take
-snapshot** connects to a program running ghc-debug-stub, pauses it, walks
-every closure reachable from its GC roots (threads and stable pointers, and
-through static reference tables the CAFs), and resumes it.
-
-- **Closure graph**: the roots, biggest first, expanded pointer by pointer.
-  Each closure shows its type, its size and the bytes it *holds* (each closure
-  charged to its first retainer on a shortest path). Selecting one shows its
-  shortest retainer path, summed up as e.g. "IS held by thunk plus, rooted at
-  CAF counter", and what it points to. Thunks are amber. A thread (its TSO)
-  shows its **stack at the snapshot**, frame by frame, each frame a link to
-  the source of the code it returns to (with `-finfo-table-map`).
-- **Surviving thunks**: take snapshots a few seconds apart. Thunks still
-  unevaluated in consecutive snapshots are listed, growing groups first, and
-  shown red in the graph. The collector moves objects, so thunks are matched
-  across snapshots by their code (name and source span) and by the shape of
-  the path retaining them from the nearest CAF, with repeats collapsed so a
-  growing chain keeps one identity.
-- **Biggest retainers**: the closures holding the most bytes.
-
-Set up the program being debugged (build it `-threaded`; add
-`-finfo-table-map -fdistinct-constructor-tables` so closures carry source
-names and spans):
+Build with `-f ghc-debug` to inspect live heap snapshots from a target linked with `ghc-debug-stub`:
 
 ```haskell
-import GHC.Debug.Stub (withGhcDebug) -- from ghc-debug-stub ^>=0.8
+import GHC.Debug.Stub (withGhcDebug)
 
 main :: IO ()
 main = withGhcDebug $ do
   ...
 ```
 
-`withGhcDebug` listens on a Unix socket under ghc-debug's data directory
-(`~/.local/share/ghc-debug/debuggee/sockets/<pid>-<prog>`, or
-`$GHC_DEBUG_SOCKET`) and prints its path; **Find sockets** lists them.
-`withGhcDebugTCP "0.0.0.0" 1235` listens on TCP instead. Then build Stronghead
-with the flag:
+Build the target with `-threaded -finfo-table-map -fdistinct-constructor-tables`, then run Stronghead with:
 
 ```sh
 cabal run -f ghc-debug stronghead
 ```
 
-(or put `flags: +ghc-debug` under `package stronghead` in
-`cabal.project.local`). With the flag, `stronghead-sample` runs the stub too
-(on TCP when `GHC_DEBUG_TCP=host:port` is set), so on Linux or macOS
-`cabal run -f ghc-debug stronghead-sample -- 60` gives the live graph a leak
-to find.
+- **Closure graph**: browse reachable closures from GC roots with shallow and retained sizes, shortest retainer paths, and thread stack frames.
+- **Surviving thunks**: compare consecutive snapshots to find unevaluated thunks that persist across GCs.
+- **Biggest retainers**: closures retaining the most memory.
 
-**Platforms.** ghc-debug 0.8 supports GHC 9.14. The client side
-(ghc-debug-client, -common, -convention) builds on Linux, macOS and Windows,
-so Stronghead builds with the flag everywhere. ghc-debug-stub, which the
-*target* links, is Unix-only: its C++ needs `sys/socket.h` and `sys/un.h` and
-fails to build on Windows (`stronghead-sample` leaves it out there). From
-Windows, run the target on Linux, macOS or WSL with `withGhcDebugTCP` and
-connect over **TCP** (WSL2 forwards `localhost`), or open a **snapshot file**
-saved with ghc-debug's `GHC.Debug.Snapshot.makeSnapshot`.
+`ghc-debug-client` builds on Linux, macOS, and Windows, but `ghc-debug-stub` (linked into the target program) requires Unix sockets and only builds on Linux and macOS. On Windows, connect over TCP (`withGhcDebugTCP`) to a target running in WSL or on a remote machine, or open a saved snapshot file.
 
-### Core / STG
+### Core & STG
 
-Point it at a folder of `-ddump-to-file` dumps (cabal puts them under
-`dist-newstyle/`) and it pairs each module's source, Core and STG. Dumps
-from a threaded or profiled build (`Main.thr.dump-stg-final`) are paired too.
-Sources are found beside the dumps, in the project the dump folder is in (up
-to its `.cabal` file), under the **project root** setting and the
-debugger's directory; any source file found this way opens here, with or
-without dumps, when another panel links to it.
-
-The source pane shows what the runtime saw of each line, in lanes of ink
-bars between the line numbers and the code:
-
-| Lane | From | Bar |
-| --- | --- | --- |
-| time, alloc | a `.prof` (`-prof -fprof-auto`, `+RTS -p`), by each cost centre's span | share of time and allocation |
-| heap | an info-table profile (`-finfo-table-map`, `+RTS -hi`), by each band's span | bytes live at the heap cursor; thunks in orange |
-| live | a ghc-debug snapshot, by each closure's source | bytes in the snapshot; thunks orange, survivors red |
-
-A line takes the costs of the smallest spans covering it, so a nested cost
-centre's lines show its own. Muted notes after the code give the numbers and
-a binding's badges, and the gutter shows breakpoints and the debugger's
-stop. Every bar and note is a link: a click goes to the cost centre, band or
-closure, a right-click lists what every panel can do with it. The line in
-focus keeps its notes in view, as does the line under the pointer.
-
-- Bindings are listed by name with what happened to them: worker/wrapper
-  (`W/W`), `INLINE`/`NOINLINE`, boxing sites, STG `let` allocations, and
-  `gone` when a source binding no longer exists in Core (inlined away).
-  With runtime data loaded the list gains **time**, **alloc** and **heap**
-  columns (cost centres and bands whose spans start in the binding's source,
-  or that name it), sorted by clicking a header; **Hot and boxed only**
-  keeps the bindings that cost at least 1% and box or allocate.
-- With a ticky eventlog loaded (`-ticky`, `+RTS -lT`) the list also gains
-  **entries** and **ticky** (bytes allocated) columns. Each counter is named
-  after its closure's STG binder (`main2_sat_s7qL{v} (Main) (fun) in s7qM`),
-  so it joins exactly to its `let` in the STG dump and through it to the
-  binding; without the dump it joins by the binding's name.
-- Selecting a binding lines up all three panes and explains it: arity,
-  strictness signature, inline pragma, size, "Re-boxes values ...",
-  "N let-bound closures in STG ...", with buttons that jump to each boxing
-  and allocation site.
-- Hovering any name highlights every occurrence in all three panes (uniques,
-  module qualifiers and `$w` prefixes are normalised away, so `go` in the
-  source lights up `Main.$wgo` and `go_s1x2`); clicking a name jumps to its
-  binding. **Hide uniques** strips `_a1Bc`-style suffixes from the display.
-- The STG pane marks each `let` and boxing site with the bytes its closures
-  hold at the heap cursor. An info table's name is its STG binder plus
-  `_info` (`main2_sat_s7qA_info`), and with `-fdistinct-constructor-tables`
-  a constructor table (`I#_Main_3_con_info`) names its numbered site
-  (`3 GHC.Internal.Types.I#! [x]`); both are exact joins within one build.
-  With ticky, each `let` also shows its closure's entries and allocation.
-  Revealing a source line scrolls the STG pane to the code compiled from it.
-- Right-click any line, name or note: **Open in editor** runs the editor
-  command from Settings at that line, and **Break here** sets a breakpoint.
+Pairs Haskell source files with `-ddump-simpl` and `-ddump-stg-final` dumps:
 
 ```sh
-ghc -O2 -ddump-simpl -ddump-stg-final -ddump-to-file Main.hs
 cabal build --ghc-options="-ddump-simpl -ddump-stg-final -ddump-to-file"
 ```
 
-### Debugger (GHCi)
+- **Bindings list**: shows top-level bindings with badges for `INLINE`/`NOINLINE`, worker/wrapper splits, boxing sites, STG `let` allocations, and bindings eliminated by inlining. When `.prof`, `-hi`, or ticky data is loaded, bindings can be filtered and sorted by time, allocation, live heap, or entry count.
+- **Synchronized panes**: selecting a binding aligns Source, Core, and STG. Hovering an identifier highlights matching names across all three panes (ignoring GHC unique suffixes and `$w` prefixes).
+- **Inline metrics**: source lines and STG `let`/boxing sites display heat bars and byte/time annotations from loaded `.prof`, `-hi`, ticky, and `ghc-debug` data.
 
-A visual front end to GHCi's debugger (`ghci`, `cabal repl`, or any command
-that starts one).
+### Debugger
 
-- Source view with candidate breakpoint lines; click the gutter to set or
-  delete a breakpoint.
-- Step into, step over (`:steplocal`), step out (`:stepout`), step module,
-  continue, trace, history, back/forward, abandon. The current span is
-  highlighted and followed.
-- **Local bindings** at each stop, each `:print`ed and shown as an
-  expandable tree, styled like the closure graph: constructors, records,
-  lists and tuples open level by level, and unevaluated parts are amber
-  `_t` thunks with their types. **Evaluate** takes a thunk to weak head
-  normal form (`seq`) and **Force** all the way (`:force`), in place; the
-  values are printed again and GHCi stays stopped where it was.
-- A console showing every command and its output, plus a prompt for raw GHCi
-  commands. `:history` steps and stops are links to their source.
-- **Breakpoints** lists every breakpoint, in any file, as links.
-- The stop names its binding, a link to it in Core & STG.
-- **Break here from anywhere**: right-click a line in Core & STG, a cost
-  centre, a band, a closure or a surviving thunk. With a session it breaks
-  on the line (`:break Module line`), loading its module first if needed;
-  without one it starts the GHCi command from Settings on the file the
-  source index finds (a `cabal` or `stack` command in its project, plain
-  GHCi in its directory). Bindings break by name (`:break Module.name`).
-- The source pane carries the same lanes and notes as Core & STG's.
+A graphical interface for `ghci` / `cabal repl`.
 
-`--debug path/to/Main.hs` starts a session on that module straight away.
+- Set and toggle breakpoints in the source gutter or from any source link in other panels.
+- Step into, step over (`:steplocal`), step out (`:stepout`), continue, trace (`:trace`), and inspect `:history`.
+- **Local bindings**: parses `:print` output into expandable trees. Unevaluated `_t` thunks are highlighted with their types and can be evaluated to WHNF (`seq`) or fully forced (`:force`) in place.
+- Includes a console for running raw GHCi commands.
 
 ### Live
 
-A "top" for a running Haskell service, and the way to attach to one. Link
-the target with the `stronghead:agent` library (it depends only on `base`,
-`bytestring` and `network`):
+Streams runtime statistics and thread states from a running program linked with `stronghead:agent` (which depends only on `base`, `bytestring`, and `network`):
 
 ```haskell
 import Stronghead.Agent
@@ -490,145 +101,71 @@ main = withAgent defaultAgentConfig $ do
   ...
 ```
 
-Build it `-threaded` and run it with `+RTS -T`. The agent listens on
-`127.0.0.1:4777` and streams RTS statistics and the live thread list (labels,
-blocking status and capability) four times a second. The panel charts
-allocation rate, live bytes, GC pauses and thread count on program time, and
-each thread row has a strip of its status over the last half minute in the
-Timeline's colours.
+Build the target with `-threaded` and run with `+RTS -T`. By default the agent listens on `127.0.0.1:4777` and streams frames every 250 ms.
 
-**One Connect wires the program.** The agent says where the program runs and
-how it was started, and Connect follows from there; the strip under the
-toolbar says what it found, and why it skipped the rest:
+Connecting to the agent also locates and opens the target's eventlog, `.hp` file, `ghc-debug` socket, and Core/STG dumps if present in its working directory. From the Live toolbar or command palette, you can send markers (`M`), trigger a major GC, request a heap census, toggle heap profiling, or take `ghc-debug` snapshots. Commands are only accepted on loopback addresses unless enabled in `AgentConfig`.
 
-- the eventlog (`+RTS -l`, at `-ol<file>` or `<program>.eventlog` in its
-  working directory), followed live in the Timeline; the agent flushes it
-  every 250 ms;
-- the heap profile (`-hT`, `-hi` ...), read as it grows, beside the
-  eventlog's own heap samples;
-- the ghc-debug socket of the same pid, for snapshots (with `-f ghc-debug`,
-  on a Unix target);
-- the working directory, searched for sources and for Core and STG dumps.
+## Navigation and Workspace
 
-So `stronghead-sample 60 +RTS -l -hT -i0.1 -T -RTS` and a Connect give the
-Timeline, the heap chart and Live all on one clock.
+- **Cross-panel links**: threads, collections, censuses, heap bands, closures, cost centres, bindings, and source lines are linked across panels. Hover to preview details from other panels, right-click for panel actions, and `Ctrl+click` to jump to the item's primary panel (`Alt+Left` / `Alt+Right` to go back and forward).
+- **Command palette (`Ctrl+K`)**: search loaded threads, bindings, cost centres, bands, closures, markers, and commands. `Ctrl+1` through `Ctrl+5` switch panels.
+- **Shared clock**: Timeline, Heap, and Live charts from the same run share a time cursor and `Shift+drag` range selection.
+- **Workspaces and panes**: open the **Workspace** menu in the header to add, rearrange, or pop out panes across panels, or switch between layout presets (**Leak hunt**, **Latency**, **Before and after**). Additional panes include:
+  - **Inspector**: shows all cross-panel data, links, actions, and suggested next steps for the focused item.
+  - **Pinboard**: bookmark items with notes and export them as a Markdown report.
+  - **Watchers**: rules that monitor live streams (heap growth across major GCs, long thread blocks, high GC CPU share, growing heap bands) and trigger markers, censuses, snapshots, or notifications.
+  - **Baselines and diffs**: mark a loaded run as a baseline to compare metrics and view heap, cost-centre, and Core/STG binding diffs against a new run.
+- **Sessions (`.stronghead`)**: save and restore open files, connections, pins, watcher rules, baseline paths, and pane layouts from the **Workspace** menu.
 
-**Acting on the program.** The **Program** toolbar, the palette (Ctrl+K) and
-the status bar's menu send the agent:
+## Sample Program
 
-- **Mark…** (**M** from any panel): an eventlog marker with your text;
-- **Major GC**, **Census now**, and **Start/Stop heap profiling**;
-
-and, through ghc-debug, **Snapshot**, **Census + snapshot**, **Snapshot
-twice, 2 s apart** and **Pause** / **Resume**. Each lands on every time axis
-of the run at once, as a mark with a square cap, dashed until the agent's
-reply stamps it in program time, and then drawn by the eventlog's own marker
-once it arrives. Snapshots are stamped the same way (through the agent, or
-from the eventlog's wall-clock anchor), in ink. Hovering a mark or a
-snapshot on a chart or the Timeline's ruler links to that instant. A
-stretch with no frames, while a snapshot or a pause holds the program, is
-shaded and labelled on Live's charts.
-
-Commands perturb the program but can't run code. The agent takes them only
-when it listens on a loopback address, unless `agentAcceptCommands` says
-otherwise. An agent built before protocol v2 still connects and streams;
-the panel says to rebuild against the current `stronghead:agent` to attach
-and act.
-
-The wire format (protocol v2, compatible with v1 both ways) is in
-`Stronghead.Live`'s header.
-
-## Data sources and connections
-
-**Sources** in the header lists each run Stronghead has something from (an
-eventlog, a heap or cost-centre profile, the agent, a ghc-debug target), by
-program and pid, with what each adds, what is missing, and the build and run
-flags that add it, ready to copy. Runs that should match but don't (a
-renamed binary, say) can be joined by hand there, and unlinked again.
-
-The **status bar** is the connection centre: the followed eventlog, the
-agent, the ghc-debug target and the GHCi session each open their panel on a
-click and have a menu on a right-click (stop following, disconnect,
-reconnect, take a snapshot, stop or restart the session). It also shows the
-shared cursor's time, which links to that instant.
-
-## Try it
-
-`stronghead-sample` misbehaves on purpose: six workers contend on one MVar, an
-`IORef` is updated lazily (a classic thunk leak), a cache grows without bound,
-and the threads are labelled.
+`stronghead-sample` is a test executable with MVar contention, a lazy `IORef` accumulator leak, and an unbounded map:
 
 ```sh
-cabal run stronghead-sample -- 10 +RTS -l -hT -i0.1 -RTS
+cabal run stronghead-sample -- 10 +RTS -l -hT -i0.1 -T -RTS
 cabal run stronghead -- stronghead-sample.eventlog
 ```
 
-While it runs, `cabal run stronghead -- --connect 127.0.0.1:4777` (or
-Connect in Live) attaches: the Timeline follows its eventlog, the heap panel
-its heap profile, and **M** marks all of them. Run it with `-T` for the
-charts: `+RTS -l -hT -i0.1 -T -RTS`. Switch on a watcher or two in the
-**Watchers** pane and they fire within seconds: the leaky accumulator keeps
-the live bytes climbing.
+To attach while it is running:
 
-To see the leak go, open the first run's eventlog and **Mark as baseline**.
-Change `modifyIORef` to `modifyIORef'` on line 82, run it again writing
-another eventlog (`+RTS -l -hT -i0.1 -olafter.eventlog -RTS`), and open
-that with the **Before and after** arrangement: the heap diff shows
-`THUNK_2_0` gone, and the heap readout's peak a quarter of what it was.
+```sh
+cabal run stronghead -- --connect 127.0.0.1:4777
+```
 
 ## Building
 
-GHC 9.10 or newer (developed with 9.14), cabal, and SDL3 plus SDL3_ttf
-(found through `pkg-config`) for nano-ui's SDL backend. nano-ui is not on
-Hackage. `cabal.project` pulls it from GitHub, pinned to a commit; to move to
-the current HEAD, update the `tag` there from
+Requires GHC 9.10+ (tested with 9.14), `cabal`, and `SDL3` + `SDL3_ttf` (via `pkg-config`). `nano-ui` is fetched from GitHub via `cabal.project`.
 
 ```sh
-git ls-remote https://github.com/goolord/nano-ui HEAD
+cabal build
+cabal test
 ```
 
-`cabal test` runs the parser and analysis tests (the ghc-debug graph analyses
-included, with or without the flag). `-f ghc-debug` adds the ghc-debug
-backend; see [Live closure graph](#live-closure-graph-ghc-debug).
+## Project Structure
 
-## Layout
-
-| Path | What it is |
+| Path | Description |
 | --- | --- |
-| `src/Stronghead/Eventlog*.hs` | Incremental eventlog fold, timeline model and its level-of-detail queries |
-| `src/Stronghead/HeapProfile.hs` | `.hp` parsing, band classification, leak suspects, retention tree |
-| `src/Stronghead/Prof.hs` | `.prof` cost-centre tree |
-| `src/Stronghead/Dump.hs` | Core/STG/source tokenising, bindings, optimisation notes, dump discovery |
+| `src/Stronghead/Eventlog*.hs` | Incremental eventlog decoder and timeline data structures |
+| `src/Stronghead/HeapProfile.hs` | `.hp` parser, band classification, leak scoring, retention trees |
+| `src/Stronghead/Prof.hs` | `.prof` parser |
+| `src/Stronghead/Dump.hs` | Core, STG, and source tokenizer and binding extractor |
 | `src/Stronghead/Ghci.hs` | GHCi subprocess driver and output parsers |
-| `src/Stronghead/Source.hs` | Source spans, the source index, the editor command |
-| `src/Stronghead/Join.hs` | Joins between artifacts: spans, cost centres, info tables, ticky counters and STG binders, `-hc` stacks and `.prof` paths, bands and closures |
-| `src/Stronghead/Live.hs` | Client for the agent's protocol (v2: info line, capabilities, commands) |
-| `src/Stronghead/Attach.hs` | Where a connected program's eventlog, heap profile, socket and dumps are |
-| `src/Stronghead/Debug.hs` | ghc-debug snapshots (the backend behind the `ghc-debug` flag) |
-| `src/Stronghead/Debug/Graph.hs` | Closure graph model: retainer paths, held bytes, thunk survival across snapshots, thread stacks |
-| `src/Stronghead/Debug/Client.hs` | ghc-debug-client traversal (built only with the flag) |
-| `src/Stronghead/Session.hs` | Pins, the session file, the pinboard's Markdown report |
-| `src/Stronghead/Next.hs` | The next-steps engine, and the kinds of data with their build and run recipes |
-| `src/Stronghead/Watch.hs` | Watcher rules, their streams' observations and their evaluation |
-| `src/Stronghead/Diff.hs` | Baselines, and the heap, cost-centre and binding diffs |
-| `agent/Stronghead/Agent.hs` | The drop-in agent |
-| `app/UI/*.hs` | The nano-ui panels; `UI.Workspace` is the pane registry, `UI.Inspector`, `UI.Pinboard`, `UI.Watchers` and `UI.Baseline` the shell's own panes |
-| `sample/Main.hs` | The deliberately leaky sample program |
+| `src/Stronghead/Source.hs` | Source spans and file path resolution |
+| `src/Stronghead/Join.hs` | Cross-artifact matching (spans, cost centres, info tables, ticky, STG) |
+| `src/Stronghead/Live.hs` | Client for the `Stronghead.Agent` wire protocol |
+| `src/Stronghead/Attach.hs` | Discovery of a connected process's eventlog, profiles, socket, and dumps |
+| `src/Stronghead/Debug*.hs` | `ghc-debug` client, closure graph model, retainer paths, survivor analysis |
+| `src/Stronghead/Session.hs` | `.stronghead` session serialization and Markdown report formatting |
+| `src/Stronghead/Next.hs` | Rule-based investigation suggestions |
+| `src/Stronghead/Watch.hs` | Stream watcher evaluation |
+| `src/Stronghead/Diff.hs` | Heap, cost-centre, and binding diffing |
+| `agent/Stronghead/Agent.hs` | Embedded telemetry agent library (`stronghead:agent`) |
+| `app/UI/*.hs` | `nano-ui` views and panels |
+| `sample/Main.hs` | Sample executable (`stronghead-sample`) |
 
-## Limits
+## Limitations
 
-- Without the `ghc-debug` flag, retention data comes from heap profiles
-  (`-hc`, `-hr`, `-hi`). With it, "held" bytes follow the breadth-first
-  shortest-path tree, not dominators: a closure reachable two ways counts once,
-  under the retainer found first. A snapshot pauses the target for the whole
-  walk (one socket round trip per closure) and stops at the closure limit
-  (200k by default, up to 1M). Weak pointers are not followed.
-- ghc-debug-stub does not build on Windows, so a Windows target can't be
-  snapshotted; see [Platforms](#live-closure-graph-ghc-debug).
-- The eventlog carries no stack traces. A profiled build's cost-centre
-  samples say what each capability ran, coarsely (one sample per tick per
-  capability), and a ghc-debug snapshot gives each thread's stack; otherwise
-  the thread inspector shows labels, timing and blocking reasons.
-- ghc-events' thread-stop table predates GHC's renumbering of blocking
-  reasons, so Stronghead reinterprets codes 16 and up (C calls, `throwTo`).
-  GHC's raw code 21 (WinIO completion) still makes ghc-events fail to decode.
+- Without `-f ghc-debug`, retention analysis uses `-hc`, `-hr`, or `-hi` heap profiles. With `ghc-debug`, retained sizes are computed along a breadth-first shortest-path tree rather than a dominator tree, and taking a snapshot pauses the target process up to the closure limit (default 200k, max 1M). Weak pointers are not traversed.
+- `ghc-debug-stub` does not build on Windows because it depends on Unix domain sockets.
+- Eventlogs only include call stacks in profiled builds (`+RTS -p -l`), and on Windows the RTS profiling timer ticks roughly every 15 ms rather than 1 ms.
+- `ghc-events` does not support GHC thread-stop status code 21 (WinIO completion) and fails to decode eventlogs containing it.

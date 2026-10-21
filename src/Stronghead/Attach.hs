@@ -1,11 +1,9 @@
--- | One Connect wires a running program: from a v2 agent's info line, work
--- out where the program's eventlog, heap profile, ghc-debug socket, sources
--- and dumps are, and check which of them are there.
+-- | Locate a connected process's eventlog, heap profile, @ghc-debug@ socket,
+-- source root, and Core/STG dumps from an agent's v2 info line.
 --
--- The paths follow the RTS's own rules. The eventlog is @-ol<file>@ when
--- given, else @<stem>.eventlog@ for @-po<stem>@, else @<program>.eventlog@,
--- in the program's working directory; the heap profile is @<stem>.hp@ or
--- @<program>.hp@ the same way. A ghc-debug socket is named
+-- File paths follow GHC RTS conventions: @-ol<file>@ if set, otherwise
+-- @<stem>.eventlog@ for @-po<stem>@, otherwise @<program>.eventlog@ in the
+-- working directory (and @.hp@ similarly). @ghc-debug@ sockets are named
 -- @<pid>-<program>@.
 module Stronghead.Attach
   ( AttachKind (..)

@@ -1,15 +1,5 @@
--- | One clock for every time view. The Timeline, the heap chart and Live's
--- charts each put program time on an 'Axis', draw the bus's cursor, range
--- and the run's markers on it ('drawMarks'), and share the gestures that
--- move them ('timeGestures'): Shift+drag selects a range, and a view that
--- scrubs moves the cursor with a plain drag. A view whose own cursor snaps
--- to samples keeps it in step with the shared one through a 'Tether'.
---
--- Besides the eventlog's markers, every time view draws the bus's moments:
--- the marks and actions Stronghead sent the agent, until their markers turn
--- up in the followed eventlog ('confirmMoments'), and the snapshots it took.
---
--- Time links only join views of matching runs ('runKeysMatch').
+-- | Shared time axis, cursor, range selection, and markers across Timeline,
+-- Heap, and Live charts.
 module UI.Clock
   ( -- * Axes
     Axis (..)

@@ -1,18 +1,5 @@
--- | Baselines and diffs: one run kept as the baseline, and what changed in
--- the run on show against it.
---
--- A baseline is what was loaded when it was marked: the eventlog's
--- summary, the heap profile on show, the @.prof@'s cost centres and the
--- dump folder's bindings, kept by their paths so a session can load them
--- again ('BaselinePaths'). The diffs are pure:
---
--- * heap profiles ('diffHeap'): bands matched by name, else by where they
---   are allocated (an @-hi@ band is named by its info table's address,
---   which changes with every build), with peak and growth before and after,
---   and the bands that are gone or new;
--- * cost centres ('diffCosts'): time and allocation per cost centre;
--- * dump folders ('diffBindings'): per binding, the badges that changed
---   (worker/wrapper, boxing sites, lets) and its size.
+-- | Baseline comparison and diffs for heap profiles, @.prof@ cost centres,
+-- and Core/STG bindings.
 module Stronghead.Diff
   ( -- * Baselines
     BaselinePaths (..)

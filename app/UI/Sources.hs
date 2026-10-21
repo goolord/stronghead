@@ -1,14 +1,4 @@
--- | The data sources popover, in the header: for each run the artifacts and
--- connections Stronghead has from it, what each one adds, and what is
--- missing, with the build and run flags that add it, ready to copy. The
--- kinds of data and their recipes are "Stronghead.Next"'s, which the
--- inspector's next steps share.
---
--- Sources are put into runs by 'groupRuns' ("Stronghead.Run"): the same
--- program and pid is one run, the same program with a pid missing on one
--- side probably is. Runs that don't match can be joined by hand; the shell
--- then treats every source of one as the other's ('srcOrigin' keeps what
--- each said itself, so the join can be undone).
+-- | Data sources popover grouping loaded artifacts and connections by run.
 module UI.Sources
   ( Source (..)
   , Datum (..)

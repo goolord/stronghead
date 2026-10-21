@@ -1,27 +1,18 @@
--- | Client side of the live-telemetry protocol spoken by "Stronghead.Agent".
+-- | Client for the "Stronghead.Agent" TCP wire protocol.
 --
--- The agent sends plain text lines over TCP:
+-- Agent to client:
 --
--- > H <program> <pid> <capabilities>       once, on connect
+-- > H <program> <pid> <capabilities>
 -- > I version=2 cwd=<%> exe=<%> args=<%,%,...> heap-profile=<mode|none>
 -- >   heap-interval-ms=<n> eventlog=<0|1> commands=<0|1>
--- >                                        once, after H (v2)
--- > S <key>=<value> <key>=<value> ...      RTS statistics
--- > T <thread-id> <status> <label...>      one per live Haskell thread
--- > C <thread-id> <capability>             after its thread's T line (v2)
--- > E                                      end of a frame
--- > A <id> ok [t=<ns>]                     a command's reply (v2)
+-- > S <key>=<value> ...
+-- > T <thread-id> <status> <label...>
+-- > C <thread-id> <capability>
+-- > E
+-- > A <id> ok [t=<ns>]
 -- > A <id> error <text>
 --
--- Values are integers; times are nanoseconds and sizes bytes, as in
--- 'GHC.Stats.RTSStats'. In the info line, @<%>@ is a percent-encoded field
--- (UTF-8 bytes; everything but ASCII letters, digits and @-_./:\\@ is
--- encoded), and @args@ is the full command line ('GHC.Environment.getFullArgs',
--- program first, RTS options included), each argument encoded and joined
--- by commas. @heap-profile@ names the RTS flag of the breakdown (@hT@,
--- @hi@, @hc@ ...) and @commands@ says whether the agent takes commands.
---
--- A v2 client writes commands, one per line, each with an id it chooses:
+-- Client to agent:
 --
 -- > <id> mark <text>                       traceMarkerIO
 -- > <id> gc                                performMajorGC
@@ -29,14 +20,7 @@
 -- > <id> heap-profiling on|off             startHeapProfTimer / stopHeapProfTimer
 -- > <id> flush                             flushEventLog
 --
--- Each is answered by an @A@ line. Every command but @flush@ also posts an
--- eventlog marker (the text, or @stronghead: major GC@ and so on), and the
--- reply's @t@ is the program time just after it ran, when the program runs
--- with @+RTS -T@.
---
--- The versions mix both ways: a v1 client ignores the lines it doesn't
--- know, and a v1 agent sends no @I@ line and never reads the socket, which
--- is how a v2 client tells it apart (see 'ldInfo' in the GUI).
+-- Protocol v2 is backward-compatible with v1 in both directions.
 module Stronghead.Live
   ( Frame (..)
   , LiveThread (..)

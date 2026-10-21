@@ -1,13 +1,5 @@
--- | Source, Core and STG side by side for one module. Bindings are listed
--- by name with what the optimiser did to them; selecting one lines up all
--- three panes, and hovering any name highlights it everywhere.
---
--- The source pane is annotated with what every other panel knows of each
--- line ("UI.Code"): time and allocation from a @.prof@, the heap a line's
--- closures hold at the census cursor, live closures from ghc-debug,
--- breakpoints and the debugger's stop. The STG pane marks each @let@ and
--- boxing site with the heap its closures hold, joined by info-table name.
--- Any file the source index finds can be opened, with or without dumps.
+-- | Side-by-side Source, Core, and STG viewer with binding summaries and
+-- runtime metric annotations.
 module UI.Core
   ( CoreState (..)
   , newCoreState

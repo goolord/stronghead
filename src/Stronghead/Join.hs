@@ -1,14 +1,5 @@
--- | The joins between artifacts: what makes a line of source, a binding, a
--- cost centre, a heap band and a closure the same thing in every panel.
---
--- Everything here is pure. Code-keyed joins hold across runs of one build:
--- cost centres and info tables are matched to source by their spans, and
--- info tables and ticky counters to STG binders by name. Each function says
--- how exact its join is.
---
--- The 'Annotation' is what a panel says about a span of source for the
--- annotated code view: a heat bar in one of its lanes, a gutter mark or a
--- trailing note, with the entity it came from.
+-- | Cross-artifact joins matching source spans, bindings, cost centres,
+-- info tables, ticky counters, heap bands, and closures.
 module Stronghead.Join
   ( -- * Spans
     sameFile

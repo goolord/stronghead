@@ -1,7 +1,6 @@
 {-# LANGUAGE CPP #-}
 
--- | Drop-in live telemetry for a Haskell program, read by the Stronghead
--- GUI's Live panel.
+-- | Embedded telemetry server for the Stronghead Live panel.
 --
 -- > import Stronghead.Agent
 -- >
@@ -9,19 +8,16 @@
 -- > main = withAgent defaultAgentConfig $ do
 -- >   ...
 --
--- Link with @-threaded@ and run with @+RTS -T@ for RTS statistics (thread
--- lists work without it). The agent listens on 127.0.0.1:4777 by default and
--- streams a frame every 250 ms to each connected viewer. If the program
--- also writes an eventlog (@+RTS -l@), the agent flushes it on the same
--- cadence so Stronghead can follow the file live.
+-- Build with @-threaded@ and run with @+RTS -T@ to enable RTS statistics.
+-- By default the agent listens on @127.0.0.1:4777@ and streams a frame every
+-- 250 ms. When the program writes an eventlog (@+RTS -l@), the agent also
+-- flushes it at the same interval.
 --
--- Protocol v2 (the wire format is described in "Stronghead.Live") adds an
--- info line, so one Connect can find the program's eventlog, heap profile
--- and sources, each thread's capability, and a small fixed set of commands
--- a viewer may send: post a marker, run a major GC, request a heap census,
--- turn heap profiling on or off, flush the eventlog. Commands perturb the
--- program but cannot run code. They are accepted by default only when the
--- agent listens on a loopback address ('agentAcceptCommands').
+-- Protocol v2 (see "Stronghead.Live") sends process metadata on connect,
+-- reports per-thread capabilities, and accepts commands (emit a marker, run
+-- a major GC, request a heap census, toggle heap profiling, flush the
+-- eventlog). Commands are enabled by default only on loopback addresses
+-- ('agentAcceptCommands').
 module Stronghead.Agent
   ( AgentConfig (..)
   , defaultAgentConfig
@@ -74,21 +70,18 @@ data AgentConfig = AgentConfig
   , agentIntervalMs :: !Int
   , agentFlushEventlog :: !Bool
   , agentAcceptCommands :: !(Maybe Bool)
-    -- ^ Whether viewers may send commands (marks, a major GC, a census,
-    -- heap profiling on and off, an eventlog flush). 'Nothing', the
-    -- default: only when the agent is bound to a loopback address, so a
-    -- program listening on the network can be watched but not poked.
+    -- ^ Whether to accept client commands. Defaults to 'Nothing' (enabled
+    -- only on loopback addresses).
   }
 
 defaultAgentConfig :: AgentConfig
 defaultAgentConfig = AgentConfig "127.0.0.1" 4777 250 True Nothing
 
--- | Run an action with the agent serving in the background.
+-- | Run an action with the agent server running in the background.
 --
--- The server thread spends its life in a blocking @accept@, which on
--- Windows is an uninterruptible foreign call: a synchronous 'killThread'
--- on it would block forever. The kills are therefore sent asynchronously;
--- the threads go away when the program exits if not before.
+-- On Windows, a blocking @accept@ is an uninterruptible foreign call, so
+-- synchronous 'killThread' would block; cleanup kills the threads
+-- asynchronously instead.
 withAgent :: AgentConfig -> IO a -> IO a
 withAgent cfg act = bracket (startAgent cfg) (mapM_ (forkIO . killThread)) (const act)
 
@@ -325,8 +318,7 @@ percentEncode = concatMap byte . B.unpack . utf8Bytes
         c = chr (fromIntegral w)
     hexDigit = toUpper . intToDigit . fromIntegral
 
--- | The working directory, from the C library: @directory@ would be a
--- dependency the agent promises not to have.
+-- | Get the current working directory via libc without depending on @directory@.
 currentDirectory :: IO FilePath
 #if defined(mingw32_HOST_OS)
 currentDirectory = allocaBytes (2 * 32768) $ \buf -> do

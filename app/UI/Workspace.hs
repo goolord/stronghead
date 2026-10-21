@@ -1,24 +1,4 @@
--- | Mixed workspaces: every pane of every panel, registered by kind, and
--- the workbenches that arrange them.
---
--- A workbench is a nano-ui pane grid whose pane ids are pane kinds: the
--- id of a pane is 'pkId' of what it shows, so a tree says by itself what
--- is in it, and a kind appears at most once in a workbench. Split ids are
--- 1000 and up. Any kind can be added to any panel's workbench; a pane is
--- moved within one by dragging its header ('paneDragHandle') and to
--- another panel through its menu, or popped out into a floating window.
---
--- A pane draws from its panel's state and from what the loaders returned
--- this frame, never from its panel being on screen: each panel offers a
--- 'PaneDraw' built from both, and whichever workbench holds the pane calls
--- it. A popped-out kind is drawn only in its window; a workbench that
--- also holds it shows where it went instead, so no pane is drawn twice.
---
--- The five panels' arrangements are presets of this registry, next to the
--- user's presets ("Leak hunt", "Latency" and any saved ones). Trees are
--- written as text for sessions: @(v 0.74 (h 0.5 tl.caps tl.threads)
--- inspector)@, where @v@ puts its two sides next to each other and @h@
--- stacks them.
+-- | Pane registry, layout trees, presets, and pop-out windows.
 module UI.Workspace
   ( -- * Pane kinds
     PaneKind (..)

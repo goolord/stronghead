@@ -1,29 +1,5 @@
--- | Next steps: given what the panels know about the entity in focus and
--- what data is loaded, what to look at or do next, each with a one-line
--- reason.
---
--- The engine follows the four investigations of the integration plan:
---
--- * __Leak.__ A suspect band, then where its closures are allocated (the
---   site and the binding), then two snapshots, then the group of thunks
---   that survives them and what holds it, then a breakpoint where they are
---   created.
--- * __Contention.__ A thread's longest blocked span, then the thread that
---   woke it or the black hole's owner, then what that thread ran (from
---   cost-centre samples), then the binding.
--- * __Hot path.__ A cost centre, then its binding in Core & STG (the
---   badges), then the STG lets and ticky counters, then the heap those
---   lets hold.
--- * __GC pressure.__ A range, then Analyse range, then the top allocators,
---   then the census at its end: when little of what was allocated
---   survives, a bigger nursery rather than a leak.
---
--- The panels say what they know as 'Fact's; the engine never looks at the
--- data itself. Each step is a link to an entity or one of the panels'
--- own actions, found by its label, so following a step takes the same
--- path as a click. Where the data a step needs is missing, the step says
--- what to load and with which flags ('datumRecipe'), as the data sources
--- popover does.
+-- | Rule-based investigation suggestions for the focused entity based on
+-- loaded artifacts and metrics.
 module Stronghead.Next
   ( -- * Data sources
     Datum (..)

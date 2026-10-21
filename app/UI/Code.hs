@@ -1,14 +1,6 @@
--- | A read-only code pane drawn on a canvas: only visible lines are built,
--- tokens are coloured by kind, every occurrence of the hovered name is
--- highlighted (across panes, via the caller), and a gutter carries line
--- numbers and markers.
---
--- Annotated, it also shows what the runtime saw of each line: a lane of
--- heat bars per measurement between the gutter and the code (time,
--- allocation, heap, live closures), gutter marks, and muted notes after the
--- line's end. Every bar and note stands for an entity: clicking it goes
--- there, and right-clicking a line, a name or a note lists every panel's
--- actions ('annotatedCode').
+-- | Read-only canvas code view with syntax coloring, cross-pane identifier
+-- highlighting, line-number gutter, per-line metric heat bars, and inline
+-- annotations.
 module UI.Code
   ( CodeViewState (..)
   , newCodeViewState

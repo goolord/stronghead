@@ -1,24 +1,16 @@
 {-# LANGUAGE CPP #-}
 
--- | A small program with the problems Stronghead is for:
+-- | Sample executable for testing Stronghead:
 --
--- * worker threads contending on one MVar (red blocked spans on the
---   timeline),
--- * a space leak: a lazy accumulator in an IORef that is modified but never
---   forced, so a chain of thunks grows until the end,
--- * a cache that only ever grows,
--- * labelled threads, traceMarker milestones, and the live agent.
+-- * worker threads contending on a single 'MVar',
+-- * a lazy accumulator in an 'IORef' that builds an unevaluated thunk chain,
+-- * an unbounded 'Map' cache,
+-- * labeled threads, 'traceMarkerIO' markers, and 'Stronghead.Agent'.
 --
--- Run it with the eventlog and a closure-type heap profile:
+-- > cabal run stronghead-sample -- 10 +RTS -l -hT -i0.1 -T -RTS
 --
--- > cabal run stronghead-sample -- 10 +RTS -l -hT -i0.1 -RTS
---
--- then open stronghead-sample.eventlog (or .hp) in Stronghead, or connect
--- the Live panel to 127.0.0.1:4777 while it runs.
---
--- Built with @-f ghc-debug@ (not on Windows), it also runs ghc-debug-stub,
--- on the socket it prints, or on TCP when @GHC_DEBUG_TCP=host:port@ is set,
--- for the heap panel's live graph.
+-- When built with @-f ghc-debug@ (Unix only), also starts @ghc-debug-stub@
+-- on a local socket or on TCP if @GHC_DEBUG_TCP=host:port@ is set.
 module Main (main) where
 
 import Control.Concurrent

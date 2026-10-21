@@ -1,13 +1,4 @@
--- | Watchers ("Stronghead.Watch") on the program Stronghead is attached
--- to: the rules, evaluated every frame on what the agent's frames and the
--- followed eventlog added since the last; what they did when they fired;
--- and where that shows: the Watchers pane, a badge in the status bar and a
--- callout over it.
---
--- A rule's responses go through the same paths as the Live panel's
--- actions: a mark through the agent, a census through the agent, a
--- snapshot through the heap panel's ghc-debug target. When one can't run,
--- the fired event says why.
+-- | Watcher rules UI, per-frame stream evaluation, and alert notifications.
 module UI.Watchers
   ( Watchers (..)
   , newWatchers

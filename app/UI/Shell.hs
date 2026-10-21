@@ -1,24 +1,5 @@
--- | The window: a header with the panel tabs, history, the palette, a
--- global Open and Settings, file drag-and-drop, and the per-frame loaders
--- that keep background work going whichever panel is showing. The panels'
--- lenses are built here each frame from what the loaders returned, so every
--- panel can link to every other ("UI.Link").
---
--- Every panel's workbench can hold any pane ("UI.Workspace"): the header's
--- Panes button adds panes and applies arrangements, and each pane's menu
--- moves it or pops it out into a floating window. The shell draws a pane
--- from what its panel's loader returned this frame, whichever workbench it
--- is in, and draws its own two panes, the inspector ("UI.Inspector") and
--- the pinboard ("UI.Pinboard").
---
--- The header's Sources button lists every run's artifacts and connections
--- ("UI.Sources"); the status bar is the connection centre, where each live
--- source opens its panel or its menu. Connect in Live attaches: what it
--- finds is opened here ('applyAttach').
---
--- The shell also keeps the investigation's aids: what is loaded, for the
--- inspector's next steps ('Have'); the watchers on the live streams
--- ("UI.Watchers"); and the baseline run with its diffs ("UI.Baseline").
+-- | Main window shell: header bar, panel tabs, background loaders, status
+-- bar, and workspace pane host.
 module UI.Shell
   ( App
   , Options (..)

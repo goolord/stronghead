@@ -1,12 +1,11 @@
 cabal-version:      3.4
 name:               stronghead
 version:            0.1.0.0
-synopsis:           A live debugger and profiler GUI for GHC programs
+synopsis:           A profiler and debugger GUI for GHC programs
 description:
-    Stronghead is an immediate-mode GUI (built on nano-ui) for the opaque
-    parts of running Haskell: eventlog timelines (capabilities, threads, GC),
-    heap profiles and space-leak hunting, Core/STG dump inspection, a GHCi
-    breakpoint stepper, and a live RTS stats dashboard fed by a drop-in agent.
+    Stronghead is a GUI profiler and debugger for GHC programs built on
+    nano-ui. It includes an eventlog timeline viewer, heap profiler, Core/STG
+    dump viewer, GHCi debugger frontend, and live RTS telemetry monitor.
 license:            MIT
 author:             goolord
 maintainer:         zacharyachurchill@gmail.com
@@ -155,9 +154,8 @@ executable stronghead
     if os(windows)
         ghc-options: -optl-mconsole
 
--- A deliberately misbehaving program: contended MVars, labelled threads, a
--- lazy accumulator space leak. Run it to produce an eventlog, a heap profile
--- and live stats to look at.
+-- Sample program with MVar contention, a lazy accumulator leak, and an
+-- unbounded map for testing profiling and debugging views.
 executable stronghead-sample
     import:           extensions, warnings
     hs-source-dirs:   sample

@@ -1,15 +1,4 @@
--- | The baseline run and the diffs against it ("Stronghead.Diff").
---
--- Marking a run as the baseline keeps what is loaded at that moment: the
--- eventlog's summary, the heap profile on show, the @.prof@'s cost centres
--- and the dump folder's bindings. Whatever is opened afterwards is the
--- current run. A session keeps the baseline by its artifacts' paths and
--- loads them again ('loadBaseline').
---
--- Three panes show the diffs, each entry a link: heap bands (matched by
--- name or by where they are allocated, with "gone" and "new"), cost
--- centres, and bindings whose badges changed. The readouts show their
--- deltas against the baseline through 'envBaseline'.
+-- | Baseline state and diff panes ("Stronghead.Diff").
 module UI.Baseline
   ( BaselineState (..)
   , newBaselineState

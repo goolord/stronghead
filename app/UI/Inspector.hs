@@ -1,13 +1,5 @@
--- | The entity inspector: everything every panel knows about one entity,
--- the long form of a peek. First what to do next ("Stronghead.Next"), each
--- step a button that follows it, with its reason. Then one section per
--- panel that has something to say, each with how that panel matched the
--- entity, its facts, what goes with it as links, and its actions as
--- buttons.
---
--- It follows the focus as it changes, and keeps its own back and forward
--- through what it has shown, apart from the window's history. With
--- "Follow the focus" off it holds on to what it shows.
+-- | Entity inspector pane showing suggested steps, per-panel facts, related
+-- links, and actions for the focused item.
 module UI.Inspector
   ( Inspector (..)
   , newInspector

@@ -1,14 +1,7 @@
--- | Which run of which program an artifact came from, and its clock.
+-- | Run metadata ('RunInfo'), run matching across artifacts, and wall-clock
+-- to program-time conversion.
 --
--- Each source knows part of the story: the eventlog has the pid, the full
--- command line, the RTS version and a wall-clock anchor; the agent's hello
--- has the program and pid; a ghc-debug socket is named @<pid>-<prog>@; a
--- @.hp@ file has its command line and start date; a @.prof@ file has both
--- in its header. 'matchRuns' decides whether two of them describe the same
--- run, which is what lets time-keyed links cross between them.
---
--- Program time is nanoseconds since the RTS started, as eventlog
--- timestamps count it.
+-- Program time is measured in nanoseconds since RTS startup.
 module Stronghead.Run
   ( RunInfo (..)
   , emptyRunInfo

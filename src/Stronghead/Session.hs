@@ -1,20 +1,4 @@
--- | What a session keeps, and the two texts it is written as: the session
--- file and the pinboard's report.
---
--- A session is what was open and where the investigation stood: the
--- artifacts and dump folders, the connections, the pins with their notes,
--- the shared cursor and range, the focus, each panel's arrangement of panes
--- and the panel in front, the watchers' rules and the baseline's
--- artifacts. It is kept as @key = value@ lines, like the
--- settings file. Lists are numbered keys (@pin.1@, @pin.1.note@). Values are
--- percent-encoded where they would otherwise be lost: a @%@, a line break,
--- and spaces at either end. Unknown keys and unreadable values are skipped,
--- so an older or hand-edited file still opens as far as it can be read.
--- Only the escapes the file needs are decoded (@%25@, @%0a@, @%0d@, @%20@
--- and @%09@), so a reference's own @%2F@ is written and read as it is.
---
--- Pane arrangements are opaque text here: the GUI writes and validates
--- them, so this module stays free of it.
+-- | Session file (@.stronghead@) serialization and Pinboard Markdown export.
 module Stronghead.Session
   ( -- * Pins
     Pin (..)

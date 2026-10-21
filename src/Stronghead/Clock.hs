@@ -1,13 +1,10 @@
--- | Moving between clocks and along them: the nearest sample to a moment,
--- the next or previous one, and the map from an artifact's own clock to
--- program time.
+-- | Time conversion and sample lookup across artifacts.
 --
--- Program time is nanoseconds since the RTS started, as eventlog
--- timestamps count it ("Stronghead.Run"). Eventlog heap samples and Live
--- frames are already on it. A @.hp@ file is not: its seconds are most
--- likely mutator CPU time (spike V3), so its censuses are put on program
--- time by pairing them with the eventlog's censuses of the same run, whose
--- totals match exactly, and only approximately when there is no eventlog.
+-- Program time is measured in nanoseconds since RTS startup. Eventlog heap
+-- samples and Live frames use program time directly. @.hp@ files record
+-- mutator CPU time, so their censuses are aligned to program time by matching
+-- total byte counts against eventlog censuses from the same run when
+-- available.
 module Stronghead.Clock
   ( -- * Samples
     nearestIndex

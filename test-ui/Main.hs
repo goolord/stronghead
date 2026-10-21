@@ -1,14 +1,5 @@
--- | The links between panels ("UI.Link"), driven headlessly through
--- nano-ui's test harness: clicks, Ctrl+clicks, right-click menus, peeks and
--- history, against stub lenses that record what they were asked to do;
--- the shared clock ("UI.Clock"): the cursor and range a time view sets on
--- the bus, and a snapping cursor kept in step with them; and the
--- annotated code view ("UI.Code"), whose heat bars are links; and the
--- Live panel's remote actions ("UI.Live"): a command lands on the clock at
--- once, the agent's reply stamps it, the eventlog's marker takes over;
--- the entity inspector ("UI.Inspector") and the pinboard ("UI.Pinboard");
--- and the pane registry ("UI.Workspace"): trees, presets, and moving a
--- pane through its menu.
+-- | Headless UI tests for cross-panel links, shared clock, code annotations,
+-- remote actions, inspector, pinboard, watchers, diffs, and workspace panes.
 module Main (main) where
 
 import Control.Concurrent (threadDelay)

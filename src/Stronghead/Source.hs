@@ -1,14 +1,4 @@
--- | Source locations and where to find their files.
---
--- GHC prints a source location in a handful of forms, and every artifact
--- Stronghead reads uses one of them: GHCi's stops and breakpoints, IPE info
--- tables, cost centres in @.prof@ files and the eventlog, and ghc-debug's
--- closure info. 'parseSrcLoc' reads them all.
---
--- The paths in those locations are relative to wherever the compiler ran,
--- which is rarely where Stronghead is looking. A 'SourceIndex' knows the
--- Haskell files under a list of roots and resolves a reported path to one
--- of them.
+-- | Source span parsing and file path resolution across project roots.
 module Stronghead.Source
   ( -- * Spans
     SrcSpan (..)

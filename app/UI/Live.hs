@@ -1,20 +1,4 @@
--- | A "top" for a running Haskell program: connects to the agent in
--- "Stronghead.Agent" and charts allocation, GC and residency as they
--- happen, with the live thread list.
---
--- The charts run on program time, so they are time views like the
--- Timeline's ("UI.Clock"): they show the shared cursor, range and the
--- followed eventlog's markers, a click or drag moves the cursor, and
--- Shift+drag selects a range there too.
---
--- Connect also attaches: from a v2 agent's info line it finds the
--- program's eventlog, heap profile, ghc-debug socket, sources and dumps
--- ('liveAttach'), for the shell to open. And it acts on the program
--- ('liveRemote'): marks, a major GC, a census and heap profiling on and off
--- go through the agent; snapshots and pausing go through ghc-debug. Each
--- lands on every time axis as a moment on the bus, stamped in program
--- time by the agent's reply, until the followed eventlog's own marker
--- takes over.
+-- | Live RTS telemetry panel, process auto-attach, and remote commands.
 module UI.Live
   ( LiveState (..)
   , newLiveState

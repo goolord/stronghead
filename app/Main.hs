@@ -1,24 +1,11 @@
--- | Stronghead: a live debugger and profiler for GHC programs.
+-- | Stronghead entry point and CLI parser.
 --
 -- > stronghead [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventlog]
 -- >            [--debug MODULE.hs] [--goto REF] [--mark TEXT] [FILE|DIR ...]
 --
--- Files are routed by extension: .eventlog to the timeline, .hp and .prof
--- to the heap explorer, .dump-simpl / .dump-stg-final / .hs to the Core
--- viewer; a directory is searched for dumps.
---
--- @--tab NAME@ (timeline, heap, core, debugger, live) picks the starting
--- panel, @--connect@ connects the Live panel to a program's agent, and
--- @--follow@ tails an eventlog the program is still writing, and @--debug@
--- starts a GHCi session on a module. @--goto@ opens an entity by its
--- reference, as "Copy reference" gives it (@source/sample%2FMain.hs/82/1/82/1@),
--- once a panel has loaded it. @--mark@ sends the connected program a mark
--- once its agent has streamed a couple of seconds (for scripts and
--- screenshots). Preferences (theme, interface scale,
--- window geometry, the panels' defaults) are loaded from and saved to the
--- settings file ("UI.Settings"). For development, @STRONGHEAD_CAPTURE=out.bmp@ saves a screenshot
--- once the window has been up for @STRONGHEAD_CAPTURE_DELAY@ seconds
--- (default 3) and exits.
+-- Setting @STRONGHEAD_CAPTURE=out.bmp@ saves a screenshot after
+-- @STRONGHEAD_CAPTURE_DELAY@ seconds (default 3) and exits without writing
+-- user settings or session state.
 module Main (main) where
 
 import Control.Monad (when)

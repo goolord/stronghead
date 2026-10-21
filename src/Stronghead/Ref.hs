@@ -1,15 +1,8 @@
--- | References to the things every panel shows: a thread, a collection, a
--- line of source, a cost centre. A 'Ref' is how one panel names an entity
--- to another.
+-- | Entity references shared across panels, with slash-delimited
+-- percent-encoded serialization ('refTarget', 'parseRefTarget') used for
+-- hyperlinks, session files, and clipboard references.
 --
--- Time-keyed refs carry their run, since a thread id or an instant means
--- nothing outside it. Code-keyed refs don't: a binding is the same binding
--- in every run of a build.
---
--- 'refTarget' gives each ref a text form, @kind/field/field@, with each
--- field percent-encoded so it can hold any text. It is the target of
--- hyperlinks, the reference stored in session files, and what "Copy
--- reference" puts on the clipboard; 'parseRefTarget' reads it back.
+-- Time-keyed references include a 'RunKey'; code-keyed references do not.
 module Stronghead.Ref
   ( Ref (..)
   , RunKey (..)
