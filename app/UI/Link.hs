@@ -200,9 +200,9 @@ data Lens = Lens
   , lensPeek :: Ref -> Maybe Peek
     -- ^ This panel's facts about it, for the peek, the inspector and the
     -- pinboard's report.
-  , lensHits :: [Hit]
+  , lensHits :: ~[Hit]
     -- ^ What the palette can find in this panel.
-  , lensAnnotations :: [Annotation]
+  , lensAnnotations :: ~[Annotation]
     -- ^ What this panel says about lines of source, for the annotated code
     -- views: heat bars, gutter marks and notes, each with its entity.
   , lensSpan :: Ref -> Maybe SrcSpan

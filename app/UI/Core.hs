@@ -19,7 +19,9 @@ import Control.Monad (forM_, join, unless, void, when)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (asum, for_)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IM
+import Data.IntSet qualified as IS
 import Data.List (sort, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
@@ -83,6 +85,22 @@ data CoreState = CoreState
   , csSort :: !(Var BindingSort)
   , csHotBoxed :: !(Var Bool)
   , csMessage :: !(Var Text)
+  , csEntriesCache :: !(IORef (Maybe ((Maybe FilePath, Maybe FilePath, Maybe FilePath), [Entry], M.Map Text Entry)))
+  , csDerivedCache :: !(IORef (Maybe (CoreDerivedKey, CoreDerived)))
+  }
+
+type CoreDerivedKey = (Bool, Maybe FilePath, Maybe FilePath, Maybe FilePath, Int, [FilePath], [Annotation])
+
+data CoreDerived = CoreDerived
+  { cdEntries :: ![Entry]
+  , cdByKey :: !(M.Map Text Entry)
+  , cdSrcNotes :: !FileNotes
+  , cdStgPlaced :: ![(Int, Int, Annotation)]
+  , cdStgNotes :: !FileNotes
+  , cdRuntime :: !(M.Map Text Runtime)
+  , cdLanes :: ![Lane]
+  , cdHeapTotal :: !Double
+  , cdTickyTotal :: !Double
   }
 
 -- | The order of the binding list.
@@ -125,6 +143,8 @@ newCoreState = do
   csSort <- newVar InFileOrder
   csHotBoxed <- newVar False
   csMessage <- newVar ""
+  csEntriesCache <- newIORef Nothing
+  csDerivedCache <- newIORef Nothing
   pure CoreState {..}
 
 -- | Put a file in the pane its kind belongs to.
@@ -366,6 +386,19 @@ intro =
     ]
     dumpCommands
 
+-- | Cached full entry list and key map for the currently loaded files.
+cachedEntries :: CoreState -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> IO ([Entry], M.Map Text Entry)
+cachedEntries st src core stg = do
+  let key = (cfPath <$> src, cfPath <$> core, cfPath <$> stg)
+  cached <- readIORef (csEntriesCache st)
+  case cached of
+    Just (k, es, byKey) | k == key -> pure (es, byKey)
+    _ -> do
+      let es = entries False src core stg
+          byKey = M.fromList [(enKey e, e) | e <- es]
+      writeIORef (csEntriesCache st) (Just (key, es, byKey))
+      pure (es, byKey)
+
 -- | Core & STG's panes, for whichever workbench holds them: the binding
 -- list, the optimiser's notes, and the source, Core and STG of the module
 -- open. Without files each code pane says what to open.
@@ -389,34 +422,64 @@ corePanes env st loaded _ = do
   let pal = palette th
       ix = clIndex loaded
       anns = concatMap lensAnnotations (envLenses env)
-      es = entries hideT src core stg
       modName = moduleOf src core stg
-      srcNotes = maybe noNotes (\cf -> notesForFile ix (cfPath cf) anns) src
-      -- Each reported path is resolved once.
-      reported = M.fromList [(ssFile sp, ()) | a <- anns, Just sp <- [anSpan a]]
-      inSource = (\cf -> let here = M.mapWithKey (\f _ -> resolvesTo ix (cfPath cf) f) reported in \sp -> M.findWithDefault False (ssFile sp) here) <$> src
-      jn = joinable inSource anns
-      -- A ticky build's counters of this module.
       tickyLane a = anLane a == LaneEntries || anLane a == LaneTicky
-      tickyHere = [a | a <- anns, tickyLane a, fmap fst (anName a) == Just modName]
-      -- The STG binding each line of the STG dump is in.
-      stgOwners = IM.fromList [(bdFirst b, (bdLast b, enKey e)) | e <- es, b <- enStg e]
-      stgOwner l = case IM.lookupLE l stgOwners of
-        Just (_, (lastLine, k)) | l <= lastLine -> Just k
-        _ -> Nothing
-      -- Each counter's binding: the one its STG let is in (exact), or,
-      -- without the STG dump, the one its name is nested in (by name).
-      tickyByEntry = M.fromListWith (++) $ case clSites loaded of
-        Just sites -> [(k, [a]) | a <- tickyHere, Just t <- [anTable a], Just l <- [siteOfTable sites t Nothing], Just k <- [stgOwner l]]
-        Nothing -> [(k, [a]) | a <- tickyHere, Just (_, k) <- [anName a]]
-      withTicky e r =
-        let as = M.findWithDefault [] (enKey e) tickyByEntry
-         in r {rtEntries = sum [anValue a | a <- as, anLane a == LaneEntries], rtTicky = sum [anValue a | a <- as, anLane a == LaneTicky]}
-      runtime = M.fromList [(enKey e, withTicky e (runtimeOf modName (isJust src) jn e)) | e <- es]
-      rt e = M.findWithDefault noRuntime (enKey e) runtime
-      lanes = [l | l <- [LaneTime, LaneAlloc, LaneHeap], any ((== l) . anLane) anns] ++ [l | not (null tickyHere), l <- [LaneEntries, LaneTicky]]
-      heapTotal = sum [anValue a | a <- anns, anLane a == LaneHeap]
-      tickyTotal = sum [anValue a | a <- tickyHere, anLane a == LaneTicky]
+      derivKey = (hideT, cfPath <$> src, cfPath <$> core, cfPath <$> stg, S.size (siFiles ix), siRoots ix, anns)
+  CoreDerived
+    { cdEntries = es
+    , cdByKey = byKey
+    , cdSrcNotes = srcNotes
+    , cdStgPlaced = stgPlaced
+    , cdStgNotes = stgNotes
+    , cdRuntime = runtime
+    , cdLanes = lanes
+    , cdHeapTotal = heapTotal
+    , cdTickyTotal = tickyTotal
+    } <- liftIO $ do
+    cached <- readIORef (csDerivedCache st)
+    case cached of
+      Just (k, d) | k == derivKey -> pure d
+      _ -> do
+        (allEs, allByKey) <- cachedEntries st src core stg
+        let es'
+              | hideT = [e | e <- allEs, not (isTypeableBinding (enKey e) || T.null (enKey e))]
+              | otherwise = allEs
+            byKey'
+              | hideT = M.fromList [(enKey e, e) | e <- es']
+              | otherwise = allByKey
+            srcNotes' = maybe noNotes (\cf -> notesForFile ix (cfPath cf) anns) src
+            reported = M.fromList [(ssFile sp, ()) | a <- anns, Just sp <- [anSpan a]]
+            inSource = (\cf -> let here = M.mapWithKey (\f _ -> resolvesTo ix (cfPath cf) f) reported in \sp -> M.findWithDefault False (ssFile sp) here) <$> src
+            jn = joinable inSource anns
+            tickyHere = [a | a <- anns, tickyLane a, fmap fst (anName a) == Just modName]
+            stgOwners = IM.fromList [(bdFirst b, (bdLast b, enKey e)) | e <- es', b <- enStg e]
+            stgOwner l = case IM.lookupLE l stgOwners of
+              Just (_, (lastLine, k)) | l <= lastLine -> Just k
+              _ -> Nothing
+            tickyByEntry = M.fromListWith (++) $ case clSites loaded of
+              Just sites -> [(k, [a]) | a <- tickyHere, Just t <- [anTable a], Just l <- [siteOfTable sites t Nothing], Just k <- [stgOwner l]]
+              Nothing -> [(k, [a]) | a <- tickyHere, Just (_, k) <- [anName a]]
+            withTicky e r =
+              let as = M.findWithDefault [] (enKey e) tickyByEntry
+               in r {rtEntries = sum [anValue a | a <- as, anLane a == LaneEntries], rtTicky = sum [anValue a | a <- as, anLane a == LaneTicky]}
+            runtime' = M.fromList [(enKey e, withTicky e (runtimeOf modName (isJust src) jn e)) | e <- es']
+            lanes' = [l | l <- [LaneTime, LaneAlloc, LaneHeap], any ((== l) . anLane) anns] ++ [l | not (null tickyHere), l <- [LaneEntries, LaneTicky]]
+            heapTotal' = sum [anValue a | a <- anns, anLane a == LaneHeap]
+            tickyTotal' = sum [anValue a | a <- tickyHere, anLane a == LaneTicky]
+            stgPlaced' = case clSites loaded of
+              Just sites ->
+                [ (l, l, a)
+                | a <- anns
+                , anLane a == LaneHeap || tickyLane a && fmap fst (anName a) == Just (sgModule sites)
+                , Just t <- [anTable a]
+                , Just l <- [siteOfTable sites t (anSpan a)]
+                ]
+              Nothing -> []
+            stgNotes' = placedNotes stgPlaced'
+            d = CoreDerived es' byKey' srcNotes' stgPlaced' stgNotes' runtime' lanes' heapTotal' tickyTotal'
+        writeIORef (csDerivedCache st) (Just (derivKey, d))
+        pure d
+  let rt e = M.findWithDefault noRuntime (enKey e) runtime
       boxedOrAlloc e = any (not . null . nBoxing . bdNotes) (enCore e) || any (not . null . nAllocs . bdNotes) (enStg e)
       isHot e =
         let r = rt e
@@ -435,26 +498,14 @@ corePanes env st loaded _ = do
           , T.null filt || filt `T.isInfixOf` T.toLower (enKey e)
           , not hotBoxed || null lanes || (isHot e && boxedOrAlloc e)
           ]
-      selEntry = selected >>= \k -> listToMaybe [e | e <- es, enKey e == k]
+      selEntry = selected >>= (`M.lookup` byKey)
       (vSrc, vCore, vStg) = csViews st
       select k = do
         writeVar (csSelected st) (Just k)
-        for_ (listToMaybe [e | e <- es, enKey e == k]) $ \e -> do
+        for_ (M.lookup k byKey) $ \e -> do
           for_ (listToMaybe (enSrc e)) (scrollToLine vSrc . bdFirst)
           for_ (listToMaybe (enCore e)) (scrollToLine vCore . bdFirst)
           for_ (listToMaybe (enStg e)) (scrollToLine vStg . bdFirst)
-      -- The heap each STG closure site holds, joined by info-table name,
-      -- and each let's ticky counter, joined by its binder.
-      stgPlaced = case clSites loaded of
-        Just sites ->
-          [ (l, l, a)
-          | a <- anns
-          , anLane a == LaneHeap || tickyLane a && fmap fst (anName a) == Just (sgModule sites)
-          , Just t <- [anTable a]
-          , Just l <- [siteOfTable sites t (anSpan a)]
-          ]
-        Nothing -> []
-      stgNotes = placedNotes stgPlaced
       -- Notes stay in view on the line in focus, and on the STG sites
       -- compiled from it.
       focusSpan = case focus of
@@ -463,7 +514,7 @@ corePanes env st loaded _ = do
       fromFocus a = anRef a == focus && isJust focus || case (focusSpan, anSpan a) of
         (Just f, Just sp) -> ssLine sp >= ssLine f && ssLine sp <= ssEndLine f && sameFile (ssFile sp) (ssFile f)
         _ -> False
-      pinnedStg = [l | (l, _, a) <- stgPlaced, fromFocus a]
+      pinnedStg = IS.fromList [l | (l, _, a) <- stgPlaced, fromFocus a]
       pinnedSrc l = case (focusSpan, src) of
         (Just f, Just cf) -> l >= ssLine f - 1 && l <= ssEndLine f - 1 && resolvesTo ix (cfPath cf) (ssFile f)
         _ -> False
@@ -474,7 +525,7 @@ corePanes env st loaded _ = do
   for_ pending $ \case
     RBinding m k | T.null m || m == modName -> do
       writeVar (csPending st) Nothing
-      when (any ((== k) . enKey) es) (select k)
+      when (M.member k byKey) (select k)
     RSource sp | Just cf <- src, resolvesTo ix (cfPath cf) (ssFile sp) -> do
       writeVar (csPending st) Nothing
       for_ (listToMaybe [enKey e | e <- es, b <- enSrc e, bdFirst b <= ssLine sp - 1, bdLast b >= ssLine sp - 1]) select
@@ -491,7 +542,7 @@ corePanes env st loaded _ = do
         (Just (RSource sp), Just cf) | resolvesTo ix (cfPath cf) (ssFile sp) -> [(ssLine sp - 1, ssEndLine sp - 1, alpha 0.16 (pAccent pal))]
         _ -> []
       codeRef kind mcf ev = case ceHoverKey ev of
-        Just k | any ((== k) . enKey) es -> Just (RBinding modName k)
+        Just k | M.member k byKey -> Just (RBinding modName k)
         _ -> case (kind, mcf, ceHoverLine ev) of
           (KindSource, Just cf, Just l) -> Just (RSource (SrcSpan (T.pack (cfPath cf)) (l + 1) 1 (l + 1) 1))
           _ -> Nothing
@@ -515,11 +566,12 @@ corePanes env st loaded _ = do
                 _ -> []
                 ++ (if kind == KindSource then focusLines else [])
               allocMarks = case (selEntry, kind) of
-                (Just e, KindStg) -> concatMap (nAllocs . bdNotes) (enStg e)
-                _ -> []
+                (Just e, KindStg) -> IS.fromList (concatMap (nAllocs . bdNotes) (enStg e))
+                _ -> IS.empty
               boxMarks = case (selEntry, kind) of
-                (Just e, KindCore) -> concatMap (nBoxing . bdNotes) (enCore e)
-                _ -> []
+                (Just e, KindCore) -> IS.fromList (concatMap (nBoxing . bdNotes) (enCore e))
+                _ -> IS.empty
+              tokFn = if hideU && kind /= KindSource then lineTokensClean else lineTokens
           ev <-
             annotatedCode
               env
@@ -529,20 +581,20 @@ corePanes env st loaded _ = do
                   notes
                   defaultCodeConfig
                     { ccLineCount = maybe 0 (V.length . cfLines) mcf
-                    , ccTokens = \l -> maybe [] (`lineTokens` l) mcf
-                    , ccHideUniques = hideU && kind /= KindSource
+                    , ccTokens = \l -> maybe [] (`tokFn` l) mcf
+                    , ccHideUniques = False
                     , ccHot = hot
                     , ccRanges = ranges
                     , ccGutter = \l ->
                         if
-                          | l `elem` allocMarks -> Just (MarkDot (pBlocked pal))
-                          | l `elem` boxMarks -> Just (MarkDot (pGCMajor pal))
+                          | IS.member l allocMarks -> Just (MarkDot (pBlocked pal))
+                          | IS.member l boxMarks -> Just (MarkDot (pGCMajor pal))
                           | otherwise -> Nothing
                     , ccEmpty = "Open a " <> title <> " file"
                     , ccColouring = colouring
                     , ccPinned = case kind of
                         KindSource -> pinnedSrc
-                        KindStg -> (`elem` pinnedStg)
+                        KindStg -> (`IS.member` pinnedStg)
                         KindCore -> const False
                     }
               )
@@ -551,7 +603,7 @@ corePanes env st loaded _ = do
           -- its binding, if it has one.
           let (hs, hc, hg) = csHovers st
           writeVar (case kind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
-          for_ (ceClickedKey ev) $ \k -> when (any ((== k) . enKey) es) (select k)
+          for_ (ceClickedKey ev) $ \k -> when (M.member k byKey) (select k)
   -- The name under the pointer in any code pane last frame lights it up
   -- in all of them.
   let (hs0, hc0, hg0) = csHovers st
@@ -662,8 +714,8 @@ notesBar st e core r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
       allocs = sum (map (length . nAllocs . bdNotes) (enStg e))
       unboxed = sum (map (nUnboxedOps . bdNotes) (enCore e))
       refsIn = fmap $ \cf ->
-        let own = concat [[bdFirst b .. bdLast b] | b <- enCore e]
-         in length (filter (`notElem` own) (occurrences cf (enKey e)))
+        let inOwn l = any (\b -> l >= bdFirst b && l <= bdLast b) (enCore e)
+         in length (filter (not . inOwn) (occurrences cf (enKey e)))
   forM_ verdicts (labelWith (fontSizeScale 0.92))
   rowWith (tight . gap 6 . wrap . fillW) $ do
     scope $ forM_ (sort (concatMap (nBoxing . bdNotes) (enCore e))) $ \l -> withKey ("box" <> tshow l) $
@@ -704,8 +756,8 @@ coreLens st loaded spanOf anns = do
       stg = clStg loaded >>= eitherToMaybe
       arts = fromMaybe [] (clArtifacts loaded)
       ix = clIndex loaded
-      es = entries False src core stg
-      modName = moduleOf src core stg
+  (es, byKey) <- liftIO (cachedEntries st src core stg)
+  let modName = moduleOf src core stg
       -- The files the panel can open: the index's, the dump folder's
       -- sources, and the one loaded.
       sources = maybe [] (pure . cfPath) src ++ [f | a <- arts, Just f <- [maSource a]]
@@ -713,7 +765,7 @@ coreLens st loaded spanOf anns = do
       fileOf sp = rsPath <$> (resolveSource local Nothing (ssFile sp) <|> resolveSource ix Nothing (ssFile sp))
       moduleFile m = rsPath <$> resolveModule ix m
       here m = T.null m || m == modName
-      entry m k = if here m then listToMaybe [e | e <- es, enKey e == k] else Nothing
+      entry m k = if here m then M.lookup k byKey else Nothing
       artIndex p = listToMaybe [i | (i, a) <- zip [0 ..] arts, p a]
       loadedFile = normalise . cfPath <$> src
       entryAt l = listToMaybe [e | e <- es, b <- enSrc e, bdFirst b <= l, bdLast b >= l]

@@ -27,6 +27,8 @@ import Data.Char (isDigit)
 import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (for_)
 import Data.IORef
+import Data.IntMap.Strict qualified as IM
+import Data.IntSet qualified as IS
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust)
 import Data.Set qualified as S
@@ -44,7 +46,7 @@ import Stronghead.Format (tshow)
 import Stronghead.Ghci
 import Stronghead.Join (Annotation (..), Lane (..), Mark (..), Shade (..))
 import Stronghead.Ref
-import Stronghead.Source (Resolved (..), SourceIndex, SrcSpan (..), findProjectRoot, mkSourceIndex, renderSrcSpan, resolveModule, resolveSource, shortFileName)
+import Stronghead.Source (Resolved (..), SourceIndex (..), SrcSpan (..), findProjectRoot, mkSourceIndex, renderSrcSpan, resolveModule, resolveSource, shortFileName)
 import UI.Code
 import UI.Common
 import UI.Link
@@ -74,6 +76,8 @@ data DebugState = DebugState
   , dsCode :: !CodeViewState
   , dsSeenLines :: !(Var Int)
   , dsPanes :: !Workbench
+  , dsCandidatesCache :: !(IORef (Maybe (FilePath, Int, [Int], IS.IntSet)))
+  , dsNotesCache :: !(IORef (Maybe ((FilePath, Int, [FilePath], [Annotation]), FileNotes)))
   }
 
 newDebugState :: IO DebugState
@@ -97,7 +101,23 @@ newDebugState = do
   dsCode <- newCodeViewState
   dsSeenLines <- newVar 0
   dsPanes <- newWorkbench "debugger" (panelPreset PDebugger)
+  dsCandidatesCache <- newIORef Nothing
+  dsNotesCache <- newIORef Nothing
   pure DebugState {..}
+
+cachedCandidates :: DebugState -> Maybe CodeFile -> IO ([Int], IS.IntSet)
+cachedCandidates _ Nothing = pure ([], IS.empty)
+cachedCandidates st (Just cf) = do
+  let p = cfPath cf
+      n = V.length (cfLines cf)
+  cached <- readIORef (dsCandidatesCache st)
+  case cached of
+    Just (p', n', ls, set) | p' == p, n' == n -> pure (ls, set)
+    _ -> do
+      let ls = candidateLines (V.toList (cfLines cf))
+          set = IS.fromList ls
+      writeIORef (dsCandidatesCache st) (Just (p, n, ls, set))
+      pure (ls, set)
 
 debugLoad :: DebugState -> NanoUI (Maybe (Either String CodeFile))
 debugLoad st = do
@@ -317,12 +337,22 @@ sourcePane env st ix ctx source stop send = do
   let pal = palette th
       cf = source >>= eitherToMaybe
       here = stop >>= stSpan
-      fileBreaks = M.fromList [(l, n) | ((f, l), n) <- M.toList breaks, Just f == path]
-      candidates = maybe S.empty (S.fromList . candidateLines . V.toList . cfLines) cf
+      fileBreaks = IM.fromList [(l, n) | ((f, l), n) <- M.toList breaks, Just f == path]
       -- What the other panels say about this file; the debugger's own
       -- marks are drawn from its state.
       others = concat [lensAnnotations l | l <- envLenses env, lensPanel l /= PDebugger]
-      notes = maybe noNotes (\p -> notesForFile ix p others) path
+  (_, candidates) <- liftIO (cachedCandidates st cf)
+  notes <- case path of
+    Nothing -> pure noNotes
+    Just p -> liftIO $ do
+      let key = (p, S.size (siFiles ix), siRoots ix, others)
+      cached <- readIORef (dsNotesCache st)
+      case cached of
+        Just (k, fn) | k == key -> pure fn
+        _ -> do
+          let fn = notesForFile ix p others
+          writeIORef (dsNotesCache st) (Just (key, fn))
+          pure fn
   let header = do
         paneMeta (maybe "no module loaded" (T.pack . takeFileName) path)
         scope $ unless (T.null (laneLegend notes)) $ paneMeta (laneLegend notes)
@@ -355,9 +385,9 @@ sourcePane env st ix ctx source stop send = do
                 ]
             , ccGutter = \l ->
                 if
-                  | M.member (l + 1) fileBreaks -> Just MarkBreakpoint
+                  | IM.member (l + 1) fileBreaks -> Just MarkBreakpoint
                   | fmap ssLine here == Just (l + 1) -> Just MarkCurrent
-                  | S.member (l + 1) candidates -> Just MarkCandidate
+                  | IS.member (l + 1) candidates -> Just MarkCandidate
                   | otherwise -> Nothing
             , ccEmpty = "Start a session and load a module to see its source."
             }
@@ -371,7 +401,7 @@ sourcePane env st ix ctx source stop send = do
     scrollToLine (dsCode st) (stopLine - 1)
   for_ (ceGutterClick ev) $ \l0 -> for_ cf $ \c -> do
     let line = l0 + 1
-    case M.lookup line fileBreaks of
+    case IM.lookup line fileBreaks of
       Just n -> deleteBreak st send (path, line) n
       Nothing -> send [":break " <> cfModule c <> " " <> tshow line]
 
@@ -540,7 +570,8 @@ debugLens st source ix spanOf = do
   dir <- readVar (dsDir st)
   wake <- askWake
   let cf = source >>= eitherToMaybe
-      inLoaded sp = maybe False (\p -> isJust (resolveSource (mkSourceIndex [] [p]) Nothing (ssFile sp))) path
+  (candLines, _) <- if running then liftIO (cachedCandidates st cf) else pure ([], IS.empty)
+  let inLoaded sp = maybe False (\p -> isJust (resolveSource (mkSourceIndex [] [p]) Nothing (ssFile sp))) path
       send cmds = liftIO (runCommands st wake cmds)
       startThen file cmds = liftIO (startOn st wake file cmds)
       fileOf sp = case resolveSource ix Nothing (ssFile sp) of
@@ -583,8 +614,7 @@ debugLens st source ix spanOf = do
           ++ [ Annotation (Just (SrcSpan (T.pack p) l 1 l 1)) Nothing Nothing (LaneMark CandidateMark) 0 ShadeInk "" Nothing
              | running
              , Just p <- [path]
-             , Just c <- [cf]
-             , l <- candidateLines (V.toList (cfLines c))
+             , l <- candLines
              ]
   pure
     (lens PDebugger)

@@ -89,6 +89,17 @@ data TimelineState = TimelineState
   , tsCode :: !(Var Bool)
     -- ^ Show a code track under each capability, from a profiled build's
     -- cost-centre samples.
+  , tsCached :: !(IORef (Maybe ((Word64, Word64, Int), TimelineCached)))
+  }
+
+data TimelineCached = TimelineCached
+  { tlcSummary :: !Summary
+  , tlcTopGCs :: ![(Int, GCEvent)]
+  , tlcWorstBlocked :: ![(ThreadInfo, Word64, Maybe (StopCode, Word64))]
+  , tlcBusiest :: ![ThreadInfo]
+  , tlcCodeProfile :: ~CodeProfile
+  , tlcTicky :: ~[(TickyCounter, TickyName, Text)]
+  , tlcGCStarts :: !(VU.Vector Word64)
   }
 
 newTimelineState :: IO TimelineState
@@ -109,7 +120,33 @@ newTimelineState = do
   tsMarkerEvents <- newVar False
   tsWindowSeen <- newIORef Nothing
   tsCode <- newVar True
+  tsCached <- newIORef Nothing
   pure TimelineState {..}
+
+cachedTimeline :: TimelineState -> Timeline -> IO TimelineCached
+cachedTimeline st tl = do
+  let key = (tlStart tl, tlEnd tl, tlEventCount tl)
+  cached <- readIORef (tsCached st)
+  case cached of
+    Just (k, c) | k == key -> pure c
+    _ -> do
+      let blockedTime ti = sum [ns | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c]
+          topBlock ti = listToMaybe (sortOn (Down . snd) [(c, ns) | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c])
+          c =
+            TimelineCached
+              { tlcSummary = summarize tl
+              , tlcTopGCs = take 8 (sortOn (\(_, g) -> Down (gcEnd g - gcStart g)) (zip [0 :: Int ..] (V.toList (tlGCs tl))))
+              , tlcWorstBlocked =
+                  take 8 $
+                    sortOn (\(_, bt, _) -> Down bt) $
+                      [(ti, bt, topBlock ti) | ti <- M.elems (tlThreads tl), let bt = blockedTime ti, bt > 0]
+              , tlcBusiest = take 6 (sortOn (Down . tiRunTime) (M.elems (tlThreads tl)))
+              , tlcCodeProfile = codeProfile tl (const True) (tlStart tl) (tlEnd tl)
+              , tlcTicky = tickyNames tl
+              , tlcGCStarts = VU.fromListN (V.length (tlGCs tl)) [gcStart g | g <- V.toList (tlGCs tl)]
+              }
+      writeIORef (tsCached st) (Just (key, c))
+      pure c
 
 openEventlog :: TimelineState -> FilePath -> Bool -> NanoUI ()
 openEventlog st path follow = do
@@ -279,13 +316,14 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
 
 body :: Env -> Bench -> TimelineState -> Timeline -> Maybe LoadProgress -> NanoUI ()
 body env bench st tl mprog = do
+  tlc <- liftIO (cachedTimeline st tl)
   let lo = fromIntegral (tlStart tl)
       hi = fromIntegral (tlEnd tl) :: Double
       full = TimeView lo hi
-      summary = summarize tl
+      summary = tlcSummary tlc
   mv <- readVar (tsView st)
   let v = maybe full (clampView lo hi) mv
-  stepCursor env st tl v
+  stepCursor env st tl (tlcGCStarts tlc) v
   -- Against the baseline run, when one is marked.
   let base = envBaseline env >>= baSummary
       vs f = (\b -> fmtChange (f b) (f summary) <> " vs baseline") <$> base
@@ -697,14 +735,21 @@ drawTrack pal v r@(Rect x y w h) tr kinds markBlocked = do
           when (markBlocked && srKind s == kindRun && stopIsBlocked (srStop s) && xb - xa > 3) $
             drawRect (Rect (xb - 2) y 2 h) (pBlocked pal)
       else do
-        let cols = [0, 1 .. w - 1]
-            frac px k =
-              let ta = xToTime v x w (x + px)
-                  tb = xToTime v x w (x + px + 1)
-               in realToFrac (timeIn tr (fromIntegral k) (floorW ta) (floorW tb) / max 1 (tb - ta)) :: Float
+        let wInt = max 1 (floor w :: Int)
+            boundary !lo !px
+              | px > wInt = []
+              | otherwise =
+                  let t = floorW (xToTime v x w (x + fromIntegral px))
+                      c = countStartingByFrom tr lo t
+                   in (t, c - 1) : boundary (max lo (c - 1)) (px + 1)
+            bounds = boundary i0 0
+            quant :: Double -> Float
             quant f = fromIntegral (round (min 1 f * 16) :: Int) / 16
-            column px = [quant (frac px k) | (k, _) <- kinds]
-            runs = groupRuns [(px, column px) | px <- cols]
+            colFracs (ta, ia) (tb, ib) =
+              let dt = max 1 (fromIntegral (tb - min tb ta) :: Double)
+               in [quant ((cumAtIndex tr ib tb (fromIntegral k) - cumAtIndex tr ia ta (fromIntegral k)) / dt) | (k, _) <- kinds]
+            cols = [(fromIntegral px, colFracs a b) | (px, (a, b)) <- zip [0 :: Int ..] (zip bounds (drop 1 bounds))]
+            runs = groupRuns cols
         forM_ runs $ \(px0, px1, fs) -> do
           let go _ [] = pure ()
               go base ((f, (_, c)) : rest) = do
@@ -743,19 +788,21 @@ drawCodeTrack pal mm tl v r@(Rect x y w h) runs focusCC = do
       else do
         -- Too many to draw: keep the most sampled run per pixel.
         let buckets =
-              M.fromListWith
+              IM.fromListWith
                 (\a b -> if crSamples a >= crSamples b then a else b)
                 [(floor (timeToX v x w (fromIntegral (crStart cr)) - x) :: Int, cr) | cr <- shown]
-        forM_ (M.toList buckets) $ \(px, cr) ->
+        forM_ (IM.toList buckets) $ \(px, cr) ->
           drawRect (Rect (x + fromIntegral px) (y + 1) 1 (h - 2)) (colour (crCostCentre cr))
 
 -- | Merge consecutive columns with identical values.
 groupRuns :: Eq b => [(Float, b)] -> [(Float, Float, b)]
 groupRuns [] = []
-groupRuns ((p, b) : rest) =
-  let (same, others) = span ((== b) . snd) rest
-      end = maybe p (fst . snd) (unsnoc same)
-   in (p, end, b) : groupRuns others
+groupRuns ((p0, b0) : rest0) = go p0 p0 b0 rest0
+  where
+    go !a !b cur [] = [(a, b, cur)]
+    go !a !b cur ((p, x) : rest)
+      | x == cur = go a p cur rest
+      | otherwise = (a, b, cur) : go p p x rest
 
 outlineSpan :: Palette -> TimeView -> Rect -> Track -> Int -> CanvasM ()
 outlineSpan pal v (Rect x y w h) tr i
@@ -794,8 +841,9 @@ drawGCStrip pal v r@(Rect x y w h) tl sel = do
   let gcs = tlGCs tl
       i0 = lowerBoundBy gcEnd gcs (floorW (tvStart v))
       inView = takeWhile (\g -> fromIntegral (gcStart g) <= tvEnd v) (V.toList (V.drop i0 gcs))
-      maxPause = maximum (1 : [fromIntegral (gcEnd g - gcStart g) | g <- V.toList gcs]) :: Double
-      height g = realToFrac (log (1 + fromIntegral (gcEnd g - gcStart g) / 1000) / log (1 + maxPause / 1000)) * (h - 4)
+      maxPause = V.foldl' (\m g -> max m (fromIntegral (gcEnd g - gcStart g))) 1 gcs :: Double
+      logDenom = log (1 + maxPause / 1000)
+      height g = realToFrac (log (1 + fromIntegral (gcEnd g - gcStart g) / 1000) / logDenom) * (h - 4)
       colour g = if gcGen g >= 1 then pGCMajor pal else pGC pal
   withClip r $
     if length inView <= floor w
@@ -807,10 +855,10 @@ drawGCStrip pal v r@(Rect x y w h) tl sel = do
       else do
         -- Too many to draw: keep the worst pause per pixel.
         let buckets =
-              M.fromListWith
+              IM.fromListWith
                 (\a b -> if gcEnd a - gcStart a >= gcEnd b - gcStart b then a else b)
                 [(floor (timeToX v x w (fromIntegral (gcStart g)) - x) :: Int, g) | g <- inView]
-        forM_ (M.toList buckets) $ \(px, g) -> do
+        forM_ (IM.toList buckets) $ \(px, g) -> do
           let hh = max 2 (height g)
           drawRect (Rect (x + fromIntegral px) (y + h - hh) 1 hh) (colour g)
   case sel of
@@ -826,11 +874,12 @@ drawMemStrip pal v r@(Rect x y w h) tl = do
   drawRect r (pTrackBg pal)
   let peak = fromIntegral (max 1 (max (VU.foldl' (\m (_, b) -> max m b) 0 (tlHeapSize tl)) (VU.foldl' (\m (_, b) -> max m b) 0 (tlLive tl)))) :: Double
       py b = y + h - 2 - realToFrac (fromIntegral b / peak) * (h - 6)
+      endT = ceiling (tvEnd v) :: Word64
       pts s =
         let i0 = max 0 (lowerBoundBy fst s (floorW (tvStart v)) - 1)
-            vis = takeWhile (\(t, _) -> fromIntegral t <= tvEnd v) (VU.toList (VU.drop i0 s))
-            extra = take 1 (VU.toList (VU.drop (i0 + length vis) s))
-         in downsample w [(timeToX v x w (fromIntegral t), b) | (t, b) <- vis ++ extra]
+            i1 = min (VU.length s) (lowerBoundBy fst s (endT + 1) + 1)
+            slice = VU.slice i0 (max 0 (i1 - i0)) s
+         in downsample w [(timeToX v x w (fromIntegral t), b) | (t, b) <- VU.toList slice]
       steps ps = case unsnoc ps of
         Nothing -> []
         Just (_, (_, lastB)) -> concat [[V2 xa (py b), V2 xb (py b)] | ((xa, b), (xb, _)) <- zip ps (drop 1 ps ++ [(x + w, lastB)])]
@@ -847,7 +896,9 @@ drawMemStrip pal v r@(Rect x y w h) tl = do
     -- Censuses as ticks along the bottom.
     let cs = censusTimes tl
         c0 = floorW (tvStart v)
-        inView = VU.filter (\c -> c >= c0 && fromIntegral c <= tvEnd v) cs
+        ci0 = lowerBoundBy id cs c0
+        ci1 = lowerBoundBy id cs (endT + 1)
+        inView = VU.slice ci0 (max 0 (ci1 - ci0)) cs
     when (VU.length inView <= floor w) $
       VU.forM_ inView $ \c -> do
         let cx = timeToX v x w (fromIntegral c)
@@ -856,10 +907,10 @@ drawMemStrip pal v r@(Rect x y w h) tl = do
 -- | At most two points per pixel: the first and the maximum.
 downsample :: Float -> [(Float, Word64)] -> [(Float, Word64)]
 downsample w ps
-  | length ps <= floor (w * 2) = ps
+  | null (drop (floor (w * 2)) ps) = ps
   | otherwise =
-      [ (fromIntegral px, maximum (map snd grp))
-      | (px, grp) <- M.toList (M.fromListWith (flip (++)) [(floor x :: Int, [(x, b)]) | (x, b) <- ps])
+      [ (fromIntegral px, maxB)
+      | (px, maxB) <- IM.toList (IM.fromListWith max [(floor x :: Int, b) | (x, b) <- ps])
       ]
 
 drawTooltip :: Palette -> MonoMetrics -> Rect -> Float -> Float -> [Text] -> CanvasM ()
@@ -1006,7 +1057,7 @@ wakerLine tl ti s = case wokenBy ti s of
 
 legendDot :: Color -> Text -> NanoUI ()
 legendDot c txt = rowWith (tight . gap 5 . alignMid) $ do
-  _ <- canvas (fixedWH 9 9 . alignMid) (\r -> drawRoundedRect r 2 c)
+  _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 9 9 . alignMid) (\r -> drawRoundedRect r 2 c)
   labelWith (alignMid . fontMuted . fontSizeScale 0.85) txt
 
 -- ---------------------------------------------------------------------------
@@ -1197,6 +1248,7 @@ gcInspector env st tl i g = do
 
 overview :: Env -> TimelineState -> Timeline -> TimeView -> NanoUI ()
 overview env st tl v = do
+  tlc <- liftIO (cachedTimeline st tl)
   let rk = runKey (tlRun tl)
       bus = envBus env
   hint "Click a slice on a capability, a thread row or the GC strip to inspect it. Shift+drag selects a range to analyse."
@@ -1220,7 +1272,7 @@ overview env st tl v = do
         whenM (button "Clear range") (writeVar (busRange bus) Nothing)
     _ -> pure ()
   sectionTitle "Longest GC pauses"
-  let gcs = take 8 (sortOn (\(_, g) -> Down (gcEnd g - gcStart g)) (zip [0 :: Int ..] (V.toList (tlGCs tl))))
+  let gcs = tlcTopGCs tlc
   tableRows $ do
     rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
       colHeader (fixedW 72 . alignEnd) "pause"
@@ -1235,30 +1287,27 @@ overview env st tl v = do
         writeVar (tsSel st) (Just (SelGC i))
         zoomTo st tl (gcStart g) (gcEnd g)
   sectionTitle "Most blocked threads"
-  let blockedTime ti = sum [ns | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c]
-      worst = take 8 (sortOn (Down . blockedTime) (filter ((> 0) . blockedTime) (M.elems (tlThreads tl))))
-  tableRows $ forM_ worst $ \ti -> withKey (tiId ti) $ do
-    let top = listToMaybe (sortOn (Down . snd) [(c, ns) | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c])
+  tableRows $ forM_ (tlcWorstBlocked tlc) $ \(ti, bt, top) -> withKey (tiId ti) $ do
     picked <- linkRow env (RThread rk (tiId ti)) False id $ do
       columnWith (tight . gap 0 . fillW . alignMid) $ do
         labelWith fillW (threadName ti)
         scope $ for_ top $ \(c, _) -> labelWith (fillW . fontMuted . fontSizeScale 0.85) (stopName c)
-      numCell 72 id (fmtNs (fromIntegral (blockedTime ti)))
+      numCell 72 id (fmtNs (fromIntegral bt))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
   sectionTitle "Busiest threads"
-  tableRows $ forM_ (take 6 (sortOn (Down . tiRunTime) (M.elems (tlThreads tl)))) $ \ti -> withKey (tiId ti) $ do
+  tableRows $ forM_ (tlcBusiest tlc) $ \ti -> withKey (tiId ti) $ do
     picked <- linkRow env (RThread rk (tiId ti)) False id $ do
       cell fillW (threadName ti)
       numCell 72 id (fmtNs (fromIntegral (tiRunTime ti)))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
   scope $ unless (V.null (tlProfSamples tl)) $ do
-    let cp = codeProfile tl (const True) (tlStart tl) (tlEnd tl)
+    let cp = tlcCodeProfile tlc
     sectionTitle ("Most sampled code (" <> fmtInt (cpSamples cp) <> " samples)")
     codeRows env tl cp 6
     sampleNote tl cp
   scope $ unless (V.null (tlTicky tl)) $ do
     sectionTitle ("Ticky counters (" <> fmtInt (V.length (tlTicky tl)) <> ")")
-    tickyRows env (take 8 [(x, tcEntries c, tcAlloc c) | x@(c, _, _) <- tickyNames tl])
+    tickyRows env (take 8 [(x, tcEntries c, tcAlloc c) | x@(c, _, _) <- tlcTicky tlc])
   sectionTitle "Program"
   forM_ (tlInfo tl) $ \(k, val) -> kv k (T.take 300 val)
 
@@ -1348,8 +1397,8 @@ rangeInspector env st tl a b = do
 
 -- | @[@ and @]@ move the cursor to the previous or next collection; with
 -- Shift, census. The view follows when the cursor leaves it.
-stepCursor :: Env -> TimelineState -> Timeline -> TimeView -> NanoUI ()
-stepCursor env st tl v = do
+stepCursor :: Env -> TimelineState -> Timeline -> VU.Vector Word64 -> TimeView -> NanoUI ()
+stepCursor env st tl gcStarts v = do
   (dir, shifted) <- stepKeys
   when (dir /= 0) $ do
     let bus = envBus env
@@ -1358,7 +1407,7 @@ stepCursor env st tl v = do
     let from = case cursor of
           Just (r, t) | runKeysMatch r rk -> t
           _ -> if dir > 0 then floorW (tvStart v) else ceiling (tvEnd v)
-        stops = if shifted then censusTimes tl else VU.fromList (map gcStart (V.toList (tlGCs tl)))
+        stops = if shifted then censusTimes tl else gcStarts
     for_ (stepTime dir stops from) $ \t -> do
       setCursor bus rk t
       unless (fromIntegral t >= tvStart v && fromIntegral t <= tvEnd v) (centreOn st tl t)
@@ -1368,7 +1417,8 @@ stepCursor env st tl v = do
 
 markersHeader :: TimelineState -> Timeline -> NanoUI ()
 markersHeader st tl = do
-  paneMeta (fmtInt (V.length (V.filter mkIsMarker (tlMarkers tl))))
+  let nMarkers = V.foldl' (\acc m -> if mkIsMarker m then acc + 1 else acc) (0 :: Int) (tlMarkers tl)
+  paneMeta (fmtInt nMarkers)
   searchInputConfigured
     defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fixedW 90 . padXY 0 0) defaultLayout}
     (tsMarkerFilter st)
@@ -1393,14 +1443,13 @@ markersList env st tl = do
         if V.null (tlMarkers tl)
           then "No markers in this log. Debug.Trace.traceMarkerIO posts one, and it shows on every time axis."
           else "No marker matches."
-    else paneScroll (grow . tight) $ columnWith (padXY 4 4 . tight . fillW . gap 0) $
-      forM_ (take 2000 rows) $ \(i, mk) -> withKey i $ do
-        picked <- linkRow env (RMarker rk i) False id $ do
-          numCell 76 fontMuted (fmtNs (fromIntegral (mkTime mk) - fromIntegral (tlStart tl)))
-          cell (fillW . if mkIsMarker mk then id else fontMuted) (mkText mk)
-        when picked $ do
-          setCursor (envBus env) rk (mkTime mk)
-          centreOn st tl (mkTime mk)
+    else paneVirtualRows (grow . tight) (padXY 4 4) (take 2000 rows) $ \(i, mk) -> withKey i $ do
+      picked <- linkRow env (RMarker rk i) False id $ do
+        numCell 76 fontMuted (fmtNs (fromIntegral (mkTime mk) - fromIntegral (tlStart tl)))
+        cell (fillW . if mkIsMarker mk then id else fontMuted) (mkText mk)
+      when picked $ do
+        setCursor (envBus env) rk (mkTime mk)
+        centreOn st tl (mkTime mk)
 
 -- ---------------------------------------------------------------------------
 -- Lens
@@ -1426,7 +1475,8 @@ timelineLens bus switch st mprog = case mprog >>= lpTimeline of
         sampled m l = costCentreNamed tl m l >>= \c -> (c,) <$> IM.lookup (cciId c) (tlSampleCounts tl)
         totalSamples = V.length (tlProfSamples tl)
         ticky = tickyNames tl
-        tickyOf m k = [x | x@(_, tn, key) <- ticky, key == k, T.null m || tnModule tn == m]
+        tickyByKey = M.fromListWith (flip (++)) [(key, [x]) | x@(_, _, key) <- ticky]
+        tickyOf m k = [x | x@(_, tn, _) <- M.findWithDefault [] k tickyByKey, T.null m || tnModule tn == m]
         -- Each counter's entries and allocation, for the STG pane and the
         -- binding list: placed at its binder's STG let ("siteOfTable"),
         -- else joined by the binding's name.
@@ -1521,8 +1571,16 @@ threadFacts tl rk ti =
     ]
   where
     tr = tiTrack ti
-    blocked = [s | i <- [0 .. trackLength tr - 1], let s = trackSpan tr i, srKind s == kindBlocked]
-    longest = listToMaybe (sortOn (\s -> Down (srEnd s - srStart s)) blocked)
+    n = trackLength tr
+    go !i !bestI !bestDur
+      | i >= n = if bestI < 0 then Nothing else Just (trackSpan tr bestI)
+      | trKind tr VU.! i == kindBlocked =
+          let dur = trEnd tr VU.! i - trStart tr VU.! i
+           in if bestI < 0 || dur > bestDur
+                then go (i + 1) i dur
+                else go (i + 1) bestI bestDur
+      | otherwise = go (i + 1) bestI bestDur
+    longest = go 0 (-1) 0
 
 -- | What the next steps need about a range: the share of it spent paused,
 -- what was allocated and how live changed, the top allocator by ticky,

@@ -9,7 +9,7 @@ module Stronghead.Fuzzy
   , fuzzyRank
   ) where
 
-import Data.Char (isAlphaNum, isLower, isSpace, isUpper)
+import Data.Char (isAlphaNum, isLower, isSpace, isUpper, toLower)
 import Data.List (sortOn)
 import Data.Ord (Down (..))
 import Data.Text (Text)
@@ -18,33 +18,43 @@ import Data.Text qualified as T
 -- | 'Nothing' when the query does not match. An empty query matches
 -- everything with score 0.
 fuzzyScore :: Text -> Text -> Maybe Int
-fuzzyScore query cand
-  | T.null q = Just 0
-  | otherwise = bonus <$> walk (T.unpack q) (zip3 [0 :: Int ..] (T.unpack lc) bounds) Nothing 0
+fuzzyScore query =
+  let q = T.toLower (T.filter (not . isSpace) query)
+   in fuzzyScorePrepared q (T.unpack q)
+
+fuzzyScorePrepared :: Text -> String -> Text -> Maybe Int
+fuzzyScorePrepared q qChars cand
+  | null qChars = Just 0
+  | otherwise = bonus <$> walk qChars 0 ' ' cand Nothing 0
   where
-    q = T.toLower (T.filter (not . isSpace) query)
-    lc = T.toLower cand
-    orig = T.unpack cand
-    -- A word starts after anything that is not a letter or digit, and at
-    -- a capital following a lower-case letter (camelCase).
-    bounds = zipWith (\p c -> not (isAlphaNum p) || (isLower p && isUpper c)) (' ' : orig) orig
-    walk [] _ _ acc = Just acc
-    walk _ [] _ _ = Nothing
-    walk qs@(x : xs) ((i, c, atWord) : rest) prev acc
-      | c == x =
-          let run = if prev == Just (i - 1) then 5 else 0
-              word = if atWord then 8 else 0
-              gapCost = maybe (min 10 i) (\p -> min 3 (i - p - 1)) prev
-           in walk xs rest (Just i) (acc + 1 + run + word - gapCost)
-      | otherwise = walk qs rest prev acc
+    walk [] _ _ _ _ !acc = Just acc
+    walk (x : xs) !i !prevC rest !prev !acc = case T.uncons rest of
+      Nothing -> Nothing
+      Just (origC, more) ->
+        let c = toLower origC
+            i' = i + 1
+         in if c == x
+              then
+                let atWord = not (isAlphaNum prevC) || (isLower prevC && isUpper origC)
+                    run = if prev == Just (i - 1) then 5 else 0
+                    word = if atWord then 8 else 0
+                    gapCost = maybe (min 10 i) (\p -> min 3 (i - p - 1)) prev
+                 in walk xs i' origC more (Just i) (acc + 1 + run + word - gapCost)
+              else walk (x : xs) i' origC more prev acc
     bonus s =
-      s
-        + (if q `T.isPrefixOf` lc then 15 else 0)
-        + (if q == lc then 25 else 0)
-        - T.length cand `div` 16
+      let lc = T.toLower cand
+       in s
+            + (if q `T.isPrefixOf` lc then 15 else 0)
+            + (if q == lc then 25 else 0)
+            - T.length cand `div` 16
 
 -- | The candidates that match, best first; ties keep their order.
 fuzzyRank :: Text -> (a -> Text) -> [a] -> [(Int, a)]
-fuzzyRank query key xs =
-  map snd . sortOn fst $
-    [((Down s, i), (s, x)) | (i, x) <- zip [0 :: Int ..] xs, Just s <- [fuzzyScore query (key x)]]
+fuzzyRank query key xs
+  | T.null q = map (0,) xs
+  | otherwise =
+      map snd . sortOn fst $
+        [((Down s, i), (s, x)) | (i, x) <- zip [0 :: Int ..] xs, Just s <- [fuzzyScorePrepared q qChars (key x)]]
+  where
+    q = T.toLower (T.filter (not . isSpace) query)
+    qChars = T.unpack q

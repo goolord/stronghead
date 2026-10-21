@@ -515,7 +515,8 @@ appView app = do
         do
           resp <- quietButton' "Sources" "What each run has, and how to add the rest"
           when (respClicked resp) (modifyVar (appSourcesOpen app) not)
-          sources <- sourcesOf app timeline0 heap0 core live0 links
+          sourcesOpen <- readVar (appSourcesOpen app)
+          sources <- if sourcesOpen then sourcesOf app timeline0 heap0 core live0 links else pure []
           sourcesPopover env (appSourcesOpen app) (respRect resp) sources (linkRuns app) (unlinkRun app)
         do
           resp <- quietButton' "Workspace" "Add a pane to this panel, use another arrangement, save or open the session"
@@ -646,13 +647,13 @@ useArrangement app p tree = do
 -- or use another arrangement: a panel's own, or a preset across panels.
 panesPopover :: App -> Panel -> Rect -> NanoUI ()
 panesPopover app active anchor = do
-  wb <- activeBench app active
-  tree <- readVar (wbTree wb)
-  out <- map poKind <$> readVar (appPopped app)
-  presets <- readVar (appPresets app)
   let close = writeVar (appPanesOpen app) False
       groups = [(maybe "Investigation" panelTitle p, [k | k <- paneKinds, pkPanel k == p]) | p <- Nothing : map Just [minBound .. maxBound]]
-  void . popupWith (appPanesOpen app) (defaultPopupConfig (AnchorRect anchor)) (fixedW 560 . maxH 680) $
+  void . popupWith (appPanesOpen app) (defaultPopupConfig (AnchorRect anchor)) (fixedW 560 . maxH 680) $ do
+    wb <- activeBench app active
+    tree <- readVar (wbTree wb)
+    out <- map poKind <$> readVar (appPopped app)
+    presets <- readVar (appPresets app)
     void . scrollArea fillW $
       columnWith (fillW . padAll 12 . tight . gap 6) $ do
         labelWith (fontMedium . fontSizeScale 1.05) ("Panes in " <> panelTitle active)
@@ -1191,16 +1192,17 @@ settingsShortcuts app = do
   when reset (writeVar (appScale app) ScaleAuto)
 
 settingsModal :: App -> NanoUI ()
-settingsModal app = do
-  zoom <- currentZoom
-  scale <- readVar (appScale app)
-  let auto = if scale == ScaleAuto then Just zoom else Nothing
-      chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
-      headOr = \case k : _ -> k; [] -> mempty
-      input f v = textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . f) defaultLayout} v
-      inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
-      core = appCore app
-  modalWith (fixedW 620) (appSettingsOpen app) "Settings" $
+settingsModal app =
+  modalWith (fixedW 620) (appSettingsOpen app) "Settings" $ do
+    zoom <- currentZoom
+    scale <- readVar (appScale app)
+    let auto = if scale == ScaleAuto then Just zoom else Nothing
+        chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
+        headOr = \case k : _ -> k; [] -> mempty
+        input f v = textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . f) defaultLayout} v
+        inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
+        core = appCore app
+        lastPath = takeDirectory (appSettingsPath app) </> ("last" <> sessionExtension)
     columnWith (fillW . tight . gap 8) $ do
       sectionTitle "Appearance"
       settingRow "Theme" $
@@ -1216,7 +1218,6 @@ settingsModal app = do
           (zoomVar (maybe 0 ((+ 1) . fromEnum)) (\i _ -> if i <= 0 then Nothing else Just (toEnum (i - 1))) (appStartPanel app))
       settingRow "" $ checkboxWith alignMid "Reopen the window where it was, at the size it was" (appRestoreWindow app)
       settingRow "" $ checkboxWith alignMid "Reopen the last session on start" (appReopenLast app)
-      lastPath <- liftIO lastSessionPath
       settingNote ("The session is saved on quit to " <> T.pack lastPath <> ". Files on the command line open instead.")
       sectionTitle "Live"
       settingRow "Agent address" $ do

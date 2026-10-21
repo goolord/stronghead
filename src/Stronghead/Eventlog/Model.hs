@@ -24,8 +24,10 @@ module Stronghead.Eventlog.Model
   , trackSpan
   , SpanRec (..)
   , timeIn
+  , cumAtIndex
   , spanIndexAt
   , countStartingBy
+  , countStartingByFrom
   , pickSpan
   , lowerBoundBy
   , firstSpanEndingAfter
@@ -228,23 +230,38 @@ trackSpan t i =
 -- | The number of spans starting at or before @t@ (so the index of the last
 -- such span plus one).
 countStartingBy :: Track -> Word64 -> Int
-countStartingBy tr t = partitionPoint (\i -> trStart tr VU.! i > t) 0 (trackLength tr)
+countStartingBy tr = countStartingByFrom tr 0
+
+-- | 'countStartingBy' starting the search at @lo@ (when @t@ is non-decreasing
+-- across queries).
+countStartingByFrom :: Track -> Int -> Word64 -> Int
+countStartingByFrom tr lo0 t
+  | lo >= len = len
+  | starts VU.! lo > t = lo
+  | lo + 1 < len && starts VU.! (lo + 1) > t = lo + 1
+  | otherwise = partitionPoint (\i -> starts VU.! i > t) lo len
+  where
+    starts = trStart tr
+    len = VU.length starts
+    lo = max 0 lo0
+
+-- | Total time of kind @k@ within @[0, t]@, given @i = countStartingBy tr t - 1@.
+cumAtIndex :: Track -> Int -> Word64 -> Int -> Double
+cumAtIndex tr i t k
+  | i < 0 = 0
+  | otherwise =
+      let cum = trCum tr V.! k
+          before = if i == 0 then 0 else cum VU.! (i - 1)
+          s = trStart tr VU.! i
+          e = trEnd tr VU.! i
+          partial
+            | fromIntegral (trKind tr VU.! i) /= k = 0
+            | otherwise = fromIntegral (min t e - s)
+       in before + partial
 
 -- | Total time of kind @k@ within @[0, t]@.
 cumAt :: Track -> Int -> Word64 -> Double
-cumAt tr k t =
-  let i = countStartingBy tr t - 1
-      cum = trCum tr V.! k
-   in if i < 0
-        then 0
-        else
-          let before = if i == 0 then 0 else cum VU.! (i - 1)
-              s = trStart tr VU.! i
-              e = trEnd tr VU.! i
-              partial
-                | fromIntegral (trKind tr VU.! i) /= k = 0
-                | otherwise = fromIntegral (min t e - s)
-           in before + partial
+cumAt tr k t = cumAtIndex tr (countStartingBy tr t - 1) t k
 
 -- | Time spent in kind @k@ within @[a, b]@, in nanoseconds.
 timeIn :: Track -> Int -> Word64 -> Word64 -> Double
@@ -424,9 +441,9 @@ summarize tl =
   Summary
     { smDuration = fromIntegral span' / 1e9
     , smGCCount = V.length (tlGCs tl)
-    , smMajorGCs = V.length (V.filter ((>= 1) . gcGen) (tlGCs tl))
-    , smGCPauseTotal = sum pauses
-    , smGCPauseMax = foldl' max 0 pauses
+    , smMajorGCs = majorGCs
+    , smGCPauseTotal = pauseTotal
+    , smGCPauseMax = pauseMax
     , smMutatorFrac = frac kindRun
     , smGCFrac = frac kindGC
     , smAllocated = maybe 0 (snd . snd) (VU.unsnoc (tlAlloc tl))
@@ -436,11 +453,19 @@ summarize tl =
     }
   where
     span' = tlEnd tl - tlStart tl
-    pauses = [fromIntegral (gcEnd g - gcStart g) | g <- V.toList (tlGCs tl)] :: [Double]
+    (!majorGCs, !pauseTotal, !pauseMax) =
+      V.foldl'
+        ( \(!maj, !tot, !mx) g ->
+            let p = fromIntegral (gcEnd g - gcStart g) :: Double
+                maj' = if gcGen g >= 1 then maj + 1 else maj
+             in (maj', tot + p, max mx p)
+        )
+        (0 :: Int, 0 :: Double, 0 :: Double)
+        (tlGCs tl)
     capTime = fromIntegral span' * fromIntegral (max 1 (V.length (tlCaps tl))) :: Double
     frac k
       | capTime <= 0 = 0
-      | otherwise = sum [timeIn c (fromIntegral k) (tlStart tl) (tlEnd tl) | c <- V.toList (tlCaps tl)] / capTime
+      | otherwise = V.foldl' (\acc c -> acc + timeIn c (fromIntegral k) (tlStart tl) (tlEnd tl)) 0 (tlCaps tl) / capTime
 
 -- ---------------------------------------------------------------------------
 -- Joins
@@ -451,11 +476,16 @@ summarize tl =
 wokenBy :: ThreadInfo -> SpanRec -> Maybe (Word64, Word32)
 wokenBy ti s
   | srKind s /= kindBlocked = Nothing
-  | otherwise = VU.find (\(t, _) -> t >= srStart s && t <= srEnd s) (tiWakeups ti)
+  | otherwise =
+      let ws = tiWakeups ti
+          i = lowerBoundBy fst ws (srStart s)
+       in case ws VU.!? i of
+            Just w@(t, _) | t <= srEnd s -> Just w
+            _ -> Nothing
 
 -- | When each of the log's heap censuses was taken, in program time.
 censusTimes :: Timeline -> VU.Vector Word64
-censusTimes tl = maybe VU.empty (VU.map (\s -> round (s * 1e9)) . hpTimes) (tlHeapProfile tl)
+censusTimes tl = maybe VU.empty hpCensusNs (tlHeapProfile tl)
 
 -- | The census that shows the heap after a collection: the first one taken
 -- after it began and before the next began. The RTS takes a census during a
@@ -595,12 +625,27 @@ data CodeProfile = CodeProfile
 -- keeps.
 codeProfile :: Timeline -> (ProfSample -> Bool) -> Word64 -> Word64 -> CodeProfile
 codeProfile tl keep a b =
-  CodeProfile (length ss) (length (filter idle ss)) (sortOn (Down . snd) (IM.toList counts))
+  CodeProfile totalSamples idleSamples (sortOn (Down . snd) (IM.toList counts))
   where
     everything = tlProfSamples tl
-    ss = filter keep (takeWhile ((<= b) . psTime) (V.toList (V.drop (lowerBoundBy psTime everything a) everything)))
-    idle s = maybe False isIdleCostCentre (psTop s >>= (`IM.lookup` tlCostCentres tl))
-    counts = IM.fromListWith (+) [(i, 1 :: Int) | s <- ss, not (idle s), Just i <- [psTop s]]
+    i0 = lowerBoundBy psTime everything a
+    i1 = if b == maxBound then V.length everything else lowerBoundBy psTime everything (b + 1)
+    inWindow = V.slice i0 (max 0 (i1 - i0)) everything
+    ccs = tlCostCentres tl
+    isIdle i = maybe False isIdleCostCentre (IM.lookup i ccs)
+    (!totalSamples, !idleSamples, !counts) =
+      V.foldl'
+        ( \(!tot, !idl, !m) s ->
+            if not (keep s)
+              then (tot, idl, m)
+              else case psTop s of
+                Nothing -> (tot + 1, idl, m)
+                Just i
+                  | isIdle i -> (tot + 1, idl + 1, m)
+                  | otherwise -> (tot + 1, idl, IM.insertWith (+) i 1 m)
+        )
+        (0 :: Int, 0 :: Int, IM.empty)
+        inWindow
 
 -- | What ran during a slice: the samples on its capability (when it is a
 -- capability's slice) taken while its thread (when it has one) was

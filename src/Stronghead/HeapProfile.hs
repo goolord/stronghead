@@ -11,6 +11,8 @@ module Stronghead.HeapProfile
   , fromSamples
   , hpOffset
   , hpOffsets
+  , lookupBand
+  , hasBand
   , parseHp
   , loadHp
   , classifyBand
@@ -27,6 +29,7 @@ module Stronghead.HeapProfile
 
 import Control.Applicative ((<|>))
 import Data.Containers.ListUtils (nubOrd)
+import Data.IntMap.Strict qualified as IM
 import Data.List (sortOn, unsnoc)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -35,6 +38,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+import Data.Word (Word64)
 
 import Stronghead.Format (readDecimal, readDouble)
 import Stronghead.Run (RunInfo, emptyRunInfo, runFromHp)
@@ -103,15 +107,25 @@ data HeapProfile = HeapProfile
   , hpTotals :: !(VU.Vector Double)
   , hpRun :: !RunInfo
     -- ^ From a @.hp@ file's @JOB@ and @DATE@, or the eventlog's run.
+  , hpOffsetsVec :: !(VU.Vector Double)
+  , hpCensusNs :: !(VU.Vector Word64)
+  , hpBandByName :: !(M.Map Text Int)
+  , hpSuspects :: ~[Suspect]
   }
   deriving stock (Eq, Show)
 
 -- | Sample @i@'s time from the start of the run, as displays show it.
 hpOffset :: HeapProfile -> Int -> Double
-hpOffset hp i = hpTimes hp VU.! i - hpStart hp
+hpOffset hp i = hpOffsetsVec hp VU.! i
 
 hpOffsets :: HeapProfile -> VU.Vector Double
-hpOffsets hp = VU.map (subtract (hpStart hp)) (hpTimes hp)
+hpOffsets = hpOffsetsVec
+
+lookupBand :: Text -> HeapProfile -> Maybe Band
+lookupBand name hp = (hpBands hp V.!) <$> M.lookup name (hpBandByName hp)
+
+hasBand :: Text -> HeapProfile -> Bool
+hasBand name hp = M.member name (hpBandByName hp)
 
 -- | Build a profile from samples of @(time, [(band, bytes)])@, with times
 -- counted from @start@ in displays. Bands missing from a sample are zero
@@ -124,25 +138,32 @@ fromSamples
   -> (Text -> Maybe InfoProv)
   -> [(Double, [(Text, Double)])]
   -> HeapProfile
-fromSamples job breakdown start prov samples0 =
-  HeapProfile
-    { hpJob = job
-    , hpBreakdown = breakdown
-    , hpTimes = VU.fromList (map fst samples)
-    , hpStart = start
-    , hpBands = V.fromList (sortOn (Down . bandPeak) bands)
-    , hpTotals = VU.fromList [sum (map snd s) | (_, s) <- samples]
-    , hpRun = emptyRunInfo
-    }
+fromSamples job breakdown start prov samples0 = hp
   where
+    hp =
+      HeapProfile
+        { hpJob = job
+        , hpBreakdown = breakdown
+        , hpTimes = times
+        , hpStart = start
+        , hpBands = bandsVec
+        , hpTotals = totals
+        , hpRun = emptyRunInfo
+        , hpOffsetsVec = VU.map (subtract start) times
+        , hpCensusNs = VU.map (\s -> round (s * 1e9)) times
+        , hpBandByName = M.fromList [(bandName b, i) | (i, b) <- zip [0 ..] sortedBands]
+        , hpSuspects = computeLeakSuspects times totals bandsVec
+        }
     samples = sortOn fst samples0
     n = length samples
+    times = VU.fromListN n (map fst samples)
+    totals = VU.fromListN n [sum (map snd s) | (_, s) <- samples]
     names = nubOrd [b | (_, s) <- samples, (b, _) <- s]
-    columns :: M.Map Text (M.Map Int Double)
+    columns :: M.Map Text (IM.IntMap Double)
     columns =
       M.fromListWith
-        (M.unionWith (+))
-        [(b, M.singleton i v) | (i, (_, s)) <- zip [0 ..] samples, (b, v) <- s]
+        (IM.unionWith (+))
+        [(b, IM.singleton i v) | (i, (_, s)) <- zip [0 ..] samples, (b, v) <- s]
     bands =
       [ Band
           { bandName = T.copy name -- not a slice that keeps the whole file
@@ -153,10 +174,12 @@ fromSamples job breakdown start prov samples0 =
           , bandDetail = infoProvDetail <$> p
           }
       | name <- names
-      , let col = M.findWithDefault M.empty name columns
-            vals = VU.generate n (\i -> M.findWithDefault 0 i col)
+      , let col = M.findWithDefault IM.empty name columns
+            vals = VU.generate n (\i -> IM.findWithDefault 0 i col)
             p = prov name
       ]
+    sortedBands = sortOn (Down . bandPeak) bands
+    bandsVec = V.fromList sortedBands
 
 -- | Guess a band's kind from its name. Exact for closure-type (@-hT@)
 -- breakdowns; a heuristic otherwise.
@@ -288,9 +311,11 @@ data Suspect = Suspect
 -- profiling the heap as the program exits rather than anything the program
 -- did.
 analysedSamples :: HeapProfile -> Int
-analysedSamples hp =
-  let tot = hpTotals hp
-      n = VU.length tot
+analysedSamples = analysedSamplesOf . hpTotals
+
+analysedSamplesOf :: VU.Vector Double -> Int
+analysedSamplesOf tot =
+  let n = VU.length tot
       peak = if n == 0 then 0 else VU.maximum tot
    in case VU.unsnoc tot of
         Just (_, lastTot) | n >= 3 && lastTot < 0.05 * peak -> n - 1
@@ -301,25 +326,46 @@ analysedSamples hp =
 -- it started. Thunk bands get a boost: a thunk that keeps surviving
 -- censuses is never being forced.
 leakSuspects :: HeapProfile -> [Suspect]
-leakSuspects hp =
-  sortOn (Down . susScore) (mapMaybe judge (zip [0 ..] (V.toList (hpBands hp))))
+leakSuspects = hpSuspects
+
+computeLeakSuspects :: VU.Vector Double -> VU.Vector Double -> V.Vector Band -> [Suspect]
+computeLeakSuspects times totals bands =
+  sortOn (Down . susScore) (mapMaybe judge (zip [0 ..] (V.toList bands)))
   where
-    n = analysedSamples hp
-    ts = VU.take n (hpTimes hp)
+    n = analysedSamplesOf totals
+    ts = VU.take n times
+    nt = fromIntegral (VU.length ts) :: Double
+    mx = if nt > 0 then VU.sum ts / nt else 0
+    den = VU.foldl' (\acc x -> acc + (x - mx) ^ (2 :: Int)) 0 ts
+    maxTotal = if VU.null totals then 0 else VU.maximum totals
     judge (i, b)
       | VU.length vs < 3 = Nothing
-      | growth < 1.5 || slope <= 0 || mono < 0.6 = Nothing
       | bandPeak b < 0.01 * maxTotal = Nothing
+      | growth < 1.5 || mono < 0.6 || slope <= 0 = Nothing
       | otherwise = Just (Suspect i score growth mono slope trailing)
       where
         vs = VU.take n (bandValues b)
+        len = VU.length vs
         firstV = maybe 0 fst (VU.uncons (VU.dropWhile (<= 0) vs))
         lastV = maybe 0 snd (VU.unsnoc vs)
         growth = if firstV <= 0 then 0 else lastV / firstV
-        steps = VU.zipWith (-) (VU.drop 1 vs) vs
-        mono = fromIntegral (VU.length (VU.filter (>= 0) steps)) / fromIntegral (max 1 (VU.length steps))
-        slope = regressionSlope ts vs
-        trailing = VU.length (VU.takeWhile (>= 0) (VU.reverse steps))
+        -- Count non-shrinking steps and trailing non-shrinking streak in one pass.
+        (!nonShrink, !trailing, _) =
+          VU.foldl'
+            ( \(!ns, !tr, !prev) v ->
+                if v >= prev
+                  then (ns + 1, tr + 1, v)
+                  else (ns, 0, v)
+            )
+            (0 :: Int, 0 :: Int, vs VU.! 0)
+            (VU.drop 1 vs)
+        mono = fromIntegral nonShrink / fromIntegral (max 1 (len - 1))
+        slope
+          | len < 2 || den == 0 = 0
+          | otherwise =
+              let my = VU.sum vs / fromIntegral len
+                  num = VU.ifoldl' (\acc j y -> acc + (ts VU.! j - mx) * (y - my)) 0 vs
+               in num / den
         thunkBoost = if bandKind b == KindThunk then 0.15 else 0
         score =
           min 1 $
@@ -327,18 +373,6 @@ leakSuspects hp =
               + 0.25 * min 1 (logBase 10 growth / 2)
               + 0.15 * min 1 (bandPeak b / max 1 maxTotal)
               + thunkBoost
-    maxTotal = if VU.null (hpTotals hp) then 0 else VU.maximum (hpTotals hp)
-
-regressionSlope :: VU.Vector Double -> VU.Vector Double -> Double
-regressionSlope xs ys
-  | n < 2 || den == 0 = 0
-  | otherwise = num / den
-  where
-    n = fromIntegral (min (VU.length xs) (VU.length ys)) :: Double
-    mx = VU.sum xs / n
-    my = VU.sum ys / n
-    num = VU.sum (VU.zipWith (\x y -> (x - mx) * (y - my)) xs ys)
-    den = VU.sum (VU.map (\x -> (x - mx) ^ (2 :: Int)) xs)
 
 -- | A tree of who holds the heap: cost-centre stacks (@-hc@) are split at
 -- @/@ and rooted at their outermost frame, so a path reads from the

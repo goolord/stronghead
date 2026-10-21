@@ -175,7 +175,7 @@ lineOwners ranges = snd (foldl' step (IS.empty, IM.empty) groups)
     step (claimed, acc) grp =
       let own = [(l, [v]) | (a, b, v) <- grp, l <- [a .. b], not (IS.member l claimed)]
        in ( IS.union claimed (IS.fromList (map fst own))
-          , IM.unionWith (++) acc (IM.fromListWith (flip (++)) own)
+          , IM.unionWith (++) acc (IM.fromListWith (++) (reverse own))
           )
 
 -- ---------------------------------------------------------------------------
@@ -470,21 +470,24 @@ data SourceGroup = SourceGroup
 -- @-finfo-table-map@), given the surviving thunks. Biggest first.
 closuresBySource :: HeapSnapshot -> Map ClosureId Int -> [SourceGroup]
 closuresBySource snap marked =
-  sortOn (Down . sgBytes) . M.elems $
+  sortOn (Down . sgBytes) . map fst . M.elems $
     M.fromListWith merge
-      [ (sp, SourceGroup sp 1 (fromEnum thunk) (cnSize n) (fromEnum (M.member (cnId n) marked)) (cnId n))
+      [ (sp, (SourceGroup sp 1 (fromEnum thunk) sz (fromEnum (M.member (cnId n) marked)) (cnId n), sz))
       | n <- M.elems (snapNodes snap)
       , Just sp <- [cnSource n >>= srcLocSpan . parseSrcLoc]
       , let thunk = cnKind n == NThunk
+            sz = cnSize n
       ]
   where
-    sizeOf i = maybe 0 cnSize (M.lookup i (snapNodes snap))
-    merge a b =
-      SourceGroup
-        { sgSpan = sgSpan a
-        , sgClosures = sgClosures a + sgClosures b
-        , sgThunks = sgThunks a + sgThunks b
-        , sgBytes = sgBytes a + sgBytes b
-        , sgSurvivors = sgSurvivors a + sgSurvivors b
-        , sgSample = if sizeOf (sgSample a) >= sizeOf (sgSample b) then sgSample a else sgSample b
-        }
+    merge (a, sa) (b, sb) =
+      let (sample, sMax) = if sa >= sb then (sgSample a, sa) else (sgSample b, sb)
+       in ( SourceGroup
+              { sgSpan = sgSpan a
+              , sgClosures = sgClosures a + sgClosures b
+              , sgThunks = sgThunks a + sgThunks b
+              , sgBytes = sgBytes a + sgBytes b
+              , sgSurvivors = sgSurvivors a + sgSurvivors b
+              , sgSample = sample
+              }
+          , sMax
+          )

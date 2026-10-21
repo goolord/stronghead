@@ -46,6 +46,8 @@ module UI.Common
   , emptyState
   , paneScroll
   , paneScrollArea
+  , paneVirtualRows
+  , canvasKeyed
   , codeBlock
     -- * Widgets
   , cell
@@ -217,28 +219,29 @@ palette th =
         , pHeap = alpha 0.30 (inkMuted i)
         }
 
+categoricalColors :: V.Vector Color
+categoricalColors =
+  V.fromList
+    [ colorRGB 66 133 244
+    , colorRGB 234 67 53
+    , colorRGB 251 188 4
+    , colorRGB 52 168 83
+    , colorRGB 171 71 188
+    , colorRGB 0 172 193
+    , colorRGB 255 112 67
+    , colorRGB 158 157 36
+    , colorRGB 92 107 192
+    , colorRGB 240 98 146
+    , colorRGB 0 137 123
+    , colorRGB 121 85 72
+    ]
+
 -- | A stable categorical colour for a band: by rank for the first twelve,
 -- by name hash after that.
 bandColor :: Int -> Text -> Color
 bandColor i name
-  | i >= 0 && i < V.length cats = cats V.! i
-  | otherwise = cats V.! (T.foldl' (\h c -> (h * 31) `xor` ord c) 7 name `mod` V.length cats)
-  where
-    cats =
-      V.fromList
-        [ colorRGB 66 133 244
-        , colorRGB 234 67 53
-        , colorRGB 251 188 4
-        , colorRGB 52 168 83
-        , colorRGB 171 71 188
-        , colorRGB 0 172 193
-        , colorRGB 255 112 67
-        , colorRGB 158 157 36
-        , colorRGB 92 107 192
-        , colorRGB 240 98 146
-        , colorRGB 0 137 123
-        , colorRGB 121 85 72
-        ]
+  | i >= 0 && i < V.length categoricalColors = categoricalColors V.! i
+  | otherwise = categoricalColors V.! (T.foldl' (\h c -> (h * 31) `xor` ord c) 7 name `mod` V.length categoricalColors)
 
 -- | 'withAlpha' with the opacity first, for composing.
 alpha :: Float -> Color -> Color
@@ -611,12 +614,23 @@ drawLineChart pal font r@(Rect x y w h) (x0, x1) fmtY series = do
   where
     one px py s = case csPoints s of
       pts@(_ : _ : _) -> do
-        let ps = [V2 (px t) (py v) | (t, v) <- pts]
+        let raw = [V2 (px t) (py v) | (t, v) <- pts]
+            ps = if null (drop (max 2 (floor w :: Int)) raw) then raw else thinPoints raw
         when (csFill s) $
           for_ ((,) <$> (case ps of p : _ -> Just p; [] -> Nothing) <*> (snd <$> unsnoc ps)) \(V2 fx _, V2 lx _) ->
             drawPath (P.polygon (V2 fx (y + h - 4) : ps ++ [V2 lx (y + h - 4)])) (alpha 0.22 (csColor s))
         drawStrokePathWith (P.stroke 1.5) {P.strokeJoin = P.RoundJoin} (P.polyline ps) (P.Solid (csColor s))
       _ -> pure ()
+    thinPoints [] = []
+    thinPoints [p] = [p]
+    thinPoints (firstP : rest) = firstP : go (floor (v2X firstP) :: Int) firstP firstP rest
+      where
+        go _ !best !lastP [] = [best | best /= firstP] ++ [lastP | lastP /= best && lastP /= firstP]
+        go !col !best _ (p@(V2 px' py') : more) =
+          let c = floor px' :: Int
+           in if c == col
+                then go col (if py' < v2Y best then p else best) p more
+                else (if best == firstP then id else (best :)) (go c p p more)
 
 -- | A compact "key value" pair for wrapping rows ('kv' spreads its value to
 -- the far edge, which only suits columns).
@@ -634,7 +648,11 @@ factMono k v = rowWith (tight . gap 5 . alignBaseline) $ do
 vrule :: Float -> NanoUI ()
 vrule h = do
   th <- uiTheme
-  void (canvas (fixedWH 1 h . alignMid) (\r -> drawRect r (inkRule (ink th))))
+  box (fixedWH 1 h . alignMid) (inkRule (ink th))
+
+-- | 'canvas' with a content key, so unchanged frames skip rebuilding its ops.
+canvasKeyed :: Int -> (Layout -> Layout) -> (Rect -> CanvasM ()) -> NanoUI Response
+canvasKeyed k f = canvasConfigured defaultCanvasConfig {canvasLayout = f defaultLayout, canvasContent = k}
 
 -- | A scroll area inside a pane, drawn on the pane's surface. nano-ui gives
 -- a scroller a sunken well (or, filling both ways, the window colour);
@@ -653,3 +671,41 @@ paneScrollArea f body = do
   columnWith (f . tight . fillW . fillH) $
     styled (inputStyle (background colorTransparent . borderWidth 0)) $
       scrollArea (pinAt 0 0 . percent 100 . fillH . tight) (themed th body)
+
+-- | A vertically scrolled list of uniform-height rows inside a pane that
+-- virtualizes when there are many items, building only the rows near the
+-- viewport.
+paneVirtualRows :: (Layout -> Layout) -> (Layout -> Layout) -> [a] -> (a -> NanoUI ()) -> NanoUI ()
+paneVirtualRows scrollLayout colLayout items drawItem
+  | n <= 80 =
+      paneScroll scrollLayout $
+        columnWith (colLayout . tight . fillW . gap 0) $
+          mapM_ drawItem items
+  | otherwise = do
+      th <- uiTheme
+      base <- uiFontSize
+      fm <- resolveFontUi base WeightNormal FontStyleNormal FontRegular
+      let !rowH = max 18 (fmLineHeight fm + 4)
+          !vec = V.fromListN n items
+      columnWith (scrollLayout . tight . fillW . fillH) $
+        styled (inputStyle (background colorTransparent . borderWidth 0)) $ do
+          sid <- currentId
+          metrics <- getScrollMetricsUi sid
+          let (!firstRow, !lastRow) = case metrics of
+                Nothing -> (0, min (n - 1) 59)
+                Just m ->
+                  let top = v2Y (scrollOffset m)
+                      vh = max 200 (rectH (scrollViewport m))
+                   in ( max 0 (floor (top / rowH) - 10)
+                      , min (n - 1) (ceiling ((top + vh) / rowH) + 10)
+                      )
+          void . scrollArea (pinAt 0 0 . percent 100 . fillH . tight) . themed th $
+            columnWith (colLayout . tight . fillW . gap 0) $ do
+              when (firstRow > 0) $
+                spacer Fit (Fixed (fromIntegral firstRow * rowH))
+              forM_ [firstRow .. lastRow] $ \i ->
+                drawItem (vec V.! i)
+              when (lastRow < n - 1) $
+                spacer Fit (Fixed (fromIntegral (n - 1 - lastRow) * rowH))
+  where
+    n = length items

@@ -73,7 +73,7 @@ setRange bus rk a b = do
 data Marks = Marks
   { tmCursor :: !(Maybe Word64)
   , tmRange :: !(Maybe (Word64, Word64))
-  , tmMarkers :: ![Word64]
+  , tmMarkers :: ~[Word64]
   , tmMoments :: ![Moment]
   }
 

@@ -87,6 +87,7 @@ data LiveState = LiveState
   , lvPause :: !(Var PauseState)
   , lvResume :: !(IORef (Maybe (IO ())))
     -- ^ Resumes the program a ghc-debug pause holds.
+  , lvCachedFrames :: !(IORef (Maybe ((Int, Maybe Double, Maybe Double), [Rates], [(Word64, Word64)], M.Map Int [Maybe Text], Double)))
   }
 
 -- | A command on its way: what it is called, and how it lands on the
@@ -144,6 +145,7 @@ newLiveState = do
   lvSecond <- newVar Nothing
   lvPause <- newVar Running
   lvResume <- newIORef Nothing
+  lvCachedFrames <- newIORef Nothing
   pure LiveState {..}
 
 keepFrames :: Int
@@ -351,9 +353,10 @@ dashboard :: Env -> Bench -> LiveState -> LiveData -> Maybe Timeline -> NanoUI (
 dashboard env bench st d logTl = do
   th <- uiTheme
   let frames = ldFrames d
-      rs = rates frames
       lastF = Seq.index frames (Seq.length frames - 1)
-      latest = snd <$> unsnoc rs
+      latest = case frames of
+        _ :|> a :|> b -> listToMaybe (rates (Seq.fromList [a, b]))
+        _ -> Nothing
       statsOn = stat "rts_stats" lastF > 0
   scope $ when (not statsOn) $
     columnWith (padBottom 8 . padXY 8 0 . tight . fillW) $
@@ -377,6 +380,21 @@ dashboard env bench st d logTl = do
            ]
   bnDraw bench (lvPanes st) (livePanes env st (Just d) logTl)
 
+cachedLiveFrames :: LiveState -> Seq Frame -> IO ([Rates], [(Word64, Word64)], M.Map Int [Maybe Text], Double)
+cachedLiveFrames st frames = do
+  let n = Seq.length frames
+      key = (n, frTime <$> Seq.lookup 0 frames, frTime <$> Seq.lookup (n - 1) frames)
+  cached <- readIORef (lvCachedFrames st)
+  case cached of
+    Just (k, rs, holes, hist, sp) | k == key -> pure (rs, holes, hist, sp)
+    _ -> do
+      let rs = rates frames
+          holes = frameGaps (toList frames)
+          hist = statusHistory frames
+          sp = historySpan frames
+      writeIORef (lvCachedFrames st) (Just (key, rs, holes, hist, sp))
+      pure (rs, holes, hist, sp)
+
 -- | Live's panes, for whichever workbench holds them: the runtime charts
 -- and the thread list. The charts show the last five minutes, or, placed
 -- with the Timeline's time panes and on the program clock, the Timeline's
@@ -388,11 +406,11 @@ livePanes env st mdata logTl site = case mdata of
     window <- readVar (busWindow (envBus env))
     let pal = palette th
         frames = ldFrames d
-        rs = rates frames
         lastF = Seq.index frames (Seq.length frames - 1)
-        series f = [(rTime r, f r) | r <- rs]
-        recent = case (rs, reverse rs) of
-          (r0 : _, rN : _) -> (rTime r0, max (rTime r0 + 1e-3) (rTime rN))
+    (rs, holes, history, span'') <- liftIO (cachedLiveFrames st frames)
+    let series f = [(rTime r, f r) | r <- rs]
+        recent = case (rs, unsnoc rs) of
+          (r0 : _, Just (_, rN)) -> (rTime r0, max (rTime r0 + 1e-3) (rTime rN))
           _ -> (0, 1)
         -- Without +RTS -T a frame's time is when it arrived, which links to
         -- nothing.
@@ -403,7 +421,6 @@ livePanes env st mdata logTl site = case mdata of
           Just (r, w) | placed, onClock, runKeysMatch r rk -> Just (tvStart w / 1e9, max (tvStart w / 1e9 + 1e-3) (tvEnd w / 1e9))
           _ -> Nothing
         span' = fromMaybe recent shared
-        holes = frameGaps (toList frames)
     mm <- monoMetrics 0.8
     marks <- if onClock then marksFor env rk logTl else pure (Marks Nothing Nothing [] [])
     let axisOf r = Axis rk (\ns -> chartTimeX r span' (ns / 1e9)) (\x -> chartXTime r span' x * 1e9)
@@ -454,21 +471,20 @@ livePanes env st mdata logTl site = case mdata of
               filt <- T.toLower <$> readVar (lvThreadFilter st)
               focus <- readVar (lvFocus st)
               let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
-                  history = statusHistory frames
-                  span'' = historySpan frames
+                  palKey = colorToWord32 (pText pal)
               rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
                 colHeader (fixedW 56 . alignEnd) "id"
                 colHeader fillW "label"
                 colHeader (fixedW 36 . alignEnd) "cap"
                 colHeader (fixedW historyW) ("last " <> fmtSec span'')
                 colHeader (fixedW 220) "status"
-              paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
-                forM_ threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
-                  numCell 56 fontMuted (tshow (ltId t))
-                  cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
-                  numCell 36 fontMuted (maybe "" tshow (ltCap t))
-                  _ <- canvas (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r (M.findWithDefault [] (ltId t) history))
-                  cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
+              paneVirtualRows (grow . tight) id threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
+                let hist = M.findWithDefault [] (ltId t) history
+                numCell 56 fontMuted (tshow (ltId t))
+                cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
+                numCell 36 fontMuted (maybe "" tshow (ltCap t))
+                _ <- canvasKeyed (contentKeyOf [keyPart palKey, keyPart hist]) (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r hist)
+                cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
         | otherwise -> Nothing
   _ -> pure $ \pid ctx ->
     if pid `elem` [paneLiveCharts, paneLiveThreads]
@@ -492,6 +508,12 @@ statusHistory frames =
       ids = M.keys (M.unions perFrame)
    in M.fromList [(i, [M.lookup i m | m <- perFrame]) | i <- ids]
 
+-- | One thread's status group across the last frames, oldest first.
+threadStatusHistory :: Int -> Seq Frame -> [Maybe Text]
+threadStatusHistory tid frames =
+  let recent = toList (Seq.drop (Seq.length frames - historyFrames) frames)
+   in [listToMaybe [statusGroup (ltStatus t) | t <- frThreads f, ltId t == tid] | f <- recent]
+
 historySpan :: Seq Frame -> Double
 historySpan frames =
   let recent = Seq.drop (Seq.length frames - historyFrames) frames
@@ -501,15 +523,22 @@ historySpan frames =
 
 -- | A strip of the thread's status in each frame, in the Timeline's
 -- colours: running, blocked on an MVar, STM or a black hole, and anything
--- else muted.
+-- else muted. Consecutive frames with the same status group are merged
+-- into one rectangle.
 drawHistory :: Palette -> Rect -> [Maybe Text] -> CanvasM ()
 drawHistory pal r@(Rect x y w h) hist = do
   drawRect r (pTrackBg pal)
   let n = max 1 (length hist)
       cw = w / fromIntegral (max n historyFrames)
       x0 = x + w - fromIntegral n * cw
-  forM_ (zip [0 :: Int ..] hist) $ \(i, g) -> for_ g $ \grp ->
-    drawRect (Rect (x0 + fromIntegral i * cw) (y + 1) (max 1 cw) (h - 2)) (groupColour pal grp)
+      go _ [] = pure ()
+      go !i (Nothing : rest) = go (i + 1) rest
+      go !i (Just grp : rest) = do
+        let (same, others) = span (== Just grp) rest
+            len = 1 + length same
+        drawRect (Rect (x0 + fromIntegral i * cw) (y + 1) (max 1 (fromIntegral len * cw)) (h - 2)) (groupColour pal grp)
+        go (i + len) others
+  go 0 hist
 
 groupColour :: Palette -> Text -> Color
 groupColour pal = \case
@@ -765,7 +794,6 @@ liveLens st mdata moments remote = case mdata of
     | Just lastF <- latestFrame d ->
         let rk = liveRun d
             thread r t = if runKeysMatch r rk then listToMaybe [lt | lt <- frThreads lastF, ltId lt == fromIntegral t] else Nothing
-            history = statusHistory (ldFrames d)
             moment r t = listToMaybe [mo | mo <- moments, runKeysMatch r (moRun mo), runKeysMatch r rk, moNs mo == t]
             onClock = frProgramExact lastF
             inFrames t = case Seq.lookup 0 (ldFrames d) of
@@ -786,7 +814,7 @@ liveLens st mdata moments remote = case mdata of
                   RThread r t -> (\lt -> if T.null (ltLabel lt) then "thread " <> tshow (ltId lt) else ltLabel lt <> " (" <> tshow (ltId lt) <> ")") <$> thread r t
                   _ -> Nothing
               , lensPeek = \case
-                  RThread r t -> (\lt -> (threadPeek lt (M.findWithDefault [] (ltId lt) history) (historySpan (ldFrames d))) {peekExact = Just (runNote "thread id" r rk)}) <$> thread r t
+                  RThread r t -> (\lt -> (threadPeek lt (threadStatusHistory (ltId lt) (ldFrames d)) (historySpan (ldFrames d))) {peekExact = Just (runNote "thread id" r rk)}) <$> thread r t
                   RInstant r t -> momentPeek <$> moment r t
                   _ -> Nothing
               , lensHits =
@@ -841,5 +869,6 @@ threadPeek lt hist secs =
               then Nothing
               else Just $ do
                 th <- uiTheme
-                void (canvas (fixedWH 300 12) (\r -> drawHistory (palette th) r hist))
+                let pal = palette th
+                void (canvasKeyed (contentKeyOf [keyPart (colorToWord32 (pText pal)), keyPart hist]) (fixedWH 300 12) (\r -> drawHistory pal r hist))
         }

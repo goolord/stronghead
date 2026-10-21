@@ -249,21 +249,23 @@ timelineObservations tl since upto =
       , inside (gcEnd g)
       ]
     spans =
-      [ ObsBlockedSpan (srStart s) (srEnd s) (ThreadNow (fromIntegral (tiId ti)) (fromMaybe "" (tiLabel ti)) (Just (stopName (srStop s))))
+      [ ObsBlockedSpan (trStart tr VU.! i) end (ThreadNow (fromIntegral (tiId ti)) (fromMaybe "" (tiLabel ti)) (Just (stopName (trStop tr VU.! i))))
       | ti <- M.elems (tlThreads tl)
       , let tr = tiTrack ti
       , i <- [firstSpanEndingAfter tr since .. trackLength tr - 1]
-      , let s = trackSpan tr i
-      , srKind s == kindBlocked
-      , inside (srEnd s)
+      , trKind tr VU.! i == kindBlocked
+      , let end = trEnd tr VU.! i
+      , inside end
       ]
     censuses = case tlHeapProfile tl of
       Just hp ->
-        [ ObsCensus t [(bandName b, bandValues b VU.! i) | b <- V.toList (hpBands hp), i < VU.length (bandValues b)]
-        | i <- [0 .. VU.length (hpTimes hp) - 1]
-        , let t = round (hpTimes hp VU.! i * 1e9)
-        , inside t
-        ]
+        let cs = hpCensusNs hp
+            i0 = lowerBoundBy id cs (since + 1)
+         in [ ObsCensus t [(bandName b, bandValues b VU.! i) | b <- V.toList (hpBands hp), i < VU.length (bandValues b)]
+            | i <- [i0 .. VU.length cs - 1]
+            , let t = cs VU.! i
+            , t <= upto
+            ]
       Nothing -> []
     second = 1000000000 :: Word64
     caps = max 1 (V.length (tlCaps tl))

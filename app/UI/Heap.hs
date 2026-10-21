@@ -38,6 +38,7 @@ import Control.Monad (forM_, guard, join, unless, void, when)
 import Data.Either (fromRight)
 import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (for_)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (sortOn)
 import Data.List.Extra (dropEnd)
 import Data.Map.Strict qualified as M
@@ -174,6 +175,8 @@ data HeapState = HeapState
     -- ^ The cost centre a link opened the tree at.
   , hsCostTotals :: !(Var (Maybe (FilePath, [CostTotal])))
     -- ^ The @.prof@'s cost centres summed, once per file.
+  , hsProfIndex :: !(Var (Maybe (FilePath, [(Int, CostCentre)], M.Map Text [CostCentre])))
+  , hsLayersCache :: !(IORef (Maybe ((Text, Text, Int, Maybe Double, Set Text, Maybe Text, Int), [Layer], Double)))
   , hsPanes :: !Workbench
   , hsDbgPanes :: !Workbench
   , hsCCPanes :: !Workbench
@@ -226,6 +229,8 @@ newHeapState = do
   hsDbgFind <- newVar Nothing
   hsCCSel <- newVar Nothing
   hsCostTotals <- newVar Nothing
+  hsProfIndex <- newVar Nothing
+  hsLayersCache <- newIORef Nothing
   hsPanes <- newWorkbench "heap" (panelPreset PHeap)
   hsDbgPanes <- newWorkbench "heap-graph" heapGraphPreset
   hsCCPanes <- newWorkbench "heap-costs" heapCostsPreset
@@ -266,7 +271,17 @@ heapLoad st = do
   hlProf <- traverse (\p -> useTaskStatus (hsProfTask st) p (loadProf p)) prof
   totals <- readVar (hsCostTotals st)
   case (prof, taskOutcome hlProf) of
-    (Just p, Just (Right pf)) | fmap fst totals /= Just p -> writeVar (hsCostTotals st) (Just (p, costTotals (pfRoots pf)))
+    (Just p, Just (Right pf)) | fmap fst totals /= Just p -> do
+      writeVar (hsCostTotals st) (Just (p, costTotals (pfRoots pf)))
+      let flat = flattenCC (pfRoots pf)
+          byName =
+            M.fromListWith
+              (flip (++))
+              [ (k, [c])
+              | (_, c) <- flat
+              , k <- [ccName c, ccModule c <> "." <> ccName c]
+              ]
+      writeVar (hsProfIndex st) (Just (p, flat, byName))
     _ -> pure ()
   hlSnap <- traverse (\r@(_, target, opts) -> useTaskStatus (hsDbgTask st) r (takeSnapshot opts target)) req
   case (req, hlSnap) of
@@ -546,8 +561,17 @@ profilePanes env st loaded logTl hp site = do
   tracking <- readVar (hsTracking st)
   tab <- readVar (hsTab st)
   mm <- monoMetrics 0.85
-  let ls = stackLayers hp hidden solo topN
-      times = hpOffsets hp
+  let layerKey = (hpJob hp, hpBreakdown hp, VU.length (hpTimes hp), snd <$> VU.unsnoc (hpTotals hp), hidden, solo, topN)
+  (ls, ymax) <- liftIO $ do
+    cached <- readIORef (hsLayersCache st)
+    case cached of
+      Just (k, l, ym) | k == layerKey -> pure (l, ym)
+      _ -> do
+        let l = stackLayers hp hidden solo topN
+            ym = maxStack l
+        writeIORef (hsLayersCache st) (Just (layerKey, l, ym))
+        pure (l, ym)
+  let times = hpOffsets hp
       fromLog = logTl >>= tlHeapProfile
       clock = profileClock source hp fromLog
       rk = profileRun source hp fromLog clock
@@ -593,7 +617,6 @@ profilePanes env st loaded logTl hp site = do
                   guard (rectContains plot0 mouse)
                   let i = nearestIndex (hpTimes hp) (xToTime v (rectX plot0) (rectW plot0) (v2X mouse) / 1e9)
                       stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
-                      ymax = maxStack ls
                       bytesAtMouse = (1 - (v2Y mouse - rectY plot0) / rectH plot0) * realToFrac ymax
                       under = [l | (l, lo', hi') <- zip3 ls stackAt (drop 1 stackAt), realToFrac bytesAtMouse >= lo', realToFrac bytesAtMouse < hi']
                   pure $
@@ -602,10 +625,10 @@ profilePanes env st loaded logTl hp site = do
             resp <-
               canvasConfigured
                 defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
-                (\r -> drawChart pal mm hp ls v cursorIx (chartAxis rk clock v (chartPlot r)) marks {tmCursor = Nothing} r (fmap (v2X mouse,v2Y mouse,) hoverLines))
+                (\r -> drawChart pal mm hp ls ymax v cursorIx (chartAxis rk clock v (chartPlot r)) marks {tmCursor = Nothing} r (fmap (v2X mouse,v2Y mouse,) hoverLines))
             let plot@(Rect px py pw ph) = chartPlot (respRect resp)
                 onAxis = v2Y mouse >= py + ph && v2X mouse >= px && v2X mouse <= px + pw
-            canvasLinks env resp (chartRefAt hp ls v (respRect resp))
+            canvasLinks env resp (chartRefAt hp ls ymax v (respRect resp))
             -- Shift+drag selects a range; a drag that starts on the time
             -- axis pans; any other drag moves the cursor; the wheel zooms.
             brushing <- timeGestures env (chartAxis rk clock v plot) resp ScrubNone
@@ -670,17 +693,17 @@ chartAxis rk clock v (Rect px _ pw _) =
 
 -- | What the pointer is on in the chart: the band under it, or else the
 -- census nearest it.
-chartRefAt :: HeapProfile -> [Layer] -> TimeView -> Rect -> V2 -> Maybe Ref
-chartRefAt hp ls v r m@(V2 mx my)
+chartRefAt :: HeapProfile -> [Layer] -> Double -> TimeView -> Rect -> V2 -> Maybe Ref
+chartRefAt hp ls ymax v r m@(V2 mx my)
   | not (rectContains plot m) || VU.null (hpTimes hp) = Nothing
   | otherwise = case under of
-      l : _ | V.any ((== lyName l) . bandName) (hpBands hp) -> Just (RBand (lyName l))
+      l : _ | hasBand (lyName l) hp -> Just (RBand (lyName l))
       _ -> Just (RCensus (runKey (hpRun hp)) i)
   where
     plot = chartPlot r
     i = nearestIndex (hpTimes hp) (xToTime v (rectX plot) (rectW plot) mx / 1e9)
     stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
-    bytes = realToFrac ((1 - (my - rectY plot) / rectH plot) * realToFrac (maxStack ls)) :: Double
+    bytes = realToFrac ((1 - (my - rectY plot) / rectH plot) * realToFrac ymax) :: Double
     under = [l | (l, lo, hi) <- zip3 ls stackAt (drop 1 stackAt), bytes >= lo, bytes < hi]
 
 maxStack :: [Layer] -> Double
@@ -688,11 +711,10 @@ maxStack = \case
   [] -> 1
   l : rest -> max 1 (VU.maximum (foldl' (VU.zipWith (+)) (lyValues l) (map lyValues rest)))
 
-drawChart :: Palette -> MonoMetrics -> HeapProfile -> [Layer] -> TimeView -> Int -> Axis -> Marks -> Rect -> Maybe (Float, Float, [Text]) -> CanvasM ()
-drawChart pal mm hp ls v cursorIx axis marks r hover = do
+drawChart :: Palette -> MonoMetrics -> HeapProfile -> [Layer] -> Double -> TimeView -> Int -> Axis -> Marks -> Rect -> Maybe (Float, Float, [Text]) -> CanvasM ()
+drawChart pal mm hp ls ymax v cursorIx axis marks r hover = do
   let plot@(Rect px py pw ph) = chartPlot r
       times = hpTimes hp
-      ymax = maxStack ls
       sx t = timeToX v px pw (t * 1e9)
       sy b = py + ph - realToFrac (b / ymax) * ph
       font = mmFont mm
@@ -711,15 +733,16 @@ drawChart pal mm hp ls v cursorIx axis marks r hover = do
   -- Stacked bands, bottom up.
   let n = VU.length times
       xs = [sx (times VU.! i) | i <- [0 .. n - 1]]
-      go _ [] = pure ()
-      go base (l : rest) = do
+      y0 = sy 0
+      revBase0 = reverse [V2 xx y0 | xx <- xs]
+      go _ _ [] = pure ()
+      go base revLower (l : rest) = do
         let top = VU.zipWith (+) base (lyValues l)
             upper = [V2 xx (sy (top VU.! i)) | (i, xx) <- zip [0 ..] xs]
-            lower = reverse [V2 xx (sy (base VU.! i)) | (i, xx) <- zip [0 ..] xs]
-        when (n >= 2) $ drawPath (P.polygon (upper ++ lower)) (lyColor l)
+        when (n >= 2) $ drawPath (P.polygon (upper ++ revLower)) (lyColor l)
         when (n == 1) $ drawRect (Rect px (sy (top VU.! 0)) 6 (sy (base VU.! 0) - sy (top VU.! 0))) (lyColor l)
-        go top rest
-  withClip plot $ go (VU.replicate n 0) ls
+        go top (reverse upper) rest
+  withClip plot $ go (VU.replicate n 0) revBase0 ls
   -- The shared range and the run's markers, census ticks along the
   -- bottom, and the census cursor.
   drawMarks pal axis plot marks
@@ -746,8 +769,9 @@ legend env st hp hidden solo = do
         let name = bandName b
             isHidden = S.member name hidden
             c = bandColor i name
+            ck = contentKeyOf [keyPart isHidden, keyPart (colorToWord32 c)]
         rowWith (padLeft 6 . tight . gap 4 . fillW) $ do
-          sw <- canvas (fixedWH 12 12 . alignMid) $ \r ->
+          sw <- canvasKeyed ck (fixedWH 12 12 . alignMid) $ \r ->
             if isHidden then drawStrokeRoundedRect r 3 1.5 c else drawRoundedRect r 3 c
           tooltip sw (if isHidden then "Show this band; click a name to show it alone" else "Hide this band; click a name to show it alone")
           when (respClicked sw) $ writeVar (hsHidden st) (if isHidden then S.delete name hidden else S.insert name hidden)
@@ -778,18 +802,18 @@ atCursor env st hp i = do
     colHeader (fixedW 100 . alignEnd) "residency"
     colHeader (fixedW 100 . alignEnd) "since previous"
     colHeader (fixedW 60 . alignEnd) "share"
-  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
-    forM_ (take 300 rows) $ \(k, b) -> withKey (bandName b) $ do
-      let val = bandValues b VU.! i
-          d = bandDelta b i
-      picked <- linkRow env (RBand (bandName b)) False id $ do
-        _ <- canvas (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 (bandColor k (bandName b)))
-        cell (fillW . fontSizeScale 0.92) (bandTitle b)
-        cell (fixedW 90 . kindTone (bandKind b)) (kindName (bandKind b))
-        numCell 100 id (fmtBytesD val)
-        numCell 100 (if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted) ((if d > 0 then "+" else "") <> fmtBytesD d)
-        numCell 60 fontMuted (fmtPct (val / max 1 total))
-      when picked $ writeVar (hsSolo st) (Just (bandName b))
+  paneVirtualRows (grow . tight . minH 160) id (take 300 rows) $ \(k, b) -> withKey (bandName b) $ do
+    let val = bandValues b VU.! i
+        d = bandDelta b i
+        c = bandColor k (bandName b)
+    picked <- linkRow env (RBand (bandName b)) False id $ do
+      _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 c)
+      cell (fillW . fontSizeScale 0.92) (bandTitle b)
+      cell (fixedW 90 . kindTone (bandKind b)) (kindName (bandKind b))
+      numCell 100 id (fmtBytesD val)
+      numCell 100 (if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted) ((if d > 0 then "+" else "") <> fmtBytesD d)
+      numCell 60 fontMuted (fmtPct (val / max 1 total))
+    when picked $ writeVar (hsSolo st) (Just (bandName b))
 
 kindName :: BandKind -> Text
 kindName = \case
@@ -834,9 +858,12 @@ leakView env st hp = do
         else hint "Bands whose residency keeps climbing census after census. Every census follows a major GC, so a band that never shrinks is data the program keeps alive."
     forM_ suspects $ \s -> do
       let b = hpBands hp V.! susBand s
+          c = bandColor (susBand s) (bandName b)
+          vs = bandValues b
+          sparkKey = contentKeyOf [keyPart (colorToWord32 c), keyPart (VU.length vs), keyPart (maybe 0 snd (VU.unsnoc vs))]
       withKey (bandName b) $ panelWith (padAll 10 . gap 4 . fillW) $ do
         rowWith (tight . gap 8 . alignMid . fillW) $ do
-          _ <- canvas (fixedWH 12 12) (\r -> drawRoundedRect r 3 (bandColor (susBand s) (bandName b)))
+          _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 12 12) (\r -> drawRoundedRect r 3 c)
           linkText env (RBand (bandName b)) fontMedium (bandName b)
           flex
           badge (if susScore s > 0.7 then Danger else Warning) ("leak score " <> fmtFixed 2 (susScore s))
@@ -848,10 +875,10 @@ leakView env st hp = do
           fact "censuses survived, never shrinking" (tshow (susSurvived s))
           fact "monotone" (fmtPct (susMonotone s))
           fact "peak" (fmtBytesD (bandPeak b))
-        _ <- canvas (fillW . fixedH 36) $ \r -> sparkBand r (bandColor (susBand s) (bandName b)) (bandValues b)
+        _ <- canvasKeyed sparkKey (fillW . fixedH 36) $ \r -> sparkBand r c vs
         scope $ for_ (bandProv b) $ \ip -> provenance env ip
-        scope $ unless (null changes) $ for_ (changeFor changes (bandName b)) $ \c ->
-          labelWith (fontMuted . fontSizeScale 0.85 . fillW) $ case bcBase c of
+        scope $ unless (null changes) $ for_ (changeFor changes (bandName b)) $ \ch ->
+          labelWith (fontMuted . fontSizeScale 0.85 . fillW) $ case bcBase ch of
             Nothing -> "New since the baseline."
             Just bf ->
               "In the baseline: peak " <> fmtBytesD (bfPeak bf) <> maybe ", not a suspect" (\sc -> ", leak score " <> fmtFixed 2 sc) (bfScore bf)
@@ -861,10 +888,12 @@ leakView env st hp = do
       separator
       sectionTitle "Thunk accumulator sentinel"
       hint "Thunks that are still on the heap at a census have survived a major GC without being forced. Thunk bands, and how many consecutive censuses they have only grown:"
+      let nAnalysed = analysedSamples hp
       forM_ thunkBands $ \b -> withKey ("thunk:" <> bandName b) $ rowWith (gap 10 . fillW . padXY 8 0) $ do
-        let vs = VU.take (analysedSamples hp) (bandValues b)
-            steps = VU.zipWith (-) (VU.drop 1 vs) vs
-            streak = VU.length (VU.takeWhile (>= 0) (VU.reverse steps))
+        let vs = VU.take nAnalysed (bandValues b)
+            streak
+              | VU.null vs = 0
+              | otherwise = fst (VU.foldl' (\(!tr, !prev) v -> if v >= prev then (tr + 1, v) else (0, v)) (0 :: Int, vs VU.! 0) (VU.drop 1 vs))
         linkText env (RBand (bandName b)) id (bandName b)
         flex
         labelWith (fontMono . fixedW 100) (fmtBytesD (maybe 0 snd (VU.unsnoc vs)))
@@ -918,19 +947,19 @@ retentionView env st hp i
       let tree = retainTree hp i
           rows = flattenTree openSet "" 0 tree
       hint ("Census at " <> fmtSec (hpOffset hp i) <> ". Read top-down: who holds (or allocated) the bytes, down to the closures. For exact retainer paths, snapshot the running program with Source: Live graph (ghc-debug).")
-      paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
-        forM_ rows $ \(path, depth, node, hasKids, isOpen) -> withKey path $ do
-          let ref = if hpBreakdown hp == "cost centre" then Just (RCostCentre "" (rtName node)) else Nothing
-          picked <- maybe (selectableRow False id) (\r -> linkRow env r False id) ref $ do
-            spacer (Fixed (fromIntegral depth * 16)) Fit
-            cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
-            labelWith fillW (rtName node)
-            _ <- canvas (fixedWH 120 8) $ \r@(Rect x y w h) -> do
-              drawRoundedRect r 2 (alpha 0.15 (colorRGB 128 128 128))
-              drawRoundedRect (Rect x y (w * realToFrac (rtBytes node / max 1 (rtBytes tree))) h) 2 (colorRGB 66 133 244)
-            cell (fontMono . fixedW 90) (fmtBytesD (rtBytes node))
-          when (picked && hasKids) $
-            writeVar (hsRetOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
+      paneVirtualRows (grow . tight . minH 160) id rows $ \(path, depth, node, hasKids, isOpen) -> withKey path $ do
+        let ref = if hpBreakdown hp == "cost centre" then Just (RCostCentre "" (rtName node)) else Nothing
+            share = realToFrac (rtBytes node / max 1 (rtBytes tree)) :: Float
+        picked <- maybe (selectableRow False id) (\r -> linkRow env r False id) ref $ do
+          spacer (Fixed (fromIntegral depth * 16)) Fit
+          cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
+          labelWith fillW (rtName node)
+          _ <- canvasKeyed (contentKey [share]) (fixedWH 120 8) $ \r@(Rect x y w h) -> do
+            drawRoundedRect r 2 (alpha 0.15 (colorRGB 128 128 128))
+            drawRoundedRect (Rect x y (w * share) h) 2 (colorRGB 66 133 244)
+          cell (fontMono . fixedW 90) (fmtBytesD (rtBytes node))
+        when (picked && hasKids) $
+          writeVar (hsRetOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
 
 flattenTree :: Set Text -> Text -> Int -> RetainTree -> [(Text, Int, RetainTree, Bool, Bool)]
 flattenTree openSet parent depth node =
@@ -949,6 +978,7 @@ costCentreTree env st = \case
   Just (Right pf) -> do
     pal <- palette <$> uiTheme
     sel <- readVar (hsCCSel st)
+    pIdx <- readVar (hsProfIndex st)
     forM_ (take 4 (drop 1 (pfHeader pf))) (labelWith (fontMuted . fontSizeScale 0.9) . T.strip)
     filt <- T.toLower <$> readVar (hsCCFilter st)
     openSet <- readVar (hsCCOpen st)
@@ -959,27 +989,30 @@ costCentreTree env st = \case
       colHeader (fixedW 60 . alignEnd) "time %"
       colHeader (fixedW 60 . alignEnd) "alloc %"
       colHeader (fixedW 150) "inherited time, alloc"
-    let matches cc = filt `T.isInfixOf` T.toLower (ccName cc <> " " <> ccModule cc)
+    let flat = maybe (flattenCC (pfRoots pf)) (\(_, f, _) -> f) pIdx
+        matches cc = filt `T.isInfixOf` T.toLower (ccName cc <> " " <> ccModule cc)
         rows
           | T.null filt = visibleCC openSet 0 (pfRoots pf)
-          | otherwise = [(d, cc, False, False) | (d, cc) <- flattenCC (pfRoots pf), matches cc]
-    paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
-      forM_ (take 2000 rows) $ \(depth, cc, hasKids, isOpen) -> withKey (ccNo cc) $ do
-        picked <- linkRow env (RCostCentre (ccModule cc) (ccName cc)) (sel == Just (ccNo cc)) id $ do
-          spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
-          cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
-          cell id (ccName cc)
-          cell (fillW . fontMuted . fontSizeScale 0.85) (ccModule cc)
-          numCell 70 id (fmtInt (ccEntries cc))
-          numCell 60 id (fmtFixed 1 (ccTime cc))
-          numCell 60 id (fmtFixed 1 (ccAlloc cc))
-          _ <- canvas (fixedWH 150 10 . alignMid) $ \(Rect x y w h) -> do
-            drawRoundedRect (Rect x y w (h / 2 - 1)) 1 (alpha 0.12 (pText pal))
-            drawRoundedRect (Rect x y (w * realToFrac (ccInhTime cc / 100)) (h / 2 - 1)) 1 (pRun pal)
-            drawRoundedRect (Rect x (y + h / 2) (w * realToFrac (ccInhAlloc cc / 100)) (h / 2 - 1)) 1 (pAccent pal)
-          pure ()
-        when (picked && hasKids) $
-          writeVar (hsCCOpen st) (if isOpen then S.delete (ccNo cc) openSet else S.insert (ccNo cc) openSet)
+          | otherwise = [(d, cc, False, False) | (d, cc) <- flat, matches cc]
+        palKey = fromIntegral (colorToWord32 (pText pal)) :: Float
+    paneVirtualRows (grow . tight . minH 160) id (take 2000 rows) $ \(depth, cc, hasKids, isOpen) -> withKey (ccNo cc) $ do
+      let it = realToFrac (ccInhTime cc / 100) :: Float
+          ia = realToFrac (ccInhAlloc cc / 100) :: Float
+      picked <- linkRow env (RCostCentre (ccModule cc) (ccName cc)) (sel == Just (ccNo cc)) id $ do
+        spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
+        cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
+        cell id (ccName cc)
+        cell (fillW . fontMuted . fontSizeScale 0.85) (ccModule cc)
+        numCell 70 id (fmtInt (ccEntries cc))
+        numCell 60 id (fmtFixed 1 (ccTime cc))
+        numCell 60 id (fmtFixed 1 (ccAlloc cc))
+        _ <- canvasKeyed (contentKey [it, ia, palKey]) (fixedWH 150 10 . alignMid) $ \(Rect x y w h) -> do
+          drawRoundedRect (Rect x y w (h / 2 - 1)) 1 (alpha 0.12 (pText pal))
+          drawRoundedRect (Rect x y (w * it) (h / 2 - 1)) 1 (pRun pal)
+          drawRoundedRect (Rect x (y + h / 2) (w * ia) (h / 2 - 1)) 1 (pAccent pal)
+        pure ()
+      when (picked && hasKids) $
+        writeVar (hsCCOpen st) (if isOpen then S.delete (ccNo cc) openSet else S.insert (ccNo cc) openSet)
 
 visibleCC :: Set Int -> Int -> [CostCentre] -> [(Int, CostCentre, Bool, Bool)]
 visibleCC openSet depth ccs =
@@ -1176,11 +1209,12 @@ nodeTone marked n
 heldBar :: HeapSnapshot -> ClosureId -> NanoUI ()
 heldBar snap i = do
   let h = M.findWithDefault 0 i (snapHeld snap)
-      share = fromIntegral h / max 1 (fromIntegral (snapBytes snap)) :: Double
+      share = realToFrac (fromIntegral h / max 1 (fromIntegral (snapBytes snap)) :: Double) :: Float
   th <- uiTheme
-  _ <- canvas (fixedWH 90 6 . alignMid) $ \r@(Rect x y w hh) -> do
-    drawRoundedRect r 2 (alpha 0.12 (inkText (ink th)))
-    drawRoundedRect (Rect x y (w * realToFrac share) hh) 2 (inkAccent (ink th))
+  let fg = inkText (ink th)
+  _ <- canvasKeyed (contentKey [share, fromIntegral (colorToWord32 fg)]) (fixedWH 90 6 . alignMid) $ \r@(Rect x y w hh) -> do
+    drawRoundedRect r 2 (alpha 0.12 fg)
+    drawRoundedRect (Rect x y (w * share) hh) 2 (inkAccent (ink th))
   numCell 90 id (fmtBytes (fromIntegral h))
 
 dbgSurvivors :: Env -> HeapState -> [HeapSnapshot] -> HeapSnapshot -> [Survivor] -> M.Map ClosureId Int -> NanoUI ()
@@ -1248,19 +1282,18 @@ dbgGraph env st sn snap marked = do
   rowWith (grow . tight . gap 10 . fillW . minH 220) $ do
     columnWith (grow . fillH . tight . gap 4) $ do
       hint "GC roots (threads, stable pointers), biggest first. Expand to follow pointers. Held: bytes a closure keeps alive, each closure charged to its first retainer on a shortest path. Thunks are amber, surviving thunks red."
-      paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
-        forM_ rows $ \(path, depth, n, expandable, isOpen, cyclic) -> withKey path $ do
-          picked <- linkRow env (RClosure sn (cnId n)) (sel == Just (cnId n)) id $ do
-            spacer (Fixed (fromIntegral (min 40 depth) * 14)) Fit
-            cell (fixedW 14 . fontMuted) (if cyclic then "↺" else if expandable then (if isOpen then "▾" else "▸") else " ")
-            cell (fillW . nodeTone marked n) (cnName n)
-            scope $ for_ (M.lookup (cnId n) marked) $ \k -> badge Danger ("×" <> tshow k)
-            cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
-            cell (fontMono . fixedW 70) (fmtBytes (fromIntegral (cnSize n)))
-            heldBar snap (cnId n)
-          when picked $ do
-            writeVar (hsDbgSel st) (Just (cnId n))
-            when expandable $ writeVar (hsDbgOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
+      paneVirtualRows (grow . tight) id rows $ \(path, depth, n, expandable, isOpen, cyclic) -> withKey path $ do
+        picked <- linkRow env (RClosure sn (cnId n)) (sel == Just (cnId n)) id $ do
+          spacer (Fixed (fromIntegral (min 40 depth) * 14)) Fit
+          cell (fixedW 14 . fontMuted) (if cyclic then "↺" else if expandable then (if isOpen then "▾" else "▸") else " ")
+          cell (fillW . nodeTone marked n) (cnName n)
+          scope $ for_ (M.lookup (cnId n) marked) $ \k -> badge Danger ("×" <> tshow k)
+          cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
+          cell (fontMono . fixedW 70) (fmtBytes (fromIntegral (cnSize n)))
+          heldBar snap (cnId n)
+        when picked $ do
+          writeVar (hsDbgSel st) (Just (cnId n))
+          when expandable $ writeVar (hsDbgOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
     panelWith (fixedW 440 . fillH . padAll 10 . gap 6) $ dbgDetail env st sn snap marked sel selPath
 
 dbgDetail :: Env -> HeapState -> Int -> HeapSnapshot -> M.Map ClosureId Int -> Maybe ClosureId -> [ClosureNode] -> NanoUI ()
@@ -1334,14 +1367,13 @@ dbgMatching env st sn snap marked b = do
     labelWith (alignMid . fillW . fontSizeScale 0.92) ("Closures matching " <> bandTitle b <> ", " <> bandMatchName how)
     whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show the biggest retainers") (writeVar (hsDbgFind st) Nothing)
   scope $ when (null matches) $ hint "None in the latest snapshot. Bands from a heap profile match by closure type (-hT), constructor (-hd) or source (-hi, with -finfo-table-map on both sides)."
-  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
-    forM_ matches $ \n -> withKey (fmtClosureId (cnId n)) $ do
-      picked <- linkRow env (RClosure sn (cnId n)) False id $ do
-        cell (fillW . nodeTone marked n) (nodeTitle n)
-        cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
-        numCell 70 id (fmtBytes (fromIntegral (cnSize n)))
-        heldBar snap (cnId n)
-      when picked $ reveal st snap (cnId n)
+  paneVirtualRows (grow . tight . minH 160) id matches $ \n -> withKey (fmtClosureId (cnId n)) $ do
+    picked <- linkRow env (RClosure sn (cnId n)) False id $ do
+      cell (fillW . nodeTone marked n) (nodeTitle n)
+      cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
+      numCell 70 id (fmtBytes (fromIntegral (cnSize n)))
+      heldBar snap (cnId n)
+    when picked $ reveal st snap (cnId n)
 
 dbgBiggestAll :: Env -> HeapState -> Int -> HeapSnapshot -> M.Map ClosureId Int -> NanoUI ()
 dbgBiggestAll env st sn snap marked = do
@@ -1351,14 +1383,13 @@ dbgBiggestAll env st sn snap marked = do
     colHeader (fixedW 120) "type"
     colHeader (fixedW 70 . alignEnd) "size"
     colHeader (fixedW 188) "held"
-  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 0) $
-    forM_ [n | i <- snapBiggest snap, Just n <- [M.lookup i (snapNodes snap)]] $ \n -> withKey (fmtClosureId (cnId n)) $ do
-      picked <- linkRow env (RClosure sn (cnId n)) False id $ do
-        cell (fillW . nodeTone marked n) (nodeTitle n)
-        cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
-        numCell 70 id (fmtBytes (fromIntegral (cnSize n)))
-        heldBar snap (cnId n)
-      when picked $ reveal st snap (cnId n)
+  paneVirtualRows (grow . tight . minH 160) id [n | i <- snapBiggest snap, Just n <- [M.lookup i (snapNodes snap)]] $ \n -> withKey (fmtClosureId (cnId n)) $ do
+    picked <- linkRow env (RClosure sn (cnId n)) False id $ do
+      cell (fillW . nodeTone marked n) (nodeTitle n)
+      cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
+      numCell 70 id (fmtBytes (fromIntegral (cnSize n)))
+      heldBar snap (cnId n)
+    when picked $ reveal st snap (cnId n)
 
 -- ---------------------------------------------------------------------------
 -- Lens
@@ -1375,6 +1406,7 @@ heapLens st loaded fromLog = do
   req <- readVar (hsDbgReq st)
   cursorT <- readVar (hsCursor st)
   totals <- readVar (hsCostTotals st)
+  pIdx <- readVar (hsProfIndex st)
   sources <- readVar (hsDbgSources st)
   survivors <- readVar (hsDbgSurvivors st)
   let profile = shownProfile source loaded fromLog
@@ -1386,7 +1418,7 @@ heapLens st loaded fromLog = do
       snapRun = case req of
         Just (_, DebugUnix p, _) | Just ri <- runFromSocket (T.pack p) -> runKey ri
         _ -> RunKey "?:?"
-      band b = profile >>= \hp -> V.find ((== b) . bandName) (hpBands hp)
+      band b = profile >>= lookupBand b
       -- A census index means this profile's censuses only when the ref
       -- names its run exactly: an eventlog and a .hp file of one run count
       -- theirs differently.
@@ -1405,8 +1437,12 @@ heapLens st loaded fromLog = do
         let s = fromIntegral t / 1e9
         guard (fromEventlog && runKeysMatch r (runKey (hpRun hp)) && s >= firstT && s <= lastT)
         pure hp
-      ccs = maybe [] (map snd . flattenCC . pfRoots) prof
-      costCentre m l = listToMaybe [c | c <- ccs, ccName c == l || ccModule c <> "." <> ccName c == l, T.null m || ccModule c == m]
+      ccs = case pIdx of
+        Just (_, flat, _) -> map snd flat
+        Nothing -> maybe [] (map snd . flattenCC . pfRoots) prof
+      costCentre m l = case pIdx of
+        Just (_, _, byName) -> listToMaybe [c | c <- M.findWithDefault [] l byName, T.null m || ccModule c == m]
+        Nothing -> listToMaybe [c | c <- ccs, ccName c == l || ccModule c <> "." <> ccName c == l, T.null m || ccModule c == m]
       closure s a = if s == sn then latest >>= M.lookup a . snapNodes else Nothing
       group k = latest >>= M.lookup k . snapThunks
       tso t = latest >>= \snap ->
@@ -1636,7 +1672,10 @@ bandPeek b at =
         if VU.length (bandValues b) >= 2
           then Just $ do
             th <- uiTheme
-            void (canvas (fixedWH 300 28) $ \r -> sparkBand r (inkText (ink th)) (bandValues b))
+            let c = inkText (ink th)
+                vs = bandValues b
+                ck = contentKeyOf [keyPart (colorToWord32 c), keyPart (VU.length vs), keyPart (maybe 0 snd (VU.unsnoc vs))]
+            void (canvasKeyed ck (fixedWH 300 28) $ \r -> sparkBand r c vs)
           else Nothing
     }
 

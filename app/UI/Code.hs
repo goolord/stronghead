@@ -39,7 +39,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
 
-import Stronghead.Dump (TokKind (..), Token (..), nameKey, stripUnique)
+import Stronghead.Dump (TokKind (..), Token (..), nameKey, stripTokensUnique)
 import Stronghead.Format (tshow)
 import Stronghead.Join (Annotation (..), Lane (..), Mark (..), Shade (..), laneName, lineOwners)
 import Stronghead.Ref (Ref)
@@ -238,15 +238,10 @@ laneLegend fn = case fnLanes fn of
 -- recomputed so the rest of the line closes up.
 displayTokens :: Bool -> [Token] -> [Token]
 displayTokens False ts = ts
-displayTokens True ts = go 0 ts
-  where
-    go _ [] = []
-    go col (t : rest) =
-      let txt = if tkKind t `elem` [TkIdent, TkCon] then stripUnique (tkText t) else tkText t
-       in t {tkText = txt, tkCol = col} : go (col + T.length txt) rest
+displayTokens True ts = stripTokensUnique ts
 
 isNameTok :: Token -> Bool
-isNameTok t = tkKind t `elem` [TkIdent, TkCon]
+isNameTok t = tkKind t == TkIdent || tkKind t == TkCon
 
 laneW :: Float
 laneW = 26
@@ -373,10 +368,18 @@ codeView cv mm cfg = do
               let ca = if l == l0 then c0 else 0
                   cb = if l == l1 then c1 else 400
               drawRect (Rect (max codeX (colX ca)) (lineY l) (max cw (colX cb - max codeX (colX ca))) lh) c
+          let hoverBarRef = hoverBar >>= lnRef
           forM_ lines' $ \l -> do
             let ly = lineY l
                 mid = ly + lh / 2
                 toks = toksOf l
+                hoveredCol = case hovered of
+                  Just (hl, ht) | hl == l -> Just (tkCol ht)
+                  _ -> Nothing
+                hoveredHintCol = case hoverHint of
+                  Just (hl, (a', _, _)) | hl == l -> Just a'
+                  _ -> Nothing
+                barsOnLine = ccBars cfg l
             drawTextWith (mmFont mm) (V2 (x + gutterW - 8) mid) AlignEnd AlignMiddle (tshow (l + 1)) (pMuted pal)
             for_ (ccGutter cfg l) $ \case
               MarkBreakpoint -> drawCircle (V2 (x + 8) mid) 5 (pBlocked pal)
@@ -384,39 +387,44 @@ codeView cv mm cfg = do
               MarkCurrent -> drawRoundedRect (Rect (x + 2) (mid - 5) 12 10) 3 (pGC pal)
               MarkDot c -> drawCircle (V2 (x + 8) mid) 4 c
             -- Heat bars: ink, except thunks and survivors.
-            forM_ (zip [0 :: Int ..] (ccLanes cfg)) $ \(i, lane) ->
-              forM_ [b | b <- ccBars cfg l, lnLane b == lane] $ \b -> do
-                let lx = x + gutterW + 3 + fromIntegral i * laneW
-                    bw = max 2 ((laneW - 6) * lnWeight b)
-                    base = case lnShade b of
-                      ShadeInk -> alpha 0.5 (pText pal)
-                      ShadeThunk -> themeOrange th
-                      ShadeSurvivor -> pBlocked pal
-                    c = if lnHead b then base else alpha 0.45 base
-                    lit = fmap lnRef hoverBar == Just (lnRef b) && isJust (lnRef b)
-                drawRoundedRect (Rect lx (ly + 4) (laneW - 6) (lh - 8)) 2 (alpha 0.05 (pText pal))
-                drawRoundedRect (Rect lx (ly + 4) bw (lh - 8)) 2 (if lit then pAccent pal else c)
+            when (not (null barsOnLine)) $
+              forM_ (zip [0 :: Int ..] (ccLanes cfg)) $ \(i, lane) ->
+                forM_ [b | b <- barsOnLine, lnLane b == lane] $ \b -> do
+                  let lx = x + gutterW + 3 + fromIntegral i * laneW
+                      bw = max 2 ((laneW - 6) * lnWeight b)
+                      base = case lnShade b of
+                        ShadeInk -> alpha 0.5 (pText pal)
+                        ShadeThunk -> themeOrange th
+                        ShadeSurvivor -> pBlocked pal
+                      c = if lnHead b then base else alpha 0.45 base
+                      lit = hoverBarRef == lnRef b && isJust (lnRef b)
+                  drawRoundedRect (Rect lx (ly + 4) (laneW - 6) (lh - 8)) 2 (alpha 0.05 (pText pal))
+                  drawRoundedRect (Rect lx (ly + 4) bw (lh - 8)) 2 (if lit then pAccent pal else c)
             withClip codeArea $ do
               forM_ toks $ \t -> do
                 let tx = colX (tkCol t)
                     tw = fromIntegral (T.length (tkText t)) * cw
                 when (tx + tw >= codeX && tx <= x + w && tkKind t /= TkSpace) $ do
-                  let isHot = isNameTok t && Just (nameKey (tkText t)) == hot
+                  let isHot = case hot of
+                        Just hKey -> isNameTok t && nameKey (tkText t) == hKey
+                        Nothing -> False
                   when isHot $ drawRoundedRect (Rect (tx - 1) (ly + 1) (tw + 2) (lh - 2)) 3 (alpha 0.28 (pAccent pal))
                   drawTextWith (mmFont mm) (V2 tx mid) AlignStart AlignMiddle (tkText t) (tokenColor (ccColouring cfg) th pal t)
-                  when (fmap snd hovered == Just t && fmap fst hovered == Just l) $
+                  when (hoveredCol == Just (tkCol t)) $
                     drawRect (Rect tx (ly + lh - 2) tw 1) (pAccent pal)
               -- Notes after the code, muted; the one under the pointer is
               -- underlined like a link.
-              let (pinned, cols) = hintColumns (rightCol r l) toks (ccHints cfg l)
-              case cols of
-                (a, _, _) : _ | pinned -> drawRect (Rect (colX a - cw) ly (x + w - colX a + cw) lh) (inkPane (ink th))
-                _ -> pure ()
-              forM_ cols $ \(a, b, (txt, _)) -> do
-                let tx = colX a
-                    under = fmap fst hoverHint == Just l && fmap (\(_, (a', _, _)) -> a') hoverHint == Just a
-                drawTextWith (mmFont mm) (V2 tx mid) AlignStart AlignMiddle txt (alpha 0.8 (pMuted pal))
-                when under $ drawRect (Rect tx (ly + lh - 2) (fromIntegral (b - a) * cw) 1) (pMuted pal)
+              let hintsOnLine = ccHints cfg l
+              when (not (null hintsOnLine)) $ do
+                let (pinned, cols) = hintColumns (rightCol r l) toks hintsOnLine
+                case cols of
+                  (a, _, _) : _ | pinned -> drawRect (Rect (colX a - cw) ly (x + w - colX a + cw) lh) (inkPane (ink th))
+                  _ -> pure ()
+                forM_ cols $ \(a, b, (txt, _)) -> do
+                  let tx = colX a
+                      under = hoveredHintCol == Just a
+                  drawTextWith (mmFont mm) (V2 tx mid) AlignStart AlignMiddle txt (alpha 0.8 (pMuted pal))
+                  when under $ drawRect (Rect tx (ly + lh - 2) (fromIntegral (b - a) * cw) 1) (pMuted pal)
           when (n == 0) $
             drawTextWith (mmFont mm) (V2 (x + codeLeft + 10) (y + 16)) AlignStart AlignMiddle (ccEmpty cfg) (pMuted pal)
           when (n > count) $ do
@@ -496,5 +504,28 @@ tokenColor colouring th pal t = case colouring of
   where
     hashed = "#" `T.isSuffixOf` tkText t
     boxing = tkKind t == TkCon && hashed && isBoxCon (tkText t)
-    unboxed = hashed && tkKind t `elem` [TkCon, TkIdent, TkOperator, TkNumber]
-    isBoxCon c = any (`T.isSuffixOf` c) ["I#", "D#", "F#", "W#", "C#", "W8#", "W16#", "W32#", "W64#", "I8#", "I16#", "I32#", "I64#"]
+    unboxed =
+      hashed && case tkKind t of
+        TkCon -> True
+        TkIdent -> True
+        TkOperator -> True
+        TkNumber -> True
+        _ -> False
+    isBoxCon c =
+      let seg = snd (T.breakOnEnd "." c)
+          w = if T.null seg then c else seg
+       in case w of
+            "I#" -> True
+            "D#" -> True
+            "F#" -> True
+            "W#" -> True
+            "C#" -> True
+            "W8#" -> True
+            "W16#" -> True
+            "W32#" -> True
+            "W64#" -> True
+            "I8#" -> True
+            "I16#" -> True
+            "I32#" -> True
+            "I64#" -> True
+            _ -> False

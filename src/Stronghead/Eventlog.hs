@@ -464,7 +464,7 @@ forceTimeline tl = do
   V.mapM_ evaluate (tlCodeRuns tl)
   _ <- evaluate (IM.size (tlSampleCounts tl))
   mapM_ evaluate (tlThreads tl)
-  for_ (tlHeapProfile tl) \hp -> evaluate hp >> V.mapM_ evaluate (hpBands hp)
+  for_ (tlHeapProfile tl) \hp -> evaluate hp >> V.mapM_ evaluate (hpBands hp) >> evaluate (length (hpSuspects hp)) >> pure ()
   pure tl
 
 -- | Read a whole eventlog.

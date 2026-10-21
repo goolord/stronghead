@@ -15,9 +15,11 @@ module Stronghead.Dump
   , loadCodeFile
   , tokenizeLine
   , stripUnique
+  , stripTokensUnique
   , stripQualifier
   , nameKey
   , lineTokens
+  , lineTokensClean
   , ModuleArtifacts (..)
   , discoverArtifacts
   , dumpModuleName
@@ -34,11 +36,13 @@ import Control.Monad.Extra (concatMapM, mapMaybeM, partitionM)
 import Data.Bifunctor (bimap)
 import Data.ByteString qualified as B
 import Data.Char (isAlpha, isAlphaNum, isDigit, isLower, isSpace, isUpper)
+import Data.Containers.ListUtils (nubOrd)
 import Data.Either.Extra (eitherToMaybe)
 import Data.List (isSuffixOf, sort, unsnoc)
 import Data.List.Extra (stripSuffix)
 import Data.Map.Strict qualified as M
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Set qualified as S
 import Data.Traversable (mapAccumL)
 import Data.Tuple (swap)
 import System.Directory (doesDirectoryExist, listDirectory)
@@ -114,9 +118,13 @@ data CodeFile = CodeFile
   , cfLines :: !(V.Vector Text)
   , cfTokens :: !(V.Vector [Token])
     -- ^ Lazily tokenised, one entry per line.
+  , cfTokensClean :: !(V.Vector [Token])
+    -- ^ Lazily unique-stripped tokens, one entry per line.
   , cfBindings :: !(V.Vector Binding)
   , cfByKey :: !(M.Map Text [Int])
     -- ^ Binding indices for each key.
+  , cfOccurrences :: ~(M.Map Text [Int])
+    -- ^ Lines mentioning each identifier key, built lazily once per file.
   }
 
 loadCodeFile :: CodeKind -> FilePath -> IO (Either String CodeFile)
@@ -138,8 +146,16 @@ parseCodeFile kind path src =
     , cfModule = modName
     , cfLines = lines'
     , cfTokens = tokens
+    , cfTokensClean = if kind == KindSource then tokens else V.map stripTokensUnique tokens
     , cfBindings = V.fromList bindings
     , cfByKey = M.fromListWith (flip (++)) [(bdKey b, [i]) | (i, b) <- zip [0 ..] bindings]
+    , cfOccurrences =
+        M.fromListWith
+          (++)
+          [ (k, [i])
+          | i <- reverse [0 .. V.length tokens - 1]
+          , k <- nubOrd [nameKey (tkText tk) | tk <- tokens V.! i, tkKind tk == TkIdent]
+          ]
     }
   where
     lines' = V.fromList (map (T.replace "\t" "        " . T.dropWhileEnd (== '\r')) (T.lines src))
@@ -164,18 +180,58 @@ tokenizeLines kind = snd . mapAccumL (\inC l -> swap (tokenizeLine kind inC l)) 
 lineTokens :: CodeFile -> Int -> [Token]
 lineTokens cf i = fromMaybe [] (cfTokens cf V.!? i)
 
-keywords :: CodeKind -> [Text]
-keywords = \case
-  KindSource ->
+lineTokensClean :: CodeFile -> Int -> [Token]
+lineTokensClean cf i = fromMaybe [] (cfTokensClean cf V.!? i)
+
+-- | Strip unique suffixes from identifier and constructor tokens on a line,
+-- recomputing column positions so the rest of the line closes up.
+stripTokensUnique :: [Token] -> [Token]
+stripTokensUnique = go 0
+  where
+    go _ [] = []
+    go !col (t : rest) =
+      let txt = if tkKind t == TkIdent || tkKind t == TkCon then stripUnique (tkText t) else tkText t
+       in t {tkText = txt, tkCol = col} : go (col + T.length txt) rest
+
+sourceKeywords, coreKeywords, stgKeywords :: S.Set Text
+sourceKeywords =
+  S.fromList
     [ "module", "import", "qualified", "as", "hiding", "where", "data", "newtype", "type", "class"
     , "instance", "deriving", "do", "if", "then", "else", "case", "of", "let", "in", "forall"
     , "family", "pattern", "mdo", "rec", "infixl", "infixr", "infix", "default", "foreign"
     ]
-  KindCore -> ["case", "of", "let", "letrec", "in", "join", "joinrec", "jump", "forall", "Rec", "end", "\\"]
-  KindStg -> ["case", "of", "let", "letrec", "in", "join", "joinrec", "jump", "forall", "Rec", "end", "\\r", "\\u", "\\s"]
+coreKeywords = S.fromList ["case", "of", "let", "letrec", "in", "join", "joinrec", "jump", "forall", "Rec", "end", "\\"]
+stgKeywords = S.fromList ["case", "of", "let", "letrec", "in", "join", "joinrec", "jump", "forall", "Rec", "end", "\\r", "\\u", "\\s"]
+
+keywords :: CodeKind -> S.Set Text
+keywords = \case
+  KindSource -> sourceKeywords
+  KindCore -> coreKeywords
+  KindStg -> stgKeywords
 
 symChar :: Char -> Bool
-symChar c = c `elem` ("!#$%&*+./<=>?@\\^|-~:" :: String)
+symChar = \case
+  '!' -> True
+  '#' -> True
+  '$' -> True
+  '%' -> True
+  '&' -> True
+  '*' -> True
+  '+' -> True
+  '.' -> True
+  '/' -> True
+  '<' -> True
+  '=' -> True
+  '>' -> True
+  '?' -> True
+  '@' -> True
+  '\\' -> True
+  '^' -> True
+  '|' -> True
+  '-' -> True
+  '~' -> True
+  ':' -> True
+  _ -> False
 
 identStart :: Char -> Bool
 identStart c = isAlpha c || c == '_'
@@ -188,7 +244,7 @@ tokenizeLine :: CodeKind -> Bool -> Text -> ([Token], Bool)
 tokenizeLine kind inComment0 line = go inComment0 0 line []
   where
     kws = keywords kind
-    go inC col t acc = case T.uncons t of
+    go inC !col t acc = case T.uncons t of
       Nothing -> (reverse acc, inC)
       Just (c, _)
         | inC ->
@@ -213,20 +269,20 @@ tokenizeLine kind inComment0 line = go inComment0 0 line []
                        in emit TkNumber (n + hashes (T.drop n t))
                   | c == '[' && kind /= KindSource && col == 0 -> emit TkPragma (T.length t)
                   | c == '[' && kind /= KindSource && annotationStart t -> emit TkPragma (bracketLen t)
-                  | c == '\\' && kind == KindStg && T.length t >= 2 && T.index t 1 `elem` ("rus" :: String) -> emit TkKeyword 2
+                  | c == '\\' && kind == KindStg && T.length t >= 2 && (let c1 = T.index t 1 in c1 == 'r' || c1 == 'u' || c1 == 's') -> emit TkKeyword 2
                   | c == '$' && T.length t >= 2 && identStart (T.index t 1) -> emit TkIdent (qualIdentLen t)
                   | identStart c ->
                       let n = qualIdentLen t
                           w = T.take n t
                           k
-                            | w `elem` kws = TkKeyword
+                            | S.member w kws = TkKeyword
                             | maybe False (isUpper . fst) (T.uncons (lastSegment w)) = TkCon
                             | otherwise = TkIdent
                        in emit k n
                   | symChar c ->
                       let n = T.length (T.takeWhile symChar t)
                           w = T.take n t
-                       in emit (if w `elem` kws then TkKeyword else TkOperator) n
+                       in emit (if S.member w kws then TkKeyword else TkOperator) n
                   | otherwise -> emit TkOperator 1
     isLineComment t = case T.uncons (T.dropWhile (== '-') t) of
       Nothing -> True
@@ -327,12 +383,7 @@ isTypeableBinding n = any (`T.isInfixOf` n) ["$trModule", "$tc", "$krep", "$tr"]
 
 -- | Lines of the file mentioning a key (as an identifier token).
 occurrences :: CodeFile -> Text -> [Int]
-occurrences cf key =
-  [ i
-  | i <- [0 .. V.length (cfLines cf) - 1]
-  , key `T.isInfixOf` (cfLines cf V.! i)
-  , any (\tk -> tkKind tk == TkIdent && nameKey (tkText tk) == key) (lineTokens cf i)
-  ]
+occurrences cf key = M.findWithDefault [] key (cfOccurrences cf)
 
 -- ---------------------------------------------------------------------------
 -- Bindings
