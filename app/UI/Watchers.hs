@@ -217,7 +217,7 @@ watchersPane env w watching ctx = do
   let header = do
         paneMeta watching
         flex
-        disabledWhen (null evs) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear fired") (writeVar (wrFired w) [] >> writeVar (wrUnseen w) 0)
+        disabledWhen (null evs) $ whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconTrash "Clear fired") (writeVar (wrFired w) [] >> writeVar (wrUnseen w) 0)
   paneWith tight ctx "Watchers" header $
     paneScroll (grow . tight) $
       columnWith (padAll 10 . fillW . tight . gap 8) $ do

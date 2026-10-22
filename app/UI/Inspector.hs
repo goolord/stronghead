@@ -109,11 +109,11 @@ inspectorBody env r = do
   labelWith (fontMono . fontMuted . fontSizeScale 0.8 . fillW) (refTarget r)
   rowWith (fillW . tight . gap 6 . wrap . lineGap 6) $ do
     pinned <- isPinned bus r
-    whenM (buttonWith (padXY 8 2 . tight) (if pinned then "Unpin" else "Pin")) (togglePin bus r)
+    whenM (iconButtonWith (padXY 8 2 . tight) iconBookmark (if pinned then "Unpin" else "Pin")) (togglePin bus r)
     focus <- readVar (busFocus bus)
-    scope $ unless (focus == Just r) $ whenM (buttonWith (padXY 8 2 . tight) "Focus everywhere") (setFocus env (Just r))
-    disabledWhen (not (shownBy r)) $ whenM (buttonWith (padXY 8 2 . tight) "Go to") (goTo env r)
-    whenM (buttonWith (padXY 8 2 . tight) "Copy reference") (void (setClipboard (refTarget r)))
+    scope $ unless (focus == Just r) $ whenM (iconButtonWith (padXY 8 2 . tight) iconTarget "Focus everywhere") (setFocus env (Just r))
+    disabledWhen (not (shownBy r)) $ whenM (iconButtonWith (padXY 8 2 . tight) iconForward "Go to") (goTo env r)
+    whenM (iconButtonWith (padXY 8 2 . tight) iconCopy "Copy reference") (void (setClipboard (refTarget r)))
   scope $ case (r, refSpan env r) of
     (RSource _, _) -> pure ()
     (_, Just sp) -> kvLink env "source" (RSource sp) (renderSrcSpan sp)
@@ -165,7 +165,7 @@ nextStepsSection env steps = unless (null steps) $
             StepGo x -> linkText env x (alignMid . fontSizeScale 0.9) (T.take 60 (refTitle env x))
             StepTry flag -> do
               labelWith (alignMid . fontMono . fontSizeScale 0.85) flag
-              whenM (buttonWith (alignMid . padXY 6 0 . tight) "Copy") (void (setClipboard flag))
+              whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconCopy "Copy") (void (setClipboard flag))
             _ -> pure ()
         labelWith (padLeft 22 . fillW . fontMuted . fontSizeScale 0.85) (stepReason s)
         scope $ case stepDo s of
@@ -176,5 +176,5 @@ nextStepsSection env steps = unless (null steps) $
               rowWith (padLeft 22 . fillW . tight . gap 6) $ do
                 labelWith (alignMid . fixedW 34 . fontMuted . fontSizeScale 0.8) what
                 labelWith (alignMid . fillW . fontMono . fontSizeScale 0.8) line
-                whenM (buttonWith (alignMid . padXY 6 0 . tight) "Copy") (void (setClipboard line))
+                whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconCopy "Copy") (void (setClipboard line))
           _ -> pure ()

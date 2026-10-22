@@ -513,18 +513,18 @@ appView app = do
         winW <- windowWidth
         scope $ when (winW >= 1640) (document app active)
         do
-          resp <- quietButton' "Sources" "What each run has, and how to add the rest"
+          resp <- quietIconButton' iconLayers "Sources" "What each run has, and how to add the rest"
           when (respClicked resp) (modifyVar (appSourcesOpen app) not)
           sourcesOpen <- readVar (appSourcesOpen app)
           sources <- if sourcesOpen then sourcesOf app timeline0 heap0 core live0 links else pure []
           sourcesPopover env (appSourcesOpen app) (respRect resp) sources (linkRuns app) (unlinkRun app)
         do
-          resp <- quietButton' "Workspace" "Add a pane to this panel, use another arrangement, save or open the session"
+          resp <- quietIconButton' iconLayout "Workspace" "Add a pane to this panel, use another arrangement, save or open the session"
           when (respClicked resp) (modifyVar (appPanesOpen app) not)
           panesPopover app active (respRect resp)
-        whenM (respClicked <$> quietButton' "Go to…" "Find a thread, binding, cost centre, band or command (Ctrl+K)") (openPalette (appPalette app))
-        whenM (respClicked <$> quietButton' "Settings" "Theme, scale, defaults and the editor command (Ctrl+,)") (writeVar (appSettingsOpen app) True)
-        whenM (quietButton "Open…") (askOpen app)
+        whenM (respClicked <$> quietIconButton' iconSearch "Go to…" "Find a thread, binding, cost centre, band or command (Ctrl+K)") (openPalette (appPalette app))
+        whenM (respClicked <$> quietIconButton' iconSettings "Settings" "Theme, scale, defaults and the editor command (Ctrl+,)") (writeVar (appSettingsOpen app) True)
+        whenM (quietIconButton iconFolderOpen "Open…") (askOpen app)
     columnWith (tight . grow . gap 0) . withKey (fromEnum active) $ case active of
       PTimeline -> timelineView env bench (appTimeline app) timeline
       PHeap -> heapView env bench (appHeap app) heap logTl
@@ -687,8 +687,8 @@ panesPopover app active anchor = do
         hint "Presets are saved with the session."
         sectionTitle "Session"
         rowWith (fillW . tight . gap 6) $ do
-          whenM (buttonWith (padXY 8 2 . tight) "Save session…") (askSaveSession app >> close)
-          whenM (buttonWith (padXY 8 2 . tight) "Open session…") (askOpenSession app >> close)
+          whenM (iconButtonWith (padXY 8 2 . tight) iconSave "Save session…") (askSaveSession app >> close)
+          whenM (iconButtonWith (padXY 8 2 . tight) iconFolderOpen "Open session…") (askOpenSession app >> close)
         sessionPath <- readVar (appSessionPath app)
         hint (maybe "A session keeps what is open, the connections, the pins, the cursor, the focus and every arrangement." (\p -> "This session: " <> T.pack p) sessionPath)
 
@@ -1242,8 +1242,8 @@ settingsModal app =
         labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack (appSettingsPath app))
         fillRow $ do
           flex
-          whenM (toolButton "Reset to defaults") (resetSettings app)
-          whenM (styled primary (toolButton "Done")) (writeVar (appSettingsOpen app) False)
+          whenM (toolIconButton iconHistory "Reset to defaults") (resetSettings app)
+          whenM (styled primary (toolIconButton iconCheck "Done")) (writeVar (appSettingsOpen app) False)
 
 -- | Every setting the dialog shows back to its default. The window's
 -- remembered geometry is left alone.

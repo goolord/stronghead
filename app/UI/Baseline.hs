@@ -170,11 +170,11 @@ diffPanes env st loaded now pid ctx
             flex
             markButton
             scope $ unless (paths == noBaselinePaths) $
-              whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear") (clearBaseline st)
+              whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconTrash "Clear") (clearBaseline st)
           markButton =
-            actionButton
-              (alignMid . padXY 8 2 . tight)
-              (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
+            actionIconButton (alignMid . padXY 8 2 . tight) iconBookmark (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
+
+
               (Just "Keep what is loaded now as the baseline; what you open next is compared with it")
               (dnMark now)
       paneWith tight ctx title header $

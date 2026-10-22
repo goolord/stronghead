@@ -278,31 +278,31 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
   toolStrip $ do
     scope $
       if running
-        then whenM (toolButton "Stop session") (liftIO (stopSession st wake))
-        else disabledWhen busy $ whenM (styled primary (toolButton "Start session")) (liftIO (startSession st wake))
+        then whenM (toolIconButton iconStop "Stop session") (liftIO (stopSession st wake))
+        else disabledWhen busy $ whenM (styled primary (toolIconButton iconPlay "Start session")) (liftIO (startSession st wake))
     scope $ when busy (rowWith (alignMid . tight) spinner)
     disabledWhen (not running || busy) $ toolGroup $ do
       input "expression, e.g. main" (fixedW 170) (dsExpr st)
       expr <- T.strip <$> readVar (dsExpr st)
-      whenM (toolButton "Step into") (send [":step " <> expr])
-      whenM (toolButton "Trace") (send [":trace " <> expr])
-      whenM (toolButton "Run") (send [expr])
+      whenM (toolIconButton iconStepInto "Step into") (send [":step " <> expr])
+      whenM (toolIconButton iconTrace "Trace") (send [":trace " <> expr])
+      whenM (toolIconButton iconBolt "Run") (send [expr])
     -- Continue and Abandon take their colour only when they can act.
     let stepping = running && not busy && isJust stop
         whenStepping f = if stepping then f else id
     disabledWhen (not stepping) $ do
       toolGroup $ do
-        whenM (toolButton "Step") (send [":step"])
-        whenM (toolButton "Step over") (send [":steplocal"])
-        whenM (toolButton "Step out") (send [":stepout"])
-        whenM (toolButton "Step module") (send [":stepmodule"])
-        whenM (styled (whenStepping success) (toolButton "Continue")) (send [":continue"])
+        whenM (toolIconButton iconStep "Step") (send [":step"])
+        whenM (toolIconButton iconStepOver "Step over") (send [":steplocal"])
+        whenM (toolIconButton iconStepOut "Step out") (send [":stepout"])
+        whenM (toolIconButton iconStepModule "Step module") (send [":stepmodule"])
+        whenM (styled (whenStepping success) (toolIconButton iconContinue "Continue")) (send [":continue"])
       toolGroup $ do
-        whenM (toolButton "Back") (send [":back"])
-        whenM (toolButton "Forward") (send [":forward"])
-        whenM (toolButton "History") (send [":history"])
+        whenM (toolIconButton iconBack "Back") (send [":back"])
+        whenM (toolIconButton iconForward "Forward") (send [":forward"])
+        whenM (toolIconButton iconHistory "History") (send [":history"])
       flex
-      whenM (styled (whenStepping destructive) (toolButton "Abandon")) (send [":abandon"])
+      whenM (styled (whenStepping destructive) (toolIconButton iconAbandon "Abandon")) (send [":abandon"])
   bnDraw bench (dsPanes st) (debugPanes env st ix source)
 
 -- | The Debugger's panes, for whichever workbench holds them: the source
@@ -423,7 +423,7 @@ breaksPane env st ctx send = do
           _ <- linkRow env (RBreakpoint f l) False fillW $ do
             cell (fixedW 26 . fontMuted . fontSizeScale 0.85) ("#" <> tshow n)
             cell (fillW . fontMono . fontSizeScale 0.9) (T.pack (takeFileName f) <> ":" <> tshow l)
-          disabledWhen (not running) $ whenM (buttonWith (alignMid . padXY 6 0 . tight) "Delete") (deleteBreak st send (Just f, l) n)
+          disabledWhen (not running) $ whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconTrash "Delete") (deleteBreak st send (Just f, l) n)
 
 -- | The local bindings at the stop, each value an expandable tree.
 bindingsPane :: DebugState -> Maybe StopInfo -> NanoUI ()
@@ -514,7 +514,7 @@ consolePane env st ctx send = do
   let i = ink th
       clear = do
         flex
-        whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear") (writeVar (dsConsole st) [])
+        whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconTrash "Clear") (writeVar (dsConsole st) [])
       at sp = RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}
       mono = fontMono . fontSizeScale 0.85
   paneWith tight ctx "GHCi console" clear $ do
@@ -544,7 +544,7 @@ consolePane env st ctx send = do
       panelWith (asRow . fillW . padXY 12 6 . gap 8) $ themed th $ do
         labelWith (alignMid . fontMono . fontTone Accent) "λ>"
         resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "Any GHCi command, e.g. :show breaks, :history, :sprint xs", ticLayout = (alignMid . fillW) defaultLayout} (dsInput st)
-        go <- disabledWhen (not running) (toolButton "Send")
+        go <- disabledWhen (not running) (toolIconButton iconSend "Send")
         when (respSubmitted resp || go) $ do
           cmd <- readVar (dsInput st)
           unless (T.null (T.strip cmd)) $ do

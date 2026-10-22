@@ -269,19 +269,19 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
     textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 150) defaultLayout} (lvHost st)
     textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 72) defaultLayout} (lvPort st)
     if want
-      then whenM (toolButton "Disconnect") (writeVar (lvWant st) False)
-      else whenM (styled primary (toolButton "Connect")) (connect st)
+      then whenM (toolIconButton iconUnlink "Disconnect") (writeVar (lvWant st) False)
+      else whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
     scope $ for_ mdata $ \d -> do
       for_ (ldHello d) $ \(p, pid, caps) -> when (isNothing (ldClosed d)) $
         toolLabel (p <> ", pid " <> tshow pid <> ", " <> tshow caps <> " capabilities")
-      for_ (ldClosed d) $ \_ -> whenM (toolButton "Reconnect") (modifyVar (lvAttempt st) (+ 1))
+      for_ (ldClosed d) $ \_ -> whenM (toolIconButton iconRefresh "Reconnect") (modifyVar (lvAttempt st) (+ 1))
     flex
     toolGroup $ do
       toolLabel "Eventlog"
       textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (alignMid . fixedW 240) defaultLayout} (lvEventlog st)
       path <- readVar (lvEventlog st)
       disabledWhen (T.null (T.strip path)) $
-        whenM (toolButton "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
+        whenM (toolIconButton iconTrace "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
   scope $ for_ mdata $ \d -> when (isNothing (ldClosed d) && not (Seq.null (ldFrames d))) $
     actionStrip st remote
   scope $ for_ mdata $ \d -> when (isNothing (ldClosed d)) (attachReport st d)
@@ -313,7 +313,7 @@ actionStrip st remote = toolStrip $ do
   forM_ (zip [0 :: Int ..] (groupsOf remote)) $ \(gi, grp) -> withKey gi $ do
     scope $ when (gi > 0) (toolGroup (pure ()))
     forM_ grp $ \a -> withKey (raLabel a) $
-      actionButton alignMid (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
+      actionIconButton alignMid (remoteIcon (raLabel a)) (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
   flex
   msg <- readVar (lvMessage st)
   scope $ unless (T.null msg) $ do
@@ -321,6 +321,15 @@ actionStrip st remote = toolStrip $ do
     whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
   where
     groupsOf as = filter (not . null) [[a | a <- as, raGroup a == g] | g <- [GroupAgent, GroupDebug]]
+    remoteIcon = \case
+      "Mark…" -> iconBookmark
+      "Major GC" -> iconRefresh
+      "Census now" -> iconLayers
+      "Stop heap profiling" -> iconStop
+      "Start heap profiling" -> iconPlay
+      "Pause" -> iconPause
+      "Resume" -> iconPlay
+      _ -> iconCamera
 
 -- | What Connect found, or how to upgrade an old agent.
 attachReport :: LiveState -> LiveData -> NanoUI ()

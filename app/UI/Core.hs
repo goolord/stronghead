@@ -487,9 +487,9 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (csFileDialog st) (mapM_ (openCodeFile st))
   let arts = fromMaybe [] (clArtifacts loaded)
   toolStrip $ do
-    whenM (toolButton "Open dump folder…") $
+    whenM (toolIconButton iconFolderOpen "Open dump folder…") $
       writeVar (csDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
-    whenM (toolButton "Open files…") $
+    whenM (toolIconButton iconFile "Open files…") $
       writeVar (csFileDialog st) . Just
         =<< askOpenFileDialog
           defaultFileDialogOptions

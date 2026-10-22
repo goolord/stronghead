@@ -334,9 +334,9 @@ heapView env bench st loaded logTl = columnWith (tight . gap 0 . grow) $ do
     rowWith (alignMid . tight) $
       boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} (\case FromEventlog -> "Eventlog samples"; FromHpFile -> ".hp file"; FromGhcDebug -> "Live graph (ghc-debug)") (hsSource st)
     scope $ unless (source == FromGhcDebug) $ toolGroup $ do
-      whenM (toolButton "Open heap profile…") $
+      whenM (toolIconButton iconFolderOpen "Open heap profile…") $
         writeVar (hsHpDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Heap profile" "hp"]}
-      whenM (toolButton "Open cost-centre profile…") $
+      whenM (toolIconButton iconFolderOpen "Open cost-centre profile…") $
         writeVar (hsProfDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Cost-centre profile" "prof"]}
     flex
   let profile = case source of
@@ -1063,11 +1063,11 @@ ghcDebugView env bench st loaded logTl
         scope $ case conn of
           ConnSocket -> do
             textInputConfigured defaultTextInputConfig {ticPlaceholder = "socket path, printed by withGhcDebug", ticLayout = (alignMid . minW 260 . fillW) defaultLayout} (hsDbgSocket st)
-            whenM (toolButton "Find sockets") (writeVar (hsDbgSockets st) =<< liftIO listSockets)
+            whenM (toolIconButton iconSearch "Find sockets") (writeVar (hsDbgSockets st) =<< liftIO listSockets)
           ConnTcp ->
             textInputConfigured defaultTextInputConfig {ticPlaceholder = "host:port, as given to withGhcDebugTCP", ticLayout = (alignMid . minW 200 . fillW) defaultLayout} (hsDbgHostPort st)
           ConnFile -> do
-            whenM (toolButton "Open snapshot…") $
+            whenM (toolIconButton iconFolderOpen "Open snapshot…") $
               writeVar (hsDbgFileDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions
             pathLabel file
             flex
@@ -1077,13 +1077,13 @@ ghcDebugView env bench st loaded logTl
           forM_ sockets $ \p -> withKey (T.pack p) $
             whenM (toolButton (T.pack (takeFileName p))) (writeVar (hsDbgSocket st) (T.pack p))
       toolStrip $ do
-        disabledWhen (running || isNothing target) $ whenM (styled primary (toolButton "Take snapshot")) (void (requestSnapshot st))
+        disabledWhen (running || isNothing target) $ whenM (styled primary (toolIconButton iconCamera "Take snapshot")) (void (requestSnapshot st))
         toolGroup $ do
           toolLabel "Closure limit"
           sliderWith (alignMid . fixedW 120) 10 1000 (hsDbgLimit st)
           numCell 52 id (fmtInt (round limit :: Int) <> "k")
         toolGroup $ checkboxWith alignMid "Follow SRTs (CAFs)" (hsDbgSrt st)
-        disabledWhen (null history || running) $ whenM (toolButton "Clear snapshots") $ do
+        disabledWhen (null history || running) $ whenM (toolIconButton iconTrash "Clear snapshots") $ do
           writeVar (hsDbgHistory st) (History (-1) [])
           writeVar (hsDbgSurvivors st) []
           writeVar (hsDbgMarked st) M.empty

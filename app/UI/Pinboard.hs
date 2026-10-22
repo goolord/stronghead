@@ -32,10 +32,10 @@ pinboardPane env export ctx = do
         paneMeta (tshow (length pins))
         flex
         disabledWhen (null pins) $ do
-          copy <- buttonWith' (alignMid . padXY 8 2 . tight) "Copy report"
+          copy <- iconButtonWith' (alignMid . padXY 8 2 . tight) iconCopy "Copy report"
           tooltip copy "The pins as Markdown, on the clipboard"
           when (respClicked copy) (void (setClipboard (pinsReport env [] pins)))
-          whenM (buttonWith (alignMid . padXY 8 2 . tight) "Export…") export
+          whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconSave "Export…") export
   paneWith tight ctx "Pinboard" header $
     if null pins
       then columnWith (padAll 12 . fillW) $ hint "Pin a thread, a band, a binding or a line from its right-click menu or the inspector. Pins keep a note each, and are saved with the session."

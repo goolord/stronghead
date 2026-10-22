@@ -115,4 +115,4 @@ recipe what t =
   rowWith (fillW . gap 6 . padLeft 12 . tight) $ do
     labelWith (alignMid . fixedW 40 . fontMuted . fontSizeScale 0.82) what
     columnWith (alignMid . fillW . tight) $ labelWith (fillW . fontMono . fontSizeScale 0.82) t
-    whenM (buttonWith (alignMid . padXY 6 0 . tight) "Copy") (void (setClipboard t))
+    whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconCopy "Copy") (void (setClipboard t))

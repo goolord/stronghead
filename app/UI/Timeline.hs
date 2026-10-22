@@ -284,7 +284,7 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
   path <- readVar (tsPath st)
   let loaded = mprog >>= lpTimeline
   toolStrip $ do
-    whenM (toolButton "Open eventlog…") $
+    whenM (toolIconButton iconFolderOpen "Open eventlog…") $
       writeVar (tsDialog st) . Just
         =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "GHC eventlog" "eventlog", FileFilter "All files" "*"]}
     checkboxWith alignMid "Follow as it is written" (tsFollow st)
@@ -296,7 +296,7 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
           v = maybe (TimeView lo hi) (clampView lo hi) mv
       let at t = if t - lo < 0.5 then "0" else fmtNs (t - lo)
       toolLabel ("Showing " <> at (tvStart v) <> " to " <> at (tvEnd v))
-      disabledWhen (isNothing mv) $ whenM (toolButton "Fit to log") (writeVar (tsView st) Nothing)
+      disabledWhen (isNothing mv) $ whenM (toolIconButton iconMaximize "Fit to log") (writeVar (tsView st) Nothing)
   mixed <- bnMixed bench (tsPanes st)
   let drawn = scope (bnDraw bench (tsPanes st) (timelinePanes env st mprog))
   case loaded of
