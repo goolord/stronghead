@@ -84,6 +84,7 @@ import Data.Char (isDigit, ord)
 import Data.Either (isLeft)
 import Data.Foldable (for_)
 import Data.List (unsnoc)
+import Data.Maybe (fromMaybe)
 import System.FilePath (takeFileName)
 
 import Data.Text (Text)
@@ -477,10 +478,10 @@ paneFlashRef :: IORef (M.Map Text Double)
 paneFlashRef = unsafePerformIO (newIORef M.empty)
 {-# NOINLINE paneFlashRef #-}
 
--- | Timestamp of the most recent mouse interaction (press, release, hold, scroll).
-lastMouseInteractionRef :: IORef Double
-lastMouseInteractionRef = unsafePerformIO (newIORef (-1000.0))
-{-# NOINLINE lastMouseInteractionRef #-}
+-- | Timestamp and screen position of the most recent mouse click / press / release.
+lastMouseClickRef :: IORef (Double, V2)
+lastMouseClickRef = unsafePerformIO (newIORef (-1000.0, V2 (-9999) (-9999)))
+{-# NOINLINE lastMouseClickRef #-}
 
 -- | Check whether the pane with the given title is currently flashing its border.
 isPaneFlashing :: Text -> Double -> IO Bool
@@ -500,7 +501,7 @@ wasPaneFlashed title = do
 clearPaneFlashes :: IO ()
 clearPaneFlashes = do
   writeIORef paneFlashRef M.empty
-  writeIORef lastMouseInteractionRef (-1000.0)
+  writeIORef lastMouseClickRef (-1000.0, V2 (-9999) (-9999))
 
 -- | View query: whether the pane with the given title is currently flashing.
 paneFlashing :: Text -> NanoUI Bool
@@ -552,13 +553,17 @@ paneWith bodyLayout ctx title trailing body = do
   now <- uiTime
   inp <- askFrameInput
 
-  let isMouseActive =
+  let isMouseClick =
         inputButtonsPressed inp /= mempty
           || inputButtonsReleased inp /= mempty
-          || inputButtonsHeld inp /= mempty
-          || inputScroll inp /= V2 0 0
-  when isMouseActive $
-    liftIO (writeIORef lastMouseInteractionRef now)
+  when isMouseClick $
+    liftIO (writeIORef lastMouseClickRef (now, inputMousePos inp))
+
+  sid <- currentId
+  mLastRect <- lastRect sid
+  let paneRect = case pcGrid ctx of
+        Just g -> pgcRect g
+        Nothing -> fromMaybe (Rect 0 0 0 0) mLastRect
 
   flashVar <- useVar (-1.0 :: Double)
   prevHashVar <- useVar (0 :: Int)
@@ -607,10 +612,14 @@ paneWith bodyLayout ctx title trailing body = do
       endCount <- liftIO (arenaCount na)
       curHash <- liftIO (computePaneHash c title startCount endCount)
       prevHash <- readVar prevHashVar
-      lastMouse <- liftIO (readIORef lastMouseInteractionRef)
-      let recentMouse = lastMouse >= 0 && (now - lastMouse) >= 0 && (now - lastMouse) < 0.40
+      (lastClickTime, lastClickPos) <- liftIO (readIORef lastMouseClickRef)
+      let recentClick = lastClickTime >= 0 && (now - lastClickTime) >= 0 && (now - lastClickTime) < 0.40
+          clickInThisPane = rectContains paneRect lastClickPos
+          attentionDiverted = recentClick && not clickInThisPane
+          isScrollingThisPane = inputScroll inp /= V2 0 0 && rectContains paneRect (inputMousePos inp)
+          shouldFlash = prevHash /= 0 && curHash /= prevHash && attentionDiverted && not isScrollingThisPane
       let paneKey = maybe title tshow (pcId ctx)
-      when (prevHash /= 0 && curHash /= prevHash && recentMouse) $ do
+      when shouldFlash $ do
         writeVar flashVar now
         liftIO $ modifyIORef' paneFlashRef (\m -> M.insert paneKey now (M.insert title now m))
       when (curHash /= prevHash) $ do

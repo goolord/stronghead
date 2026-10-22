@@ -155,7 +155,7 @@ codeScene w cv point = do
   let record t = liftIO (modifyIORef' (wLog w) (t :))
       heap = (lens PHeap) {lensShows = (== band), lensReveal = \r -> record ("heap " <> refTarget r), lensTitle = \r -> if r == band then Just "thunk in go" else Nothing}
       env = Env (wBus w) [heap] tab (writeVar (wTab w)) haveNothing Nothing
-      src = ["module M where", "go = 1 + 2", ""]
+      src = ["module M where", "go = 1 + 2"] ++ ["line " <> tshow i | i <- [3 .. 60 :: Int]]
       ann = (annotationAt (SrcSpan "M.hs" 2 6 2 10) LaneHeap 2048 "2 KiB live" (Just band)) {anShade = ShadeThunk}
       cfg =
         withNotes
@@ -350,6 +350,11 @@ main = do
   mapM_ codeFrame [bDown, bUp, inp0, inp0]
   barMenu <- collectOverlayTextSpans codeCtx inp0
   check "right-clicking a heat bar opens its entity's menu" (hasText "thunk in go" barMenu && hasText "Show in Heap & leaks" barMenu)
+  mapM_ codeFrame [keyInp KeyEscape inp0, inp0]
+  let scrollInp = inp0 {inputMousePos = codePos, inputScroll = V2 0 2}
+  mapM_ codeFrame [scrollInp, inp0 {inputMousePos = codePos}]
+  cvScrolled <- readVarIO (cvScroll cv)
+  check "scrolling code with scroll wheel updates vertical scroll" (cvScrolled > 0)
 
   putStrLn "ghci values"
   valCtx <- newContext
@@ -689,16 +694,20 @@ main = do
   clearPaneFlashes
   let fplaces = [BenchPlace "Bench F" benchFlash]
       fdraw pid ctx = Just $ pane ctx (paneTitle pid) (pure ()) $ do
-        if pid == paneInspector
+        if pid == panePinboard
           then do
-            c <- readVar counterVar
-            void (label ("Count: " <> tshow c))
+            void (label "Pinboard content")
             resp <- buttonWith' (padAll 4) "Increment"
             when (respClicked resp) (modifyVar counterVar (+ 1))
-          else void (label "Pinboard content")
+          else do
+            c <- readVar counterVar
+            void (label ("Count: " <> tshow c))
+            respSelf <- buttonWith' (padAll 4) "SelfIncrement"
+            when (respClicked respSelf) (modifyVar counterVar (+ 1))
       fscene = void (columnWith (fixedWH 800 500) (workspace fplaces fpopped benchFlash fdraw))
       fframe inp = evalUi fctx inp fscene
       fclick pos = let (p, r) = clickPair iinp pos in mapM_ fframe [p, r, iinp, iinp]
+      fscroll pos = mapM_ fframe [iinp {inputMousePos = pos, inputScroll = V2 0 1}, iinp {inputMousePos = pos}]
   warmup2 fctx iinp fscene >>= \_ -> pure ()
   _ <- fframe iinp
   check "initial layout does not trigger a flash" . not =<< wasPaneFlashed "Inspector"
@@ -713,12 +722,27 @@ main = do
   fspans <- collectTextSpans fctx
   incB <- findSpan "Increment" fspans
   fclick incB
-  check "mouse click changing panel value causes panel to flash" =<< wasPaneFlashed "Inspector"
-  check "unchanged pane does not flash" . not =<< wasPaneFlashed "Pinboard"
+  check "mouse click changing another panel causes that panel (where attention was diverted from) to flash" =<< wasPaneFlashed "Inspector"
+  check "pane where click occurred does not flash" . not =<< wasPaneFlashed "Pinboard"
   now <- evalUi fctx iinp uiTime
   check "pane currently flashing" =<< isPaneFlashing "Inspector" now
   check "paneFlashing query also detects it" =<< evalUi fctx iinp (paneFlashing "Inspector")
   check "flash expires after duration" . not =<< isPaneFlashing "Inspector" (now + 1.0)
+
+  clearPaneFlashes
+  _ <- fframe iinp
+  spansSelf <- collectTextSpans fctx
+  selfB <- findSpan "SelfIncrement" spansSelf
+  fclick selfB
+  check "mouse click inside pane does not cause that pane to flash" . not =<< wasPaneFlashed "Inspector"
+
+  clearPaneFlashes
+  _ <- fframe iinp
+  spansScroll <- collectTextSpans fctx
+  pinText <- findSpan "Pinboard content" spansScroll
+  fscroll pinText
+  check "scrolling with scroll wheel does not flash scrolled pane" . not =<< wasPaneFlashed "Pinboard"
+  check "scrolling with scroll wheel does not flash other pane" . not =<< wasPaneFlashed "Inspector"
 
   cVal <- readVarIO counterVar
   clearPaneFlashes
