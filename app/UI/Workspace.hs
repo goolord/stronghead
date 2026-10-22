@@ -358,7 +358,7 @@ workspace places popped bench draw = do
           , pgTree = ControlledTree tree
           , pgDividerColor = Just (inkGround (ink th))
           , pgViewPane = \pid g -> do
-              let ctx = PaneCtx (Just g) (Just (menu pid))
+              let ctx = PaneCtx (Just g) (Just (menu pid)) (Just pid)
               if any ((== pid) . poKind) out
                 then paneWith (padAll 12 . gap 8) ctx (paneTitle pid) (pure ()) $ do
                   hint "In a floating window."
@@ -370,7 +370,7 @@ workspace places popped bench draw = do
     tree = wbTree bench
     here = wbName bench
     menu pid = do
-      menuHeader (paneTitle pid)
+      labelWith (padXY 16 6 . fontMedium . fontSizeScale 0.92 . fillW) (paneTitle pid)
       moved <- or <$> traverse (moveTo pid) [p | p <- places, wbName (bpBench p) /= here]
       menuSeparator
       out <- menuItem "Pop out"

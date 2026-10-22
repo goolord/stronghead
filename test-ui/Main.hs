@@ -19,6 +19,7 @@ import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
 import Stronghead.Dump (CodeKind (..), tokenizeLine)
+import Stronghead.Format (tshow)
 import Stronghead.Ghci (Value (..))
 import Stronghead.Eventlog.Model (Marker (..), Timeline (..), emptyTimeline)
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
@@ -35,7 +36,7 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (TimeView (..), Workbench (..), floatingPane, monoMetrics, newWorkbench, pane)
+import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, wasPaneFlashed)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Inspector
 import UI.Link
@@ -638,7 +639,7 @@ main = do
   benchA <- newWorkbench "a" (Split 1000 AxisV 0.5 (Pane paneHeapChart) (Pane paneInspector))
   benchB <- newWorkbench "b" (Pane paneTlCaps)
   popped <- newVar []
-  let places = [BenchPlace "Bench A" benchA, BenchPlace "Bench B" benchB]
+  let places = [BenchPlace "Bench A" benchA, BenchPlace "Bench B" benchB, BenchPlace "Heap & leaks, live graph" benchB]
       draw pid ctx = Just (pane ctx (paneTitle pid) (pure ()) (void (label "body")))
       mscene = void (columnWith (fixedWH 800 500) (workspace places popped benchA draw))
       mframe inp = evalUi mctx inp mscene
@@ -657,9 +658,14 @@ main = do
   check "double-clicking a header maximises its pane" (hasText "Heap residency" maxed && not (hasText "Inspector" maxed))
   dbl
   check "and again restores it" . hasText "Inspector" =<< collectTextSpans mctx
+  let (rDown, rUp) = rightClickPair iinp title
+  mapM_ mframe [rDown, rUp, iinp, iinp]
+  openedRight <- collectOverlayTextSpans mctx iinp
+  check "right-clicking a header opens its menu" (hasText "Move to Bench B" openedRight && hasText "Move to Heap & leaks, live graph" openedRight)
+  mapM_ mframe [keyInp KeyEscape iinp, iinp]
   for_ (take 1 menus) $ \(Rect x y bw bh) -> mclick (V2 (x + bw / 2) (y + bh / 2))
   opened <- collectOverlayTextSpans mctx iinp
-  check "the menu moves, pops out and closes" (hasText "Move to Bench B" opened && hasText "Pop out" opened && hasText "Close pane" opened && not (hasText "Move to Bench A" opened))
+  check "the menu moves, pops out and closes" (hasText "Move to Bench B" opened && hasText "Move to Heap & leaks, live graph" opened && hasText "Pop out" opened && hasText "Close pane" opened && not (hasText "Move to Bench A" opened))
   moveB <- findSpan "Move to Bench B" opened
   mclick moveB
   check "a pane moves to another workbench" . (== Just [paneInspector]) . fmap treeKinds =<< readVarIO (wbTree benchA)
@@ -674,6 +680,54 @@ main = do
   _ <- mframe iinp
   _ <- mframe iinp
   check "a workbench that still holds it says where it went" . hasText "In a floating window." =<< collectTextSpans mctx
+
+  putStrLn "flashing pane border"
+  fctx <- newContext
+  benchFlash <- newWorkbench "f" (Split 1000 AxisV 0.5 (Pane paneInspector) (Pane panePinboard))
+  fpopped <- newVar []
+  counterVar <- newVar (0 :: Int)
+  clearPaneFlashes
+  let fplaces = [BenchPlace "Bench F" benchFlash]
+      fdraw pid ctx = Just $ pane ctx (paneTitle pid) (pure ()) $ do
+        if pid == paneInspector
+          then do
+            c <- readVar counterVar
+            void (label ("Count: " <> tshow c))
+            resp <- buttonWith' (padAll 4) "Increment"
+            when (respClicked resp) (modifyVar counterVar (+ 1))
+          else void (label "Pinboard content")
+      fscene = void (columnWith (fixedWH 800 500) (workspace fplaces fpopped benchFlash fdraw))
+      fframe inp = evalUi fctx inp fscene
+      fclick pos = let (p, r) = clickPair iinp pos in mapM_ fframe [p, r, iinp, iinp]
+  warmup2 fctx iinp fscene >>= \_ -> pure ()
+  _ <- fframe iinp
+  check "initial layout does not trigger a flash" . not =<< wasPaneFlashed "Inspector"
+  check "other pane also does not flash initially" . not =<< wasPaneFlashed "Pinboard"
+
+  clearPaneFlashes
+  writeVarIO counterVar 10
+  _ <- fframe iinp
+  check "non-mouse update does not trigger a flash" . not =<< wasPaneFlashed "Inspector"
+
+  clearPaneFlashes
+  fspans <- collectTextSpans fctx
+  incB <- findSpan "Increment" fspans
+  fclick incB
+  check "mouse click changing panel value causes panel to flash" =<< wasPaneFlashed "Inspector"
+  check "unchanged pane does not flash" . not =<< wasPaneFlashed "Pinboard"
+  now <- evalUi fctx iinp uiTime
+  check "pane currently flashing" =<< isPaneFlashing "Inspector" now
+  check "paneFlashing query also detects it" =<< evalUi fctx iinp (paneFlashing "Inspector")
+  check "flash expires after duration" . not =<< isPaneFlashing "Inspector" (now + 1.0)
+
+  cVal <- readVarIO counterVar
+  clearPaneFlashes
+  _ <- fframe iinp
+  spansAfter <- collectTextSpans fctx
+  let countText = "Count: " <> tshow cVal
+  countSpan <- findSpan countText spansAfter
+  fclick countSpan
+  check "mouse click without value change does not flash" . not =<< wasPaneFlashed "Inspector"
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

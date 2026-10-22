@@ -26,6 +26,7 @@ module UI.Code
   ) where
 
 import Control.Monad (forM_, guard, when)
+import Data.Bits (shiftL, xor)
 import Data.Foldable (for_)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
@@ -338,11 +339,16 @@ codeView cv mm cfg = do
       hot = maybe (ccHot cfg) Just hoverKey
   inp <- askInput
   let ctrlHeld = modCtrl (inputModifiers inp)
+  let rKey = foldl' (\h (a, b, _) -> h * 31 + a * 1000 + b) (0 :: Int) (ccRanges cfg)
+      sKey = round (scroll * 100) :: Int
+      hKey = round (hscroll * 10) :: Int
+      contentKeyVal = sKey `xor` (hKey `shiftL` 8) `xor` (rKey `shiftL` 16)
   resp <-
     canvasConfigured
       defaultCanvasConfig
         { canvasLayout = ccLayout cfg defaultLayout
         , canvasTrackPointer = True
+        , canvasContent = contentKeyVal
         , canvasCursor = Just $ \_ (Rect x _ _ _) (V2 px _) ->
             if
               | ctrlHeld -> UiCursorPointer

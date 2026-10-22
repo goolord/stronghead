@@ -40,7 +40,12 @@ module UI.Common
   , floatingPane
   , pane
   , paneWith
+  , isPaneFlashing
+  , paneFlashing
+  , wasPaneFlashed
+  , clearPaneFlashes
   , paneMeta
+  , paneMenu
   , readout
   , readoutDelta
   , emptyState
@@ -84,7 +89,19 @@ import System.FilePath (takeFileName)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
+import Stronghead.Format (tshow)
+import Data.Bits (shiftL, shiftR, (.|.))
+import Data.IntMap.Strict qualified as IM
+import Data.Map.Strict qualified as M
+import Data.Word (Word64)
+import GHC.Float (castFloatToWord32)
+import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef
+
 import NanoUI
+import NanoUI.Internal.Context (Context (..), CustomDrawingEntry (..), DrawingCacheState (..), intKey)
+import NanoUI.Internal.Layout.Arena (arenaCount, getNodeValue, getStyleIdx, getText, getWidgetId)
+import NanoUI.Internal.Monad (askContext, askFrameInput)
 import NanoUI.Path qualified as P
 
 -- ---------------------------------------------------------------------------
@@ -448,12 +465,80 @@ newWorkbench name tree = Workbench name <$> newVar (Just tree)
 data PaneCtx = PaneCtx
   { pcGrid :: !(Maybe PaneGridCtx)
   , pcMenu :: !(Maybe (NanoUI Bool))
+  , pcId   :: !(Maybe Word64)
   }
 
 -- | A pane in a floating window: no grid, no menu.
 floatingPane :: PaneCtx
-floatingPane = PaneCtx Nothing Nothing
+floatingPane = PaneCtx Nothing Nothing Nothing
 
+-- | Tracks which pane (by key) most recently started flashing and when.
+paneFlashRef :: IORef (M.Map Text Double)
+paneFlashRef = unsafePerformIO (newIORef M.empty)
+{-# NOINLINE paneFlashRef #-}
+
+-- | Timestamp of the most recent mouse interaction (press, release, hold, scroll).
+lastMouseInteractionRef :: IORef Double
+lastMouseInteractionRef = unsafePerformIO (newIORef (-1000.0))
+{-# NOINLINE lastMouseInteractionRef #-}
+
+-- | Check whether the pane with the given title is currently flashing its border.
+isPaneFlashing :: Text -> Double -> IO Bool
+isPaneFlashing title now = do
+  m <- readIORef paneFlashRef
+  case M.lookup title m of
+    Nothing -> pure False
+    Just t -> pure (t >= 0 && now >= t && (now - t) < 0.5)
+
+-- | Check whether the pane was triggered to flash since the last clear.
+wasPaneFlashed :: Text -> IO Bool
+wasPaneFlashed title = do
+  m <- readIORef paneFlashRef
+  pure (M.member title m)
+
+-- | Clear the record of pane flashes.
+clearPaneFlashes :: IO ()
+clearPaneFlashes = do
+  writeIORef paneFlashRef M.empty
+  writeIORef lastMouseInteractionRef (-1000.0)
+
+-- | View query: whether the pane with the given title is currently flashing.
+paneFlashing :: Text -> NanoUI Bool
+paneFlashing title = do
+  now <- uiTime
+  liftIO (isPaneFlashing title now)
+
+-- | FNV-1a 64-bit hash of text.
+hashText :: Text -> Word64
+hashText = T.foldl' (\h c -> (h * 1099511628211) `xor` fromIntegral (ord c)) 14695981039346656037
+
+-- | Compute a signature/hash of the nodes rendered in a pane.
+computePaneHash :: Context -> Text -> Int -> Int -> IO Int
+computePaneHash ctx title start end = do
+  let na = ctxNodeArena ctx
+  dc <- readIORef (ctxDrawingCache ctx)
+  let customs = dcsCustomDrawings dc
+  let initHash = fromIntegral (hashText title) :: Int
+  let count = max 0 (end - start)
+  let initAcc = (initHash `shiftL` 7) `xor` count
+  let go !acc !i
+        | i >= end = pure acc
+        | otherwise = do
+            txt <- getText na i
+            val <- getNodeValue na i
+            stIdx <- getStyleIdx na i
+            wid <- getWidgetId na i
+            let hTxt = if T.null txt then 0 else fromIntegral (hashText txt) :: Int
+            let hVal = fromIntegral (castFloatToWord32 val) :: Int
+            let hSt = stIdx
+            let hCustom = case IM.lookup (intKey wid) customs of
+                  Nothing -> 0
+                  Just cde -> cdrContent cde
+            let step = (hTxt * 1099511628211) `xor` (hVal * 1469598103934665603) `xor` (hSt * 2166136261) `xor` (hCustom * 16777619)
+            let acc' = ((acc `shiftL` 5) .|. (acc `shiftR` 59)) `xor` step
+            go acc' (i + 1)
+  finalHash <- go initAcc start
+  pure (if finalHash == 0 then 1 else finalHash)
 -- | A pane: a header with its title and @trailing@ (meta text, actions),
 -- and a padded body. Drag the header to move the pane, double-click it to
 -- maximize; the header's last button opens the pane's menu.
@@ -464,37 +549,91 @@ pane = paneWith (padAll 10 . gap 6)
 paneWith :: (Layout -> Layout) -> PaneCtx -> Text -> NanoUI () -> NanoUI a -> NanoUI a
 paneWith bodyLayout ctx title trailing body = do
   th <- uiTheme
+  now <- uiTime
+  inp <- askFrameInput
+
+  let isMouseActive =
+        inputButtonsPressed inp /= mempty
+          || inputButtonsReleased inp /= mempty
+          || inputButtonsHeld inp /= mempty
+          || inputScroll inp /= V2 0 0
+  when isMouseActive $
+    liftIO (writeIORef lastMouseInteractionRef now)
+
+  flashVar <- useVar (-1.0 :: Double)
+  prevHashVar <- useVar (0 :: Int)
+
+  flashStart <- readVar flashVar
+  let flashDuration = 0.5 :: Double
+  let elapsed = now - flashStart
+  let flashing = flashStart >= 0 && elapsed >= 0 && elapsed < flashDuration
+  let flashFactor =
+        if flashing
+          then max 0 (min 1 (realToFrac ((1 - elapsed / flashDuration) ** 2)))
+          else 0 :: Float
+
+  when flashing $ wakeAfter 0.016
+
   let i = ink th
-      headerRow = asRow . fillW . fixedH 34 . padXY 12 0 . gap 8
+      baseBorder = inkRule i
+      accent = inkAccent i
+      borderColorActive = if flashing then lerpColor baseBorder accent flashFactor else baseBorder
+      borderWidthActive = if flashing && flashFactor > 0.05 then 2 else 1
+
+  menuOpen <- useVar False
+  let headerRow = asRow . fillW . fixedH 34 . padXY 12 0 . gap 8
       contents = do
         labelWith (alignMid . fontMedium . fontSizeScale 0.92) title
         themed th trailing
-        for_ (pcMenu ctx) (themed th . paneMenu)
-  styled (panelStyle (background (inkPane i) . borderColor (inkRule i) . borderWidth 1 . cornerRadius 6)) $
+        for_ (pcMenu ctx) (themed th . paneMenuWithVar menuOpen)
+  styled (panelStyle (background (inkPane i) . borderColor borderColorActive . borderWidth borderWidthActive . cornerRadius 6)) $
     panelWith (tight . gap 0 . fillW . fillH) $ do
+      c <- askContext
+      let na = ctxNodeArena c
+      startCount <- liftIO (arenaCount na)
       styled (panelStyle (background colorTransparent . borderBottom 1 (inkRule i) . cornerRadius 0)) $
         case pcGrid ctx of
           -- The header drags the pane; a press on a control in it does not.
           Just g -> paneDragHandle g headerRow contents
           Nothing -> panelWith headerRow contents
       for_ (pcGrid ctx) $ \g -> do
-        inp <- askInput
         let Rect x y w _ = pgcRect g
-        when (rectContains (Rect x y w 34) (inputMousePos inp) && pressedIn MouseLeft inp && inputMouseClicks inp >= 2) $
+            inHeader = rectContains (Rect x y w 34) (inputMousePos inp)
+        when (inHeader && pressedIn MouseLeft inp && inputMouseClicks inp >= 2) $
           if pgcMaximized g then pgcRestore g else pgcMaximize g
-      themed th $ columnWith (fillW . fillH . bodyLayout) body
+        when (inHeader && pressedIn MouseRight inp) $
+          for_ (pcMenu ctx) (const (writeVar menuOpen True))
+      res <- themed th $ columnWith (fillW . fillH . bodyLayout) body
+      endCount <- liftIO (arenaCount na)
+      curHash <- liftIO (computePaneHash c title startCount endCount)
+      prevHash <- readVar prevHashVar
+      lastMouse <- liftIO (readIORef lastMouseInteractionRef)
+      let recentMouse = lastMouse >= 0 && (now - lastMouse) >= 0 && (now - lastMouse) < 0.40
+      let paneKey = maybe title tshow (pcId ctx)
+      when (prevHash /= 0 && curHash /= prevHash && recentMouse) $ do
+        writeVar flashVar now
+        liftIO $ modifyIORef' paneFlashRef (\m -> M.insert paneKey now (M.insert title now m))
+      when (curHash /= prevHash) $ do
+        writeVar prevHashVar curHash
+      pure res
 
 -- | The pane menu's button, a popover of the menu's items that closes once
 -- one is picked.
 paneMenu :: NanoUI Bool -> NanoUI ()
 paneMenu items = do
   open <- useVar False
+  paneMenuWithVar open items
+
+-- | 'paneMenu' with an explicit open flag, so right-clicking the pane's
+-- header bar can open it too.
+paneMenuWithVar :: Var Bool -> NanoUI Bool -> NanoUI ()
+paneMenuWithVar open items = do
   th <- uiTheme
   resp <- styled (quiet . buttonStyle (foreground (inkMuted (ink th)))) (buttonWith' (alignMid . padXY 6 0 . tight) "⋯")
   tooltip resp "Move, pop out or close this pane; drag the header to rearrange"
   when (respClicked resp) (modifyVar open not)
-  _ <- popupWith open (defaultPopupConfig (AnchorRect (respRect resp))) (fixedW 240) $
-    columnWith (fillW . padAll 6 . tight . gap 0) $ do
+  _ <- popupWith open (defaultPopupConfig (AnchorRect (respRect resp))) (minW 200 . padXY 0 4) $
+    columnWith (fillW . tight . gap 0) $ do
       picked <- items
       when picked (writeVar open False)
   pure ()
