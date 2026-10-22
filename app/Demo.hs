@@ -37,7 +37,6 @@ import Data.IORef
   , writeIORef
   )
 import Data.List (sortOn)
-import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Word (Word8)
@@ -55,7 +54,7 @@ import System.Directory
   )
 import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode, exitFailure, exitSuccess)
-import System.FilePath (takeDirectory, takeFileName, (</>))
+import System.FilePath (takeDirectory, (</>))
 import System.IO
   ( IOMode (..)
   , hClose
@@ -75,7 +74,7 @@ import System.Process
 import Text.Printf (printf)
 
 import NanoUI
-import NanoUI.Backend (MouseButton (..), applyMouseButton, buttonsFromList, emptyInput)
+import NanoUI.Backend (applyMouseButton, emptyInput)
 import NanoUI.Backend.Sdl
   ( NanoUIFont (..)
   , SdlEnv
@@ -86,8 +85,8 @@ import NanoUI.Backend.Sdl
   , syncDisplay
   , withSdl
   )
-import NanoUI.Testing (Context, collectOverlayTextSpans, collectTextSpans, newPixelContext, withTheme)
-import NanoUI.Testing.Harness (DemoSpan, findExact, findHeader, findRightmost, hasText, keyInp, spanCenter)
+import NanoUI.Testing (Context, collectOverlayTextSpans, collectTextSpans, newPixelContext)
+import NanoUI.Testing.Harness (DemoSpan, findExact, findRightmost, hasText, keyInp, spanCenter)
 
 import UI.Common (strongheadTheme)
 import UI.Settings (loadSettings)
@@ -393,7 +392,7 @@ spans r = do
 findPrefix :: Rec -> Text -> IO V2
 findPrefix r needle = do
   ss <- spans r
-  case sortOn (\(r', _, _, _, _) -> negate (rectY' r')) [s | s@(r', txt, _, _, _) <- ss, needle `T.isPrefixOf` txt] of
+  case sortOn (\(r', _, _, _, _) -> negate (rectY' r')) [s | s@(_, txt, _, _, _) <- ss, needle `T.isPrefixOf` txt] of
     ((r', _, _, _, _) : _) -> pure (spanCenter r')
     [] -> dumpVisible r >> fail ("demo: no span starting " <> show needle)
   where
@@ -582,6 +581,14 @@ tour r repo = do
     m <- findPrefix r "main"
     clickAt r m
     wait r 0.7
+  -- The code tabs flash on update; switch through Core and STG to inspect them.
+  softly "code tabs" $ do
+    clickAt r =<< exact r "Core"
+    wait r 0.7
+    clickAt r =<< exact r "STG"
+    wait r 0.7
+    clickAt r =<< exact r "Source"
+    wait r 0.5
   -- The inspector follows the focus: jump to its source, then set a
   -- breakpoint from here, on the binding itself.
   softly "go to its source" $ do
