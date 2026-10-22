@@ -37,6 +37,8 @@ module UI.Workspace
   , treeKinds
   , addPane
   , removePane
+  , renamePane
+  , splitAtDrop
   , hasPane
   , encodeTree
   , decodeTree
@@ -62,7 +64,10 @@ import Control.Monad.State.Strict (StateT, evalStateT, get, modify)
 import Data.Bifunctor (bimap, first)
 import Data.Char (isSpace)
 import Data.Containers.ListUtils (nubOrd)
+import Data.Foldable (for_)
+import Data.IORef (modifyIORef', readIORef, writeIORef)
 import Data.List (find)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Void (Void)
 import Data.Word (Word64)
 import Numeric (showFFloat)
@@ -212,6 +217,35 @@ removePane k = \case
     (Nothing, b') -> b'
     (a', Nothing) -> a'
 
+-- | Replace a pane id in place within a tree.
+renamePane :: Word64 -> Word64 -> GridNode -> GridNode
+renamePane old new = \case
+  Pane i -> Pane (if i == old then new else i)
+  Split i ax r a b -> Split i ax r (renamePane old new a) (renamePane old new b)
+
+-- | Split a tree at a drop location to insert a pane with a fresh split id.
+splitAtDrop :: PaneDropLocation -> Word64 -> GridNode -> GridNode
+splitAtDrop loc newPid tree0 =
+  let tree = fromMaybe tree0 (removePane newPid tree0)
+      sid = maximum (999 : splitIds tree) + 1
+      mkSplit ax True a b = Split sid ax 0.5 a b
+      mkSplit ax False a b = Split sid ax 0.5 b a
+      edgeAxis PaneLeft = (AxisV, True)
+      edgeAxis PaneRight = (AxisV, False)
+      edgeAxis PaneAbove = (AxisH, True)
+      edgeAxis PaneBelow = (AxisH, False)
+   in case loc of
+        OutsideGrid edge ->
+          let (ax, onFirst) = edgeAxis edge
+           in mkSplit ax onFirst (Pane newPid) tree
+        BesidePane targetPid edge ->
+          let (ax, onFirst) = edgeAxis edge
+              go (Pane i)
+                | i == targetPid = mkSplit ax onFirst (Pane newPid) (Pane i)
+                | otherwise = Pane i
+              go (Split i sAx r a b) = Split i sAx r (go a) (go b)
+           in go tree
+
 encodeTree :: GridNode -> Text
 encodeTree = \case
   Pane i -> maybe ("pane." <> tshow i) pkKey (paneKind i)
@@ -271,8 +305,7 @@ panelPreset = \case
   PHeap -> Split 1000 AxisH 0.46 (Split 1001 AxisV 0.75 (Pane paneHeapChart) (Pane paneHeapBands)) (Split 1002 AxisV 0.64 (Pane paneHeapAnalysis) (Pane paneInspector))
   PCore ->
     Split 1000 AxisV 0.22 (Split 1001 AxisH 0.58 (Pane paneCoreBindings) (Pane paneInspector)) $
-      Split 1002 AxisH 0.2 (Pane paneCoreNotes) $
-        Split 1003 AxisV 0.44 (Pane paneCoreSource) (Split 1004 AxisV 0.45 (Pane paneCoreCore) (Pane paneCoreStg))
+      Split 1002 AxisH 0.26 (Pane paneCoreNotes) (Pane paneCoreSource)
   PDebugger -> Split 1000 AxisH 0.7 (Split 1001 AxisV 0.68 (Pane paneDbgSource) (Split 1002 AxisH 0.62 (Pane paneDbgLocals) (Pane paneDbgBreaks))) (Pane paneDbgConsole)
   PLive -> Split 1000 AxisH 0.58 (Pane paneLiveCharts) (Pane paneLiveThreads)
 
@@ -344,8 +377,9 @@ workspace :: [BenchPlace] -> Var [Popped] -> Workbench -> PaneDraw -> NanoUI ()
 workspace places popped bench draw = do
   th <- uiTheme
   out <- readVar popped
-  columnWith (fillW . grow . padTop 8 . padBottom 8 . padXY 8 0) $
-    void $
+  liftIO $ modifyIORef' (wbTabDrag bench) (fmap (\h -> h {htDrop = Nothing}))
+  columnWith (fillW . grow . padTop 8 . padBottom 8 . padXY 8 0) $ do
+    gridResp <-
       paneGrid
         defaultPaneGridConfig
           { pgLayout = fillW . fillH
@@ -358,7 +392,7 @@ workspace places popped bench draw = do
           , pgTree = ControlledTree tree
           , pgDividerColor = Just (inkGround (ink th))
           , pgViewPane = \pid g -> do
-              let ctx = PaneCtx (Just g) (Just (menu pid)) (Just pid)
+              let ctx = PaneCtx (Just g) (Just (menu pid)) (Just pid) (Just bench)
               if any ((== pid) . poKind) out
                 then paneWith (padAll 12 . gap 8) ctx (paneTitle pid) (pure ()) $ do
                   hint "In a floating window."
@@ -366,9 +400,39 @@ workspace places popped bench draw = do
                 else maybe (paneEmpty ctx (paneTitle pid) "Nothing draws this pane." []) id (draw pid ctx)
               pure (PaneView (paneTitle pid) False)
           }
+    held <- liftIO (readIORef (wbTabDrag bench))
+    for_ held $ \h -> do
+      let offStrip = isNothing (htDrop h)
+          gridDrop = case pgrDropTarget gridResp of
+            Just t | offStrip, pgdPane t /= htFrom h || htFromCount h > 1 -> Just t
+            _ -> Nothing
+      scope $ when (htPhase h == Dragging && offStrip) $
+        tabGhost (htTitle h) (htAt h) (pgdRect <$> gridDrop)
+      when (htPhase h == DragReleased) $ do
+        liftIO (writeIORef (wbTabDrag bench) Nothing)
+        htCommit h (htDrop h) (pgdLocation <$> gridDrop)
   where
     tree = wbTree bench
     here = wbName bench
+    tabGhost title (V2 mx my) mTarget = do
+      th <- uiTheme
+      baseSize <- uiFontSize
+      fm <- resolveFontUi baseSize WeightNormal FontStyleNormal FontRegular
+      tw <- lineWidthUi fm title
+      let th' = fmLineHeight fm
+          ghost = Rect (mx + 10) (my - th' * 0.5) (tw + 24) (th' + 12)
+          Rect gx gy gw gh = ghost
+          Rect tx ty tw' th'' = fromMaybe (Rect 0 0 0 0) mTarget
+          accent = themeAccent th
+          panel = themePanel th
+      void $
+        canvasKeyed (contentKey [gx, gy, gw, gh, tx, ty, tw', th'']) (pinAt 0 0 . grow . pointer PointerPass) $ \_ -> do
+          for_ mTarget $ \r -> do
+            drawRect r (withAlpha accent 0.15)
+            drawStrokeRoundedRect (rectInflate (-1) r) 0 1.5 (withAlpha accent 0.8)
+          drawRoundedRect ghost 4 (withAlpha (styleBg panel) 0.92)
+          drawStrokeRoundedRect ghost 4 1 accent
+          drawText (V2 (gx + 12) (gy + gh * 0.5)) AlignStart AlignMiddle title (styleFg panel)
     menu pid = do
       labelWith (padXY 16 6 . fontMedium . fontSizeScale 0.92 . fillW) (paneTitle pid)
       moved <- or <$> traverse (moveTo pid) [p | p <- places, wbName (bpBench p) /= here]

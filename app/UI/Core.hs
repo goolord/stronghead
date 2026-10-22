@@ -19,7 +19,7 @@ import Control.Monad (forM_, join, unless, void, when)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (asum, for_)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
 import Data.List (sort, sortOn)
@@ -87,6 +87,14 @@ data CoreState = CoreState
   , csMessage :: !(Var Text)
   , csEntriesCache :: !(IORef (Maybe ((Maybe FilePath, Maybe FilePath, Maybe FilePath), [Entry], M.Map Text Entry)))
   , csDerivedCache :: !(IORef (Maybe (CoreDerivedKey, CoreDerived)))
+  , csTabGroups :: !(Var (M.Map Word64 [Word64]))
+    -- ^ For each code pane in the workbench, the ordered list of code tabs
+    -- ('paneCoreSource', 'paneCoreCore', 'paneCoreStg') it holds.
+  , csActiveTabs :: !(Var (M.Map Word64 Word64))
+    -- ^ For each code pane in the workbench, the tab currently in front.
+  , csTabGestures :: !(IORef (M.Map Word64 (DragHandle Word64)))
+  , csTabHashes :: !(IORef (M.Map Word64 Int))
+  , csTabJumpRev :: !(IORef (M.Map Word64 Int))
   }
 
 type CoreDerivedKey = (Bool, Maybe FilePath, Maybe FilePath, Maybe FilePath, Int, [FilePath], [Annotation])
@@ -145,7 +153,162 @@ newCoreState = do
   csMessage <- newVar ""
   csEntriesCache <- newIORef Nothing
   csDerivedCache <- newIORef Nothing
+  csTabGroups <- newVar (M.singleton paneCoreSource [paneCoreSource, paneCoreCore, paneCoreStg])
+  csActiveTabs <- newVar (M.singleton paneCoreSource paneCoreSource)
+  csTabGestures <- newIORef M.empty
+  csTabHashes <- newIORef M.empty
+  csTabJumpRev <- newIORef M.empty
   pure CoreState {..}
+
+codeTabIds :: [Word64]
+codeTabIds = [paneCoreSource, paneCoreCore, paneCoreStg]
+
+paneForKind :: CodeKind -> Word64
+paneForKind = \case
+  KindSource -> paneCoreSource
+  KindCore -> paneCoreCore
+  KindStg -> paneCoreStg
+
+-- | Bring a code tab to the front in whichever pane holds it.
+activateCodeTab :: CoreState -> Word64 -> NanoUI ()
+activateCodeTab st tid = do
+  groups <- readVar (csTabGroups st)
+  let hosts = nubOrd (paneCoreSource : [h | (h, ts) <- M.toList groups, tid `elem` ts])
+  for_ hosts $ \h ->
+    modifyVar (csActiveTabs st) (M.insert h tid)
+
+-- | Reconcile the stored tab groups with the code panes currently in the
+-- workbench tree.
+reconcileTabGroups ::
+  [Word64] ->
+  M.Map Word64 [Word64] ->
+  M.Map Word64 Word64 ->
+  (M.Map Word64 [Word64], M.Map Word64 Word64)
+reconcileTabGroups hostPanes groups0 actives0
+  | null hostPanes = (groups0, actives0)
+  | otherwise =
+      let claim (seen, acc) h =
+            let raw = M.findWithDefault [h] h groups0
+                valid =
+                  [ t
+                  | t <- raw
+                  , t `elem` codeTabIds
+                  , not (t `elem` seen)
+                  , t == h || not (t `elem` hostPanes)
+                  ]
+                tabsH = if null valid then [h | not (h `elem` seen)] else valid
+                seen' = seen ++ tabsH
+             in (seen', (h, tabsH) : acc)
+          (claimed, pairsRev) = foldl' claim ([], []) hostPanes
+          pairs0 = reverse pairsRev
+          unclaimed = [t | t <- codeTabIds, not (t `elem` claimed)]
+          groups1 = case pairs0 of
+            [] -> M.empty
+            (h0, ts0) : rest -> M.fromList ((h0, ts0 ++ unclaimed) : rest)
+          actives1 =
+            M.fromList
+              [ (h, act')
+              | (h, ts) <- M.toList groups1
+              , let cur = M.findWithDefault h h actives0
+                    act' = if cur `elem` ts then cur else fromMaybe h (listToMaybe ts)
+              ]
+       in (groups1, actives1)
+
+paneTabGesture :: CoreState -> Word64 -> NanoUI (DragHandle Word64)
+paneTabGesture st pid = do
+  known <- liftIO (M.lookup pid <$> readIORef (csTabGestures st))
+  case known of
+    Just g -> pure g
+    Nothing -> liftIO $ do
+      g <- newDrag
+      atomicModifyIORef' (csTabGestures st) (\m -> (M.insert pid g m, g))
+
+commitCodeTabDrop ::
+  Workbench ->
+  CoreState ->
+  Word64 ->
+  Word64 ->
+  Maybe (Word64, Int) ->
+  Maybe PaneDropLocation ->
+  NanoUI ()
+commitCodeTabDrop bench st draggedTab fromPid mStripDrop mGridDrop = do
+  mTree <- readVar (wbTree bench)
+  let hostPanes = [p | p <- maybe [] treeKinds mTree, p `elem` codeTabIds]
+  groups0 <- readVar (csTabGroups st)
+  actives0 <- readVar (csActiveTabs st)
+  let (groups, actives) = reconcileTabGroups hostPanes groups0 actives0
+      fromTabs = M.findWithDefault [fromPid] fromPid groups
+      remFrom = filter (/= draggedTab) fromTabs
+  case mStripDrop of
+    Just (targetPid, idx)
+      | targetPid == fromPid -> do
+          let (before, after) = splitAt (max 0 (min (length remFrom) idx)) remFrom
+              newTabs = before ++ [draggedTab] ++ after
+          writeVar (csTabGroups st) (M.insert fromPid newTabs groups)
+          writeVar (csActiveTabs st) (M.insert fromPid draggedTab actives)
+      | otherwise -> do
+          let targetTabs0 = filter (/= draggedTab) (M.findWithDefault [targetPid] targetPid groups)
+              (before, after) = splitAt (max 0 (min (length targetTabs0) idx)) targetTabs0
+              newTargetTabs = before ++ [draggedTab] ++ after
+          case remFrom of
+            [] -> do
+              let groups' = M.insert targetPid newTargetTabs (M.delete fromPid groups)
+                  actives' = M.insert targetPid draggedTab (M.delete fromPid actives)
+              writeVar (csTabGroups st) groups'
+              writeVar (csActiveTabs st) actives'
+              modifyVar (wbTree bench) (>>= removePane fromPid)
+            firstRem : _
+              | fromPid == draggedTab -> do
+                  let groups' =
+                        M.insert targetPid newTargetTabs
+                          . M.insert firstRem remFrom
+                          $ M.delete fromPid groups
+                      oldAct = M.findWithDefault firstRem fromPid actives
+                      newFromAct = if oldAct `elem` remFrom then oldAct else firstRem
+                      actives' =
+                        M.insert targetPid draggedTab
+                          . M.insert firstRem newFromAct
+                          $ M.delete fromPid actives
+                  writeVar (csTabGroups st) groups'
+                  writeVar (csActiveTabs st) actives'
+                  modifyVar (wbTree bench) (fmap (renamePane fromPid firstRem))
+              | otherwise -> do
+                  let oldAct = M.findWithDefault firstRem fromPid actives
+                      newFromAct = if oldAct `elem` remFrom then oldAct else firstRem
+                      groups' = M.insert targetPid newTargetTabs (M.insert fromPid remFrom groups)
+                      actives' = M.insert targetPid draggedTab (M.insert fromPid newFromAct actives)
+                  writeVar (csTabGroups st) groups'
+                  writeVar (csActiveTabs st) actives'
+    Nothing -> for_ mGridDrop $ \loc ->
+      case remFrom of
+        [] ->
+          modifyVar (wbTree bench) (fmap (splitAtDrop loc draggedTab))
+        firstRem : _
+          | fromPid == draggedTab -> do
+              let loc' = case loc of
+                    BesidePane p e | p == fromPid -> BesidePane firstRem e
+                    other -> other
+                  oldAct = M.findWithDefault firstRem fromPid actives
+                  newFromAct = if oldAct `elem` remFrom then oldAct else firstRem
+                  groups' =
+                    M.insert draggedTab [draggedTab]
+                      . M.insert firstRem remFrom
+                      $ M.delete fromPid groups
+                  actives' =
+                    M.insert draggedTab draggedTab
+                      . M.insert firstRem newFromAct
+                      $ M.delete fromPid actives
+              writeVar (csTabGroups st) groups'
+              writeVar (csActiveTabs st) actives'
+              modifyVar (wbTree bench) (fmap (splitAtDrop loc' draggedTab . renamePane fromPid firstRem))
+          | otherwise -> do
+              let oldAct = M.findWithDefault firstRem fromPid actives
+                  newFromAct = if oldAct `elem` remFrom then oldAct else firstRem
+                  groups' = M.insert draggedTab [draggedTab] (M.insert fromPid remFrom groups)
+                  actives' = M.insert draggedTab draggedTab (M.insert fromPid newFromAct actives)
+              writeVar (csTabGroups st) groups'
+              writeVar (csActiveTabs st) actives'
+              modifyVar (wbTree bench) (fmap (splitAtDrop loc draggedTab))
 
 -- | Put a file in the pane its kind belongs to.
 openCodeFile :: CoreState -> FilePath -> NanoUI ()
@@ -155,6 +318,7 @@ openCodeFile st p = for_ (kindForPath p) $ \k -> do
     KindCore -> (s, Just p, g)
     KindStg -> (s, c, Just p)
   writeVar (csSelected st) Nothing
+  activateCodeTab st (paneForKind k)
 
 -- | Open a source file on its own, away from the dump folder's modules.
 openSourceAlone :: CoreState -> FilePath -> NanoUI ()
@@ -163,6 +327,7 @@ openSourceAlone st p = do
   writeVar (csLoadedModule st) Nothing
   writeVar (csPaths st) (Just p, Nothing, Nothing)
   writeVar (csSelected st) Nothing
+  activateCodeTab st paneCoreSource
 
 openDumpDir :: CoreState -> FilePath -> NanoUI ()
 openDumpDir st dir = do
@@ -403,10 +568,14 @@ cachedEntries st src core stg = do
 -- list, the optimiser's notes, and the source, Core and STG of the module
 -- open. Without files each code pane says what to open.
 corePanes :: Env -> CoreState -> CoreLoaded -> [Word64] -> NanoUI PaneDraw
-corePanes env st loaded _ = do
+corePanes env st loaded sitePanes = do
   let src = clSource loaded >>= eitherToMaybe
       core = clCore loaded >>= eitherToMaybe
       stg = clStg loaded >>= eitherToMaybe
+      hostPanes = [p | p <- sitePanes, p `elem` codeTabIds]
+  groups0 <- readVar (csTabGroups st)
+  actives0 <- readVar (csActiveTabs st)
+  let (groups, actives) = reconcileTabGroups hostPanes groups0 actives0
   hideU <- readVar (csHideUniques st)
   hideT <- readVar (csHideTypeable st)
   colouring <- readVar (csColouring st)
@@ -501,11 +670,21 @@ corePanes env st loaded _ = do
       selEntry = selected >>= (`M.lookup` byKey)
       (vSrc, vCore, vStg) = csViews st
       select k = do
+        curSel <- readVar (csSelected st)
         writeVar (csSelected st) (Just k)
         for_ (M.lookup k byKey) $ \e -> do
-          for_ (listToMaybe (enSrc e)) (scrollToLine vSrc . bdFirst)
-          for_ (listToMaybe (enCore e)) (scrollToLine vCore . bdFirst)
-          for_ (listToMaybe (enStg e)) (scrollToLine vStg . bdFirst)
+          for_ (listToMaybe (enSrc e)) $ \b -> do
+            scrollToLine vSrc (bdFirst b)
+            when (curSel /= Just k) $
+              liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreSource 1)
+          for_ (listToMaybe (enCore e)) $ \b -> do
+            scrollToLine vCore (bdFirst b)
+            when (curSel /= Just k) $
+              liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreCore 1)
+          for_ (listToMaybe (enStg e)) $ \b -> do
+            scrollToLine vStg (bdFirst b)
+            when (curSel /= Just k) $
+              liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreStg 1)
       -- Notes stay in view on the line in focus, and on the STG sites
       -- compiled from it.
       focusSpan = case focus of
@@ -528,6 +707,7 @@ corePanes env st loaded _ = do
       when (M.member k byKey) (select k)
     RSource sp | Just cf <- src, resolvesTo ix (cfPath cf) (ssFile sp) -> do
       writeVar (csPending st) Nothing
+      activateCodeTab st paneCoreSource
       for_ (listToMaybe [enKey e | e <- es, b <- enSrc e, bdFirst b <= ssLine sp - 1, bdLast b >= ssLine sp - 1]) select
       scrollToLine vSrc (ssLine sp - 1)
       -- The STG compiled from the line, by its source notes.
@@ -536,7 +716,9 @@ corePanes env st loaded _ = do
          in scrollToLineAt vStg (max 0 (l - 3)) (indent - 6)
     RBand _ | Just l <- pendingStgLine -> do
       writeVar (csPending st) Nothing
+      activateCodeTab st paneCoreStg
       scrollToLine vStg l
+      liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreStg 1)
     _ -> pure ()
   let focusLines = case (focus, src) of
         (Just (RSource sp), Just cf) | resolvesTo ix (cfPath cf) (ssFile sp) -> [(ssLine sp - 1, ssEndLine sp - 1, alpha 0.16 (pAccent pal))]
@@ -546,64 +728,262 @@ corePanes env st loaded _ = do
         _ -> case (kind, mcf, ceHoverLine ev) of
           (KindSource, Just cf, Just l) -> Just (RSource (SrcSpan (T.pack (cfPath cf)) (l + 1) 1 (l + 1) 1))
           _ -> Nothing
-      codePane ctx title cv mcf kind = do
-        let notes = case kind of
-              KindSource -> srcNotes
-              KindStg -> stgNotes
-              KindCore -> noNotes
-            meta = do
-              paneMeta (maybe (if kind == KindSource then "not found: set the project root in Settings" else "not loaded") (T.pack . takeFileName . cfPath) mcf)
-              scope $ unless (T.null (laneLegend notes)) $ paneMeta (laneLegend notes)
-        paneWith tight ctx title meta $ do
-          let ranges = case (selEntry, mcf) of
-                (Just e, Just _) ->
-                  [ (bdFirst b, bdLast b, alpha 0.10 (pAccent pal))
-                  | b <- case kind of
-                      KindSource -> enSrc e
-                      KindCore -> enCore e
-                      KindStg -> enStg e
-                  ]
-                _ -> []
-                ++ (if kind == KindSource then focusLines else [])
-              allocMarks = case (selEntry, kind) of
-                (Just e, KindStg) -> IS.fromList (concatMap (nAllocs . bdNotes) (enStg e))
-                _ -> IS.empty
-              boxMarks = case (selEntry, kind) of
-                (Just e, KindCore) -> IS.fromList (concatMap (nBoxing . bdNotes) (enCore e))
-                _ -> IS.empty
-              tokFn = if hideU && kind /= KindSource then lineTokensClean else lineTokens
-          ev <-
-            annotatedCode
-              env
-              cv
-              mm
-              ( withNotes
-                  notes
-                  defaultCodeConfig
-                    { ccLineCount = maybe 0 (V.length . cfLines) mcf
-                    , ccTokens = \l -> maybe [] (`tokFn` l) mcf
-                    , ccHideUniques = False
-                    , ccHot = hot
-                    , ccRanges = ranges
-                    , ccGutter = \l ->
-                        if
-                          | IS.member l allocMarks -> Just (MarkDot (pBlocked pal))
-                          | IS.member l boxMarks -> Just (MarkDot (pGCMajor pal))
-                          | otherwise -> Nothing
-                    , ccEmpty = "Open a " <> title <> " file"
-                    , ccColouring = colouring
-                    , ccPinned = case kind of
-                        KindSource -> pinnedSrc
-                        KindStg -> (`IS.member` pinnedStg)
-                        KindCore -> const False
-                    }
+      tabInfo tid
+        | tid == paneCoreCore = ("Core", vCore, core, KindCore, noNotes)
+        | tid == paneCoreStg = ("STG", vStg, stg, KindStg, stgNotes)
+        | otherwise = ("Source", vSrc, src, KindSource, srcNotes)
+      computeTabHash tid = do
+        let (tTitle, cv, mcf, kind, notes) = tabInfo tid
+        scV <- readVar (cvScroll cv)
+        scH <- readVar (cvHScroll cv)
+        selNow <- readVar (csSelected st)
+        let selEntryNow = selNow >>= (`M.lookup` byKey)
+        jumpRev <- liftIO (M.findWithDefault 0 tid <$> readIORef (csTabJumpRev st))
+        let ranges =
+              ( case (selEntryNow, mcf) of
+                  (Just e, Just _) ->
+                    [ (bdFirst b, bdLast b)
+                    | b <- case kind of
+                        KindSource -> enSrc e
+                        KindCore -> enCore e
+                        KindStg -> enStg e
+                    ]
+                  _ -> []
               )
-              (codeRef kind mcf)
-          -- Hovering a name lights it up in every pane; clicking one jumps to
-          -- its binding, if it has one.
-          let (hs, hc, hg) = csHovers st
-          writeVar (case kind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
-          for_ (ceClickedKey ev) $ \k -> when (M.member k byKey) (select k)
+                ++ [(a, b) | kind == KindSource, (a, b, _) <- focusLines]
+            marks = case (selEntryNow, mcf, kind) of
+              (Just e, Just _, KindStg) -> concatMap (nAllocs . bdNotes) (enStg e)
+              (Just e, Just _, KindCore) -> concatMap (nBoxing . bdNotes) (enCore e)
+              _ -> []
+            pinnedList = case (mcf, kind) of
+              (Just _, KindStg) -> IS.toList pinnedStg
+              (Just _, KindSource) -> [a | (a, _, _) <- focusLines]
+              _ -> []
+            pathTxt = maybe "" (T.pack . cfPath) mcf
+            lineCnt = maybe 0 (V.length . cfLines) mcf
+            hideUFlag = if isJust mcf && kind /= KindSource && hideU then (1 :: Int) else 0
+            colFlag = if isJust mcf then fromEnum colouring else 0
+            notesKey =
+              ( laneLegend notes
+              , IM.keys (fnBars notes)
+              , IM.keys (fnHints notes)
+              , IM.keys (fnMarks notes)
+              )
+            sigTxt =
+              T.intercalate
+                "|"
+                [ tTitle
+                , pathTxt
+                , tshow lineCnt
+                , tshow (round (scV * 100) :: Int)
+                , tshow (round (scH * 100) :: Int)
+                , tshow ranges
+                , tshow marks
+                , tshow pinnedList
+                , tshow hideUFlag
+                , tshow colFlag
+                , tshow notesKey
+                , tshow jumpRev
+                ]
+            h = fromIntegral (hashText sigTxt) :: Int
+        pure (if h == 0 then 1 else h)
+      tabbedCodePane ctx pid = do
+        now <- uiTime
+        inp <- askInput
+        let isMouseClick =
+              inputButtonsPressed inp /= mempty
+                || inputButtonsReleased inp /= mempty
+        when isMouseClick $
+          liftIO (writeIORef lastMouseClickRef (now, inputMousePos inp))
+        sid <- currentId
+        mLastRect <- lastRect sid
+        let paneRect = case pcGrid ctx of
+              Just g -> pgcRect g
+              Nothing -> fromMaybe (Rect 0 0 0 0) mLastRect
+            groupTabs = case pcBench ctx of
+              Nothing -> [pid]
+              Just _ -> M.findWithDefault [pid] pid groups
+            activeTab = case pcBench ctx of
+              Nothing -> pid
+              Just _ -> M.findWithDefault pid pid actives
+            (activeTitle, activeCv, activeMcf, activeKind, activeNotes) = tabInfo activeTab
+            flashDuration = 0.5 :: Double
+            factorFor t0 =
+              let el = now - t0
+               in if t0 >= 0 && el >= 0 && el < flashDuration
+                    then max 0 (min 1 (realToFrac ((1 - el / flashDuration) ** 2)))
+                    else 0 :: Float
+        flashMap0 <- liftIO (readIORef paneFlashRef)
+        let paneFlashKey = "pane:" <> tshow pid
+            paneFlashFactor0 = factorFor (fromMaybe (-1.0) (M.lookup paneFlashKey flashMap0))
+            i = ink th
+            baseBorder = inkRule i
+            accent = inkAccent i
+            borderColorActive = if paneFlashFactor0 > 0 then lerpColor baseBorder accent paneFlashFactor0 else baseBorder
+            borderWidthActive = if paneFlashFactor0 > 0.05 then 2 else 1
+        menuOpen <- useVar False
+        let metaContent = rowWith (alignMid . tight . gap 8 . padRight 6) $ do
+              paneMeta (maybe (if activeKind == KindSource then "not found: set the project root in Settings" else "not loaded") (T.pack . takeFileName . cfPath) activeMcf)
+              scope $ unless (T.null (laneLegend activeNotes)) $ paneMeta (laneLegend activeNotes)
+              for_ (pcMenu ctx) (themed th . paneMenuWithVar menuOpen)
+            trailingMeta = case pcGrid ctx of
+              Just g -> paneDragHandle g tight (themed th metaContent)
+              Nothing -> themed th metaContent
+            tabItems = [tab tid (paneTitle tid) () | tid <- groupTabs]
+            renderBar =
+              tabBarConfigured'
+                (TabsConfig TabContained TabTop trailingMeta)
+                (constVar activeTab)
+                tabItems
+        styled (panelStyle (background (inkPane i) . borderColor borderColorActive . borderWidth borderWidthActive . cornerRadius 6)) $
+          panelWith (tight . gap 0 . fillW . fillH) $ do
+            resp <- renderBar
+            when (tabActive resp /= activeTab) $
+              modifyVar (csActiveTabs st) (M.insert pid (tabActive resp))
+            for_ (pcGrid ctx) $ \g -> do
+              let Rect x y w _ = pgcRect g
+                  inHeader = rectContains (Rect x y w 34) (inputMousePos inp)
+                  onTab = any (\(_, r) -> rectContains (respRect r) (inputMousePos inp)) (tabHeaders resp)
+              when (inHeader && not onTab && pressedIn MouseLeft inp && inputMouseClicks inp >= 2) $
+                if pgcMaximized g then pgcRestore g else pgcMaximize g
+              when (inHeader && pressedIn MouseRight inp) $
+                for_ (pcMenu ctx) (const (writeVar menuOpen True))
+            for_ (pcBench ctx) $ \bench -> do
+              gesture <- paneTabGesture st pid
+              drag <- useDrag gesture (tabHeaders resp)
+              for_ drag $ \d -> liftIO $
+                if dragPhase d == DragCancelled
+                  then writeIORef (wbTabDrag bench) Nothing
+                  else do
+                    prev <- readIORef (wbTabDrag bench)
+                    let tId = dragPayload d
+                    writeIORef (wbTabDrag bench) $
+                      Just
+                        HeldTab
+                          { htTab = tId
+                          , htTitle = paneTitle tId
+                          , htFrom = pid
+                          , htFromCount = length groupTabs
+                          , htAt = dragAt d
+                          , htPhase = dragPhase d
+                          , htDrop = prev >>= htDrop
+                          , htCommit = commitCodeTabDrop bench st tId pid
+                          }
+              held <- liftIO (readIORef (wbTabDrag bench))
+              for_ held $ \h -> do
+                let key = htTab h
+                    others = [respRect r | (k, r) <- tabHeaders resp, k /= key]
+                    beforeCount = length (takeWhile (/= activeTab) groupTabs)
+                    landing = case insertionIndex DragAxisX (tabStripRect resp) others (inputMousePos inp) of
+                      Just idx -> Just idx
+                      Nothing
+                        | htFrom h /= pid
+                        , rectContains paneRect (inputMousePos inp) ->
+                            Just (1 + beforeCount)
+                        | otherwise -> Nothing
+                for_ landing $ \idx -> do
+                  liftIO $ modifyIORef' (wbTabDrag bench) (fmap (\h' -> h' {htDrop = Just (pid, idx)}))
+                  let boundary = case splitAt idx others of
+                        (_, r : _) -> rectX r - 1
+                        (_, []) -> maybe (rectX (tabStripRect resp) + 2) (\r -> rectX r + rectW r + 1) (listToMaybe (reverse others))
+                      Rect _ sy _ sh = tabStripRect resp
+                  when (boundary > 0 && sh > 0) $
+                    scope $ void $
+                      canvasKeyed (contentKey [boundary, sy, sh]) (pinAt 0 0 . grow . pointer PointerPass) $ \_ ->
+                        drawRect (Rect (boundary - 1) sy 2 sh) accent
+            selNow <- readVar (csSelected st)
+            let selEntryNow = selNow >>= (`M.lookup` byKey)
+            themed th $ columnWith (fillW . fillH . tight) $ withKey activeTab $ do
+              let ranges =
+                    ( case (selEntryNow, activeMcf) of
+                        (Just e, Just _) ->
+                          [ (bdFirst b, bdLast b, alpha 0.10 (pAccent pal))
+                          | b <- case activeKind of
+                              KindSource -> enSrc e
+                              KindCore -> enCore e
+                              KindStg -> enStg e
+                          ]
+                        _ -> []
+                    )
+                      ++ (if activeKind == KindSource then focusLines else [])
+                  allocMarks = case (selEntryNow, activeKind) of
+                    (Just e, KindStg) -> IS.fromList (concatMap (nAllocs . bdNotes) (enStg e))
+                    _ -> IS.empty
+                  boxMarks = case (selEntryNow, activeKind) of
+                    (Just e, KindCore) -> IS.fromList (concatMap (nBoxing . bdNotes) (enCore e))
+                    _ -> IS.empty
+                  tokFn = if hideU && activeKind /= KindSource then lineTokensClean else lineTokens
+              ev <-
+                annotatedCode
+                  env
+                  activeCv
+                  mm
+                  ( withNotes
+                      activeNotes
+                      defaultCodeConfig
+                        { ccLineCount = maybe 0 (V.length . cfLines) activeMcf
+                        , ccTokens = \l -> maybe [] (`tokFn` l) activeMcf
+                        , ccHideUniques = False
+                        , ccHot = hot
+                        , ccRanges = ranges
+                        , ccGutter = \l ->
+                            if
+                              | IS.member l allocMarks -> Just (MarkDot (pBlocked pal))
+                              | IS.member l boxMarks -> Just (MarkDot (pGCMajor pal))
+                              | otherwise -> Nothing
+                        , ccEmpty = "Open a " <> activeTitle <> " file"
+                        , ccColouring = colouring
+                        , ccPinned = case activeKind of
+                            KindSource -> pinnedSrc
+                            KindStg -> (`IS.member` pinnedStg)
+                            KindCore -> const False
+                        }
+                  )
+                  (codeRef activeKind activeMcf)
+              -- Hovering a name lights it up in every pane; clicking one jumps to
+              -- its binding, if it has one.
+              let (hs, hc, hg) = csHovers st
+              writeVar (case activeKind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
+              for_ (ceClickedKey ev) $ \k -> when (M.member k byKey) (select k)
+            (lastClickTime, lastClickPos) <- liftIO (readIORef lastMouseClickRef)
+            let recentClick = lastClickTime >= 0 && (now - lastClickTime) >= 0 && (now - lastClickTime) < 0.40
+                clickInThisPane = rectContains paneRect lastClickPos
+                isScrollingThisPane = inputScroll inp /= V2 0 0 && rectContains paneRect (inputMousePos inp)
+            forM_ groupTabs $ \tid -> do
+              curHash <- computeTabHash tid
+              prevHash <- liftIO (M.findWithDefault 0 tid <$> readIORef (csTabHashes st))
+              let tabHdrRect = maybe (Rect 0 0 0 0) respRect (lookup tid (tabHeaders resp))
+                  clickOnThisTabHdr = rectContains tabHdrRect lastClickPos
+                  attentionDivertedForTab
+                    | tid == activeTab = recentClick && not clickInThisPane && not isScrollingThisPane
+                    | otherwise = recentClick && not clickOnThisTabHdr
+              when (prevHash /= 0 && curHash /= prevHash && attentionDivertedForTab) $ do
+                let (tTitle, _, _, _, _) = tabInfo tid
+                liftIO $ do
+                  recordTabFlash tTitle tid now
+                  when (tid == activeTab && not clickInThisPane) $
+                    recordTabFlash paneFlashKey pid now
+              when (curHash /= prevHash) $
+                liftIO $ modifyIORef' (csTabHashes st) (M.insert tid curHash)
+            flashMap <- liftIO (readIORef paneFlashRef)
+            let tabFlashFactor tid =
+                  let (tTitle, _, _, _, _) = tabInfo tid
+                      t0 = fromMaybe (-1.0) (M.lookup tTitle flashMap <|> M.lookup (tshow tid) flashMap)
+                   in factorFor t0
+                paneFlashFactor = factorFor (fromMaybe (-1.0) (M.lookup paneFlashKey flashMap))
+                anyFlashing = paneFlashFactor > 0 || any (\tid -> tabFlashFactor tid > 0) groupTabs
+            when anyFlashing $ wakeAfter 0.016
+            forM_ (tabHeaders resp) $ \(tid, hdrResp) -> do
+              let ff = tabFlashFactor tid
+                  hr0 = respRect hdrResp
+              scope $ when (ff > 0.05 && rectW hr0 > 0 && rectH hr0 > 0) $ do
+                let hr = rectInflate (-1) hr0
+                    fillCol = alpha (0.24 * ff) accent
+                    strokeCol = lerpColor baseBorder accent ff
+                void $
+                  canvasKeyed (contentKey [fromIntegral tid, rectX hr, rectY hr, rectW hr, rectH hr, ff]) (pinAt 0 0 . grow . pointer PointerPass) $ \_ -> do
+                    drawRoundedRect hr 4 fillCol
+                    drawStrokeRoundedRect hr 4 2 strokeCol
   -- The name under the pointer in any code pane last frame lights it up
   -- in all of them.
   let (hs0, hc0, hg0) = csHovers st
@@ -650,9 +1030,7 @@ corePanes env st loaded _ = do
               case selEntry of
                 Nothing -> hint "Select a binding to see what the optimiser did to it: worker/wrapper, inlining, boxing, and the closures STG allocates."
                 Just e -> notesBar st e core (rt e) (not (null lanes))
-      | pid == paneCoreSource -> Just (codePane ctx "Source" vSrc src KindSource)
-      | pid == paneCoreCore -> Just (codePane ctx "Core" vCore core KindCore)
-      | pid == paneCoreStg -> Just (codePane ctx "STG" vStg stg KindStg)
+      | pid `elem` codeTabIds -> Just (tabbedCodePane ctx pid)
       | otherwise -> Nothing
   where
     pct v = if v > 0 then fmtFixed 1 v else "·"
@@ -719,9 +1097,13 @@ notesBar st e core r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
   forM_ verdicts (labelWith (fontSizeScale 0.92))
   rowWith (tight . gap 6 . wrap . fillW) $ do
     scope $ forM_ (sort (concatMap (nBoxing . bdNotes) (enCore e))) $ \l -> withKey ("box" <> tshow l) $
-      whenM (buttonWith tight ("box @" <> tshow (l + 1))) (scrollToLine vCore l)
+      whenM (buttonWith tight ("box @" <> tshow (l + 1))) $ do
+        scrollToLine vCore l
+        liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreCore 1)
     scope $ forM_ (sort (concatMap (nAllocs . bdNotes) (enStg e))) $ \l -> withKey ("let" <> tshow l) $
-      whenM (buttonWith tight ("alloc @" <> tshow (l + 1))) (scrollToLine vStg l)
+      whenM (buttonWith tight ("alloc @" <> tshow (l + 1))) $ do
+        scrollToLine vStg l
+        liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreStg 1)
 
 -- | The module the loaded files are of.
 moduleOf :: Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Text

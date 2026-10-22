@@ -18,7 +18,7 @@ import NanoUI
 import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
-import Stronghead.Dump (CodeKind (..), tokenizeLine)
+import Stronghead.Dump (CodeKind (..), parseCodeFile, tokenizeLine)
 import Stronghead.Format (tshow)
 import Stronghead.Ghci (Value (..))
 import Stronghead.Eventlog.Model (Marker (..), Timeline (..), emptyTimeline)
@@ -28,7 +28,7 @@ import Stronghead.Next (Fact (..), Have (..), Step (..), StepDo (..), haveNothin
 import Stronghead.Ref
 import Stronghead.Run (RunInfo (..), emptyRunInfo, runFromHello, runKey)
 import Stronghead.Session (Pin (..))
-import Stronghead.Source (SrcSpan (..))
+import Stronghead.Source (SrcSpan (..), mkSourceIndex)
 import Stronghead.Watch
 import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
 import Stronghead.HeapProfile (fromSamples)
@@ -37,6 +37,7 @@ import UI.Baseline
 import UI.Clock
 import UI.Code
 import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, wasPaneFlashed)
+import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Inspector
 import UI.Link
@@ -752,6 +753,157 @@ main = do
   countSpan <- findSpan countText spansAfter
   fclick countSpan
   check "mouse click without value change does not flash" . not =<< wasPaneFlashed "Inspector"
+
+  putStrLn "core tabs, flashing and dragging"
+  check "PCore preset groups code panes into Source tab host" $
+    treeKinds (panelPreset PCore) == [paneCoreBindings, paneInspector, paneCoreNotes, paneCoreSource]
+  coreCtx <- newContext
+  cst <- newCoreState
+  cpopped <- newVar []
+  clearPaneFlashes
+  let cbench = csPanes cst
+      cplaces = [BenchPlace "Core & STG" cbench]
+      srcDump =
+        T.unlines
+          [ "module Main where"
+          , ""
+          , "go :: Int -> Int -> Int"
+          , "go 0 acc = acc"
+          , "go n acc = go (n - 1) (acc + n)"
+          , ""
+          , "main :: IO ()"
+          , "main = print (go 10 0)"
+          ]
+      coreDump =
+        T.unlines
+          [ "==================== Tidy Core ===================="
+          , "Rec {"
+          , "Main.$wgo [InlPrag=[2], Occ=LoopBreaker]"
+          , "  :: GHC.Prim.Int# -> GHC.Prim.Int# -> GHC.Prim.Int#"
+          , "[GblId, Arity=2, Str=<1L><L>, Unf=OtherCon []]"
+          , "Main.$wgo"
+          , "  = \\ (ww_s1 :: GHC.Prim.Int#) (ww1_s2 :: GHC.Prim.Int#) ->"
+          , "      case ww_s1 of ds_X0 {"
+          , "        __DEFAULT -> Main.$wgo (GHC.Prim.-# ds_X0 1#) (GHC.Prim.+# ww1_s2 ds_X0);"
+          , "        0# -> ww1_s2"
+          , "      }"
+          , "end Rec }"
+          , ""
+          , "Main.go [InlPrag=INLINE[final]] :: Int -> Int -> Int"
+          , "[GblId, Arity=2, Str=<1!P(L)><1!P(L)>, Cpr=1]"
+          , "Main.go"
+          , "  = \\ (n_a1 :: Int) (acc_a2 :: Int) ->"
+          , "      case n_a1 of { GHC.Types.I# ww_s1 ->"
+          , "      case acc_a2 of { GHC.Types.I# ww1_s2 ->"
+          , "      case Main.$wgo ww_s1 ww1_s2 of ww2_s3 { __DEFAULT -> GHC.Types.I# ww2_s3 }"
+          , "      }"
+          , "      }"
+          , ""
+          , "Main.main :: IO ()"
+          , "[GblId]"
+          , "Main.main = System.IO.print @Int GHC.Show.$fShowInt (Main.go 10 0)"
+          ]
+      stgDump =
+        T.unlines
+          [ "Main.go [GblId, Arity=2] :: GHC.Types.Int -> GHC.Types.Int -> GHC.Types.Int"
+          , "[GblId, Arity=2, Unf=OtherCon []] ="
+          , "    \\r [n_s1 acc_s2]"
+          , "        let {"
+          , "          sat_s3 [Occ=Once1] :: GHC.Types.Int"
+          , "          [LclId] ="
+          , "              {n_s1, acc_s2} \\u [] Main.go n_s1 acc_s2;"
+          , "        } in  sat_s3;"
+          , ""
+          , "Main.main :: GHC.Types.IO ()"
+          , "[GblId] ="
+          , "    \\r [void_0E] Main.go 10 0;"
+          ]
+      cloaded =
+        CoreLoaded
+          { clArtifacts = Nothing
+          , clSource = Just (Right (parseCodeFile KindSource "Main.hs" srcDump))
+          , clCore = Just (Right (parseCodeFile KindCore "Main.dump-simpl" coreDump))
+          , clStg = Just (Right (parseCodeFile KindStg "Main.dump-stg-final" stgDump))
+          , clIndex = mkSourceIndex [] []
+          , clSites = Nothing
+          }
+      cinp = withInput 1300 1000
+      coreScene = void $ columnWith (fixedWH 1300 1000) $ do
+        need <- maybe [] treeKinds <$> readVar (wbTree cbench)
+        draw <- corePanes (worldEnv w PCore) cst cloaded need
+        workspace cplaces cpopped cbench draw
+      coreFrame inp = evalUi coreCtx inp coreScene
+      cclick pos = let (p, r) = clickPair cinp pos in mapM_ coreFrame [p, r, cinp, cinp]
+      cdrag fromPos@(V2 fx fy) toPos =
+        let p0 = pressAt cinp fromPos
+            h1 = holdAt p0 (V2 (fx + 12) fy)
+            h2 = holdAt h1 toPos
+            r0 = releaseAt h2
+         in mapM_ coreFrame [p0, h1, h2, h2, r0, cinp, cinp]
+  warmup2 coreCtx cinp coreScene >>= \_ -> pure ()
+  _ <- coreFrame cinp
+  check "Source, Core, STG are in tabs by default" . (== Just [paneCoreSource, paneCoreCore, paneCoreStg]) . M.lookup paneCoreSource =<< readVarIO (csTabGroups cst)
+  cspans0 <- collectTextSpans coreCtx
+  check "all three tab headers and active tab file are rendered" $
+    hasText "Source" cspans0 && hasText "Core" cspans0 && hasText "STG" cspans0 && hasText "Main.hs" cspans0 && not (hasText "Main.dump-simpl" cspans0)
+
+  clearPaneFlashes
+  coreTabPos <- findSpan "Core" cspans0
+  cclick coreTabPos
+  cspansCore <- collectTextSpans coreCtx
+  check "clicking Core tab switches active tab to Core" (hasText "Main.dump-simpl" cspansCore)
+  check "switching tabs directly does not trigger a flash" . not =<< wasPaneFlashed "Core"
+  srcTabPos <- findSpan "Source" cspansCore
+  cclick srcTabPos
+  check "clicking Source tab switches back to Source" . hasText "Main.hs" =<< collectTextSpans coreCtx
+
+  clearPaneFlashes
+  cspans1 <- collectTextSpans coreCtx
+  goBindPos <- findSpan "go" cspans1
+  cclick goBindPos
+  check "clicking a binding flashes active Source tab" =<< wasPaneFlashed "Source"
+  check "clicking a binding flashes background Core tab" =<< wasPaneFlashed "Core"
+  check "clicking a binding flashes background STG tab" =<< wasPaneFlashed "STG"
+  check "clicking a binding flashes Optimiser notes pane" =<< wasPaneFlashed "go"
+  check "Bindings pane where click occurred does not flash" . not =<< wasPaneFlashed "Bindings"
+
+  clearPaneFlashes
+  _ <- coreFrame cinp
+  cspans2 <- collectTextSpans coreCtx
+  let boxSpans = [V2 (x + bw / 2) (y + bh / 2) | (Rect x y bw bh, t, _, _, _) <- cspans2, "box @" `T.isPrefixOf` t]
+  for_ (take 1 boxSpans) cclick
+  check "clicking a boxing note in Optimiser notes flashes background Core tab" =<< wasPaneFlashed "Core"
+  check "clicking a boxing note does not flash unchanged Source tab" . not =<< wasPaneFlashed "Source"
+
+  clearPaneFlashes
+  _ <- coreFrame cinp
+  cspans3 <- collectTextSpans coreCtx
+  let allocSpans = [V2 (x + bw / 2) (y + bh / 2) | (Rect x y bw bh, t, _, _, _) <- cspans3, "alloc @" `T.isPrefixOf` t]
+  for_ (take 1 allocSpans) cclick
+  check "clicking an alloc note in Optimiser notes flashes background STG tab" =<< wasPaneFlashed "STG"
+  check "clicking an alloc note does not flash unchanged Source tab" . not =<< wasPaneFlashed "Source"
+
+  -- Dragging a tab within the tab strip reorders the tabs.
+  cspans4 <- collectTextSpans coreCtx
+  stgPos <- findSpan "STG" cspans4
+  V2 sx sy <- findSpan "Source" cspans4
+  cdrag stgPos (V2 (sx - 6) sy)
+  check "dragging STG tab onto Source tab reorders the tab group" . (== Just [paneCoreStg, paneCoreSource, paneCoreCore]) . M.lookup paneCoreSource =<< readVarIO (csTabGroups cst)
+
+  -- Dragging a tab out to a pane edge splits a new pane in the workbench grid.
+  cspans5 <- collectTextSpans coreCtx
+  corePos2 <- findSpan "Core" cspans5
+  cdrag corePos2 (V2 1250 600)
+  check "dragging Core tab out to a pane edge splits it into its own pane" . elem paneCoreCore . maybe [] treeKinds =<< readVarIO (wbTree cbench)
+  check "split Core pane has its own tab group" . (== Just [paneCoreCore]) . M.lookup paneCoreCore =<< readVarIO (csTabGroups cst)
+
+  -- Dragging a tab from a split pane back onto the tab strip merges it back.
+  cspans6 <- collectTextSpans coreCtx
+  let coreHeaders = [V2 (x + bw / 2) (y + bh / 2) | (Rect x y bw bh, t, _, _, _) <- cspans6, t == "Core"]
+  srcPos2 <- findSpan "Source" cspans6
+  for_ (take 1 coreHeaders) $ \cpos -> cdrag cpos srcPos2
+  check "dragging split Core tab back onto Source tab merges it back" . not . elem paneCoreCore . maybe [] treeKinds =<< readVarIO (wbTree cbench)
+  check "merged tab group holds all three code tabs again" . (== 3) . maybe 0 length . M.lookup paneCoreSource =<< readVarIO (csTabGroups cst)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

@@ -35,17 +35,23 @@ module UI.Common
   , actionButton
   , firstPath
   , Workbench (..)
+  , HeldTab (..)
   , newWorkbench
   , PaneCtx (..)
   , floatingPane
   , pane
   , paneWith
+  , paneFlashRef
+  , lastMouseClickRef
+  , hashText
+  , recordTabFlash
   , isPaneFlashing
   , paneFlashing
   , wasPaneFlashed
   , clearPaneFlashes
   , paneMeta
   , paneMenu
+  , paneMenuWithVar
   , readout
   , readoutDelta
   , emptyState
@@ -448,6 +454,18 @@ actionButton f label tip run = do
 firstPath :: (FilePath -> NanoUI ()) -> [FilePath] -> NanoUI ()
 firstPath f = mapM_ f . take 1
 
+-- | A tab currently being dragged across a workbench.
+data HeldTab = HeldTab
+  { htTab :: !Word64
+  , htTitle :: !Text
+  , htFrom :: !Word64
+  , htFromCount :: !Int
+  , htAt :: !V2
+  , htPhase :: !DragPhase
+  , htDrop :: !(Maybe (Word64, Int))
+  , htCommit :: !(Maybe (Word64, Int) -> Maybe PaneDropLocation -> NanoUI ())
+  }
+
 -- | The split tree of a panel's panes, kept in the panel's state so the
 -- arrangement survives switching panels. Pane ids name pane kinds
 -- ("UI.Workspace"); split ids are 1000 and up. The name keys it in
@@ -455,10 +473,11 @@ firstPath f = mapM_ f . take 1
 data Workbench = Workbench
   { wbName :: !Text
   , wbTree :: !(Var (Maybe GridNode))
+  , wbTabDrag :: !(IORef (Maybe HeldTab))
   }
 
 newWorkbench :: Text -> GridNode -> IO Workbench
-newWorkbench name tree = Workbench name <$> newVar (Just tree)
+newWorkbench name tree = Workbench name <$> newVar (Just tree) <*> newIORef Nothing
 
 -- | Where a pane is drawn: in a workbench's grid, or on its own in a
 -- floating window. 'pcMenu' draws the pane's menu (move, pop out, close)
@@ -467,11 +486,17 @@ data PaneCtx = PaneCtx
   { pcGrid :: !(Maybe PaneGridCtx)
   , pcMenu :: !(Maybe (NanoUI Bool))
   , pcId   :: !(Maybe Word64)
+  , pcBench :: !(Maybe Workbench)
   }
 
 -- | A pane in a floating window: no grid, no menu.
 floatingPane :: PaneCtx
-floatingPane = PaneCtx Nothing Nothing Nothing
+floatingPane = PaneCtx Nothing Nothing Nothing Nothing
+
+-- | Record a flash for a tab or pane by its title and id.
+recordTabFlash :: Text -> Word64 -> Double -> IO ()
+recordTabFlash title tid now =
+  modifyIORef' paneFlashRef (\m -> M.insert (tshow tid) now (M.insert title now m))
 
 -- | Tracks which pane (by key) most recently started flashing and when.
 paneFlashRef :: IORef (M.Map Text Double)

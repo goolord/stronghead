@@ -185,6 +185,7 @@ test-suite stronghead-ui-test
         UI.Clock
         UI.Code
         UI.Common
+        UI.Core
         UI.Debugger
         UI.Inspector
         UI.Link
@@ -203,6 +204,8 @@ test-suite stronghead-ui-test
         megaparsec >=9.5 && <9.9,
         mtl >=2.2 && <2.4,
         nano-ui ^>=0.2,
+        nano-ui-sdl ^>=0.2,
+        process ^>=1.6,
         stronghead,
         text >=2.0 && <2.2,
         time >=1.12 && <1.16,
