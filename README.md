@@ -5,7 +5,7 @@ A profiler and debugger GUI for GHC programs, built on
 cost-centre profiles, Core and STG dumps, GHCi debugging, and live runtime
 telemetry into one window.
 
-https://github.com/user-attachments/assets/da008b39-6a8c-4a0d-9f6c-3a37044d7a68
+https://github.com/user-attachments/assets/e032a2e9-78a7-4ab8-89d2-284be45da7c6
 
 ## Features
 
