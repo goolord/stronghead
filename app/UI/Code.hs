@@ -336,6 +336,8 @@ codeView cv mm cfg = do
         Nothing -> hoverBar >>= lnRef
       hoverKey = if isJust noteRef then Nothing else nameKey . tkText . snd <$> hovered
       hot = maybe (ccHot cfg) Just hoverKey
+  inp <- askInput
+  let ctrlHeld = modCtrl (inputModifiers inp)
   resp <-
     canvasConfigured
       defaultCanvasConfig
@@ -343,6 +345,7 @@ codeView cv mm cfg = do
         , canvasTrackPointer = True
         , canvasCursor = Just $ \_ (Rect x _ _ _) (V2 px _) ->
             if
+              | ctrlHeld -> UiCursorPointer
               | px > x + codeLeft -> if isJust noteRef then UiCursorPointer else UiCursorText
               | px > x + gutterW -> UiCursorPointer
               | otherwise -> UiCursorDefault
@@ -431,7 +434,6 @@ codeView cv mm cfg = do
             let barH = max 16 (h * fromIntegral count / fromIntegral n)
                 barY = y + (h - barH) * (scroll / max 1 maxScroll)
             drawRoundedRect (Rect (x + w - 5) barY 4 barH) 2 (pGrid pal)
-  inp <- askInput
   (wx, wy) <- useWheelDeltaOn resp
   let shiftHeld = modShift (inputModifiers inp)
   when (wy /= 0 && not shiftHeld) $ writeVar (cvScroll cv) (max 0 (min maxScroll (scroll + wy * 3)))

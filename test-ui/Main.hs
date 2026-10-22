@@ -334,6 +334,13 @@ main = do
   _ <- codeFrame inp0 {inputMousePos = bar}
   _ <- codeFrame inp0 {inputMousePos = bar}
   check "the pointer on a heat bar is on its entity" . (== Just band) =<< readVarIO (busHover (wBus w))
+  let V2 bx by = bar
+      codePos = V2 (bx + 50) by
+      ctrl inp = inp {inputModifiers = (inputModifiers inp) {modCtrl = True}}
+  _ <- codeFrame inp0 {inputMousePos = codePos}
+  check "cursor over code is text without control" . (== UiCursorText) =<< uiCursorKind codeCtx inp0 {inputMousePos = codePos}
+  _ <- codeFrame (ctrl inp0) {inputMousePos = codePos}
+  check "cursor over code is pointer when holding control" . (== UiCursorPointer) =<< uiCursorKind codeCtx (ctrl inp0) {inputMousePos = codePos}
   codeClick inp0 bar
   check "clicking a heat bar goes to its entity" . (== ["heap band/0x4fe0"]) =<< logged
   check "in its panel" . (== PHeap) =<< tab
