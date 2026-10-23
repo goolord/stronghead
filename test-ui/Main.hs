@@ -36,7 +36,7 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, wasPaneFlashed)
+import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Inspector
@@ -45,6 +45,7 @@ import UI.Live
 import UI.Palette
 import UI.Pinboard
 import UI.Sources
+import UI.Timeline (markersHeader, newTimelineState)
 import UI.Watchers
 import UI.Workspace
 
@@ -904,6 +905,38 @@ main = do
   for_ (take 1 coreHeaders) $ \cpos -> cdrag cpos srcPos2
   check "dragging split Core tab back onto Source tab merges it back" . not . elem paneCoreCore . maybe [] treeKinds =<< readVarIO (wbTree cbench)
   check "merged tab group holds all three code tabs again" . (== 3) . maybe 0 length . M.lookup paneCoreSource =<< readVarIO (csTabGroups cst)
+
+  putStrLn "markers header"
+  mhCtx <- newContext
+  tlState <- newTimelineState
+  let mhInp = withInput 600 200
+      makeTl (count :: Int) =
+        emptyTimeline
+          { tlMarkers = V.fromList [Marker (fromIntegral i) ("m" <> tshow i) Nothing True | i <- [1 .. count]]
+          }
+      renderHeader inp tl = evalUi mhCtx inp $
+        paneWith tight floatingPane "Markers" (markersHeader tlState tl) (pure ())
+
+  _ <- renderHeader mhInp (makeTl 0)
+  inputNodes0 <- nodesOfType NodeTextInput mhCtx
+  _ <- renderHeader mhInp (makeTl 54)
+  inputNodes54 <- nodesOfType NodeTextInput mhCtx
+  _ <- renderHeader mhInp (makeTl 120)
+  inputNodes120 <- nodesOfType NodeTextInput mhCtx
+
+  let inputRect nodes = case nodes of
+        [(_, r)] -> pure r
+        _ -> fail ("expected 1 text input node, got " <> show (length nodes))
+  Rect x0 _ w0 _ <- inputRect inputNodes0
+  Rect x54 _ w54 _ <- inputRect inputNodes54
+  Rect x120 _ _ _ <- inputRect inputNodes120
+
+  check "markers number changing does not move search box" (x0 == x54 && x54 == x120)
+  check "search box width is consistent and fills remaining space" (w0 == w54 && w0 > 200)
+
+  _ <- renderHeader (withInput 800 200) (makeTl 54)
+  [(_, Rect _ _ w800 _)] <- nodesOfType NodeTextInput mhCtx
+  check "search box fills expanded remaining space" (w800 > w54 + 190)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

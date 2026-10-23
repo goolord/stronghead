@@ -18,6 +18,7 @@ module UI.Timeline
   , openEventlog
   , timelineLens
   , timelineSync
+  , markersHeader
   ) where
 
 import Control.Monad (forM_, unless, when)
@@ -1418,11 +1419,10 @@ stepCursor env st tl gcStarts v = do
 markersHeader :: TimelineState -> Timeline -> NanoUI ()
 markersHeader st tl = do
   let nMarkers = V.foldl' (\acc m -> if mkIsMarker m then acc + 1 else acc) (0 :: Int) (tlMarkers tl)
-  paneMeta (fmtInt nMarkers)
+  paneMetaWith (fixedW 32) (fmtInt nMarkers)
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fixedW 90 . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fillW . padXY 0 0) defaultLayout}
     (tsMarkerFilter st)
-  flex
   checkboxWith alignMid "Events" (tsMarkerEvents st)
 
 -- | Every marker in the log, as links; clicking one moves the cursor to it.

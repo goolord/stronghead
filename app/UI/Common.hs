@@ -90,6 +90,7 @@ module UI.Common
   , wasPaneFlashed
   , clearPaneFlashes
   , paneMeta
+  , paneMetaWith
   , paneMenu
   , paneMenuWithVar
   , readout
@@ -806,7 +807,11 @@ paneMenuWithVar open items = do
 
 -- | Muted text in a pane header, after the title.
 paneMeta :: Text -> NanoUI ()
-paneMeta = labelWith (alignMid . fontMuted . fontSizeScale 0.85)
+paneMeta = paneMetaWith id
+
+-- | 'paneMeta' with an additional layout modifier, e.g. 'fixedW'.
+paneMetaWith :: (Layout -> Layout) -> Text -> NanoUI ()
+paneMetaWith f = labelWith (alignMid . fontMuted . fontSizeScale 0.85 . f)
 
 -- | The vital numbers of a run as one instrument line: each value over its
 -- name, separated by hairlines. Wraps onto more lines when narrow.
