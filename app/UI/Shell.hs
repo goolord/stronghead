@@ -21,7 +21,7 @@ import Data.Either (isRight)
 import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (for_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (isSuffixOf)
+import Data.List (find, isSuffixOf)
 import Data.List.Extra (chunksOf)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
@@ -144,6 +144,8 @@ data App = App
     -- ^ The last session, reopened on the first frame.
   , appPendingModule :: !(Var (Maybe T.Text))
     -- ^ A session's module, picked once its dump folder is searched.
+  , appPendingPreset :: !(Var (Maybe T.Text))
+    -- ^ An arrangement preset asked for on the command line.
   , appReopenLast :: !(Var Bool)
   , appWatchers :: !Watchers
   , appBaseline :: !BaselineState
@@ -163,13 +165,19 @@ data Options = Options
     -- ^ An entity to open, by its reference.
   , optMark :: !(Maybe T.Text)
     -- ^ A mark to send the connected program, once it can take one.
+  , optBaseline :: !(Maybe FilePath)
+    -- ^ A baseline artifact (.hp, .eventlog, .prof) to diff against.
+  , optTheme :: !(Maybe T.Text)
+    -- ^ UI theme (light, dark, system).
+  , optPreset :: !(Maybe T.Text)
+    -- ^ Initial layout arrangement preset.
   , optPersist :: !Bool
     -- ^ Whether settings changed while running are saved as they change
     -- (off for screenshot runs, which leave the settings file alone).
   }
 
 defaultOptions :: Options
-defaultOptions = Options [] Nothing Nothing Nothing Nothing Nothing Nothing True
+defaultOptions = Options [] Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing True
 
 -- | The app, starting from saved settings; the command line wins over them.
 newApp :: Settings -> Options -> IO App
@@ -235,9 +243,19 @@ newApp settings Options {..} = do
   appSessionOpen <- newVar Nothing
   appSessionPath <- newVar Nothing
   appPendingModule <- newVar Nothing
+  appPendingPreset <- newVar optPreset
   appReopenLast <- newVar (cfgReopenSession settings)
   appWatchers <- newWatchers
   appBaseline <- newBaselineState
+  for_ optBaseline $ \basePath -> do
+    let p = if ".hp" `isSuffixOf` basePath
+              then noBaselinePaths { blHeapProfile = Just basePath }
+              else if ".eventlog" `isSuffixOf` basePath
+                then noBaselinePaths { blEventlog = Just basePath }
+                else if ".prof" `isSuffixOf` basePath
+                  then noBaselinePaths { blCostCentres = Just basePath }
+                  else noBaselinePaths { blDumps = Just basePath }
+    writeVarIO (bvPaths appBaseline) p
   -- The last session comes back only when the command line asks for
   -- nothing of its own.
   let asked = not (null optFiles) || isJust optConnect || isJust optFollow || isJust optDebug
@@ -337,6 +355,13 @@ appView app = do
     writeVar (appPending app) []
     mapM_ (openAny app) pending
     for_ (appStartTab app) (writeVar (appTab app))
+  reopenPreset <- readVar (appPendingPreset app)
+  for_ reopenPreset $ \targetPreset -> do
+    writeVar (appPendingPreset app) Nothing
+    presets <- readVar (appPresets app)
+    let active = fromMaybe PHeap (appStartTab app)
+    for_ (find (\p -> T.toLower (prName p) == T.toLower targetPreset) presets) $ \p ->
+      useArrangement app active (prTree p)
   follow <- readVar (appFollow app)
   for_ follow $ \p -> do
     writeVar (appFollow app) Nothing

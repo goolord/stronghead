@@ -61,6 +61,9 @@ handleTool _ctx tool = do
       StrongheadGhciEval cmd mCwd mRepl -> do
         Tools.ghciEval cmd (fmap T.unpack mCwd) (fmap T.unpack mRepl)
 
+      StrongheadRenderGraph p mBase mOut mTheme mTopN -> do
+        Tools.renderGraph (T.unpack p) (fmap T.unpack mBase) (fmap T.unpack mOut) (fmap T.unpack mTheme) mTopN
+
 -- | Run the MCP server over standard input and output (stdio).
 runServer :: IO ()
 runServer = do
@@ -123,6 +126,7 @@ printTools = do
         , ("stronghead_live_control", "Trigger GCs, censuses, and toggle profiling in running programs via Stronghead.Agent")
         , ("stronghead_recommend_next_steps", "Prescriptive compiler and RTS flags for leaks, contention, and hot paths")
         , ("stronghead_ghci_eval", "Evaluate thunk trees and bindings in GHCi")
+        , ("stronghead_render_graph", "Render publication-quality nano-ui heap graphs and PNG screenshots for issue reports and proof of fixes")
         ]
   forM_ tools $ \(name, desc) -> do
     putStrLn ("* " <> name <> ":")

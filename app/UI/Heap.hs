@@ -30,6 +30,13 @@ module UI.Heap
     -- * For the shell's next steps and baseline
   , heapOnShow
   , snapshotCount
+    -- * Exported for headless/SVG rendering with nano-ui-svg
+  , Layer (..)
+  , stackLayers
+  , drawChart
+  , chartPlot
+  , chartAxis
+  , maxStack
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -747,7 +754,7 @@ drawChart pal mm hp ls ymax v cursorIx axis marks r hover = do
   -- bottom, and the census cursor.
   drawMarks pal axis plot marks
   withClip (Rect px py pw (ph + 4)) $ forM_ xs $ \xx -> drawStroke (V2 xx (py + ph)) (V2 xx (py + ph + 3)) 1 (pMuted pal)
-  when (cursorIx < n) $ do
+  when (cursorIx >= 0 && cursorIx < n) $ do
     let cx = sx (times VU.! cursorIx)
     when (cx >= px && cx <= px + pw) $ drawStroke (V2 cx py) (V2 cx (py + ph)) 2 (pAccent pal)
   for_ hover $ \(hx, hy, lines') -> do

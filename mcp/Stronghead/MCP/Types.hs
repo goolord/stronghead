@@ -57,6 +57,13 @@ data StrongheadTool
       , cwd :: !(Maybe Text)
       , repl_cmd :: !(Maybe Text)
       }
+  | StrongheadRenderGraph
+      { path :: !Text
+      , baseline_path :: !(Maybe Text)
+      , output_path :: !(Maybe Text)
+      , theme :: !(Maybe Text)
+      , top_n :: !(Maybe Int)
+      }
   deriving stock (Show, Eq)
 
 -- | Descriptions for tools and arguments used by 'deriveToolHandlerWithDescription'.
@@ -122,6 +129,13 @@ toolDescriptions =
       unevaluated thunks (_t0, _t1) that can be forced.
       """
     )
+  , ( "StrongheadRenderGraph"
+    , """
+      Produces publication-quality bespoke SVG heap profile graphs matching classic hp2ps
+      PostScript styling with modern Stronghead formatting, typography, and empirical
+      before/after diff layouts for issue reports and proof of fixes.
+      """
+    )
   , ("path", "Path to the profiling artifact (.hp or .eventlog)")
   , ("dump_path", "Path to GHC dump directory or dump file (.dump-simpl, .dump-stg-final)")
   , ("top_n", "Maximum number of top suspects to return (default: 5)")
@@ -131,6 +145,7 @@ toolDescriptions =
   , ("include_stg", "Whether to include STG intermediate representation (default: true)")
   , ("top_threads", "Maximum number of threads to detail in contention breakdown (default: 8)")
   , ("baseline", "Path to baseline run (.hp or .eventlog)")
+  , ("baseline_path", "Optional path to baseline .hp file to diff against")
   , ("current", "Path to current run (.hp or .eventlog)")
   , ("baseline_dumps", "Optional dump directory for baseline run")
   , ("current_dumps", "Optional dump directory for current run")
@@ -147,4 +162,6 @@ toolDescriptions =
   , ("file_path", "Path to source file, eventlog, or heap profile")
   , ("cwd", "Working directory for GHCi")
   , ("repl_cmd", "Command to start GHCi (default: 'cabal repl')")
+  , ("output_path", "Optional file path where the generated SVG graph will be saved (.svg)")
+  , ("theme", "Graph theme: 'classic' (hp2ps PostScript look), 'dark' (Stronghead dark mode), or 'light' (modern light)")
   ]

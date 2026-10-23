@@ -13,6 +13,7 @@ module Stronghead.MCP.Tools
   , liveControl
   , recommendNextSteps
   , ghciEval
+  , renderGraph
     -- * Helpers
   , loadProfile
   ) where
@@ -27,10 +28,18 @@ import Data.Maybe (catMaybes, fromMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
-import System.Directory (doesDirectoryExist, doesFileExist)
-import System.FilePath (takeFileName, (</>))
+import Numeric (showFFloat)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
+import System.FilePath (takeBaseName, takeDirectory, takeFileName, (</>))
+import System.IO (IOMode (WriteMode), hSetEncoding, utf8, withFile)
+
+import UI.Graph
+  ( renderHpDiffSvg
+  , renderHpSvg
+  )
 
 import Stronghead.Diff
   ( BandChange (..)
@@ -77,6 +86,7 @@ import Stronghead.HeapProfile
   , InfoProv (..)
   , RetainTree (..)
   , Suspect (..)
+  , leakSuspects
   , loadHp
   , looksStructured
   , retainTree
@@ -820,3 +830,102 @@ ghciEval cmd mCwd mRepl = do
       pure $ Right $ renderMD do
         h1 ("GHCi Execution Output: " <> code cmd)
         codeBlock_ outText
+
+-- ---------------------------------------------------------------------------
+-- 9. Bespoke SVG Heap Profile Graph Generator
+
+-- | Produce publication-quality bespoke SVG heap profile graphs matching classic hp2ps
+-- PostScript styling with modern Stronghead formatting, typography, and empirical
+-- before/after diff layouts for issue reports and proof of fixes.
+renderGraph
+  :: FilePath             -- ^ Path to .hp file
+  -> Maybe FilePath       -- ^ Optional baseline .hp file
+  -> Maybe FilePath       -- ^ Optional output SVG path
+  -> Maybe String         -- ^ Theme ("classic", "dark", "light")
+  -> Maybe Int            -- ^ Top N bands
+  -> IO (Either Text Text)
+renderGraph hpPath mBaseline mOutPath mTheme mTopN = do
+  exists <- doesFileExist hpPath
+  if not exists
+    then pure (Left $ "Heap profile not found: " <> T.pack hpPath)
+    else do
+      mBaseValid <- case mBaseline of
+        Just bp -> do
+          be <- doesFileExist bp
+          if be
+            then fmap (Right . Just) (makeAbsolute bp)
+            else pure (Left $ "Baseline heap profile not found: " <> T.pack bp)
+        Nothing -> pure (Right Nothing)
+      case mBaseValid of
+        Left err -> pure (Left err)
+        Right validBaseline -> do
+          absHp <- makeAbsolute hpPath
+          eHp <- loadProfile absHp
+          case eHp of
+            Left err -> pure (Left $ "Failed to load heap profile: " <> T.pack err)
+            Right curHp -> do
+              let writeUtf8File fp txt = withFile fp WriteMode \h -> do
+                    hSetEncoding h utf8
+                    TIO.hPutStr h txt
+
+              case validBaseline of
+                Nothing -> do
+                  let outSvg = fromMaybe (takeDirectory absHp </> takeBaseName absHp <> ".svg") mOutPath
+                  svg <- renderHpSvg mTheme mTopN curHp
+                  createDirectoryIfMissing True (takeDirectory outSvg)
+                  writeUtf8File outSvg svg
+
+                  let peak = if VU.null (hpTotals curHp) then 0 else VU.maximum (hpTotals curHp)
+                      censuses = VU.length (hpTimes curHp)
+                      suspects = length (leakSuspects curHp)
+                      metrics = "\n**Heap Profile Summary:**\n\n"
+                                <> "* **Peak Residency:** " <> fmtBytesD peak <> "\n"
+                                <> "* **Total Censuses:** " <> tshow censuses <> "\n"
+                                <> "* **Identified Leak Suspects:** " <> tshow suspects <> "\n"
+
+                  pure $ Right $
+                    "### Standalone SVG Heap Profile Graph\n\n"
+                    <> "Generated bespoke vector heap profile graph using nano-ui-svg:\n\n"
+                    <> "![" <> T.pack (takeFileName outSvg) <> "](" <> T.pack outSvg <> ")\n"
+                    <> metrics
+
+                Just absBase -> do
+                  eBase <- loadProfile absBase
+                  case eBase of
+                    Left err -> pure (Left $ "Failed to load baseline heap profile: " <> T.pack err)
+                    Right baseHp -> do
+                      let outSvg = fromMaybe (takeDirectory absHp </> takeBaseName absHp <> "_proof_diff.svg") mOutPath
+                      diffSvg <- renderHpDiffSvg mTheme mTopN baseHp curHp
+                      createDirectoryIfMissing True (takeDirectory outSvg)
+                      writeUtf8File outSvg diffSvg
+
+                      let basePeak = if VU.null (hpTotals baseHp) then 0 else VU.maximum (hpTotals baseHp)
+                          curPeak = if VU.null (hpTotals curHp) then 0 else VU.maximum (hpTotals curHp)
+                          baseCensuses = VU.length (hpTimes baseHp)
+                          curCensuses = VU.length (hpTimes curHp)
+                          baseSuspects = length (leakSuspects baseHp)
+                          curSuspects = length (leakSuspects curHp)
+                          reduction = if basePeak > 0
+                            then let pct = (1.0 - (curPeak / basePeak)) * 100.0 :: Double
+                                  in T.pack (showFFloat (Just 1) pct "") <> "%"
+                            else "N/A"
+
+                      let diffTable =
+                            "\n### Empirical Verification & Metrics Comparison\n\n"
+                            <> "| Metric | Baseline (Before Fix) | Current (After Fix) | Improvement |\n"
+                            <> "| :--- | :--- | :--- | :--- |\n"
+                            <> "| **Peak Heap Residency** | " <> fmtBytesD basePeak
+                            <> " | " <> fmtBytesD curPeak
+                            <> " | **-" <> reduction <> "** reduction |\n"
+                            <> "| **Total Censuses** | " <> tshow baseCensuses
+                            <> " | " <> tshow curCensuses
+                            <> " | " <> (let d = curCensuses - baseCensuses in if d >= 0 then "+" <> tshow d else tshow d) <> " |\n"
+                            <> "| **Identified Leak Suspects** | " <> tshow baseSuspects
+                            <> " | " <> tshow curSuspects
+                            <> " | " <> (if curSuspects < baseSuspects then "Fixed (" <> tshow (baseSuspects - curSuspects) <> " suspects eliminated)" else "0") <> " |\n"
+
+                      pure $ Right $
+                        "## Stronghead Proof of Fix (Bespoke SVG Graph)\n\n"
+                        <> "Generated bespoke publication-quality SVG heap graph for issue reporting:\n\n"
+                        <> "![" <> T.pack (takeFileName outSvg) <> "](" <> T.pack outSvg <> ")\n\n"
+                        <> diffTable

@@ -2,23 +2,16 @@
 --
 -- > stronghead [--tab NAME] [--connect HOST:PORT] [--follow FILE.eventlog]
 -- >            [--debug MODULE.hs] [--goto REF] [--mark TEXT] [FILE|DIR ...]
---
--- Setting @STRONGHEAD_CAPTURE=out.bmp@ saves a screenshot after
--- @STRONGHEAD_CAPTURE_DELAY@ seconds (default 3) and exits without writing
--- user settings or session state.
 module Main (main) where
 
-import Control.Monad (when)
-import Data.Maybe (fromMaybe, isNothing)
-import System.Environment (getArgs, lookupEnv)
+import System.Environment (getArgs)
 import System.IO (stderr)
-import Text.Read (readMaybe)
 
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as T
 import NanoUI
-import NanoUI.Backend.Sdl (NanoUIFont (..), SdlOptions (..), askSdlEnv, defaultSdlOptions, runSdlApp, saveScreenshot)
+import NanoUI.Backend.Sdl (NanoUIFont (..), SdlOptions (..), defaultSdlOptions, runSdlApp)
 import Options.Applicative qualified as Opt
 
 import Demo (demoMain)
@@ -36,13 +29,15 @@ main = do
 
 mainWindowed :: IO ()
 mainWindowed = do
-  capture <- lookupEnv "STRONGHEAD_CAPTURE"
-  opts <- Opt.execParser (optionsInfo (isNothing capture))
+  opts <- Opt.execParser (optionsInfo True)
   settings <- loadSettings
-  app <- newApp settings opts
-  delay <- maybe 3 (fromMaybe 3 . readMaybe) <$> lookupEnv "STRONGHEAD_CAPTURE_DELAY"
-  started <- newVar (Nothing :: Maybe Double)
-  let window = if cfgRestoreWindow settings then cfgWindow settings else Nothing
+  let settings' = case optTheme opts of
+        Just "light"  -> settings { cfgTheme = ThemeLight }
+        Just "dark"   -> settings { cfgTheme = ThemeDark }
+        Just "system" -> settings { cfgTheme = ThemeSystem }
+        _             -> settings
+  app <- newApp settings' opts
+  let window = if cfgRestoreWindow settings' then cfgWindow settings' else Nothing
   runSdlApp
     defaultSdlOptions
       { sdlWindowSettings =
@@ -52,17 +47,14 @@ mainWindowed = do
             , wsPosition = maybe WindowPositionDefault (uncurry WindowPositionAt) (window >>= swPosition)
             , wsMinSize = Just (Size 960 640)
             }
-      , sdlAppThemeFor = Just (strongheadTheme . choiceAppearance (cfgTheme settings))
-      , sdlAppUiScale = uiScaleFactor (cfgScale settings)
+      , sdlAppThemeFor = Just (strongheadTheme . choiceAppearance (cfgTheme settings'))
+      , sdlAppUiScale = uiScaleFactor (cfgScale settings')
       , sdlAppFontSize = 15
       , sdlAppMonoFont = FontSearch ["JetBrains Mono", "Cascadia Mono", "Source Code Pro", "Consolas", "DejaVu Sans Mono", "monospace"]
       }
-    (appView app >> maybe (pure ()) (captureAfter started delay) capture)
-  -- A screenshot run leaves the user's settings and last session as they
-  -- were.
-  when (isNothing capture) do
-    saveAppSettings app >>= either (T.hPutStrLn stderr) pure
-    saveLastSession app >>= either (T.hPutStrLn stderr) pure
+    (appView app)
+  saveAppSettings app >>= either (T.hPutStrLn stderr) pure
+  saveLastSession app >>= either (T.hPutStrLn stderr) pure
 
 optionsInfo :: Bool -> Opt.ParserInfo Options
 optionsInfo persist =
@@ -80,23 +72,12 @@ optionsParser persist =
     <*> Opt.optional (Opt.strOption (Opt.long "debug" <> Opt.metavar "MODULE.hs" <> Opt.help "Start a GHCi session on a module"))
     <*> Opt.optional (Opt.strOption (Opt.long "goto" <> Opt.metavar "REF" <> Opt.help "Open an entity by its reference"))
     <*> Opt.optional (Opt.strOption (Opt.long "mark" <> Opt.metavar "TEXT" <> Opt.help "Send a mark to the connected program"))
+    <*> Opt.optional (Opt.strOption (Opt.long "baseline" <> Opt.metavar "FILE" <> Opt.help "Baseline profile or eventlog to diff against"))
+    <*> Opt.optional (Opt.strOption (Opt.long "theme" <> Opt.metavar "THEME" <> Opt.help "UI theme (light, dark, system)"))
+    <*> Opt.optional (Opt.strOption (Opt.long "preset" <> Opt.metavar "PRESET" <> Opt.help "Window layout arrangement preset"))
     <*> pure persist
   where
     parseConnect :: Text -> (Text, Text)
     parseConnect addr =
       let (host, port) = T.breakOnEnd ":" addr
        in if T.null host then ("127.0.0.1", port) else (T.dropEnd 1 host, port)
-
--- | Save a screenshot once the window has been up for a while, then quit.
-captureAfter :: Var (Maybe Double) -> Double -> FilePath -> NanoUI ()
-captureAfter started delay path = do
-  now <- uiTime
-  t0 <- readVar started
-  case t0 of
-    Nothing -> writeVar started (Just now)
-    Just s -> do
-      wakeAfter 0.1
-      when (now - s >= delay) $
-        askSdlEnv >>= \case
-          Just env -> liftIO (saveScreenshot env path) >> quitUi
-          Nothing -> quitUi
