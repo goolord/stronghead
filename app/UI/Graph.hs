@@ -45,20 +45,26 @@ import UI.Common
   ( MonoMetrics (..)
   , Palette (..)
   , TimeView (..)
+  , alpha
+  , axisTicks
   , badge
   , bandColor
   , canvasKeyed
   , monoMetrics
+  , niceStep
   , numCell
   , palette
   , strongheadTheme
+  , timeToX
   )
 import UI.Heap
-  ( chartPlot
+  ( Layer (..)
+  , chartPlot
   , drawChart
   , maxStack
   , stackLayers
   )
+import NanoUI.Path qualified as P
 
 
 
@@ -185,8 +191,8 @@ cleanAttrs txt attrs =
             | Just (x, "") <- readFloat xVal ->
                 -- Case 1: Chart Y-axis tick pre-shifted to negative x
                 (x < 0) ||
-                -- Case 2: Byte amounts in legend or chips (right-aligned numCell)
-                (T.isSuffixOf " B" txt || T.isSuffixOf " KiB" txt || T.isSuffixOf " MiB" txt || T.isSuffixOf " GiB" txt)
+                -- Case 2: A bare byte amount ("24.0 KiB"): a right-aligned numCell
+                isByteAmount txt
             | otherwise -> False
           _ -> False
    in if isRightAligned
@@ -203,6 +209,13 @@ cleanAttrs txt attrs =
   readFloat s = case reads (T.unpack s) of
     [(v, rest)] -> Just (v :: Float, rest)
     _           -> Nothing
+
+-- | Whether a label is just a byte amount as 'fmtBytesD' prints it, such as
+-- @24.0 KiB@ or @888 B@, and not a sentence that happens to end in a unit.
+isByteAmount :: Text -> Bool
+isByteAmount t = case T.words t of
+  [num, unit] -> unit `elem` ["B", "KiB", "MiB", "GiB", "TiB"] && not (T.null num) && T.all (\c -> (c >= '0' && c <= '9') || c == '.' || c == '-') num
+  _ -> False
 
 parseAttr :: Text -> Text -> Maybe Text
 parseAttr key src =
@@ -248,7 +261,9 @@ heapPanelUi pal mm hp topN panelTitle = do
       suspects = length (leakSuspects hp)
       lo = hpStart hp * 1e9
       dur = if VU.null times then 0 else VU.last times - hpStart hp
-      hi = if VU.null times then lo + 1e9 else max (lo + 1e6) (VU.last times * 1e9)
+      -- A little room after the last census, as the GUI's chart window has,
+      -- so the final point does not sit on the plot's edge.
+      hi = if VU.null times then lo + 1e9 else let end = VU.last times * 1e9 in max (lo + 1e6) (end + 0.015 * (end - lo))
       v = TimeView lo hi
       ls = stackLayers hp S.empty Nothing topN
       ymax = max 1 (maxStack ls)
@@ -275,10 +290,14 @@ heapPanelUi pal mm hp topN panelTitle = do
         labelWith (fontMono . fontSizeScale 0.82 . fontBold) (fmtBytesD peak <> " peak")
 
     -- Chart plot and legend side-by-side
+    th <- uiTheme
+    let sep = themeWindow th
     rowWith (fillW . grow . gap 8) $ do
       void $ canvasConfigured
         defaultCanvasConfig { canvasLayout = (fillW . fillH) defaultLayout }
-        (\r -> drawChart pal mm hp ls ymax v (-1) (axis r) marks r Nothing)
+        (\r -> do
+            drawChart pal mm hp ls ymax v (-1) (axis r) marks r Nothing
+            proofOverlay pal sep hp ls ymax v r)
 
       columnWith (fixedW 256 . gap 4) $ do
         labelWith (fontSizeScale 0.8 . fontBold . fontMuted) ("BANDS (" <> tshow (length (hpBands hp)) <> " TOTAL)")
@@ -298,6 +317,34 @@ heapPanelUi pal mm hp topN panelTitle = do
             rowWith (fixedW 54 . alignEnd . alignMid) $
               when isLeak $
                 badge Danger "LEAK"
+
+-- | Readability aids drawn over 'drawChart' for the static proof graphs,
+-- which have no hover readout: a light vertical rule at every labelled time
+-- tick so a point can be read against the axis, a thin separator along the
+-- top of each band so neighbouring colours stay distinct, and a dot at each
+-- census on the total so the actual samples are visible.
+proofOverlay :: Palette -> Color -> HeapProfile -> [Layer] -> Double -> TimeView -> Rect -> CanvasM ()
+proofOverlay pal sep hp ls ymax v r = do
+  let plot@(Rect px py pw ph) = chartPlot r
+      times = hpTimes hp
+      n = VU.length times
+      sx t = timeToX v px pw (t * 1e9)
+      sy b = py + ph - realToFrac (b / ymax) * ph
+      -- The same ticks 'drawChart' labels along the bottom.
+      o0 = tvStart v / 1e9 - hpStart hp
+      o1 = tvEnd v / 1e9 - hpStart hp
+      tstep = niceStep ((o1 - o0) / 8)
+      xs = [sx (times VU.! i) | i <- [0 .. n - 1]]
+      tops = drop 1 (scanl (VU.zipWith (+)) (VU.replicate n 0) (map lyValues ls))
+  withClip plot $ do
+    forM_ (take 100 (axisTicks tstep o0 o1)) $ \o -> do
+      let x = sx (o + hpStart hp)
+      drawStroke (V2 x py) (V2 x (py + ph)) 1 (pGrid pal)
+    when (n >= 2) $ forM_ tops $ \top ->
+      drawStrokePath (P.polyline [V2 x (sy (top VU.! i)) | (i, x) <- zip [0 ..] xs]) 1 (alpha 0.7 sep)
+  forM_ (take 1 (reverse tops)) $ \total ->
+    forM_ (zip [0 ..] xs) $ \(i, x) ->
+      drawRoundedRect (Rect (x - 2.5) (sy (total VU.! i) - 2.5) 5 5) 2.5 (pText pal)
 
 -- | Renders the Before & After proof diff view.
 heapDiffUi :: Palette -> MonoMetrics -> HeapProfile -> HeapProfile -> Int -> NanoUI ()
@@ -334,8 +381,8 @@ heapDiffUi pal mm baseHp curHp topN = do
           labelWith (fontMono . fontSizeScale 0.95 . fontBold) (tshow baseCensuses <> " -> " <> tshow curCensuses)
           labelWith (fontMono . fontSizeScale 0.85 . fontMuted) (tshow (curCensuses - baseCensuses) <> " diff")
 
-    -- Side-by-side heap panels
-    rowWith (fillW . grow . gap 10) $ do
+    -- Before above After, so each chart gets the full width.
+    columnWith (fillW . grow . gap 10) $ do
       columnWith (fillW . grow) $
         heapPanelUi pal mm baseHp topN "1. Baseline (Before Fix — Leaking)"
       columnWith (fillW . grow) $
@@ -363,6 +410,6 @@ renderHpDiffSvg mTheme mTopN baseHp curHp = do
       theme = strongheadTheme appearance
       pal = palette theme
       topN = fromMaybe 12 mTopN
-  renderUiFrameToSvg 1380 700 theme $ do
+  renderUiFrameToSvg 1200 1180 theme $ do
     mm <- monoMetrics 0.88
     heapDiffUi pal mm baseHp curHp topN
