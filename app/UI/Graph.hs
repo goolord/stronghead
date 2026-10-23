@@ -195,6 +195,7 @@ cleanAttrs txt attrs =
                 isByteAmount txt
             | otherwise -> False
           _ -> False
+      isCentered = isCenteredChip txt
    in if isRightAligned
         then case (mX, mLen) of
           (Just xVal, Just lenVal)
@@ -204,11 +205,30 @@ cleanAttrs txt attrs =
                     replacedX = replaceAttr "x=\"" targetX attrsWithoutLen
                  in replacedX <> " text-anchor=\"end\""
           _ -> attrsWithoutLen
-        else attrsWithoutLen
- where
-  readFloat s = case reads (T.unpack s) of
-    [(v, rest)] -> Just (v :: Float, rest)
-    _           -> Nothing
+        else if isCentered
+          then case (mX, mLen) of
+            (Just xVal, Just lenVal)
+              | Just (x, "") <- readFloat xVal
+              , Just (l, "") <- readFloat lenVal ->
+                  let targetX = T.pack (showFFloat (Just 1) (x + l / 2) "")
+                      replacedX = replaceAttr "x=\"" targetX attrsWithoutLen
+                   in replacedX <> " text-anchor=\"middle\""
+            _ -> attrsWithoutLen
+          else attrsWithoutLen
+  where
+   readFloat s = case reads (T.unpack s) of
+     [(v, rest)] -> Just (v :: Float, rest)
+     _           -> Nothing
+
+-- | Whether a label is a metric chip or badge that should be horizontally
+-- centered inside its box so left and right padding are perfectly equal.
+isCenteredChip :: Text -> Bool
+isCenteredChip t =
+  " censuses" `T.isSuffixOf` t ||
+  " profiled" `T.isSuffixOf` t ||
+  " peak" `T.isSuffixOf` t ||
+  t == "LEAK" ||
+  "LEAK SUSPECTS" `T.isSuffixOf` t
 
 -- | Whether a label is just a byte amount as 'fmtBytesD' prints it, such as
 -- @24.0 KiB@ or @888 B@, and not a sentence that happens to end in a unit.
@@ -271,23 +291,23 @@ heapPanelUi pal mm hp topN panelTitle = do
       axis r = linearAxis rk v (rectX (chartPlot r)) (rectW (chartPlot r))
       marks = Marks Nothing Nothing [] []
 
-  panelWith (padAll 10 . gap 8 . fillW . fillH) $ do
-    -- Title row: Panel title on left, Leak Suspects badge on right
-    rowWith (alignMid . gap 8 . fillW) $ do
-      labelWith (fontBold . fontSizeScale 1.05) panelTitle
-      flex
-      if suspects > 0
-        then badge Danger (tshow suspects <> " LEAK SUSPECTS")
-        else badge Success "0 LEAK SUSPECTS"
+  panelWith (padAll 10 . gap 6 . fillW . fillH) $ do
+    -- Header block: Title row and Metric chips row closely stacked
+    columnWith (tight . gap 4 . fillW) $ do
+      rowWith (tight . alignMid . gap 8 . fillW) $ do
+        labelWith (fontBold . fontSizeScale 1.05) panelTitle
+        flex
+        if suspects > 0
+          then badge Danger (tshow suspects <> " LEAK SUSPECTS")
+          else badge Success "0 LEAK SUSPECTS"
 
-    -- Metric chips row: censuses, duration, peak bytes
-    rowWith (alignMid . gap 6 . fillW) $ do
-      cardWith (padXY 12 5) $
-        labelWith (fontMono . fontSizeScale 0.82 . fontBold) (tshow censuses <> " censuses")
-      cardWith (padXY 12 5) $
-        labelWith (fontMono . fontSizeScale 0.82 . fontMuted) (fmtSec dur <> " profiled")
-      cardWith (padXY 12 5) $
-        labelWith (fontMono . fontSizeScale 0.82 . fontBold) (fmtBytesD peak <> " peak")
+      rowWith (tight . alignMid . gap 6 . fillW) $ do
+        cardWith (padXY 10 3) $
+          labelWith (fontSizeScale 0.82 . fontBold) (tshow censuses <> " censuses")
+        cardWith (padXY 10 3) $
+          labelWith (fontSizeScale 0.82 . fontMuted) (fmtSec dur <> " profiled")
+        cardWith (padXY 10 3) $
+          labelWith (fontSizeScale 0.82 . fontBold) (fmtBytesD peak <> " peak")
 
     -- Chart plot and legend side-by-side
     th <- uiTheme
