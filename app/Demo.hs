@@ -484,7 +484,7 @@ tour r repo = do
   -- Connect: the agent says hello, and Connect finds everything else.
   clickAt r =<< exact r "Connect"
   await r "capabilities" 20
-  await r "Connect found" 10
+  await r "Connect found" 30
   wait r 1.4
 
   -- Remote commands: a mark, a collection.

@@ -542,7 +542,7 @@ discoverArtifacts root = do
       case r of
         Left _ -> pure []
         Right entries -> do
-          let paths = [dir </> e | e <- sort entries, e `notElem` [".git", "node_modules"]]
+          let paths = [dir </> e | e <- sort entries, case e of '.' : _ -> False; _ -> e /= "node_modules"]
           (dirs, files) <- partitionM doesDirectoryExist paths
           (files ++) <$> concatMapM (walk (d - 1)) dirs
 
