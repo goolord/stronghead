@@ -262,7 +262,7 @@ heapPanelUi pal mm hp topN panelTitle = do
         defaultCanvasConfig { canvasLayout = (fillW . fillH) defaultLayout }
         (\r -> drawChart pal mm hp ls ymax v (-1) (axis r) marks r Nothing)
 
-      columnWith (fixedW 250 . gap 4) $ do
+      columnWith (fixedW 256 . gap 4) $ do
         labelWith (fontSizeScale 0.8 . fontBold . fontMuted) ("BANDS (" <> tshow (length (hpBands hp)) <> " TOTAL)")
         let bands = V.toList (hpBands hp)
             topBands = take topN bands
@@ -272,12 +272,12 @@ heapPanelUi pal mm hp topN panelTitle = do
               c = bandColor i name
               bPeak = if VU.null (bandValues b) then 0 else VU.maximum (bandValues b)
               isLeak = S.member name leakNames
-              dispName = if T.length name > 15 then T.take 14 name <> "…" else name
+              dispName = if T.length name > 14 then T.take 13 name <> "…" else name
           rowWith (alignMid . gap 6 . fillW) $ do
             void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMid) (\r -> drawRoundedRect r 2 c)
-            labelWith (fontMono . fontSizeScale 0.8 . fixedW 114) dispName
-            numCell 64 (fontSizeScale 0.78 . fontMuted) (fmtBytesD bPeak)
-            rowWith (fixedW 42 . alignEnd . alignMid) $
+            labelWith (fontMono . fontSizeScale 0.8 . fixedW 108) dispName
+            numCell 62 (fontSizeScale 0.78 . fontMuted) (fmtBytesD bPeak)
+            rowWith (fixedW 54 . alignEnd . alignMid) $
               when isLeak $
                 badge Danger "LEAK"
 
