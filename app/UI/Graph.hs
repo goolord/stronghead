@@ -126,14 +126,32 @@ renderUiFrameToSvg width height theme ui = do
 -- elements render with natural typographic proportions. When an anchor-end tick was
 -- pre-shifted to a negative x coordinate by 'drawTextBox', or when text is a right-aligned
 -- byte amount (ending in " B", " KiB", " MiB", " GiB"), restores 'text-anchor="end"'
--- at the right edge (x + textLength). Also enables tabular numbers at the SVG root.
+-- at the right edge (x + textLength). Also scopes canvas clip and gradient IDs across
+-- multiple drawings (e.g. side-by-side diff panels) so IDs never collide, and enables
+-- tabular numbers at the SVG root.
 cleanSvgText :: Text -> Text
 cleanSvgText txt =
   let withTabular = if "<svg " `T.isInfixOf` txt && not ("tabular-nums" `T.isInfixOf` txt)
                       then replaceFirst "<svg " "<svg style=\"font-variant-numeric: tabular-nums;\" " txt
                       else txt
-   in processTextTags withTabular
+      scoped = scopeCanvasDefs withTabular
+   in processTextTags scoped
  where
+  scopeCanvasDefs src =
+    let chunks = T.splitOn "<g><defs>" src
+     in case chunks of
+          [] -> src
+          (firstChunk : restChunks) ->
+            let scopedRest = zipWith scopeOne [1 :: Int ..] restChunks
+             in T.intercalate "<g><defs>" (firstChunk : scopedRest)
+
+  scopeOne k chunk =
+    let prefix = "c" <> tshow k <> "_"
+     in T.replace "id=\"clip_" ("id=\"" <> prefix <> "clip_")
+          (T.replace "url(#clip_" ("url(#" <> prefix <> "clip_")
+            (T.replace "id=\"grad_" ("id=\"" <> prefix <> "grad_")
+              (T.replace "url(#grad_" ("url(#" <> prefix <> "grad_") chunk)))
+
   replaceFirst target repl src =
     let (before, match) = T.breakOn target src
      in if T.null match
