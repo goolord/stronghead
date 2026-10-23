@@ -282,11 +282,11 @@ heapPanelUi pal mm hp topN panelTitle = do
 
     -- Metric chips row: censuses, duration, peak bytes
     rowWith (alignMid . gap 6 . fillW) $ do
-      cardWith (padXY 8 3) $
+      cardWith (padXY 12 5) $
         labelWith (fontMono . fontSizeScale 0.82 . fontBold) (tshow censuses <> " censuses")
-      cardWith (padXY 8 3) $
+      cardWith (padXY 12 5) $
         labelWith (fontMono . fontSizeScale 0.82 . fontMuted) (fmtSec dur <> " profiled")
-      cardWith (padXY 8 3) $
+      cardWith (padXY 12 5) $
         labelWith (fontMono . fontSizeScale 0.82 . fontBold) (fmtBytesD peak <> " peak")
 
     -- Chart plot and legend side-by-side
@@ -314,7 +314,7 @@ heapPanelUi pal mm hp topN panelTitle = do
             void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMid) (\r -> drawRoundedRect r 2 c)
             labelWith (fontMono . fontSizeScale 0.8 . fixedW 108) dispName
             numCell 62 (fontSizeScale 0.78 . fontMuted) (fmtBytesD bPeak)
-            rowWith (fixedW 54 . alignEnd . alignMid) $
+            rowWith (fixedW 58 . alignEnd . alignMid) $
               when isLeak $
                 badge Danger "LEAK"
 

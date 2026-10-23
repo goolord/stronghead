@@ -429,7 +429,7 @@ badge t txt = do
   th <- uiTheme
   let c = toneColor th t
   styled (panelStyle (background (alpha 0.16 c) . borderWidth 0 . cornerRadius 4)) $
-    panelWith (alignMid . padXY 6 1) (labelWith (fontColor c . fontSizeScale 0.8) txt)
+    panelWith (alignMid . padXY 10 4) (labelWith (fontColor c . fontSizeScale 0.8) txt)
 
 pathLabel :: Maybe FilePath -> NanoUI ()
 pathLabel = \case
