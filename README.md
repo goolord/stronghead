@@ -75,23 +75,13 @@ main = withGhcDebug $ do
   ...
 ```
 
-### Model Context Protocol (MCP) Server for AI Assistants
+### MCP server for AI assistants
 
-Stronghead includes a native [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server built on the [`mcp-server`](https://hackage.haskell.org/package/mcp-server) library. It exposes Stronghead's profiling and optimization analysis engines directly to AI coding assistants (Claude Desktop, Cursor, Zed, Antigravity, Claude Code).
+Stronghead includes a Model Context Protocol (MCP) server that exposes its heap
+profiler, Core/STG dump analyzer, and eventlog diagnostics to AI coding assistants
+(Claude Desktop, Cursor, Antigravity).
 
-Instead of forcing AI agents to guess where to insert `BangPatterns` or speculative `seq`, Stronghead MCP gives LLMs direct semantic observability into GHC Core/STG optimization decisions, memory residency, and runtime bottlenecks.
-
-#### Running the MCP Server
-
-```sh
-# Start stdio MCP server (standard JSON-RPC over stdin/stdout)
-cabal run stronghead-mcp
-
-# Or inspect available tools
-cabal run stronghead-mcp -- --tools
-```
-
-#### Client Configuration (e.g., `claude_desktop_config.json` or Antigravity `mcp_config.json`)
+Add to your MCP client configuration (e.g. `claude_desktop_config.json`):
 
 ```json
 {
@@ -104,18 +94,11 @@ cabal run stronghead-mcp -- --tools
 }
 ```
 
-#### Available MCP Tools
+To test over stdio or inspect available tools from the command line:
 
-| Tool | Purpose | Key Inputs |
-|:---|:---|:---|
-| `stronghead_diagnose_leak` | Pinpoint space leaks, calculate suspect scores (0-1), growth slopes, and cost-centre retention trees | `path` (`.hp` or `.eventlog`), `top_n`, `threshold` |
-| `stronghead_inspect_core` | Inspect optimized Core & STG for worker-wrapper, strictness signatures, constructor boxing, and STG `let` allocations | `binding`, `dump_path`, `module_name`, `include_stg` |
-| `stronghead_eventlog_summary` | Aggregate GC pause percentiles (p50, p90, p95, p99, max), mutator/GC time, and thread contention breakdown (MVar, STM) | `path` (`.eventlog`), `top_threads` |
-| `stronghead_diff_runs` | Empirically compare baseline vs current profiling runs to verify memory and latency improvements | `baseline`, `current`, `baseline_dumps`, `current_dumps` |
-| `stronghead_retainer_path` | Trace shortest retainer path from GC roots via `ghc-debug` (Root $\to$ `IORef` $\to$ `Thunk` $\to$ `Data`) | `closure_address`, `band_name`, `target` |
-| `stronghead_live_control` | Remotely trigger major GC, take heap censuses, toggle profiling, or query live RTS stats via `Stronghead.Agent` | `command`, `host`, `port`, `text` |
-| `stronghead_recommend_next_steps` | Generate prescriptive GHC compiler & RTS flags for leaks, contention, or GC pressure | `issue_type`, `entity`, `file_path` |
-| `stronghead_ghci_eval` | Inspect thunk trees and unevaluated `_t` closures via GHCi `:print` | `command`, `cwd`, `repl_cmd` |
+```sh
+cabal run stronghead-mcp -- --tools
+```
 
 ## License
 
