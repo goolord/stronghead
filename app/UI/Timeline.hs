@@ -330,17 +330,17 @@ body env bench st tl mprog = do
       vs f = (\b -> fmtChange (f b) (f summary) <> " vs baseline") <$> base
       rate sm = fromIntegral (smAllocated sm) / max 1e-9 (smDuration sm)
   columnWith (padBottom 8 . tight . fillW) $
-    readoutDelta
-      [ ("duration", fmtSec (smDuration summary), vs smDuration)
-      , ("mutator", fmtPct (smMutatorFrac summary), vs smMutatorFrac)
-      , ("GC time", fmtPct (smGCFrac summary), vs smGCFrac)
-      , ("collections, " <> fmtInt (smMajorGCs summary) <> " major", fmtInt (smGCCount summary), vs (fromIntegral . smGCCount))
-      , ("longest pause", fmtNs (smGCPauseMax summary), vs smGCPauseMax)
-      , ("allocated", fmtBytes (smAllocated summary), vs (fromIntegral . smAllocated))
-      , ("allocation rate", fmtRate (rate summary), vs rate)
-      , ("peak live", fmtBytes (smPeakLive summary), vs (fromIntegral . smPeakLive))
-      , ("threads", fmtInt (smThreads summary), Nothing)
-      , ("events", fmtInt (tlEventCount tl), Nothing)
+    readoutDeltaWith
+      [ ("duration", fmtSec (smDuration summary), vs smDuration, id)
+      , ("mutator", fmtPct (smMutatorFrac summary), vs smMutatorFrac, id)
+      , ("GC time", fmtPct (smGCFrac summary), vs smGCFrac, id)
+      , ("collections, " <> fmtInt (smMajorGCs summary) <> " major", fmtInt (smGCCount summary), vs (fromIntegral . smGCCount), fixedW 144)
+      , ("longest pause", fmtNs (smGCPauseMax summary), vs smGCPauseMax, id)
+      , ("allocated", fmtBytes (smAllocated summary), vs (fromIntegral . smAllocated), id)
+      , ("allocation rate", fmtRate (rate summary), vs rate, id)
+      , ("peak live", fmtBytes (smPeakLive summary), vs (fromIntegral . smPeakLive), id)
+      , ("threads", fmtInt (smThreads summary), Nothing, id)
+      , ("events", fmtInt (tlEventCount tl), Nothing, id)
       ]
   bnDraw bench (tsPanes st) (timelinePanes env st mprog)
 

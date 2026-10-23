@@ -95,6 +95,7 @@ module UI.Common
   , paneMenuWithVar
   , readout
   , readoutDelta
+  , readoutDeltaWith
   , emptyState
   , paneScroll
   , paneScrollArea
@@ -821,9 +822,14 @@ readout items = readoutDelta [(name, value, Nothing) | (name, value) <- items]
 -- | 'readout' with, under a value, its change against the baseline run
 -- when there is one.
 readoutDelta :: [(Text, Text, Maybe Text)] -> NanoUI ()
-readoutDelta items =
+readoutDelta items = readoutDeltaWith [(name, value, delta, id) | (name, value, delta) <- items]
+
+-- | 'readoutDelta' with layout modifiers on the subtitles (e.g. 'fixedW' so
+-- dynamic counts in a subtitle do not shift subsequent columns).
+readoutDeltaWith :: [(Text, Text, Maybe Text, Layout -> Layout)] -> NanoUI ()
+readoutDeltaWith items =
   rowWith (padTop 14 . padXY 20 0 . tight . gap 0 . fillW . wrap . lineGap 8) $
-    forM_ (zip [0 :: Int ..] items) $ \(i, (name, value, delta)) -> withKey i $
+    forM_ (zip [0 :: Int ..] items) $ \(i, (name, value, delta, modSub)) -> withKey i $
       rowWith (tight . gap 0) $ do
         scope $ when (i > 0) (vrule 34)
         columnWith (padLeft (if i > 0 then 14 else 0) . padRight 14 . tight . gap 0) $ do
@@ -831,7 +837,7 @@ readoutDelta items =
           rowWith (tight . gap 3) $ do
             cell (fontMono . fontSizeScale 1.3) number
             scope $ unless (T.null unit) (cell (fontMuted . fontSizeScale 0.9) unit)
-          labelWith (fontMuted . fontSizeScale 0.8) name
+          labelWith (modSub . fontMuted . fontSizeScale 0.8) name
           scope $ for_ delta $ labelWith (fontMuted . fontMono . fontSizeScale 0.75)
 
 -- | A reading's number and its unit ("5.084 s", "16.5%"), so the unit can

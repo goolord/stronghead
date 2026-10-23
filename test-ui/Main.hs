@@ -36,7 +36,7 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, wasPaneFlashed)
+import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, readoutDeltaWith, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Inspector
@@ -937,6 +937,33 @@ main = do
   _ <- renderHeader (withInput 800 200) (makeTl 54)
   [(_, Rect _ _ w800 _)] <- nodesOfType NodeTextInput mhCtx
   check "search box fills expanded remaining space" (w800 > w54 + 190)
+
+  putStrLn "timeline readout subtitle"
+  roCtx <- newContext
+  let roInp = withInput 1280 200
+      renderReadout (majorCount :: Int) = evalUi roCtx roInp $
+        readoutDeltaWith
+          [ ("duration", "52.938 s", Nothing, id)
+          , ("collections, " <> tshow majorCount <> " major", "2,950", Nothing, fixedW 144)
+          , ("longest pause", "187.61 ms", Nothing, id)
+          ]
+      findX text spans = case [rectX r | (r, t, _, _, _) <- spans, t == text] of
+        (x : _) -> pure x
+        [] -> fail ("no span " <> T.unpack text)
+
+  _ <- renderReadout 0
+  spans0 <- collectTextSpans roCtx
+  xPause0 <- findX "longest pause" spans0
+
+  _ <- renderReadout 221
+  spans221 <- collectTextSpans roCtx
+  xPause221 <- findX "longest pause" spans221
+
+  _ <- renderReadout 999
+  spans999 <- collectTextSpans roCtx
+  xPause999 <- findX "longest pause" spans999
+
+  check "collections subtitle changing does not move subsequent readouts" (xPause0 == xPause221 && xPause221 == xPause999)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
