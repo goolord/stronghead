@@ -37,11 +37,14 @@ import Stronghead.Ghci
 import Stronghead.HeapProfile
 import Stronghead.Join
 import Stronghead.Live
+import Stronghead.Markdown qualified as MD
 import Stronghead.Next
 import Stronghead.Prof
 import Stronghead.Ref
 import Stronghead.Run
 import Stronghead.Session
+import Stronghead.MCP.Tools qualified as MCPTools
+import Stronghead.MCP.Types qualified as MCPTypes
 import Stronghead.TextFile (readTextFile, writeTextFile)
 import Stronghead.Source
 import Stronghead.Watch
@@ -799,6 +802,50 @@ main = do
     fmap (\s -> (sesWatchers s, sesBaseline s)) (decodeSession "version = 1\n") == Right (defaultRules, noBaselinePaths)
   check "a hand-written rule replaces its kind only" $
     fmap (map ruOn . sesWatchers) (decodeSession "version = 1\nwatch.1 = band-growing n=4 on=true\n") == Right [False, False, False, True]
+
+  putStrLn "mcp tools"
+  leakRes <- MCPTools.diagnoseLeak "stronghead-sample.hp" 5 0.1
+  check "mcp: leak diagnosis detects THUNK_2_0" $ case leakRes of
+    Right txt -> "THUNK_2_0" `T.isInfixOf` txt && "Leak Suspects Analysis" `T.isInfixOf` txt
+    Left _ -> False
+
+  evRes <- MCPTools.eventlogSummary "stronghead-sample.eventlog" 5
+  check "mcp: eventlog summary reports contention and GC pause" $ case evRes of
+    Right txt -> "MVar Lock Contention Detected" `T.isInfixOf` txt && "GC Execution Time" `T.isInfixOf` txt
+    Left _ -> False
+
+  diffRes <- MCPTools.diffRuns "stronghead-sample.hp" "stronghead-sample.hp" Nothing Nothing
+  check "mcp: diff runs identifies unchanged bands" $ case diffRes of
+    Right txt -> "UNCHANGED" `T.isInfixOf` txt && "Overall Metric Deltas" `T.isInfixOf` txt
+    Left _ -> False
+
+  stepsLeak <- MCPTools.recommendNextSteps "leak" (Just "THUNK_2_0") (Just "sample/Main.hs")
+  check "mcp: recommend steps gives provenance flags for space leak" $
+    "-finfo-table-map" `T.isInfixOf` stepsLeak && "+RTS -l -hi -i0.1 -RTS" `T.isInfixOf` stepsLeak
+
+  stepsCont <- MCPTools.recommendNextSteps "contention" (Just "worker-1") Nothing
+  check "mcp: recommend steps gives timeline options for contention" $
+    "-threaded -rtsopts" `T.isInfixOf` stepsCont && "+RTS -l -RTS" `T.isInfixOf` stepsCont
+
+  check "mcp: tool descriptions present for all tools" $
+    not (null MCPTypes.toolDescriptions)
+
+  putStrLn "markdown combinators"
+  let doc = MD.renderMD do
+        MD.h1 "Title"
+        MD.field "Status" "Active"
+        MD.subfield "Sub" "Value"
+        MD.bullet "Item 1"
+        MD.numberedList ["Step A", "Step B"]
+        MD.tableAligned [(MD.AlignLeft, "Col1"), (MD.AlignRight, "Col2")] [["A", "1"], ["B", "2"]]
+        MD.warning "Caution Header" ["Body line 1", "Body line 2"]
+        MD.codeBlock "haskell" "main = pure ()"
+  check "markdown: renders h1" ("# Title\n\n" `T.isInfixOf` doc)
+  check "markdown: renders field and subfield" ("- **Status:** Active\n  - **Sub:** Value\n- Item 1\n" `T.isInfixOf` doc)
+  check "markdown: renders numbered list" ("1. Step A\n2. Step B\n" `T.isInfixOf` doc)
+  check "markdown: renders table with alignment" ("| Col1 | Col2 |\n| :--- | ---: |\n| A | 1 |\n| B | 2 |" `T.isInfixOf` doc)
+  check "markdown: renders alert" ("> [!WARNING] Caution Header\n> Body line 1\n> Body line 2" `T.isInfixOf` doc)
+  check "markdown: renders code block" ("```haskell\nmain = pure ()\n```" `T.isInfixOf` doc)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
