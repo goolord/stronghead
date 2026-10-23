@@ -45,8 +45,8 @@ data Source = Source
 -- run a source named itself.
 sourcesPopover :: Env -> Var Bool -> Rect -> [Source] -> ([Source] -> RunInfo -> NanoUI ()) -> (RunKey -> NanoUI ()) -> NanoUI ()
 sourcesPopover env open anchor sources link unlink =
-  popupWith open (defaultPopupConfig (AnchorRect anchor)) (fixedW 720 . maxH 640) $
-    void . scrollArea fillW $
+  popupWith open (defaultPopupConfig (AnchorRect anchor)) (fixedW 720 . maxH 640 . padAll 0) $
+    void . bareScrollArea fillW $
       columnWith (fillW . padAll 12 . tight . gap 10) $ do
         labelWith (fontMedium . fontSizeScale 1.05) "Data sources"
         let timed = [s | s <- sources, srcRun s /= emptyRunInfo]

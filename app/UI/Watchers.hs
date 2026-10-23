@@ -283,8 +283,8 @@ watchStatus env w = do
       writeVar (wrUnseen w) 0
       writeVar (wrToast w) Nothing
     let anchor = AnchorRect (respRect area)
-    popupWith (wrListOpen w) (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove} (fixedW 560 . maxH 480) $
-      void . scrollArea fillW $
+    popupWith (wrListOpen w) (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove} (fixedW 560 . maxH 480 . padAll 0) $
+      void . bareScrollArea fillW $
         columnWith (fillW . padAll 12 . tight . gap 4) $ do
           labelWith (fontMedium . fontSizeScale 1.05) "What the watchers saw"
           firedList env evs
@@ -292,8 +292,9 @@ watchStatus env w = do
       th <- uiTheme
       shown <- useVar True
       writeVar shown True
-      popupWith shown (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove, cfgDismissable = False} (fixedW 420) $
-        calloutWith (toneColor th Warning) (fillW . padAll 10 . gap 4) $ do
+      let warnCol = toneColor th Warning
+      styled (popupStyle (background (lerpColor warnCol (styleBg (themePopup th)) 0.88) . borderColor warnCol)) $
+        popupWith shown (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove, cfgDismissable = False} (fixedW 420 . padAll 10 . gap 4) $ do
           rowWith (fillW . tight . gap 8) $ do
             labelWith (alignMid . fontMedium . fontSizeScale 0.92 . fillW) (feTitle ev)
             whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (wrToast w) Nothing)

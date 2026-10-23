@@ -674,12 +674,12 @@ panesPopover :: App -> Panel -> Rect -> NanoUI ()
 panesPopover app active anchor = do
   let close = writeVar (appPanesOpen app) False
       groups = [(maybe "Investigation" panelTitle p, [k | k <- paneKinds, pkPanel k == p]) | p <- Nothing : map Just [minBound .. maxBound]]
-  void . popupWith (appPanesOpen app) (defaultPopupConfig (AnchorRect anchor)) (fixedW 560 . maxH 680) $ do
+  void . popupWith (appPanesOpen app) (defaultPopupConfig (AnchorRect anchor)) (fixedW 560 . maxH 680 . padAll 0) $ do
     wb <- activeBench app active
     tree <- readVar (wbTree wb)
     out <- map poKind <$> readVar (appPopped app)
     presets <- readVar (appPresets app)
-    void . scrollArea fillW $
+    void . bareScrollArea fillW $
       columnWith (fillW . padAll 12 . tight . gap 6) $ do
         labelWith (fontMedium . fontSizeScale 1.05) ("Panes in " <> panelTitle active)
         hint "Add a pane beside the others, then drag its header to place it. Its ⋯ menu moves it to another panel or pops it out."

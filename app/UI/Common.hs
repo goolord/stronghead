@@ -97,6 +97,8 @@ module UI.Common
   , emptyState
   , paneScroll
   , paneScrollArea
+  , bareScroll
+  , bareScrollArea
   , paneVirtualRows
   , canvasKeyed
   , codeBlock
@@ -149,7 +151,7 @@ import Data.IORef
 import NanoUI
 import NanoUI.Adornment qualified as A
 import NanoUI.Internal.Context (Context (..), CustomDrawingEntry (..), DrawingCacheState (..), intKey)
-import NanoUI.Internal.Layout.Arena (arenaCount, getNodeValue, getStyleIdx, getText, getWidgetId)
+import NanoUI.Internal.Layout.Arena (arenaCount, getNodeValue, getStyleIdx, getText, getWidgetId, lookupNodeByWidgetId, setStyleIdx)
 import NanoUI.Internal.Monad (askContext, askFrameInput)
 import NanoUI.Path qualified as P
 
@@ -962,6 +964,23 @@ canvasKeyed k f = canvasConfigured defaultCanvasConfig {canvasLayout = f default
 -- inside a pane that reads as a box within the box, so the well is made
 -- transparent and the scroller takes a percentage width to stay off the
 -- window-colour path. @f@ sizes the area, e.g. @grow . minH 160@.
+-- | A scroll area without an embedded well, border or background: children
+-- are clipped to the viewport, and scrollbars paint over them.
+bareScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
+bareScrollArea f child = do
+  (wid, res) <- scrollArea f child
+  ctx <- askContext
+  liftIO $ do
+    mIdx <- lookupNodeByWidgetId (ctxNodeArena ctx) wid
+    for_ mIdx $ \idx -> do
+      si <- getStyleIdx (ctxNodeArena ctx) idx
+      setStyleIdx (ctxNodeArena ctx) idx (si .|. 32)
+  pure (wid, res)
+
+-- | 'bareScrollArea' discarding the container id.
+bareScroll :: (Layout -> Layout) -> NanoUI a -> NanoUI a
+bareScroll f child = snd <$> bareScrollArea f child
+
 paneScroll :: (Layout -> Layout) -> NanoUI a -> NanoUI a
 paneScroll f body = snd <$> paneScrollArea f body
 
@@ -972,8 +991,7 @@ paneScrollArea f body = do
   -- in flow, a scroller reports its content's height, and that would push
   -- the pane's neighbours aside.
   columnWith (f . tight . fillW . fillH) $
-    styled (inputStyle (background colorTransparent . borderWidth 0)) $
-      scrollArea (pinAt 0 0 . percent 100 . fillH . tight) (themed th body)
+    bareScrollArea (pinAt 0 0 . percent 100 . fillH . tight) (themed th body)
 
 -- | A vertically scrolled list of uniform-height rows inside a pane that
 -- virtualizes when there are many items, building only the rows near the
@@ -1002,7 +1020,7 @@ paneVirtualRows scrollLayout colLayout items drawItem
                    in ( max 0 (floor (top / rowH) - 10)
                       , min (n - 1) (ceiling ((top + vh) / rowH) + 10)
                       )
-          void . scrollArea (pinAt 0 0 . percent 100 . fillH . tight) . themed th $
+          void . bareScrollArea (pinAt 0 0 . percent 100 . fillH . tight) . themed th $
             columnWith (colLayout . tight . fillW . gap 0) $ do
               when (firstRow > 0) $
                 spacer Fit (Fixed (fromIntegral firstRow * rowH))
