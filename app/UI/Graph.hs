@@ -24,7 +24,14 @@ import Data.Vector.Unboxed qualified as VU
 import Numeric (showFFloat)
 
 import NanoUI
-import NanoUI.Backend (damageFullNow, emptyInput, runFrame)
+import NanoUI.Backend
+  ( FontMetrics (..)
+  , damageFullNow
+  , emptyInput
+  , runFrame
+  , withFontMetrics
+  , withMonoFontMetrics
+  )
 import NanoUI.Draw.FrameSvg (FrameSvgConfig (..), defaultFrameSvgConfig, frameToSvg)
 import NanoUI.Internal.Context (setDrawExternalText, setDrawSquareGeometry)
 import NanoUI.Testing (newPixelContext)
@@ -42,6 +49,7 @@ import UI.Common
   , bandColor
   , canvasKeyed
   , monoMetrics
+  , numCell
   , palette
   , strongheadTheme
   )
@@ -58,11 +66,46 @@ import UI.Heap
 -- NanoUI Headless Frame Capture -> SVG via nano-ui-svg frameToSvg
 -- ---------------------------------------------------------------------------
 
+-- | Realistic monospace font metrics for headless SVG layout.
+monoFm :: Float -> FontMetrics
+monoFm cell =
+  FontMetrics
+    { fmLineHeight = cell
+    , fmAscent = cell * 0.8
+    , fmSnapScale = 1.0
+    , fmAdvance = const (cell * 0.60)
+    , fmKerning = \_ _ -> 0
+    , fmShape = const Nothing
+    , fmGlyph = const Nothing
+    , fmBackend = Nothing
+    }
+
+-- | Realistic proportional font metrics for headless SVG layout (Segoe UI / Inter proportions).
+sansFm :: Float -> FontMetrics
+sansFm cell =
+  FontMetrics
+    { fmLineHeight = cell
+    , fmAscent = cell * 0.8
+    , fmSnapScale = 1.0
+    , fmAdvance = \c ->
+        case c of
+          ' ' -> cell * 0.28
+          _ | c >= '0' && c <= '9' -> cell * 0.55
+          _ | c >= 'a' && c <= 'z' -> cell * 0.52
+          _ | c >= 'A' && c <= 'Z' -> cell * 0.62
+          _ -> cell * 0.52
+    , fmKerning = \_ _ -> 0
+    , fmShape = const Nothing
+    , fmGlyph = const Nothing
+    , fmBackend = Nothing
+    }
+
 -- | Renders a 'NanoUI ()' frame into a standalone SVG document using nano-ui-svg's 'frameToSvg'.
 -- The root window rectangle is filled with 'themeWindow theme' (dark slate `#181818`).
 renderUiFrameToSvg :: Float -> Float -> Theme -> NanoUI () -> IO Text
 renderUiFrameToSvg width height theme ui = do
-  ctx <- newPixelContext
+  ctx0 <- newPixelContext
+  let ctx = withMonoFontMetrics (withFontMetrics ctx0 (sansFm 16)) (monoFm 16)
   setTheme ctx theme
   setDrawSquareGeometry ctx True
   setDrawExternalText ctx True
@@ -74,41 +117,70 @@ renderUiFrameToSvg width height theme ui = do
   (_, drawData, _) <- runFrame ctx baseInp (ui >> damageFullNow)
   let cfg = defaultFrameSvgConfig
         { fsPrecision = 1
-        , fsFontFamily = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+        , fsFontFamily = "Inter, 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif"
         }
   svg <- frameToSvg cfg ctx baseInp drawData
   pure (cleanSvgText svg)
 
 -- | Strips 'textLength="..." lengthAdjust="spacingAndGlyphs"' attributes so SVG text
 -- elements render with natural typographic proportions. When an anchor-end tick was
--- pre-shifted to a negative x coordinate by 'drawTextBox', restores 'text-anchor="end"'
--- at the right edge (x + textLength).
+-- pre-shifted to a negative x coordinate by 'drawTextBox', or when text is a right-aligned
+-- byte amount (ending in " B", " KiB", " MiB", " GiB"), restores 'text-anchor="end"'
+-- at the right edge (x + textLength). Also enables tabular numbers at the SVG root.
 cleanSvgText :: Text -> Text
 cleanSvgText txt =
-  let (before, match) = T.breakOn "<text " txt
-   in if T.null match
-        then before
-        else
-          let afterOpen = T.drop 6 match
-              (tagAttrs, rest) = T.breakOn ">" afterOpen
-           in if T.null rest
-                then before <> match
-                else before <> "<text " <> cleanAttrs tagAttrs <> cleanSvgText rest
+  let withTabular = if "<svg " `T.isInfixOf` txt && not ("tabular-nums" `T.isInfixOf` txt)
+                      then replaceFirst "<svg " "<svg style=\"font-variant-numeric: tabular-nums;\" " txt
+                      else txt
+   in processTextTags withTabular
+ where
+  replaceFirst target repl src =
+    let (before, match) = T.breakOn target src
+     in if T.null match
+          then src
+          else before <> repl <> T.drop (T.length target) match
 
-cleanAttrs :: Text -> Text
-cleanAttrs attrs =
-  let mNegX = parseAttr "x=\"" attrs
-      mLen  = parseAttr "textLength=\"" attrs
+  processTextTags src =
+    let (before, match) = T.breakOn "<text " src
+     in if T.null match
+          then before
+          else
+            let afterOpen = T.drop 6 match
+                (tagAttrs, rest) = T.breakOn ">" afterOpen
+             in if T.null rest
+                  then before <> match
+                  else
+                    let afterTag = T.drop 1 rest
+                        (textContent, afterText) = T.breakOn "</text>" afterTag
+                     in if T.null afterText
+                          then before <> "<text " <> cleanAttrs textContent tagAttrs <> ">" <> afterTag
+                          else before <> "<text " <> cleanAttrs textContent tagAttrs <> ">" <> textContent <> "</text>" <> processTextTags (T.drop 7 afterText)
+
+cleanAttrs :: Text -> Text -> Text
+cleanAttrs txt attrs =
+  let mX   = parseAttr "x=\"" attrs
+      mLen = parseAttr "textLength=\"" attrs
       attrsWithoutLen = removeAttr "textLength" (removeAttr "lengthAdjust" attrs)
-   in case (mNegX, mLen) of
-        (Just xVal, Just lenVal)
-          | Just (x, "") <- readFloat xVal
-          , Just (l, "") <- readFloat lenVal
-          , x < 0 ->
-              let targetX = T.pack (showFFloat (Just 1) (x + l) "")
-                  replacedX = replaceAttr "x=\"" targetX attrsWithoutLen
-               in replacedX <> " text-anchor=\"end\""
-        _ -> attrsWithoutLen
+      isRightAligned =
+        case (mX, mLen) of
+          (Just xVal, Just _)
+            | Just (x, "") <- readFloat xVal ->
+                -- Case 1: Chart Y-axis tick pre-shifted to negative x
+                (x < 0) ||
+                -- Case 2: Byte amounts in legend or chips (right-aligned numCell)
+                (T.isSuffixOf " B" txt || T.isSuffixOf " KiB" txt || T.isSuffixOf " MiB" txt || T.isSuffixOf " GiB" txt)
+            | otherwise -> False
+          _ -> False
+   in if isRightAligned
+        then case (mX, mLen) of
+          (Just xVal, Just lenVal)
+            | Just (x, "") <- readFloat xVal
+            , Just (l, "") <- readFloat lenVal ->
+                let targetX = T.pack (showFFloat (Just 1) (x + l) "")
+                    replacedX = replaceAttr "x=\"" targetX attrsWithoutLen
+                 in replacedX <> " text-anchor=\"end\""
+          _ -> attrsWithoutLen
+        else attrsWithoutLen
  where
   readFloat s = case reads (T.unpack s) of
     [(v, rest)] -> Just (v :: Float, rest)
@@ -167,19 +239,22 @@ heapPanelUi pal mm hp topN panelTitle = do
       marks = Marks Nothing Nothing [] []
 
   panelWith (padAll 10 . gap 8 . fillW . fillH) $ do
-    -- Title and Chips row
+    -- Title row: Panel title on left, Leak Suspects badge on right
     rowWith (alignMid . gap 8 . fillW) $ do
       labelWith (fontBold . fontSizeScale 1.05) panelTitle
       flex
-      cardWith (padXY 8 3) $
-        labelWith (fontMono . fontSizeScale 0.85 . fontBold) (tshow censuses <> " censuses")
-      cardWith (padXY 8 3) $
-        labelWith (fontMono . fontSizeScale 0.85 . fontMuted) (fmtSec dur <> " profiled")
-      cardWith (padXY 8 3) $
-        labelWith (fontMono . fontSizeScale 0.85 . fontBold) (fmtBytesD peak <> " peak")
       if suspects > 0
         then badge Danger (tshow suspects <> " LEAK SUSPECTS")
         else badge Success "0 LEAK SUSPECTS"
+
+    -- Metric chips row: censuses, duration, peak bytes
+    rowWith (alignMid . gap 6 . fillW) $ do
+      cardWith (padXY 8 3) $
+        labelWith (fontMono . fontSizeScale 0.82 . fontBold) (tshow censuses <> " censuses")
+      cardWith (padXY 8 3) $
+        labelWith (fontMono . fontSizeScale 0.82 . fontMuted) (fmtSec dur <> " profiled")
+      cardWith (padXY 8 3) $
+        labelWith (fontMono . fontSizeScale 0.82 . fontBold) (fmtBytesD peak <> " peak")
 
     -- Chart plot and legend side-by-side
     rowWith (fillW . grow . gap 8) $ do
@@ -187,7 +262,7 @@ heapPanelUi pal mm hp topN panelTitle = do
         defaultCanvasConfig { canvasLayout = (fillW . fillH) defaultLayout }
         (\r -> drawChart pal mm hp ls ymax v (-1) (axis r) marks r Nothing)
 
-      columnWith (fixedW 190 . gap 4) $ do
+      columnWith (fixedW 250 . gap 4) $ do
         labelWith (fontSizeScale 0.8 . fontBold . fontMuted) ("BANDS (" <> tshow (length (hpBands hp)) <> " TOTAL)")
         let bands = V.toList (hpBands hp)
             topBands = take topN bands
@@ -197,13 +272,14 @@ heapPanelUi pal mm hp topN panelTitle = do
               c = bandColor i name
               bPeak = if VU.null (bandValues b) then 0 else VU.maximum (bandValues b)
               isLeak = S.member name leakNames
-          rowWith (alignMid . gap 4 . fillW) $ do
+              dispName = if T.length name > 15 then T.take 14 name <> "…" else name
+          rowWith (alignMid . gap 6 . fillW) $ do
             void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMid) (\r -> drawRoundedRect r 2 c)
-            labelWith (fontMono . fontSizeScale 0.8) (T.take 18 name)
-            flex
-            labelWith (fontMono . fontSizeScale 0.75 . fontMuted) (fmtBytesD bPeak)
-            when isLeak $
-              badge Danger "LEAK"
+            labelWith (fontMono . fontSizeScale 0.8 . fixedW 114) dispName
+            numCell 64 (fontSizeScale 0.78 . fontMuted) (fmtBytesD bPeak)
+            rowWith (fixedW 42 . alignEnd . alignMid) $
+              when isLeak $
+                badge Danger "LEAK"
 
 -- | Renders the Before & After proof diff view.
 heapDiffUi :: Palette -> MonoMetrics -> HeapProfile -> HeapProfile -> Int -> NanoUI ()
@@ -256,7 +332,7 @@ renderHpSvg mTheme mTopN hp = do
       theme = strongheadTheme appearance
       pal = palette theme
       topN = fromMaybe 12 mTopN
-  renderUiFrameToSvg 1000 560 theme $ do
+  renderUiFrameToSvg 1000 580 theme $ do
     mm <- monoMetrics 0.88
     heapPanelUi pal mm hp topN "Heap Profile Residency"
 
@@ -269,6 +345,6 @@ renderHpDiffSvg mTheme mTopN baseHp curHp = do
       theme = strongheadTheme appearance
       pal = palette theme
       topN = fromMaybe 12 mTopN
-  renderUiFrameToSvg 1260 680 theme $ do
+  renderUiFrameToSvg 1380 700 theme $ do
     mm <- monoMetrics 0.88
     heapDiffUi pal mm baseHp curHp topN
