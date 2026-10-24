@@ -45,6 +45,7 @@ module UI.Link
   , linked
   , linkRow
   , linkText
+  , linkText'
   , kvLink
   , canvasLinks
   , refMenu
@@ -445,14 +446,17 @@ linkRow env ref selected f body = do
 
 -- | A name that is a link, like a hyperlink: underlined under the pointer,
 -- and a plain click goes to it.
-linkText :: Env -> Ref -> (Layout -> Layout) -> Text -> NanoUI ()
-linkText env ref f txt = do
+linkText' :: Env -> Ref -> (Layout -> Layout) -> Text -> NanoUI Bool
+linkText' env ref f txt = do
   sid <- currentId
   prev <- lastRect sid
   mouse <- uiMousePos
   let under = maybe False (`rectContains` mouse) prev
-  (_, area) <- withCursorShape UiCursorPointer $ mouseArea tight (labelWith (f . (if under then fontUnderline else id)) txt)
-  void (linkedWith True env ref area)
+  (_, area) <- withCursorShape UiCursorPointer $ rowWith' (f . tight) (labelWith (f . (if under then fontUnderline else id)) txt)
+  linkedWith True env ref area
+
+linkText :: Env -> Ref -> (Layout -> Layout) -> Text -> NanoUI ()
+linkText env ref f txt = void (linkText' env ref f txt)
 
 -- | 'kv' whose value is a link.
 kvLink :: Env -> Text -> Ref -> Text -> NanoUI ()

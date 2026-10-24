@@ -3,11 +3,11 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (unless, void, when)
+import Control.Monad (forM, unless, void, when)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef
-import Data.List ((!?))
+import Data.List ((!?), sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Sequence qualified as Seq
@@ -38,6 +38,7 @@ import UI.Clock
 import UI.Code
 import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, readoutDeltaWith, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
+import UI.Heap (atCursor, leakView, newHeapState)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Inspector
 import UI.Link
@@ -964,6 +965,139 @@ main = do
   xPause999 <- findX "longest pause" spans999
 
   check "collections subtitle changing does not move subsequent readouts" (xPause0 == xPause221 && xPause221 == xPause999)
+
+  putStrLn "leak suspects table layout"
+  lsCtx <- newContext
+  hstate <- newHeapState
+  let baseHp = fromSamples "" "closure type" 0 (const Nothing)
+        [(t, [("THUNK_2_0", t * 4e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", t * 2e6)]) | t <- [1 .. 5]]
+      curHp1 = fromSamples "" "closure type" 0 (const Nothing)
+        [(t, [("THUNK_2_0", t * 4.2e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", t * 2.1e6)]) | t <- [1 .. 5]]
+      renderLeakView curHp = evalUi lsCtx (withInput 1000 600) $ do
+        let env = (worldEnv w PHeap) {envBaseline = Just (Baseline bpaths Nothing (Just baseHp) Nothing Nothing)}
+        void (columnWith (fixedWH 1000 600) (leakView env hstate curHp))
+
+  let findPrefixR prefix spans = case [rectX r + rectW r | (r, t, _, _, _) <- spans, prefix `T.isPrefixOf` t] of
+        (x : _) -> pure x
+        [] -> fail ("no span with prefix " <> T.unpack prefix)
+      findPrefixX prefix spans = case [rectX r | (r, t, _, _, _) <- spans, prefix `T.isPrefixOf` t] of
+        (x : _) -> pure x
+        [] -> fail ("no span with prefix " <> T.unpack prefix)
+
+  _ <- renderLeakView curHp1
+  spans1 <- collectTextSpans lsCtx
+  xStatusHdr1 <- findPrefixX "status" spans1
+  rThunkBefore1 <- findPrefixR "19.1" spans1
+  rIsBefore1 <- findPrefixR "9.5" spans1
+  xThunkNow1 <- findPrefixX "20.0" spans1
+  xIsNow1 <- findPrefixX "10.0" spans1
+
+  let curHp3 = fromSamples "" "closure type" 0 (const Nothing)
+        [(t, [("THUNK_2_0", t * 90e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", t * 50e6)]) | t <- [1 .. 5]]
+  _ <- renderLeakView curHp3
+  spans3 <- collectTextSpans lsCtx
+  xStatusHdr3 <- findPrefixX "status" spans3
+  rThunkBefore3 <- findPrefixR "19.1" spans3
+  rIsBefore3 <- findPrefixR "9.5" spans3
+
+  check "columns align across rows with different name lengths" (rThunkBefore1 == rIsBefore1 && xThunkNow1 == xIsNow1)
+  check "values changing does not move column positions" (xStatusHdr1 == xStatusHdr3 && rThunkBefore1 == rThunkBefore3 && rIsBefore3 == rThunkBefore3)
+
+  putStrLn "at cursor table layout and vertical centering"
+  acCtx <- newContext
+  acState <- newHeapState
+  let acHp = fromSamples "" "closure type" 0 (const Nothing)
+        [ (1, [ ("THUNK_2_0", 19.5e6)
+              , ("ghc-internal:GHC.Internal.Bignum.Integer.IS", 9.7e6)
+              ])
+        ]
+      renderAtCursor winW winH ctx state = evalUi ctx (withInput winW winH) $ do
+        let env = worldEnv w PHeap
+        void (columnWith (fixedWH winW winH) (atCursor env state acHp 0))
+
+  _ <- renderAtCursor 1200 600 acCtx acState
+  acSpans <- collectTextSpans acCtx
+  let headerSpans = [s | s@(Rect _ y _ _, _, _, _, _) <- acSpans, y > 20, y < 50]
+      headerRects = sortOn rectX [r | (r, _, _, _, _) <- headerSpans]
+      noHeaderOverlaps = and [rectX r1 + rectW r1 <= rectX r2 + 0.1 | (r1, r2) <- zip headerRects (drop 1 headerRects)]
+  check "headers do not collide at 1200px width" (length headerRects >= 5 && noHeaderOverlaps)
+
+  -- In a 650px pane, column 0 dynamically truncates long names with ellipsis, while short names fit
+  medCtx <- newContext
+  medState <- newHeapState
+  _ <- renderAtCursor 650 600 medCtx medState
+  _ <- renderAtCursor 650 600 medCtx medState
+  medSpans <- collectTextSpans medCtx
+  let medTexts = [t | (_, t, _, _, _) <- medSpans]
+  check "long closure name truncates dynamically with ellipsis in medium pane" (any (\t -> "..." `T.isInfixOf` t || "…" `T.isInfixOf` t) medTexts)
+  check "short closure name remains untruncated in medium pane" ("THUNK_2_0" `elem` medTexts)
+
+  -- In a 500px pane, all columns fit without horizontal scroll and headers do not overlap
+  fit500Ctx <- newContext
+  fit500State <- newHeapState
+  _ <- renderAtCursor 500 600 fit500Ctx fit500State
+  _ <- renderAtCursor 500 600 fit500Ctx fit500State
+  fit500Scrolls <- nodesOfType NodeScrollContainer fit500Ctx
+  horz500Overflows <- forM fit500Scrolls $ \(wid, _) -> do
+    mMetrics <- getScrollMetrics fit500Ctx wid
+    pure $ case mMetrics of
+      Just sm -> v2X (scrollRange sm) > 0
+      Nothing -> False
+  check "all columns fit without horizontal scroll at 500px width" (not (or horz500Overflows))
+
+  -- Header cells do not collide or overflow across widths
+  spans500 <- collectTextSpans fit500Ctx
+  let medHeaderSpans = [s | s@(Rect _ y _ _, _, _, _, _) <- spans500, y > 20, y < 50]
+      medHeaderRects = sortOn rectX [r | (r, _, _, _, _) <- medHeaderSpans]
+      noMedOverlaps = and [rectX r1 + rectW r1 <= rectX r2 + 0.1 | (r1, r2) <- zip medHeaderRects (drop 1 medHeaderRects)]
+  check "headers do not overlap at 500px width" (length medHeaderRects >= 5 && noMedOverlaps)
+
+  -- Table height responds to being resized
+  resizeCtx1 <- newContext
+  resizeState1 <- newHeapState
+  let manyRows = [(1, [("ghc-internal:GHC.Internal.Bignum.Integer.IS", 9.7e6)] ++ [("band_" <> tshow k, fromIntegral k * 1e5) | k <- [0 .. 99 :: Int]])]
+      manyHp = fromSamples "" "closure type" 0 (const Nothing) manyRows
+      renderMany winW winH ctx state = evalUi ctx (withInput winW winH) $ do
+        let env = worldEnv w PHeap
+        void (columnWith (fixedWH winW winH) (atCursor env state manyHp 0))
+
+  _ <- renderMany 1000 600 resizeCtx1 resizeState1
+  _ <- renderMany 1000 600 resizeCtx1 resizeState1
+  scrolls1 <- nodesOfType NodeScrollContainer resizeCtx1
+  let bodyH1 = case [rectH r | (_, r) <- scrolls1, rectH r > 50] of
+        (h : _) -> h
+        [] -> 0
+
+  resizeCtx2 <- newContext
+  resizeState2 <- newHeapState
+  _ <- renderMany 1000 350 resizeCtx2 resizeState2
+  scrolls2 <- nodesOfType NodeScrollContainer resizeCtx2
+  let bodyH2 = case [rectH r | (_, r) <- scrolls2, rectH r > 50] of
+        (h : _) -> h
+        [] -> 0
+
+  check "table height responds to being resized" (bodyH2 > 0 && bodyH1 > bodyH2 && abs ((bodyH1 - bodyH2) - 250) < 5)
+
+  -- Test vertical scrollbar does not appear when content fits vertically across widths
+  let fiveRows = [(1, [("THUNK_2_0", 19.5e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", 9.7e6), ("band1", 1e6), ("band2", 2e6), ("band3", 3e6)])]
+      fiveHp = fromSamples "" "closure type" 0 (const Nothing) fiveRows
+      renderFive winW winH ctx state = evalUi ctx (withInput winW winH) $ do
+        let env = worldEnv w PHeap
+        void (columnWith (fixedWH winW winH) (atCursor env state fiveHp 0))
+
+  noScrollChecks <- forM [1200, 800, 600, 500, 400] $ \testW -> do
+    tCtx <- newContext
+    tState <- newHeapState
+    _ <- renderFive testW 400 tCtx tState
+    _ <- renderFive testW 400 tCtx tState
+    scrolls <- nodesOfType NodeScrollContainer tCtx
+    hasAnyOverflow <- forM scrolls $ \(wid, _) -> do
+      mMetrics <- getScrollMetrics tCtx wid
+      pure $ case mMetrics of
+        Just sm -> v2X (scrollRange sm) > 0 || v2Y (scrollRange sm) > 0
+        Nothing -> False
+    pure (not (or hasAnyOverflow))
+  check "no scrollbar when table fits both axes across widths (1200 down to 400)" (and noScrollChecks)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

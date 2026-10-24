@@ -71,7 +71,7 @@ import System.Process
   , proc
   , terminateProcess
   )
-import Text.Printf (printf)
+import Numeric (showFFloat)
 
 import NanoUI
 import NanoUI.Backend (applyMouseButton, emptyInput)
@@ -292,7 +292,9 @@ resync r = do
   writeIORef (recLast r) now
 
 frameName :: Int -> FilePath
-frameName = printf "f%05d.bmp"
+frameName i =
+  let s = show i
+  in "f" ++ replicate (max 0 (5 - length s)) '0' ++ s ++ ".bmp"
 
 -- Gestures ---------------------------------------------------------------------
 
@@ -461,10 +463,10 @@ record app repo dir = do
     -- slow frames do not stretch the tour.
     let durs = replicate (length entries) (1 / fps)
     writeFile (dir </> "frames.txt") $
-      concat [printf "file '%s'\nduration %.4f\n" (frameName i) d | (i, d) <- zip [0 :: Int ..] durs]
-        ++ printf "file '%s'\n" (frameName (length entries - 1))
+      concat ["file '" ++ frameName i ++ "'\nduration " ++ showFFloat (Just 4) d "\n" | (i, d) <- zip [0 :: Int ..] durs]
+        ++ ("file '" ++ frameName (length entries - 1) ++ "'\n")
     let total = sum durs
-    printf "demo: %d frames, %.1f s; drawing the pointer\n" (length entries) total
+    putStrLn $ "demo: " ++ show (length entries) ++ " frames, " ++ showFFloat (Just 1) total " s; drawing the pointer"
     forM_ (zip3 [0 :: Int ..] entries durs) $ \(i, (pos, down, _), _) ->
       drawPointer (dir </> frameName i) pos down
 

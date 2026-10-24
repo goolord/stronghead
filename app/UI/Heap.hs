@@ -37,6 +37,8 @@ module UI.Heap
   , chartPlot
   , chartAxis
   , maxStack
+  , leakView
+  , atCursor
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -56,6 +58,7 @@ import Data.Set qualified as S
 import Data.Word (Word64)
 import System.Directory (getFileSize)
 import System.FilePath (takeFileName)
+import Numeric (showFFloat)
 
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -790,38 +793,73 @@ legend env st hp hidden solo = do
 -- ---------------------------------------------------------------------------
 -- Tabs
 
+shorten :: Int -> Text -> Text
+shorten maxLen t
+  | T.length t <= maxLen = t
+  | otherwise = T.take (maxLen - 1) t <> "…"
+
+numSortKey :: RealFloat a => Int -> a -> Text
+numSortKey decimals val = T.justifyRight 20 '0' (T.pack (showFFloat (Just decimals) val ""))
+
 atCursor :: Env -> HeapState -> HeapProfile -> Int -> NanoUI ()
 atCursor env st hp i = do
   byDelta <- readVar (hsByDelta st)
   let total = hpTotals hp VU.! i
-      rows =
-        sortOn
-          (\(_, b) -> Down (if byDelta then abs (bandDelta b i) else bandValues b VU.! i))
-          [(k, b) | (k, b) <- zip [0 :: Int ..] (V.toList (hpBands hp)), bandValues b VU.! i > 0 || bandDelta b i /= 0]
-  rowWith (tight . gap 10 . fillW) $ do
-    labelWith (alignMid . fontMuted) (fmtSec (hpOffset hp i) <> ", " <> fmtBytesD total <> " live")
-    flex
-    checkboxWith alignMid "Sort by change since the previous census" (hsByDelta st)
-  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
-    colHeader (fixedW 10) ""
-    colHeader fillW "closure or band"
-    colHeader (fixedW 90) "kind"
-    colHeader (fixedW 100 . alignEnd) "residency"
-    colHeader (fixedW 100 . alignEnd) "since previous"
-    colHeader (fixedW 60 . alignEnd) "share"
-  paneVirtualRows (grow . tight . minH 160) id (take 300 rows) $ \(k, b) -> withKey (bandName b) $ do
-    let val = bandValues b VU.! i
-        d = bandDelta b i
-        c = bandColor k (bandName b)
-    picked <- linkRow env (RBand (bandName b)) False id $ do
-      _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 c)
-      cell (fillW . fontSizeScale 0.92) (bandTitle b)
-      cell (fixedW 90 . kindTone (bandKind b)) (kindName (bandKind b))
-      numCell 100 id (fmtBytesD val)
-      numCell 100 (if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted) ((if d > 0 then "+" else "") <> fmtBytesD d)
-      numCell 60 fontMuted (fmtPct (val / max 1 total))
-    when picked $ writeVar (hsSolo st) (Just (bandName b))
-
+      rawRows = [(k, b) | (k, b) <- zip [0 :: Int ..] (V.toList (hpBands hp)), bandValues b VU.! i > 0 || bandDelta b i /= 0]
+  sortVar <- useVar (if byDelta then SortCol 3 SortDesc else SortCol 2 SortDesc)
+  prevByDelta <- useVar byDelta
+  prev <- readVar prevByDelta
+  when (byDelta /= prev) $ do
+    writeVar prevByDelta byDelta
+    writeVar sortVar (if byDelta then SortCol 3 SortDesc else SortCol 2 SortDesc)
+  columnWith (tight . fillW . fillH . gap 6) $ do
+    rowWith (tight . gap 10 . fillW) $ do
+      labelWith (alignMid . fontMuted) (fmtSec (hpOffset hp i) <> ", " <> fmtBytesD total <> " live")
+      flex
+      checkboxWith alignMid "Sort by change since the previous census" (hsByDelta st)
+    let cols = mconcat
+          [ headed "closure or band" $ \(k, b) ->
+              let c = bandColor k (bandName b)
+                  title = bandTitle b
+              in Cell (Just title) (shorten 20 title) $ Just $
+                   rowWith (fillW . fillH . alignMid . gap 6) $ do
+                     _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 c)
+                     picked <- linkText' env (RBand (bandName b)) (fillW . fontSizeScale 0.92) title
+                     when picked $ writeVar (hsSolo st) (Just (bandName b))
+          , headed "kind" $ \(_, b) ->
+              let kName = kindName (bandKind b)
+              in cellSort kName $ cellWidget $
+                   rowWith (fillW . fillH . alignMid) $
+                     labelWith (kindTone (bandKind b) . fillW) kName
+          , headed "residency" $ \(_, b) ->
+              let val = bandValues b VU.! i
+              in Cell
+                   (Just (numSortKey 0 val))
+                   (tshow (round val :: Integer))
+                   (Just $ rowWith (fillW . fillH . alignMid) $
+                      labelWith (fontMono . alignEnd . fillW) (fmtBytesD val))
+          , headed "since previous" $ \(_, b) ->
+              let d = bandDelta b i
+                  stTone = if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted
+                  txt = (if d > 0 then "+" else "") <> fmtBytesD d
+              in Cell
+                   (Just (numSortKey 0 (d + 1e15)))
+                   (tshow (round (abs d) :: Integer))
+                   (Just $ rowWith (fillW . fillH . alignMid) $
+                      labelWith (fontMono . stTone . alignEnd . fillW) txt)
+          , headed "share" $ \(_, b) ->
+              let val = bandValues b VU.! i
+                  sh = val / max 1 total
+              in Cell
+                   (Just (numSortKey 4 sh))
+                   (tshow (round (sh * 10000) :: Integer))
+                   (Just $ rowWith (fillW . fillH . alignMid) $
+                      labelWith (fontMono . fontMuted . alignEnd . fillW) (fmtPct sh))
+          ]
+        cfg = defaultTableConfig
+          { tableColSizes = [ColStretch, ColFixed 72, ColFixed 96, ColFixed 116, ColFixed 64]
+          }
+    tableConfigured cfg (grow . tight . fillW . fillH) "atCursor" cols rawRows sortVar
 kindName :: BandKind -> Text
 kindName = \case
   KindThunk -> "thunk"
@@ -847,17 +885,46 @@ leakView env st hp = do
     scope $ unless (null wereSuspects) $ do
       sectionTitle "Since the baseline"
       hint "The baseline's leak suspects, and what became of them in the run on show."
-      forM_ (zip [0 :: Int ..] wereSuspects) $ \(i, (c, bf)) -> withKey ("base" <> tshow i) $ rowWith (gap 10 . fillW . padXY 8 0) $ do
-        let title = figuresTitle bf
-        case bcCur c of
-          Just cf -> linkText env (RBand (bfName cf)) id (T.take 60 title)
-          Nothing -> labelWith id (T.take 60 title)
-        flex
-        labelWith (fontMono . fixedW 180 . fontMuted) (fmtBytesD (bfPeak bf) <> " → " <> maybe "—" (fmtBytesD . bfPeak) (bcCur c))
-        labelWith (fixedW 200 . (if bcStatus c `elem` [BandGone, BandShrank] then fontTone Success else fontTone Warning)) $ case bcStatus c of
-          BandGone -> "gone"
-          BandShrank -> "much smaller (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")"
-          _ -> "still there (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")" <> maybe "" (const ", still a suspect") (bcCur c >>= bfScore)
+      sortVar <- useVar (SortCol 0 SortAsc)
+      let suspectCols = mconcat
+            [ headed "leak suspect" $ \(c, bf) ->
+                let title = figuresTitle bf
+                    name = maybe (bfName bf) bfName (bcCur c)
+                in Cell (Just title) (shorten 20 title) $ Just $
+                     rowWith (fillW . fillH . alignMid) $ do
+                       picked <- linkText' env (RBand name) (fillW . fontSizeScale 0.92) title
+                       when picked $ writeVar (hsSolo st) (Just name)
+            , headed "peak before" $ \(_, bf) ->
+                let peak = bfPeak bf
+                    txt = fmtBytesD peak
+                in Cell
+                     (Just (numSortKey 0 peak))
+                     (tshow (round peak :: Integer))
+                     (Just $ rowWith (fillW . fillH . alignMid) $
+                        labelWith (fontMono . fontMuted . alignEnd . fillW) txt)
+            , headed "peak now" $ \(c, _) ->
+                let mPeak = bcCur c >>= (Just . bfPeak)
+                    txt = maybe "—" fmtBytesD mPeak
+                    sortKey = maybe (-1) bfPeak (bcCur c)
+                in Cell
+                     (Just (numSortKey 0 (max 0 sortKey)))
+                     (tshow (round (max 0 sortKey) :: Integer))
+                     (Just $ rowWith (fillW . fillH . alignMid) $
+                        labelWith (fontMono . alignEnd . fillW) txt)
+            , headed "status" $ \(c, bf) ->
+                let (stTone, stText) = case bcStatus c of
+                      BandGone -> (Success, "gone")
+                      BandShrank -> (Success, "much smaller (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")")
+                      _ -> (Warning, "still there (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")" <> maybe "" (const ", still a suspect") (bcCur c >>= bfScore))
+                in Cell (Just stText) (shorten 20 stText) $ Just $
+                     rowWith (fillW . fillH . alignMid) $
+                       labelWith (fontTone stTone . fillW) stText
+            ]
+          cfg = defaultTableConfig
+            { tableColSizes = [ColStretch, ColFixed 100, ColFixed 100, ColFixed 200]
+            }
+          tableH = fromIntegral (min 8 (length wereSuspects) + 1) * 29 + 6
+      tableConfigured cfg (fixedH tableH) "wereSuspects" suspectCols wereSuspects sortVar
       separator
     scope $
       if null suspects
@@ -896,15 +963,39 @@ leakView env st hp = do
       sectionTitle "Thunk accumulator sentinel"
       hint "Thunks that are still on the heap at a census have survived a major GC without being forced. Thunk bands, and how many consecutive censuses they have only grown:"
       let nAnalysed = analysedSamples hp
-      forM_ thunkBands $ \b -> withKey ("thunk:" <> bandName b) $ rowWith (gap 10 . fillW . padXY 8 0) $ do
-        let vs = VU.take nAnalysed (bandValues b)
-            streak
-              | VU.null vs = 0
-              | otherwise = fst (VU.foldl' (\(!tr, !prev) v -> if v >= prev then (tr + 1, v) else (0, v)) (0 :: Int, vs VU.! 0) (VU.drop 1 vs))
-        linkText env (RBand (bandName b)) id (bandName b)
-        flex
-        labelWith (fontMono . fixedW 100) (fmtBytesD (maybe 0 snd (VU.unsnoc vs)))
-        labelWith ((if streak >= 5 then fontTone Danger else fontMuted) . fixedW 200) (tshow streak <> " censuses growing")
+      thunkSortVar <- useVar (SortCol 2 SortDesc)
+      let thunkCols = mconcat
+            [ headed "thunk band" $ \b ->
+                let name = bandName b
+                in Cell (Just name) (shorten 20 name) $ Just $
+                     rowWith (fillW . fillH . alignMid) $ do
+                       picked <- linkText' env (RBand name) (fillW . fontSizeScale 0.92) name
+                       when picked $ writeVar (hsSolo st) (Just name)
+            , headed "residency" $ \b ->
+                let vs = VU.take nAnalysed (bandValues b)
+                    val = maybe 0 snd (VU.unsnoc vs)
+                in Cell
+                     (Just (numSortKey 0 val))
+                     (tshow (round val :: Integer))
+                     (Just $ rowWith (fillW . fillH . alignMid) $
+                        labelWith (fontMono . alignEnd . fillW) (fmtBytesD val))
+            , headed "growing streak" $ \b ->
+                let vs = VU.take nAnalysed (bandValues b)
+                    streak
+                      | VU.null vs = 0
+                      | otherwise = fst (VU.foldl' (\(!tr, !prev) v -> if v >= prev then (tr + 1, v) else (0, v)) (0 :: Int, vs VU.! 0) (VU.drop 1 vs))
+                    sText = tshow streak <> " censuses growing"
+                in Cell
+                     (Just (numSortKey 0 (fromIntegral streak :: Double)))
+                     (tshow streak)
+                     (Just $ rowWith (fillW . fillH . alignMid) $
+                        labelWith ((if streak >= 5 then fontTone Danger else fontMuted) . fillW) sText)
+            ]
+          tcfg = defaultTableConfig
+            { tableColSizes = [ColStretch, ColFixed 100, ColFixed 180]
+            }
+          tTableH = fromIntegral (min 8 (length thunkBands) + 1) * 29 + 6
+      tableConfigured tcfg (fixedH tTableH) "thunkBands" thunkCols thunkBands thunkSortVar
 
 -- | Where a band's closures come from, with the site and the binding as
 -- links.
@@ -1250,13 +1341,19 @@ dbgSurvivors env st history latest survivors marked =
     sectionTitle "Thunks in the latest snapshot"
     let groups = take 60 (sortOn (Down . tgBytes . snd) (M.toList (snapThunks latest)))
     scope $ when (null groups) $ hint "No unevaluated thunks reachable."
-    forM_ groups $ \(k, g) -> withKey ("g:" <> tshow k) $ do
-      picked <- linkRow env (RThunkGroup k) False id $ do
-        cell (fillW . (if any (`M.member` marked) (tgSample g) then fontTone Danger else fontTone Warning)) (tkName k)
-        cell (fontMuted . fontSizeScale 0.85) (fromMaybe "" (tkSource k))
-        cell (fontMono . fixedW 80) (fmtInt (tgCount g))
-        cell (fontMono . fixedW 90) (fmtBytes (fromIntegral (tgBytes g)))
-      when picked $ for_ (take 1 (tgSample g)) (reveal st latest)
+    scope $ unless (null groups) $ do
+      rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+        colHeader fillW "thunk"
+        colHeader (fixedW 160) "source"
+        colHeader (fixedW 70 . alignEnd) "count"
+        colHeader (fixedW 80 . alignEnd) "size"
+      tableRows $ forM_ groups $ \(k, g) -> withKey ("g:" <> tshow k) $ do
+        picked <- linkRow env (RThunkGroup k) False id $ do
+          cell (fillW . (if any (`M.member` marked) (tgSample g) then fontTone Danger else fontTone Warning)) (tkName k)
+          cell (fixedW 160 . fontMuted . fontSizeScale 0.85) (fromMaybe "" (tkSource k))
+          numCell 70 id (fmtInt (tgCount g))
+          numCell 80 id (fmtBytes (fromIntegral (tgBytes g)))
+        when picked $ for_ (take 1 (tgSample g)) (reveal st latest)
 
 -- | Rows of the expanded tree: path key, depth, closure, whether it can be
 -- expanded, whether it is, and whether it closes a cycle.
