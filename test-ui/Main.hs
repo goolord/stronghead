@@ -1003,6 +1003,29 @@ main = do
   check "columns align across rows with different name lengths" (rThunkBefore1 == rIsBefore1 && xThunkNow1 == xIsNow1)
   check "values changing does not move column positions" (xStatusHdr1 == xStatusHdr3 && rThunkBefore1 == rThunkBefore3 && rIsBefore3 == rThunkBefore3)
 
+  -- A vertical bar's lane must not tip the tables into horizontal scrolling:
+  -- with more baseline suspects than the table's fixed height shows, the body
+  -- scrolls vertically and the vertical bar's lane narrows its viewport. At
+  -- this pane width the columns still fit that narrowed viewport, so the
+  -- stretch column absorbs the lane and no horizontal scrollbar appears.
+  let baseMany = fromSamples "" "closure type" 0 (const Nothing)
+        [(t, [(T.pack ("old" <> show k), t * fromIntegral (k + 2) * 1e6) | k <- [1 .. 10 :: Int]]) | t <- [1 .. 5]]
+      curMany = fromSamples "" "closure type" 0 (const Nothing)
+        [(t, [("THUNK_2_0", t * 4.2e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", t * 2.1e6)]) | t <- [1 .. 5]]
+      laneW = 470
+      renderLane = evalUi lsCtx (withInput laneW 600) $ do
+        let env = (worldEnv w PHeap) {envBaseline = Just (Baseline bpaths Nothing (Just baseMany) Nothing Nothing)}
+        void (columnWith (fixedWH laneW 600) (leakView env hstate curMany))
+  _ <- renderLane
+  _ <- renderLane
+  laneScrolls <- nodesOfType NodeScrollContainer lsCtx
+  laneChecks <- forM laneScrolls $ \(wid, _) -> do
+    mMetrics <- getScrollMetrics lsCtx wid
+    pure $ case mMetrics of
+      Just sm | scrollAxes sm == ScrollAxisXY -> v2X (scrollRange sm) == 0
+      _ -> True
+  check "no horizontal scrollbar beside the vertical bar at 470px width" (and laneChecks)
+
   putStrLn "at cursor table layout and vertical centering"
   acCtx <- newContext
   acState <- newHeapState
