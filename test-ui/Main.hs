@@ -3,7 +3,7 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM, unless, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef
@@ -1025,6 +1025,30 @@ main = do
       Just sm | scrollAxes sm == ScrollAxisXY -> v2X (scrollRange sm) == 0
       _ -> True
   check "no horizontal scrollbar beside the vertical bar at 470px width" (and laneChecks)
+
+  -- Squeezed, not scrolled: below the pinned columns' total (stretch 0 +
+  -- 100 + 100 + 200 + rules = 403), the tables compress their columns
+  -- proportionally instead of growing a horizontal bar. Across a run of
+  -- narrow widths, every 2D body stays horizontally still, whether the rows
+  -- overflow (a 10-suspect baseline) or not (the two-suspect one).
+  squeezeChecks <- forM [340, 360 .. 500] $ \winW -> do
+    sqCtx <- newContext
+    sqState <- newHeapState
+    let sqHp = fromSamples "" "closure type" 0 (const Nothing)
+          [(t, [("THUNK_2_0", t * 4.2e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", t * 2.1e6)]) | t <- [1 .. 5]]
+        sqRender = evalUi sqCtx (withInput winW 600) $ do
+          let env = (worldEnv w PHeap) {envBaseline = Just (Baseline bpaths Nothing (Just baseMany) Nothing Nothing)}
+          void (columnWith (fixedWH winW 600) (leakView env sqState sqHp))
+    _ <- sqRender
+    _ <- sqRender
+    sqScrolls <- nodesOfType NodeScrollContainer sqCtx
+    overs <- forM sqScrolls $ \(wid, _) -> do
+      mMetrics <- getScrollMetrics sqCtx wid
+      pure $ case mMetrics of
+        Just sm | scrollAxes sm == ScrollAxisXY -> v2X (scrollRange sm) > 0
+        _ -> False
+    pure (not (or overs))
+  check "tables squeeze instead of scrolling sideways at narrow widths" (and squeezeChecks)
 
   putStrLn "at cursor table layout and vertical centering"
   acCtx <- newContext

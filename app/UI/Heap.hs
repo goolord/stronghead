@@ -858,6 +858,7 @@ atCursor env st hp i = do
           ]
         cfg = defaultTableConfig
           { tableColSizes = [ColStretch, ColFixed 72, ColFixed 96, ColFixed 116, ColFixed 64]
+          , tableSqueeze = True
           }
     tableConfigured cfg (grow . tight . fillW . fillH) "atCursor" cols rawRows sortVar
 kindName :: BandKind -> Text
@@ -922,6 +923,7 @@ leakView env st hp = do
             ]
           cfg = defaultTableConfig
             { tableColSizes = [ColStretch, ColFixed 100, ColFixed 100, ColFixed 200]
+            , tableSqueeze = True
             }
           tableH = fromIntegral (min 8 (length wereSuspects) + 1) * 29 + 6
       tableConfigured cfg (fixedH tableH) "wereSuspects" suspectCols wereSuspects sortVar
@@ -993,6 +995,7 @@ leakView env st hp = do
             ]
           tcfg = defaultTableConfig
             { tableColSizes = [ColStretch, ColFixed 100, ColFixed 180]
+            , tableSqueeze = True
             }
           tTableH = fromIntegral (min 8 (length thunkBands) + 1) * 29 + 6
       tableConfigured tcfg (fixedH tTableH) "thunkBands" thunkCols thunkBands thunkSortVar
