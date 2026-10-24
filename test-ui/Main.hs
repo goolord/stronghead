@@ -1050,6 +1050,36 @@ main = do
     pure (not (or overs))
   check "tables squeeze instead of scrolling sideways at narrow widths" (and squeezeChecks)
 
+  -- settle sweep: the squeeze reacts to last frame's rect, so it must reach a
+  -- fixed point and stop, at every width; an oscillation (squeeze changes
+  -- wrapping, wrapping toggles a bar lane, the lane changes the budget, ...)
+  -- would keep re-running frames forever and eat pane drags.
+  settleChecks <- forM [340, 342 .. 520] $ \winW -> do
+    stCtx <- newContext
+    stState <- newHeapState
+    let stHp = fromSamples "" "closure type" 0 (const Nothing)
+          [(t, [("THUNK_2_0", t * 4.2e6), ("ghc-internal:GHC.Internal.Bignum.Integer.IS", t * 2.1e6)]) | t <- [1 .. 5]]
+        stEnv = (worldEnv w PHeap) {envBaseline = Just (Baseline bpaths Nothing (Just baseMany) Nothing Nothing)}
+        stRender = evalUi stCtx (withInput winW 600) $
+          void (columnWith (fixedWH winW 600) (leakView stEnv stState stHp))
+    settled <- do
+      let pump :: Int -> Maybe [(Rect, Maybe V2)] -> IO (Maybe Int)
+          pump 0 _ = pure Nothing
+          pump k prev = do
+            _ <- stRender
+            scrolls <- nodesOfType NodeScrollContainer stCtx
+            state <- forM scrolls $ \(wid, r) -> do
+              m <- getScrollMetrics stCtx wid
+              pure (r, fmap scrollRange m)
+            if Just state == prev
+              then pure (Just (k :: Int))
+              else pump (k - 1) (Just state)
+      pump 25 Nothing
+    case settled of
+      Nothing -> putStrLn ("never settles at " <> show winW) >> pure False
+      Just _ -> pure True
+  check "leak view settles at every narrow width" (and settleChecks)
+
   putStrLn "at cursor table layout and vertical centering"
   acCtx <- newContext
   acState <- newHeapState
