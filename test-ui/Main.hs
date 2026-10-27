@@ -3,7 +3,7 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM, forM_, unless, void, when)
+import Control.Monad (forM, unless, void, when)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.IORef
@@ -1047,8 +1047,30 @@ main = do
       pure $ case mMetrics of
         Just sm | scrollAxes sm == ScrollAxisXY -> v2X (scrollRange sm) > 0
         _ -> False
-    pure (not (or overs))
-  check "tables squeeze instead of scrolling sideways at narrow widths" (and squeezeChecks)
+    sqSpans <- collectTextSpans sqCtx
+    let hasStretchCol = any (\(Rect _ _ sw _, t, _, _, _) -> sw > 16 && "le" `T.isPrefixOf` t) sqSpans
+    pure (not (or overs) && hasStretchCol)
+  check "tables squeeze instead of scrolling sideways at narrow widths and keep stretch column visible" (and squeezeChecks)
+
+  -- When all rows fit inside the table's max height (<= 8 rows), no vertical
+  -- scrollbar appears, including under 15pt TrueType metrics (lineHeight = 20).
+  fitVertChecks <- forM [400, 500, 800] $ \winW -> do
+    fvCtx0 <- newContext
+    let fvCtx = withFontMetrics fvCtx0 ((ctxFontMetrics fvCtx0) {fmLineHeight = 20, fmAscent = 15})
+    fvState <- newHeapState
+    let fvRender = evalUi fvCtx (withInput winW 600) $ do
+          let env = (worldEnv w PHeap) {envBaseline = Just (Baseline bpaths Nothing (Just baseHp) Nothing Nothing)}
+          void (columnWith (fixedWH winW 600) (leakView env fvState curHp1))
+    _ <- fvRender
+    _ <- fvRender
+    fvScrolls <- nodesOfType NodeScrollContainer fvCtx
+    vOvers <- forM fvScrolls $ \(wid, _) -> do
+      mMetrics <- getScrollMetrics fvCtx wid
+      pure $ case mMetrics of
+        Just sm | scrollAxes sm == ScrollAxisXY -> v2Y (scrollRange sm) > 0
+        _ -> False
+    pure (not (or vOvers))
+  check "leak suspect tables hide vertical scrollbar when all rows fit" (and fitVertChecks)
 
   -- settle sweep: the squeeze reacts to last frame's rect, so it must reach a
   -- fixed point and stop, at every width; an oscillation (squeeze changes
@@ -1098,6 +1120,16 @@ main = do
       headerRects = sortOn rectX [r | (r, _, _, _, _) <- headerSpans]
       noHeaderOverlaps = and [rectX r1 + rectW r1 <= rectX r2 + 0.1 | (r1, r2) <- zip headerRects (drop 1 headerRects)]
   check "headers do not collide at 1200px width" (length headerRects >= 5 && noHeaderOverlaps)
+
+  -- Table row 0 cells are vertically centered with each other and with the row canvas
+  cNodes <- nodesOfType NodeDrawing acCtx
+  let row0CanvasCenter = case [rectY r + rectH r / 2 | (_, r) <- cNodes, rectY r > 50, rectY r < 80] of
+        (cy : _) -> cy
+        [] -> 0
+      row0Spans = [s | s@(Rect _ y _ _, _, _, _, _) <- acSpans, y > 50, y < 80]
+      row0Centers = [y + h / 2 | (Rect _ y _ h, _, _, _, _) <- row0Spans]
+      cellsVertCentered = row0CanvasCenter > 0 && length row0Centers >= 5 && all (\c -> abs (c - row0CanvasCenter) < 1.0) row0Centers
+  check "table row cells are vertically centered with the color canvas" cellsVertCentered
 
   -- In a 650px pane, column 0 dynamically truncates long names with ellipsis, while short names fit
   medCtx <- newContext
