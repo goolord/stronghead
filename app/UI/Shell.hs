@@ -1052,11 +1052,11 @@ statusBar app env active winW timeline live heap hooks baseline = do
   path <- readVar (tsPath tl)
   styled (panelStyle (background (inkGround i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
     panelWith (asRow . fillW . fixedH 30 . padXY 12 0 . gap 12) $ themed th $ do
-      -- Show active document name on the left whenever it isn't shown in the header.
-      scope $ when (winW < 1560) $ do
-        docName <- activeDocumentName app active
-        for_ docName $ \nm ->
-          labelWith (alignMid . fontMono . fontMuted . fontSizeScale 0.82) (T.take 36 nm)
+      -- Show active document name on the left when it isn't in the header and
+      -- isn't already named by a live connection item right next to it.
+      docName <- if winW < 1560 then activeDocumentName app active timeline live else pure Nothing
+      scope $ for_ docName $ \nm ->
+        labelWith (alignMid . fontMono . fontMuted . fontSizeScale 0.82) (T.take 36 nm)
       scope $ for_ timeline $ \p -> do
         let file = maybe "the eventlog" (T.pack . takeFileName) path
             toTimeline = writeVar (appTab app) PTimeline
@@ -1085,7 +1085,8 @@ statusBar app env active winW timeline live heap hooks baseline = do
               Just why -> menuItemDisabled ("Mark… (" <> why <> ")")
             whenM (menuItem "Show in Live") toLive
         for_ (ldClosed d) $ \why ->
-          connection (Just Danger) ("Agent disconnected: " <> T.take 80 why) toLive $ do
+          connection (Just Danger) "Agent disconnected" toLive $ do
+            menuHeader (T.take 64 why)
             whenM (menuItem "Reconnect") reconnect
             whenM (menuItem "Forget the connection") (writeVar (lvWant lv) False)
       scope $ for_ (dhTarget hooks) $ \t -> do
@@ -1122,34 +1123,57 @@ statusBar app env active winW timeline live heap hooks baseline = do
         labelWith (alignMid . fontMuted . fontSizeScale 0.82) "Focus"
         rowWith (alignMid . tight) $ linkText env r (fontSizeScale 0.82) (T.take (if compactStatus then 32 else 52) (refTitle env r))
         whenM (buttonWith (alignMid . padXY 5 0 . tight) "Clear") (setFocus env Nothing)
-      scope $ when (winW >= 1060) $
-        labelWith (alignMid . fontMuted . fontSizeScale 0.82) (panelHint compactStatus active)
+      let statusItems =
+            length
+              ( filter
+                  id
+                  [ isJust docName
+                  , isJust timeline
+                  , isJust live
+                  , isJust (dhTarget hooks)
+                  , ghci || busy
+                  , isJust (boBaseline baseline)
+                  , isJust focus
+                  ]
+              )
+          crowdedStatus = compactStatus || statusItems >= 4
+      scope $ when (winW >= 1060 && (winW >= 1560 || statusItems < 5)) $
+        labelWith (alignMid . fontMuted . fontSizeScale 0.82) (panelHint crowdedStatus active)
       do
         resp <- styled quiet (iconButtonWith' (alignMid . padXY 5 1 . tight) iconKeyboard "")
         tooltip resp "Keyboard shortcuts (? or F1)"
         when (respClicked resp) (modifyVar (appShortcutsOpen app) not)
 
-activeDocumentName :: App -> Panel -> NanoUI (Maybe T.Text)
-activeDocumentName app active = case active of
-  PTimeline -> fmap (T.pack . takeFileName) <$> readVar (tsPath (appTimeline app))
+activeDocumentName :: App -> Panel -> Maybe LoadProgress -> Maybe LiveData -> NanoUI (Maybe T.Text)
+activeDocumentName app active timeline live = case active of
+  PTimeline ->
+    if maybe False (\p -> lpFollowing p || not (lpDone p)) timeline
+      then pure Nothing
+      else fmap (T.pack . takeFileName) <$> readVar (tsPath (appTimeline app))
   PHeap -> do
     source <- readVar (hsSource (appHeap app))
     case source of
       FromHpFile -> fmap (T.pack . takeFileName) <$> readVar (hsHpPath (appHeap app))
-      FromEventlog -> fmap (T.pack . takeFileName) <$> readVar (tsPath (appTimeline app))
+      FromEventlog ->
+        if maybe False (\p -> lpFollowing p || not (lpDone p)) timeline
+          then pure Nothing
+          else fmap (T.pack . takeFileName) <$> readVar (tsPath (appTimeline app))
       FromGhcDebug -> pure (Just "ghc-debug live graph")
   PCore -> do
     (s, c, g) <- readVar (csPaths (appCore app))
     pure (T.pack . takeFileName <$> (c <|> g <|> s))
   PDebugger -> fmap (T.pack . takeFileName) <$> readVar (dsSourcePath (appDebug app))
-  PLive -> do
-    want <- readVar (lvWant (appLive app))
-    if not want
+  PLive ->
+    if isJust live
       then pure Nothing
       else do
-        host <- readVar (lvHost (appLive app))
-        port <- readVar (lvPort (appLive app))
-        pure (Just (host <> ":" <> port))
+        want <- readVar (lvWant (appLive app))
+        if not want
+          then pure Nothing
+          else do
+            host <- readVar (lvHost (appLive app))
+            port <- readVar (lvPort (appLive app))
+            pure (Just (host <> ":" <> port))
 
 -- | A live source in the status bar: a click opens its panel, a
 -- right-click its menu.

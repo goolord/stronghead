@@ -11,7 +11,8 @@
 --
 -- > cabal run -v0 stronghead -- --demo scratch/demo-frames
 -- > ffmpeg -y -f concat -safe 0 -i scratch/demo-frames/frames.txt \
--- >   -vsync vfr -pix_fmt yuv420p -c:v libx264 -crf 18 stronghead-demo.mp4
+-- >   -fps_mode passthrough -r 30 -pix_fmt yuv420p -c:v libx264 -crf 18 \
+-- >   -movflags +faststart stronghead-demo.mp4
 module Demo (demoMain) where
 
 import Control.Concurrent (threadDelay)
@@ -492,6 +493,8 @@ tour r repo = do
   -- Remote commands: a mark, a collection.
   clickAt r =<< exact r "Mark…"
   await r "Mark the program's timeline" 3
+  key r KeyEnd
+  replicateM_ 8 (key r KeyBackspace)
   typeText r "watch the leak"
   key r KeyEnter
   wait r 0.5
@@ -580,7 +583,7 @@ tour r repo = do
     clickAt r =<< exact r "Main"
     wait r 0.4
   softly "open a binding" $ do
-    m <- findPrefix r "main"
+    m <- exact r "main2" `catch` \(_ :: SomeException) -> findPrefix r "main"
     clickAt r m
     wait r 0.7
   -- The code tabs flash on update; switch through Core and STG to inspect them.

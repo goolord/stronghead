@@ -922,8 +922,12 @@ main = do
         , (900, Nothing, MemReturn 0 120 40 80)
         , (910, Just 0, SparkCounters 100 10 2 60 15 13 0)
         , (920, Just 0, UserMarker "sh:exc ErrorCall boom")
+        , (930, Just 0, UserMarker "sh:alloc-spike worker 8388608 4194304 Main.go")
+        , (940, Just 0, UserMarker "second 1")
         ]
       extTl = snapshot (foldl' (\b (t, c, s) -> feedEvent b (E.Event t s c)) emptyBuilder extEvents)
+  check "extended: internal sh:* markers stay out of user tlMarkers" $
+    map mkText (V.toList (tlMarkers extTl)) == ["second 1"]
   check "extended: UserSpan paired with exact alloc bytes" $
     case V.toList (tlUserSpans extTl) of
       [sp] -> usName sp == "http.checkout" && usAllocBytes sp == 65536 && usThread sp == 10 && usStart sp == 100 && usEnd sp == 600
@@ -953,8 +957,9 @@ main = do
       && mrReturned (tlMemReturns extTl V.! 0) == 80
       && ssConverted (tlSparks extTl) == 60
       && ssOverflowed (tlSparks extTl) == 2
-      && V.length (tlAlerts extTl) == 1
+      && V.length (tlAlerts extTl) == 2
       && taKind (tlAlerts extTl V.! 0) == "exception"
+      && taKind (tlAlerts extTl V.! 1) == "alloc-spike"
   let rn = runnableStats extTl
       hm = gcPauseHeatmap extTl 4 4
   check "extended: runnableStats and gcPauseHeatmap populated" $

@@ -945,12 +945,18 @@ emptyState title body commands = emptyStateWith title body commands (pure ())
 -- | 'emptyState' with primary action buttons below the copyable commands.
 emptyStateWith :: Text -> [Text] -> [Text] -> NanoUI () -> NanoUI ()
 emptyStateWith title body commands actions =
-  columnWith (fillW . fillH . padAll 36 . gap 10) $ do
-    columnWith (maxW 640 . fillW . tight . gap 10) $ do
-      labelWith (fontSemiBold . fontSizeScale 1.15 . fillW) title
-      forM_ body (labelWith (fontMuted . fontSizeScale 0.94 . fillW))
-      scope $ unless (null commands) (codeBlock commands)
-      rowWith (tight . gap 8 . padTop 4 . wrap . lineGap 6 . fillW) actions
+  columnWith (fillW . fillH . padAll 24) $ do
+    flex
+    rowWith (fillW . tight) $ do
+      flex
+      columnWith (maxW 640 . fillW . tight . gap 10) $ do
+        labelWith (fontSemiBold . fontSizeScale 1.15 . fillW) title
+        forM_ body (labelWith (fontMuted . fontSizeScale 0.94 . fillW))
+        scope $ unless (null commands) (codeBlock commands)
+        rowWith (tight . gap 8 . padTop 4 . wrap . lineGap 6 . fillW) actions
+      flex
+    flex
+    flex
 
 -- | Lines of shell or Haskell, in a sunken monospace block with a one-click
 -- Copy button.

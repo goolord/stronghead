@@ -110,9 +110,21 @@ drawMarks pal ax r@(Rect x y w h) m = withClip r $ do
       drawRect (Rect xa y (xb - xa) h) (alpha 0.10 (pSelection pal))
       drawRect (Rect xa y 1 h) (alpha 0.45 (pSelection pal))
       drawRect (Rect (xb - 1) y 1 h) (alpha 0.45 (pSelection pal))
-  forM_ (tmMarkers m) $ \t -> do
-    let px = xOf t
-    when (visible px) $ drawStroke (V2 px y) (V2 px (y + h)) 1 (alpha 0.55 (pMarker pal))
+  let drawThinnedMarkers _ [] = pure ()
+      drawThinnedMarkers !lastX (t : rest) = do
+        let px = xOf t
+        if px < x - 1
+          then drawThinnedMarkers lastX rest
+          else
+            if px > x + w + 1
+              then pure ()
+              else
+                if px - lastX >= 2
+                  then do
+                    drawStroke (V2 px y) (V2 px (y + h)) 1 (alpha 0.55 (pMarker pal))
+                    drawThinnedMarkers px rest
+                  else drawThinnedMarkers lastX rest
+  drawThinnedMarkers (x - 10) (tmMarkers m)
   -- Stronghead's own moments carry a square cap. A mark's line is dashed
   -- while its time is an estimate, and left to the eventlog's marker once
   -- that is there. A snapshot or a pause is a line in ink.

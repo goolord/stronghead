@@ -165,16 +165,13 @@ diffPanes env st loaded now pid ctx
       let header = do
             scope $
               if paths == noBaselinePaths
-                then paneMeta "no baseline"
-                else paneMeta ("against " <> baselineName paths <> if boLoading loaded then " (reading…)" else "")
-            flex
+                then paneMetaWith fillW "no baseline"
+                else paneMetaWith fillW ("against " <> baselineName paths <> if boLoading loaded then " (reading…)" else "")
             markButton
             scope $ unless (paths == noBaselinePaths) $
-              whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconTrash "Clear") (clearBaseline st)
+              whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear") (clearBaseline st)
           markButton =
-            actionIconButton (alignMid . padXY 8 2 . tight) iconBookmark (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
-
-
+            actionButton (alignMid . padXY 8 2 . tight) (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
               (Just "Keep what is loaded now as the baseline; what you open next is compared with it")
               (dnMark now)
       paneWith tight ctx title header $

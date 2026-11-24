@@ -682,13 +682,26 @@ drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
   forM_ (zip3 [0 :: Int ..] (rCode rows) (V.toList (tlCodeRuns tl))) $ \(i, cr@(Rect _ cy _ ch), runs) -> do
     sub (cy + ch / 2) ("  code " <> tshow i)
     drawCodeTrack pal mm tl v cr runs focusCC
-  -- Markers run down through the capability tracks.
-  withClip (Rect px (rectY (rRuler rows)) pw (capsBottom - rectY (rRuler rows))) $
-    forM_ (markersIn tl v) $ \mk -> do
-      let mx = timeToX v px pw (fromIntegral (mkTime mk))
-      if mkIsMarker mk
-        then drawStroke (V2 mx (rectY (rRuler rows) + rectH (rRuler rows))) (V2 mx capsBottom) 1 (alpha 0.55 (pMarker pal))
-        else drawStroke (V2 mx (rectY (rRuler rows) + 18)) (V2 mx (rectY (rRuler rows) + rulerH)) 1 (alpha 0.6 (pMuted pal))
+  -- Markers run down through the capability tracks (thinned to 2 px so
+  -- dense marker streams never turn the chart into a solid wall).
+  withClip (Rect px (rectY (rRuler rows)) pw (capsBottom - rectY (rRuler rows))) $ do
+    let go _ _ [] = pure ()
+        go !lastM !lastE (mk : rest) = do
+          let mx = timeToX v px pw (fromIntegral (mkTime mk))
+          if mkIsMarker mk
+            then
+              if mx - lastM >= 2
+                then do
+                  drawStroke (V2 mx (rectY (rRuler rows) + rectH (rRuler rows))) (V2 mx capsBottom) 1 (alpha 0.55 (pMarker pal))
+                  go mx lastE rest
+                else go lastM lastE rest
+            else
+              if mx - lastE >= 2
+                then do
+                  drawStroke (V2 mx (rectY (rRuler rows) + 18)) (V2 mx (rectY (rRuler rows) + rulerH)) 1 (alpha 0.6 (pMuted pal))
+                  go lastM mx rest
+                else go lastM lastE rest
+    go (px - 10) (px - 10) (markersIn tl v)
   let Rect _ gy _ _ = rGC rows
       Rect _ my' _ _ = rMem rows
       maxPause = V.foldl' (\m g -> max m (fromIntegral (gcEnd g - gcStart g) :: Double)) 0 (tlGCs tl)
@@ -698,7 +711,7 @@ drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
   sub (gy + 30) (if maxPause > 0 then "max " <> fmtNs maxPause else "log scale")
   drawGCStrip pal v (rGC rows) tl sel
   label' (my' + 12) "Heap"
-  sub (my' + 30) (if peakLive > 0 && peakHeap > 0 then fmtBytes peakLive <> " / " <> fmtBytes peakHeap else "size, live")
+  sub (my' + 30) (if peakLive > 0 then "live " <> fmtBytes peakLive else if peakHeap > 0 then "size " <> fmtBytes peakHeap else "size, live")
   drawMemStrip pal v (rMem rows) tl
   -- The shared cursor and range, down the whole plot, with a handle on the
   -- ruler to drag.
@@ -725,10 +738,18 @@ drawRuler pal mm tl v (Rect px py pw ph) = do
     -- A label that would run past the plot is left off rather than cut.
     when (tx + 4 + fromIntegral (T.length txt) * mmCharW mm <= px + pw) $
       drawTextWith (mmFont mm) (V2 (tx + 4) (py + 11)) AlignStart AlignMiddle txt (pMuted pal)
-  forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
-    let mx = timeToX v px pw (fromIntegral (mkTime mk))
-    -- On the baseline, under the tick labels.
-    drawPath (P.polygon [V2 (mx - 4) (py + ph - 8), V2 (mx + 4) (py + ph - 8), V2 mx (py + ph)]) (pMarker pal)
+  let drawRulerMarkers _ [] = pure ()
+      drawRulerMarkers !lastX (mk : rest)
+        | not (mkIsMarker mk) = drawRulerMarkers lastX rest
+        | otherwise = do
+            let mx = timeToX v px pw (fromIntegral (mkTime mk))
+            if mx - lastX >= 4
+              then do
+                -- On the baseline, under the tick labels.
+                drawPath (P.polygon [V2 (mx - 4) (py + ph - 8), V2 (mx + 4) (py + ph - 8), V2 mx (py + ph)]) (pMarker pal)
+                drawRulerMarkers mx rest
+              else drawRulerMarkers lastX rest
+  drawRulerMarkers (px - 10) (markersIn tl v)
 
 -- | The label gutter down the left of a canvas, ruled off from the plot.
 drawGutter :: Palette -> Rect -> CanvasM ()

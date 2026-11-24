@@ -61,7 +61,7 @@ data LiveSubTab = LiveThreadsList | LiveStacksView | LiveFlameView | LiveProbesV
 
 liveSubTabName :: LiveSubTab -> Text
 liveSubTabName = \case
-  LiveThreadsList -> "Threads"
+  LiveThreadsList -> "List"
   LiveStacksView -> "Stacks"
   LiveFlameView -> "Flamegraph"
   LiveProbesView -> "Probes"
@@ -339,31 +339,38 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
       tick <- readVar (lvBeaconsTick st)
       mBeacons <- useTask (lvBeaconsTask st) tick discoverAgents
       let cardStyle = panelStyle (background (inkPane i) . borderWidth 1 . borderColor (inkRule i) . cornerRadius 6)
-          emptyActions = do
-            whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
-            whenM (toolIconButton iconRefresh "Rescan processes") (modifyVar (lvBeaconsTick st) (+ 1))
+          hasBeacons = maybe False (not . null) mBeacons
+          emptyActions =
+            if hasBeacons
+              then pure ()
+              else do
+                whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
+                whenM (toolIconButton iconRefresh "Rescan processes") (modifyVar (lvBeaconsTick st) (+ 1))
       scope $
-        columnWith (grow . tight . gap 12) $ do
+        columnWith (grow . tight . gap 0 . fillW . fillH) $ do
           case mBeacons of
             Just bs@(_ : _) ->
-              columnWith (padAll 16 . padBottom 0 . tight . gap 6 . fillW) $ do
-                rowWith (tight . gap 8 . alignMid . fillW) $ do
-                  sectionTitle ("Discovered local Haskell processes (" <> tshow (length bs) <> ")")
-                  flex
-                  whenM (toolIconButton iconRefresh "Rescan") (modifyVar (lvBeaconsTick st) (+ 1))
-                forM_ bs $ \b -> withKey (abPath b) $
-                  styled cardStyle $
-                    panelWith (padXY 12 8 . fillW) $ themed th $
-                      rowWith (tight . gap 12 . alignMid . fillW) $ do
-                        statusDot Success
-                        labelWith fontMedium (abProgram b)
-                        labelWith (fontMono . fontMuted) ("pid " <> tshow (abPid b))
-                        labelWith fontMono (abHost b <> ":" <> tshow (abPort b))
-                        labelWith (fillW . fontMuted . fontSizeScale 0.88) (abCwd b)
-                        whenM (styled primary (buttonWith tight "Connect")) $ do
-                          writeVar (lvHost st) (abHost b)
-                          writeVar (lvPort st) (tshow (abPort b))
-                          connect st
+              rowWith (fillW . padTop 24 . padXY 24 0 . tight) $ do
+                flex
+                columnWith (tight . gap 6 . maxW 640 . fillW) $ do
+                  rowWith (tight . gap 8 . alignMid . fillW) $ do
+                    sectionTitle ("Discovered local Haskell processes (" <> tshow (length bs) <> ")")
+                    flex
+                    whenM (toolIconButton iconRefresh "Rescan") (modifyVar (lvBeaconsTick st) (+ 1))
+                  forM_ bs $ \b -> withKey (abPath b) $
+                    styled cardStyle $
+                      panelWith (padXY 12 8 . fillW) $ themed th $
+                        rowWith (tight . gap 12 . alignMid . fillW) $ do
+                          statusDot Success
+                          labelWith fontMedium (abProgram b)
+                          labelWith (fontMono . fontMuted) ("pid " <> tshow (abPid b))
+                          labelWith fontMono (abHost b <> ":" <> tshow (abPort b))
+                          labelWith (fillW . fontMuted . fontSizeScale 0.88) (abCwd b)
+                          whenM (styled primary (buttonWith tight "Connect")) $ do
+                            writeVar (lvHost st) (abHost b)
+                            writeVar (lvPort st) (tshow (abPort b))
+                            connect st
+                flex
             _ -> pure ()
           emptyStateWith
             "Connect to a running program"
@@ -390,7 +397,7 @@ actionStrip st remote = do
     forM_ (zip [0 :: Int ..] (groupsOf remote)) $ \(gi, grp) -> withKey gi $ do
       scope $ when (gi > 0) (box (fixedWH 1 20 . alignMid) (inkRule (ink th)))
       forM_ grp $ \a -> withKey (raLabel a) $
-        actionIconButton alignMid (remoteIcon (raLabel a)) (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
+        actionButton alignMid (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
     flex
     msg <- readVar (lvMessage st)
     scope $ unless (T.null msg) $ do
@@ -398,15 +405,6 @@ actionStrip st remote = do
       whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
   where
     groupsOf as = filter (not . null) [[a | a <- as, raGroup a == g] | g <- [GroupAgent, GroupDebug]]
-    remoteIcon = \case
-      "Mark…" -> iconBookmark
-      "Major GC" -> iconRefresh
-      "Census now" -> iconLayers
-      "Stop heap profiling" -> iconStop
-      "Start heap profiling" -> iconPlay
-      "Pause" -> iconPause
-      "Resume" -> iconPlay
-      _ -> iconCamera
 
 -- | What Connect found, or how to upgrade an old agent.
 attachReport :: LiveState -> LiveData -> NanoUI ()

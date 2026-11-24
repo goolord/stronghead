@@ -65,12 +65,16 @@ main = withDebugStub $ withAgent defaultAgentConfig $ do
         labelThread t name
 
   -- Contended workers: each does its pure work while holding the shared
-  -- MVar, so the others queue up behind it.
+  -- MVar, so the others queue up behind it. Sample spans every 25th iteration
+  -- so critical-path diagnostics have rich data without flooding the log.
   forM_ [1 .. 6 :: Int] $ \i -> spawn ("worker-" <> show i) $ \iter -> do
-    withSpan ("worker-job-" <> show i) $
-      modifyMVar_ shared $ \n -> do
-        x <- evaluate (length (show [1 .. 2000 + i * 100 + iter `mod` 7]))
-        pure (n + x `mod` 7)
+    let job =
+          modifyMVar_ shared $ \n -> do
+            x <- evaluate (length (show [1 .. 2000 + i * 100 + iter `mod` 7]))
+            pure (n + x `mod` 7)
+    if iter `mod` 25 == 0
+      then withSpan ("worker-job-" <> show i) job
+      else job
     yield
 
   -- The leak: modifyIORef (not modifyIORef') builds (+) thunks forever.
@@ -86,9 +90,11 @@ main = withDebugStub $ withAgent defaultAgentConfig $ do
     when (k `mod` 200 == 0) (threadDelay 1000)
 
   -- A pure, allocation-heavy CPU burner: lots of short-lived garbage.
-  spawn "map-builder" $ \iter ->
-    withAllocGuard "map-builder-burst" (4 * 1024 * 1024) $
-      void (evaluate (M.size (M.fromList [(i, i * iter) | i <- [1 .. 20000 :: Int]])))
+  spawn "map-builder" $ \iter -> do
+    let burst = void (evaluate (M.size (M.fromList [(i, i * iter) | i <- [1 .. 20000 :: Int]])))
+    if iter `mod` 20 == 0
+      then withAllocGuard "map-builder-burst" (4 * 1024 * 1024) burst
+      else burst
 
   forM_ [1 .. seconds] $ \s -> do
     threadDelay 1000000

@@ -39,7 +39,7 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (Ink (..), TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, ink, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
+import UI.Common (Ink (..), PaneCtx (..), TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, ink, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
 import UI.Flamegraph (diffFlamegraphView, eraCohortHeatmapView, flamegraphView, latencyHeatmapView)
 import UI.Graph (renderFlamegraphSvg, renderHpDiffSvg, renderHpSvg)
@@ -1328,6 +1328,27 @@ main = do
          in warm (inkGround i) && warm (inkPane i) && warm (inkRule i)
   check "both Dark and Light palettes preserve Stronghead's warm neutral tone"
     (warmOk AppearanceDark && warmOk AppearanceLight)
+
+  -- Heap diff header buttons stay inside a 480px split pane without pushing Clear off-edge.
+  diffCtx <- ttfMetrics <$> newContext
+  diffSt <- newBaselineState
+  diffBus <- newBus
+  let diffEnv = Env diffBus [] PHeap (const (pure ())) haveNothing Nothing
+      diffHp = fromSamples "prog +RTS -hT" "closure type" 0 (const Nothing) [(1.0, [("THUNK_2_0", 1000000)])]
+      diffPaths = noBaselinePaths {blEventlog = Just "C:\\Users\\zach\\Dev\\stronghead\\stronghead-sample.eventlog"}
+      diffBase = Baseline diffPaths Nothing (Just diffHp) Nothing Nothing
+      diffLoaded = BaselineLoaded (Just diffBase) False Nothing
+      diffNow = DiffNow (Just diffHp) Nothing (Right (pure ()))
+      diffUi = do
+        setUiTheme (strongheadTheme (Just AppearanceDark))
+        writeVar (bvPaths diffSt) diffPaths
+        columnWith (fillW . fillH . tight) $
+          for_ (diffPanes diffEnv diffSt diffLoaded diffNow paneDiffHeap (PaneCtx Nothing (Just (menuItem "Close")) (Just paneDiffHeap) Nothing)) id
+  warmup2 diffCtx (withInput 480 400) diffUi >>= \_ -> pure ()
+  diffSpans <- collectTextSpans diffCtx
+  let diffOverflow = [t | (Rect x y bw _, t, _, _, _) <- diffSpans, y < 40, x + bw > 480.5]
+  check "Heap diff header buttons fit cleanly inside 480px split pane"
+    (hasText "Mark again" diffSpans && hasText "Clear" diffSpans && null diffOverflow)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

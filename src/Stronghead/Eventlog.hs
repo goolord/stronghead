@@ -110,6 +110,9 @@ data Builder = Builder
   , bLive :: ![(Word64, Word64)]
   , bSize :: ![(Word64, Word64)]
   , bMarkers :: ![Marker]
+  , bInternalMarkers :: ![Marker]
+    -- ^ Stronghead agent protocol markers (@sh:span:*@, @sh:alloc-spike@, @sh:exc@),
+    -- parsed into 'tlUserSpans' and 'tlAlerts' without cluttering user 'tlMarkers'.
   , bHeap :: !HeapB
   , bInfo :: ![(Text, Text)]
   , bRun :: !RunInfo
@@ -138,6 +141,7 @@ emptyBuilder =
   Builder
     IM.empty
     IM.empty
+    []
     []
     []
     []
@@ -224,13 +228,27 @@ capEvent b c t = \case
           _ -> 0
         b' = onThread tid (\tb -> tb {tbWakeups = (t, waker) : tbWakeups tb}) b
      in if other /= c then addPointTo b' pointWakeup tid else b'
-  UserMarker name -> b {bMarkers = Marker t name (Just c) True : bMarkers b}
-  UserMessage m -> b {bMarkers = Marker t m (Just c) False : bMarkers b}
+  UserMarker name -> addMarker b (Marker t name (Just c) True)
+  UserMessage m -> addMarker b (Marker t m (Just c) False)
   other -> globalEvent b t other
   where
     onCap f bb = bb {bCaps = IM.alter (Just . f . fromMaybe emptyCap) c (bCaps bb)}
     addPoint = addPointTo b
     addPointTo bb k x = onCap (\cb -> cb {cbPoints = (t, k, x) : cbPoints cb}) bb
+
+-- | Whether a marker carries Stronghead's own structured instrumentation
+-- protocol (@withSpan@, @withAllocGuard@, @withExceptionTap@). Those events
+-- feed 'tlUserSpans' and 'tlAlerts' and must not flood user markers or charts.
+isInternalMarker :: Text -> Bool
+isInternalMarker txt =
+  "sh:span:" `T.isPrefixOf` txt
+    || "sh:alloc-spike " `T.isPrefixOf` txt
+    || "sh:exc " `T.isPrefixOf` txt
+
+addMarker :: Builder -> Marker -> Builder
+addMarker b mk
+  | isInternalMarker (mkText mk) = b {bInternalMarkers = mk : bInternalMarkers b}
+  | otherwise = b {bMarkers = mk : bMarkers b}
 
 -- | End whatever span is open on a capability at time @t@; a run span cut
 -- short this way gets @stop@ as its end reason.
@@ -251,8 +269,8 @@ globalEvent b t = \case
   HeapSize {sizeBytes} -> b {bSize = (t, sizeBytes) : bSize b}
   CreateThread tid -> onThread tid (\tb -> tb {tbCreated = Just t}) b
   ThreadLabel tid lbl -> onThread tid (\tb -> tb {tbLabel = Just lbl}) b
-  UserMarker name -> b {bMarkers = Marker t name Nothing True : bMarkers b}
-  UserMessage m -> b {bMarkers = Marker t m Nothing False : bMarkers b}
+  UserMarker name -> addMarker b (Marker t name Nothing True)
+  UserMessage m -> addMarker b (Marker t m Nothing False)
   RtsIdentifier _ ident -> run (\r -> r {riRts = Just ident}) (info "RTS" ident)
   ProgramArgs _ as -> run (mergeRunInfo (runFromArgs as)) (info "Arguments" (T.unwords as))
   OsProcessPid _ p -> run (\r -> r {riPid = Just (fromIntegral p)}) (info "PID" (tshow p))
@@ -376,8 +394,8 @@ snapshot b
         , tlNonmoving = bNonmoving b
         , tlMemReturns = V.fromList (sortOn mrTime (bMemReturns b))
         , tlGCSyncLags = V.fromList (computeGCSyncLags tracks gcs (sortOn fst (bGCReqs b)))
-        , tlUserSpans = V.fromList (extractUserSpans tracks sortedMarkers)
-        , tlAlerts = V.fromList (extractTraceAlerts sortedMarkers)
+        , tlUserSpans = V.fromList (extractUserSpans tracks sortedInternal)
+        , tlAlerts = V.fromList (extractTraceAlerts sortedInternal)
         , tlEventCount = bCount b
         }
   where
@@ -388,6 +406,7 @@ snapshot b
     tracks = V.fromList [mkTrack (sortOn srStart (reverse (cbSpans (closeOpen end 0 0 cb)))) | cb <- caps]
     gcs = gcClusters (sortOn fst gcSpans) (sortOn (\(GCStat x _ _ _) -> x) (bGCStats b))
     sortedMarkers = sortOn mkTime (bMarkers b)
+    sortedInternal = sortOn mkTime (bInternalMarkers b)
     costCentres = hbCostCentres (bHeap b)
     -- A sample belongs to the thread running on its capability then.
     samples =
@@ -495,17 +514,29 @@ computeGCSyncLags tracks gcs reqs =
           ]
         -- Also include any RequestParGC/RequestSeqGC shortly before gcStart
         reqWindowStart = if gcStart g > 500000000 then gcStart g - 500000000 else 0
-        earlyReqs = [(t, c) | (t, c) <- reqs, t >= reqWindowStart, t <= gcEnd g]
+        mEarlyReq = firstReqIn reqWindowStart (gcEnd g)
   , not (null capEntries)
   , let (firstEntryT, firstEntryCap, _) = foldl1 (\a@(t1, _, _) b@(t2, _, _) -> if t1 <= t2 then a else b) capEntries
         (lastEntryT, lastCap, straggler) = foldl1 (\a@(t1, _, _) b@(t2, _, _) -> if t1 >= t2 then a else b) capEntries
-        (firstT, firstCap) = case earlyReqs of
-          (rt, rc) : _ | rt < firstEntryT -> (rt, rc)
+        (firstT, firstCap) = case mEarlyReq of
+          Just (rt, rc) | rt < firstEntryT -> (rt, rc)
           _ -> (firstEntryT, firstEntryCap)
         lag = if lastEntryT > firstT then lastEntryT - firstT else 0
   , lag > 0
   ]
   where
+    reqsVec = VU.fromList reqs
+    nReqs = VU.length reqsVec
+    firstReqIn lo hi =
+      let i = bsearch 0 nReqs
+          bsearch !l !r
+            | l >= r = l
+            | otherwise =
+                let m = l + (r - l) `div` 2
+                 in if fst (reqsVec VU.! m) < lo then bsearch (m + 1) r else bsearch l m
+       in if i < nReqs
+            then let p@(rt, _) = reqsVec VU.! i in if rt <= hi then Just p else Nothing
+            else Nothing
     firstGCIn tr a b =
       let i0 = firstSpanEndingAfter tr a
           n = trackLength tr

@@ -991,7 +991,7 @@ leakView env st hp = do
                        labelWith (alignMid . fontTone stTone . fillW) stText
             ]
           cfg = defaultTableConfig
-            { tableColSizes = [ColStretch, ColFixed 100, ColFixed 100, ColFixed 200]
+            { tableColSizes = [ColStretch, ColFixed 114, ColFixed 98, ColFixed 195]
             , tableSqueeze = True
             }
           tableMaxH = 9 * 29 + 6
