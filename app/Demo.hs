@@ -10,9 +10,9 @@
 -- Run from the repository root:
 --
 -- > cabal run -v0 stronghead -- --demo scratch/demo-frames
--- > ffmpeg -y -f concat -safe 0 -i scratch/demo-frames/frames.txt \
--- >   -fps_mode passthrough -r 30 -pix_fmt yuv420p -c:v libx264 -crf 18 \
--- >   -movflags +faststart stronghead-demo.mp4
+-- > ffmpeg -y -framerate 30 -i scratch/demo-frames/f%05d.bmp \
+-- >   -pix_fmt yuv420p -c:v libx264 -crf 18 -movflags +faststart \
+-- >   scratch/stronghead-demo.mp4
 module Demo (demoMain) where
 
 import Control.Concurrent (threadDelay)
@@ -57,12 +57,15 @@ import System.Environment (getExecutablePath, lookupEnv)
 import System.Exit (ExitCode, exitFailure, exitSuccess)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
-  ( IOMode (..)
+  ( BufferMode (..)
+  , IOMode (..)
   , hClose
   , hPutBuf
   , hPutStrLn
+  , hSetBuffering
   , openFile
   , stderr
+  , stdout
   , withBinaryFile
   )
 import System.Process
@@ -90,7 +93,11 @@ import NanoUI.Testing (Context, collectOverlayTextSpans, collectTextSpans, newPi
 import NanoUI.Testing.Harness (DemoSpan, findExact, findRightmost, hasText, keyInp, spanCenter)
 
 import UI.Common (strongheadTheme)
-import UI.Settings (loadSettings)
+import UI.Settings
+  ( Settings (..)
+  , ThemeChoice (..)
+  , loadSettings
+  )
 import UI.Shell (App, appView, defaultOptions, newApp, optFiles, optPersist, optTab)
 
 -- | Frames per second of the recording.
@@ -98,9 +105,9 @@ fps :: Double
 fps = 30
 
 -- | Every scripted dwell is scaled by this: the tour reads briskly on
--- screen. 1.15 is about a minute and a quarter.
+-- screen across all panels and unified workbench panes.
 tempo :: Double
-tempo = 1.15
+tempo = 1.0
 
 winW, winH :: Float
 winW = 1500
@@ -114,7 +121,7 @@ sampleArgs :: IO [String]
 sampleArgs =
   maybe defaultArgs words <$> lookupEnv "STRONGHEAD_DEMO_SAMPLE_ARGS"
   where
-    defaultArgs = ["360", "+RTS", "-l", "-hT", "-i0.1", "-T", "-N2", "-A64m", "-RTS"]
+    defaultArgs = ["1200", "+RTS", "-l", "-hT", "-i0.1", "-T", "-N2", "-A64m", "-RTS"]
 
 -- | A recording session: the paced frame loop and the pointer it draws.
 data Rec = Rec
@@ -134,6 +141,8 @@ data Rec = Rec
 
 demoMain :: FilePath -> IO ()
 demoMain dir = handle report $ do
+  hSetBuffering stdout LineBuffering
+  hSetBuffering stderr LineBuffering
   repo <- getCurrentDirectory
   sample <- findSample
   dumps <- demoDumps repo
@@ -141,7 +150,14 @@ demoMain dir = handle report $ do
   putStrLn ("demo: frames -> " <> dir)
   putStrLn ("demo: sample   " <> sample)
   putStrLn ("demo: dumps    " <> maybe "none" id dumps)
-  settings <- loadSettings
+  settings0 <- loadSettings
+  let settings =
+        settings0
+          { cfgTheme = ThemeDark
+          , cfgRestoreWindow = False
+          , cfgReopenSession = False
+          , cfgProjectRoot = T.pack repo
+          }
   app <-
     newApp
       settings
@@ -237,7 +253,7 @@ frame r f = do
   writeIORef (recLast r) t
   writeIORef (recFrame r) (n + 1)
   modifyIORef' (recLog r) ((pos, down, t) :)
-  when (n `mod` 300 == 0) $ putStrLn ("demo: frame " <> show n)
+  when (n `mod` 100 == 0) $ putStrLn ("demo: frame " <> show n <> " (dt=" <> showFFloat (Just 3) (t - prev) "s)")
 
 frames :: Double -> Int
 frames secs = max 1 (round (secs * fps * tempo))
@@ -481,205 +497,297 @@ instance Exception DemoStop
 
 tour :: Rec -> FilePath -> IO ()
 tour r repo = do
+  -- 1. Live RTS telemetry, Agent v3 CloneStack flamegraphs, & ghc-heap probes
   step "the program, live"
-  wait r 0.9
+  wait r 0.8
 
-  -- Connect: the agent says hello, and Connect finds everything else.
+  -- Connect: the agent says hello, and auto-attach wires the eventlog,
+  -- heap profile, working directory, and dumps.
   clickAt r =<< exact r "Connect"
   await r "capabilities" 20
   await r "Connect found" 30
-  wait r 1.4
+  wait r 1.1
 
-  -- Remote commands: a mark, a collection.
+  -- Remote commands: post a timeline marker and trigger a major GC.
   clickAt r =<< exact r "Mark…"
   await r "Mark the program's timeline" 3
   key r KeyEnd
   replicateM_ 8 (key r KeyBackspace)
   typeText r "watch the leak"
   key r KeyEnter
-  wait r 0.5
+  wait r 0.4
   clickAt r =<< exact r "Major GC"
-  wait r 0.9
+  wait r 0.7
 
-  -- Every thread, live from the agent: filter one out, peek at it, pin it.
-  softly "thread filter and peek" $ do
+  -- Cross-platform CloneStack backtraces, live statistical flamegraph, and
+  -- in-process ghc-heap value probes (works on Windows/macOS/Linux).
+  softly "live CloneStack backtraces" $ do
+    clickAt r =<< exact r "Capture stacks"
+    awaitRec r "Thread " 6
+    wait r 1.0
+  softly "live statistical stack flamegraph" $ do
+    clickAt r =<< exact r "Sample stacks"
+    wait r 1.6
+    softly "filter MVar off-CPU stacks" $ do
+      clickAt r =<< exact r "Off-CPU (MVar)"
+      wait r 0.8
+    softly "all live stacks" $ do
+      clickAt r =<< exact r "All"
+      wait r 0.7
+    clickAt r =<< exact r "Stop stack sampler"
+    wait r 0.3
+  softly "live ghc-heap value probes" $ do
+    clickAt r =<< exact r "Read probes"
+    awaitRec r "leaky-accumulator" 6
+    wait r 1.2
+  softly "thread list filter and pin" $ do
+    clickAt r =<< exact r "List"
+    wait r 0.3
     lf <- findPrefix r "Filter by label or id"
     clickAt r lf
     typeText r "work"
-    wait r 0.5
+    wait r 0.4
     w3 <- exact r "worker-3"
     moveTo r w3 0.3
-    wait r 0.9
+    wait r 0.8
     pinThread r
 
-  -- A cut-short run: just the live phase (a reproducer for the follower).
+  -- Optional cut-short mode for quick live-only smoke tests.
   liveOnly <- lookupEnv "STRONGHEAD_DEMO_LIVE_ONLY"
   when (liveOnly == Just "1") $ do
-    wait r 8
+    wait r 4
     throwIO DemoStop
 
-  -- The timeline, followed as it is written.
-  step "timeline"
+  -- 2. Eventlog timeline: live tailing, causal critical-path arrows, & latency heatmaps
+  step "timeline & causal critical path"
   clickAt r =<< exact r "Timeline"
-  wait r 1.0
+  wait r 0.9
   caps <- exact r "Capabilities"
-  moveTo r (off caps 420 210) 0.4
+  moveTo r (off caps 420 210) 0.35
   wheel r (-4)
-  wait r 0.6
+  wait r 0.5
   wheel r 6
   wait r 0.3
-  softly "range" $ do
+  softly "range analysis" $ do
     moveTo r (off caps 260 200) 0.3
-    dragTo r shift (off caps 700 200) 0.7
-    wait r 0.4
+    dragTo r shift (off caps 700 200) 0.65
+    wait r 0.35
     clickAt r =<< exact r "Analyse range"
-    wait r 1.1
+    wait r 1.05
     clickAt r =<< exact r "Back to overview"
-    wait r 0.3
-
-  -- A pane can take the whole workbench: double-click its header.
-  softly "maximise the threads pane" $ do
+    softly "clear range" $ clickAt r =<< exact r "Clear range"
+    wait r 0.25
+  softly "causal critical-path wakeup arrows" $ do
+    tlHdr <- exact r "Threads"
+    clickAt r (off tlHdr 260 148)
+    wait r 1.15
+    softly "return to timeline overview" $ do
+      clickAt r =<< exact r "Back to overview"
+      softly "clear highlight" $ clickAt r =<< exact r "Clear highlight"
+      wait r 0.25
+  softly "GC pause & runnable latency heatmaps and contention hubs" $ do
+    ov <- exact r "Longest GC pauses"
+    moveTo r (off ov 60 120) 0.3
+    wheel r (-7)
+    wait r 1.1
+  softly "maximise and restore threads pane" $ do
     tlTitle <- exact r "Threads"
     dblClickAt r tlTitle
-    wait r 0.9
+    wait r 0.8
     tlTitle2 <- exact r "Threads"
     dblClickAt r tlTitle2
     wait r 0.3
 
-  -- The heap, live: the bands the program is leaking.
-  step "heap"
+  -- 3. Heap & leaks: visual residency diff, probe closure anatomy, what-if sever, & strictness advisor
+  step "heap, visual diff, & topological anatomy"
   clickAt r =<< exact r "Heap & leaks"
-  wait r 0.9
+  wait r 0.8
   clickAt r =<< exact r "Leak suspects"
-  wait r 0.9
-  softly "solo the thunks" $ do
+  wait r 0.8
+  softly "solo leaking thunk band" $ do
     m <- rightmost r "THUNK_2_0"
     moveTo r m 0.3
     click r
-    wait r 0.6
+    wait r 0.55
     clickAt r =<< exact r "Unsolo THUNK_2_0"
-    wait r 0.4
-
-  -- A baseline, then the diff against it.
-  softly "baseline" $ do
+    wait r 0.35
+  softly "baseline & visual residency comparison chart" $ do
     clickAt r =<< exact r "Go to…"
     await r "Go to anything" 3
     typeText r "baseline"
-    wait r 0.3
+    wait r 0.25
     clickAt r =<< exact r "Mark as baseline"
-    wait r 0.4
+    wait r 1.1
     clickAt r =<< exact r "Go to…"
     typeText r "heap diff"
     clickAt r =<< exact r "Add pane: Heap diff"
-    wait r 1.1
+    wait r 1.3
+  softly "promote live probes to heap anatomy & strictness advisor" $ do
+    clickAt r =<< exact r "Go to…"
+    await r "Go to anything" 3
+    typeText r "promote live"
+    wait r 0.25
+    clickAt r =<< findPrefix r "Promote live probes"
+    awaitRec r "Folded quotient spines" 5
+    wait r 1.0
+    softly "what-if counterfactual severing" $ do
+      sev <- findPrefix r "What-if sever"
+      clickAt r sev
+      wait r 1.1
+    softly "scroll to strictness & container value-laziness advisors" $ do
+      spHdr <- findPrefix r "Folded quotient spines"
+      moveTo r (off spHdr 80 140) 0.3
+      wheel r (-7)
+      wait r 1.2
+    softly "inspect closure retainer graph" $ do
+      clickAt r =<< exact r "Closure graph"
+      wait r 0.9
+      clickAt r =<< exact r "Eventlog samples"
+      wait r 0.35
 
-  -- Core and STG, against the run's own numbers. The dumps cover both the
-  -- agent library and the sample; switch to the sample's module.
-  step "core"
+  -- 4. Core, STG, & Cmm/Asm: module optimization smells, static captures, boxing legend, & low-level IR
+  step "core, STG, & Cmm/Asm forensics"
   clickAt r =<< exact r "Core & STG"
-  wait r 0.8
-  softly "switch to Main" $ do
+  wait r 0.7
+  softly "switch to Main & inspect module smells" $ do
     clickAt r =<< exact r "Agent"
     clickAt r =<< exact r "Main"
-    wait r 0.4
-  softly "open a binding" $ do
+    wait r 0.95
+  softly "open binding" $ do
     m <- exact r "main2" `catch` \(_ :: SomeException) -> findPrefix r "main"
     clickAt r m
-    wait r 0.7
-  -- The code tabs flash on update; switch through Core and STG to inspect them.
-  softly "code tabs" $ do
+    wait r 0.65
+  softly "cycle code tabs with change flashing" $ do
     clickAt r =<< exact r "Core"
-    wait r 0.7
+    wait r 0.65
     clickAt r =<< exact r "STG"
-    wait r 0.7
+    wait r 0.65
     clickAt r =<< exact r "Source"
-    wait r 0.5
-  -- The inspector follows the focus: jump to its source, then set a
-  -- breakpoint from here, on the binding itself.
-  softly "go to its source" $ do
+    wait r 0.45
+  softly "jump to binding source from inspector" $ do
     g <- exact r "Go to"
     clickAt r g
-    wait r 0.6
-  softly "break on entry" $ do
-    b <- findPrefix r "Break on entry"
-    clickAt r b
+    wait r 0.55
+  softly "toggle syntax & boxing colour legend" $ do
+    clickAt r =<< exact r "Syntax"
     wait r 0.4
-  softly "boxing colours" $ do
     clickAt r =<< exact r "Boxing"
     wait r 0.6
+  softly "open Cmm & native Asm forensics pane" $ do
+    clickAt r =<< exact r "Show Cmm / Asm"
+    awaitRec r "Cmm & Asm" 4
+    wait r 0.95
+    softly "switch to native Asm" $ do
+      clickAt r =<< rightmost r "Asm"
+      wait r 0.9
 
-  -- The GHCi debugger, on the same program.
-  step "debugger"
+  -- 5. GHCi debugger: interactive stepping, Laziness X-Ray badges, & thunk forcing
+  step "debugger, laziness X-Ray, & thunk forcing"
   clickAt r =<< exact r "Debugger"
-  wait r 0.5
+  wait r 0.45
   ghciField <- findPrefix r "ghci"
   clickAt r ghciField
   key r KeyEnd
-  replicateM_ 8 (key r KeyBackspace)
+  replicateM_ 16 (key r KeyBackspace)
   typeText r "cabal repl stronghead:stronghead-sample"
   wdField <- findPrefix r "working directory"
   clickAt r wdField
   key r KeyEnd
-  replicateM_ 8 (key r KeyBackspace)
+  replicateM_ 16 (key r KeyBackspace)
   typeText r (T.pack repo)
   loadField <- findPrefix r "src/Main.hs"
   clickAt r loadField
   key r KeyEnd
-  replicateM_ 8 (key r KeyBackspace)
+  replicateM_ 16 (key r KeyBackspace)
   typeText r "sample/Main.hs"
   clickAt r =<< exact r "Start session"
-  await r "GHCi session running" 150
-  wait r 0.4
-  -- The expression is already 'main'; Step into runs it and stops at once.
-  softly "step into main" $ do
+  await r "GHCi session running" 180
+  await r "Main.hs" 60
+  wait r 0.45
+  softly "step into main for Laziness X-Ray & thunk inspection" $ do
     clickAt r =<< exact r "Step into"
     awaitRec r "Stopped in" 45
     wait r 0.6
-  softly "force a thunk" $ do
-    f <- exact r "Force"
-    clickAt r f
-    wait r 0.7
-  softly "step" $ do
-    clickAt r =<< exact r "Step over"
-    wait r 0.6
-  softly "abandon" $ do
-    clickAt r =<< exact r "Abandon"
-    wait r 0.4
+    softly "force a thunk in place" $ do
+      f <- exact r "Force"
+      clickAt r f
+      wait r 0.65
+    softly "step forward to populate Laziness X-Ray transitions" $ do
+      clickAt r =<< exact r "Step"
+      wait r 0.55
+      clickAt r =<< exact r "Step over"
+      wait r 0.65
+    softly "abandon evaluation" $ do
+      clickAt r =<< exact r "Abandon"
+      wait r 0.35
 
-  -- Back to the program: watchers on the live stream, the pinboard.
-  step "watchers"
+  -- 6. Unified Workbench: Automated Triage feed, Lens Pipe query explorer, Target Runner & Pareto Lab
+  step "triage feed & cross-artifact Lens query"
+  softly "open Triage & query workbench arrangement" $ do
+    clickAt r =<< exact r "Workspace"
+    wait r 0.45
+    clickAt r =<< exact r "Triage & query"
+    wait r 1.2
+    softly "run pointer-path regex preset on accumulator thunk spines" $ do
+      clickAt r =<< exact r "Accumulator thunk spines"
+      wait r 1.1
+    softly "run spine-strict value-lazy container query" $ do
+      clickAt r =<< exact r "Spine-strict, value-lazy containers"
+      wait r 1.1
+    softly "remove a query stage pill interactively" $ do
+      pill <- findPrefix r "sort dom"
+      clickAt r pill
+      wait r 0.7
+
+  step "target runner, capture recipes, & performance budget lab"
+  softly "open Runner & lab workbench arrangement" $ do
+    clickAt r =<< exact r "Workspace"
+    wait r 0.45
+    clickAt r =<< exact r "Runner & lab"
+    wait r 1.1
+    softly "preview IR & Ticky capture recipe" $ do
+      clickAt r =<< exact r "Hot-Loop, Core/STG/Cmm & Ticky"
+      wait r 0.85
+      clickAt r =<< exact r "Space-Leak Provenance (-hi)"
+      wait r 0.75
+
+  -- 7. Live stream watchers, pinboard, keyboard shortcuts modal, & Leak hunt finale
+  step "watchers, pinboard, shortcuts, & finale"
   clickAt r =<< exact r "Live"
-  wait r 0.5
-  softly "add watchers" $ do
+  wait r 0.45
+  softly "add watchers & fire live growth rule" $ do
     clickAt r =<< exact r "Go to…"
     typeText r "watchers"
     clickAt r =<< exact r "Add pane: Watchers"
-    wait r 0.6
-  softly "enable a watcher" $ do
-    rule <- findPrefix r "A heap band growing"
+    wait r 0.45
+    rulesHdr <- exact r "Rules"
+    moveTo r (off rulesHdr 60 80) 0.25
+    wheel r (-6)
+    rule <- findPrefix r "A heap band growing" `catch` \(_ :: SomeException) -> findPrefix r "A thread blocked longer"
     clickAt r rule
     awaitRec r "Watchers:" 12
-    wait r 0.6
-  softly "pinboard" $ do
+    wait r 0.65
+  softly "pinboard investigation notes" $ do
     clickAt r =<< exact r "Go to…"
     typeText r "pinboard"
     clickAt r =<< exact r "Add pane: Pinboard"
-    wait r 0.5
+    wait r 0.45
     note <- findPrefix r "Note"
     clickAt r note
-    typeText r "the MVar queue"
-    wait r 0.4
-
-  -- Arrangements, and out on the leak hunt.
-  step "workspace"
-  softly "leak hunt" $ do
-    clickAt r =<< exact r "Workspace"
-    wait r 0.7
-    clickAt r =<< exact r "Leak hunt"
-    wait r 0.4
+    typeText r "lazy IORef + MVar queue"
+    wait r 0.45
+  softly "keyboard shortcuts modal" $ do
+    key r (KeyF 1)
+    wait r 0.95
+    key r KeyEscape
+    wait r 0.3
   clickAt r =<< exact r "Heap & leaks"
-  wait r 1.2
-  wait r 1.5
+  wait r 0.4
+  softly "leak hunt arrangement" $ do
+    clickAt r =<< exact r "Workspace"
+    wait r 0.5
+    clickAt r =<< exact r "Leak hunt"
+    wait r 1.8
   where
     step name = putStrLn ("demo: " <> name)
 

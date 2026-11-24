@@ -31,7 +31,7 @@ import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import System.Directory (doesDirectoryExist, listDirectory)
-import System.FilePath (dropExtension, takeFileName, (</>))
+import System.FilePath (dropExtension, takeDirectory, takeFileName, (</>))
 import System.Process (CreateProcess (..), ProcessHandle, createProcess, proc)
 
 import Stronghead.TextFile (readTextFile)
@@ -57,42 +57,48 @@ data CabalTarget = CabalTarget
   deriving stock (Eq, Show)
 
 -- | Discover Cabal targets across @.cabal@ files in @root@ (and one child
--- directory level for multi-package @cabal.project@ workspaces).
+-- directory level for multi-package @cabal.project@ workspaces, walking up
+-- parent directories when @root@ is a build or dump subdirectory).
 discoverCabalTargets :: FilePath -> IO [CabalTarget]
-discoverCabalTargets root = do
-  ok <- doesDirectoryExist root
-  if not ok
-    then pure []
-    else do
-      topEntries <- fromRight [] <$> try @SomeException (listDirectory root)
-      let topCabals = [root </> e | e <- topEntries, ".cabal" `isSuffixOf` e]
-      subDirs <-
-        sequence
-          [ do
-              let p = root </> e
-              isD <- doesDirectoryExist p
-              pure (if isD && not (hiddenOrBuild e) then [p] else [])
-          | e <- topEntries
-          ]
-      subCabals <-
-        fmap concat $
-          sequence
-            [ do
-                es <- fromRight [] <$> try @SomeException (listDirectory d)
-                pure [d </> f | f <- es, ".cabal" `isSuffixOf` f]
-            | d <- concat subDirs
-            ]
-      parsed <-
-        sequence
-          [ do
-              eTxt <- try @SomeException (readTextFile cf)
-              pure case eTxt of
-                Left _ -> []
-                Right txt -> parseCabalTargets cf txt
-          | cf <- topCabals ++ subCabals
-          ]
-      pure (sortOn (\t -> (ctKind t, ctPackage t, ctName t)) (concat parsed))
+discoverCabalTargets root0 = go (4 :: Int) root0
   where
+    go stepsLeft root = do
+      ok <- doesDirectoryExist root
+      if not ok
+        then pure []
+        else do
+          topEntries <- fromRight [] <$> try @SomeException (listDirectory root)
+          let topCabals = [root </> e | e <- topEntries, ".cabal" `isSuffixOf` e]
+          subDirs <-
+            sequence
+              [ do
+                  let p = root </> e
+                  isD <- doesDirectoryExist p
+                  pure (if isD && not (hiddenOrBuild e) then [p] else [])
+              | e <- topEntries
+              ]
+          subCabals <-
+            fmap concat $
+              sequence
+                [ do
+                    es <- fromRight [] <$> try @SomeException (listDirectory d)
+                    pure [d </> f | f <- es, ".cabal" `isSuffixOf` f]
+                | d <- concat subDirs
+                ]
+          let allCabals = topCabals ++ subCabals
+          if null allCabals && stepsLeft > 0 && takeDirectory root /= root
+            then go (stepsLeft - 1) (takeDirectory root)
+            else do
+              parsed <-
+                sequence
+                  [ do
+                      eTxt <- try @SomeException (readTextFile cf)
+                      pure case eTxt of
+                        Left _ -> []
+                        Right txt -> parseCabalTargets cf txt
+                  | cf <- allCabals
+                  ]
+              pure (sortOn (\t -> (ctKind t, ctPackage t, ctName t)) (concat parsed))
     hiddenOrBuild ('.' : _) = True
     hiddenOrBuild n = "dist-" `T.isPrefixOf` T.pack n || n `elem` ["node_modules", "scratch"]
 

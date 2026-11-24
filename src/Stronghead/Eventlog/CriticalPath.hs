@@ -91,13 +91,18 @@ data CriticalPathResult = CriticalPathResult
   }
   deriving stock (Eq, Show)
 
+-- | Maximum span evaluations per 'analyzeCriticalPath' call so pathological
+-- multi-thread MVar contention rings over millions of events stay sub-millisecond.
+maxCritSteps :: Int
+maxCritSteps = 2500
+
 -- | Trace the causal critical path of @targetTid@ across @[a, b]@.
 analyzeCriticalPath :: Timeline -> Word32 -> Word64 -> Word64 -> CriticalPathResult
 analyzeCriticalPath tl targetTid a b
   | b <= a =
       CriticalPathResult a b targetTid [] [] 0 0 0 0 0 Nothing
   | otherwise =
-      let (segs, edges) = traceInterval tl 0 S.empty targetTid targetTid a b
+      let (_, segs, edges) = traceInterval tl maxCritSteps 0 S.empty targetTid targetTid a b
           orderedSegs = sortOn csStart segs
           orderedEdges = sortOn ceTime edges
           ownCpu = sum [dur s | s <- orderedSegs, csKind s == CritRunning]
@@ -144,6 +149,8 @@ analyzeSpanCriticalPath tl sp = analyzeCriticalPath tl (usThread sp) (usStart sp
 traceInterval
   :: Timeline
   -> Int
+  -- ^ Remaining span evaluation budget.
+  -> Int
   -> S.Set (Word32, Word64, Word64)
   -> Word32
   -- ^ Original root thread being diagnosed.
@@ -151,31 +158,35 @@ traceInterval
   -- ^ Thread currently on the critical path.
   -> Word64
   -> Word64
-  -> ([CriticalSegment], [CausalEdge])
-traceInterval tl depth seen rootTid tid a b
-  | b <= a || depth > 8 || S.member (tid, a, b) seen = ([], [])
+  -> (Int, [CriticalSegment], [CausalEdge])
+traceInterval tl !budget !depth seen rootTid tid a b
+  | b <= a || budget <= 0 || depth > 5 || S.member (tid, a, b) seen = (budget, [], [])
   | otherwise = case M.lookup tid (tlThreads tl) of
-      Nothing -> ([CriticalSegment a b tid (CritExternal 0) "thread not in timeline"], [])
+      Nothing -> (budget - 1, [CriticalSegment a b tid (CritExternal 0) "thread not in timeline"], [])
       Just ti ->
         let tr = tiTrack ti
             i0 = firstSpanEndingAfter tr a
             n = trackLength tr
+            -- Stride smoothly when zoomed out across tens of thousands of spans on root thread.
+            spanCount = max 1 (firstSpanEndingAfter tr b - i0)
+            stride = if depth == 0 && spanCount > 1200 then max 1 (spanCount `div` 1200) else 1
             seen' = S.insert (tid, a, b) seen
-            go i accSegs accEdges
-              | i >= n || trStart tr VU.! i >= b = (accSegs, accEdges)
+            go !bud !i accSegs accEdges
+              | bud <= 0 || i >= n || trStart tr VU.! i >= b = (bud, accSegs, accEdges)
               | otherwise =
                   let sp = trackSpan tr i
                       s0 = max a (srStart sp)
                       s1 = min b (srEnd sp)
                    in if s1 <= s0
-                        then go (i + 1) accSegs accEdges
+                        then go bud (i + stride) accSegs accEdges
                         else
-                          let (newSegs, newEdges) = classifySpan tl depth seen' rootTid ti sp s0 s1
-                           in go (i + 1) (newSegs ++ accSegs) (newEdges ++ accEdges)
-         in go i0 [] []
+                          let (bud', newSegs, newEdges) = classifySpan tl (bud - 1) depth seen' rootTid ti sp s0 s1
+                           in go bud' (i + stride) (newSegs ++ accSegs) (newEdges ++ accEdges)
+         in go budget i0 [] []
 
 classifySpan
   :: Timeline
+  -> Int
   -> Int
   -> S.Set (Word32, Word64, Word64)
   -> Word32
@@ -183,22 +194,23 @@ classifySpan
   -> SpanRec
   -> Word64
   -> Word64
-  -> ([CriticalSegment], [CausalEdge])
-classifySpan tl depth seen rootTid ti sp s0 s1
+  -> (Int, [CriticalSegment], [CausalEdge])
+classifySpan tl !budget !depth seen rootTid ti sp s0 s1
   | srKind sp == kindRun =
       let k =
             if tiId ti == rootTid
               then CritRunning
               else CritBlockerRunning (tiId ti) ("running on " <> threadName ti)
-       in ([CriticalSegment s0 s1 (tiId ti) k (threadName ti)], [])
+       in (budget, [CriticalSegment s0 s1 (tiId ti) k (threadName ti)], [])
   | srKind sp == kindRunnable =
       let segs = splitByGC tl (tiId ti) s0 s1 CritRunnable "waiting in runnable queue"
-       in (segs, [])
+       in (budget, segs, [])
   | srKind sp == kindBlocked =
       let code = srStop sp
           reason = stopName code
           -- Prefer blackhole owner when known, else thread that posted wakeup.
           mBlocker
+            | budget <= 0 = Nothing
             | code == 9 && srAux sp /= 0 && srAux sp /= tiId ti =
                 Just (srAux sp, s1, "blackhole owned by " <> nameOf (srAux sp))
             | Just (wt, waker) <- wokenBy ti sp
@@ -210,35 +222,38 @@ classifySpan tl depth seen rootTid ti sp s0 s1
        in case mBlocker of
             Just (blockerTid, edgeT, desc) ->
               let edge = CausalEdge edgeT blockerTid (tiId ti) desc
-                  (subSegs, subEdges) = traceInterval tl (depth + 1) seen rootTid blockerTid s0 s1
+                  (bud', subSegs, subEdges) = traceInterval tl budget (depth + 1) seen rootTid blockerTid s0 s1
                in if null subSegs
-                    then ([CriticalSegment s0 s1 (tiId ti) (CritExternal code) desc], [edge])
-                    else (subSegs, edge : subEdges)
+                    then (bud', [CriticalSegment s0 s1 (tiId ti) (CritExternal code) desc], [edge])
+                    else (bud', subSegs, edge : subEdges)
             Nothing ->
               let segs = splitByGC tl (tiId ti) s0 s1 (CritExternal code) reason
-               in (segs, [])
-  | otherwise = ([], [])
+               in (budget, segs, [])
+  | otherwise = (budget, [], [])
   where
     nameOf t = maybe ("thread " <> T.pack (show t)) threadName (M.lookup t (tlThreads tl))
 
 -- | Split an off-CPU interval around any overlapping stop-the-world GC pauses
 -- so GC time is accurately attributed rather than misbilled as runnable wait.
 splitByGC :: Timeline -> Word32 -> Word64 -> Word64 -> CriticalKind -> Text -> [CriticalSegment]
-splitByGC tl tid a b fallbackKind fallbackDetail = go a overlapping
+splitByGC tl tid a b fallbackKind fallbackDetail = go a i0
   where
     gcs = tlGCs tl
+    nGcs = V.length gcs
     i0 = lowerBoundBy gcEnd gcs a
-    overlapping =
-      takeWhile (\g -> gcStart g < b) (V.toList (V.drop i0 gcs))
-    go cur []
-      | cur < b = [CriticalSegment cur b tid fallbackKind fallbackDetail]
-      | otherwise = []
-    go cur (g : rest) =
-      let gs = max cur (gcStart g)
-          ge = min b (gcEnd g)
-          before = [CriticalSegment cur gs tid fallbackKind fallbackDetail | gs > cur]
-          during = [CriticalSegment gs ge tid CritGC ("GC gen " <> T.pack (show (gcGen g))) | ge > gs]
-       in before ++ during ++ go (max cur ge) rest
+    go !cur !j
+      | cur >= b = []
+      | j >= nGcs = [CriticalSegment cur b tid fallbackKind fallbackDetail]
+      | otherwise =
+          let g = gcs V.! j
+           in if gcStart g >= b
+                then [CriticalSegment cur b tid fallbackKind fallbackDetail]
+                else
+                  let gs = max cur (gcStart g)
+                      ge = min b (gcEnd g)
+                      before = [CriticalSegment cur gs tid fallbackKind fallbackDetail | gs > cur]
+                      during = [CriticalSegment gs ge tid CritGC ("GC gen " <> T.pack (show (gcGen g))) | ge > gs]
+                   in before ++ during ++ go (max cur ge) (j + 1)
 
 -- ---------------------------------------------------------------------------
 -- 2D Latency Heatmaps (time bucket x log-spaced duration bucket)
@@ -301,7 +316,9 @@ runnableHeatmap tl tBins vBins =
     [ (trStart tr VU.! i, fromIntegral (trEnd tr VU.! i - trStart tr VU.! i))
     | ti <- M.elems (tlThreads tl)
     , let tr = tiTrack ti
-    , i <- [0 .. trackLength tr - 1]
+          n = trackLength tr
+          stride = max 1 (n `div` 2500)
+    , i <- [0, stride .. n - 1]
     , trKind tr VU.! i == kindRunnable
     , trEnd tr VU.! i > trStart tr VU.! i
     ]
@@ -349,12 +366,14 @@ analyzeStmContention tl =
   where
     threads = M.elems (tlThreads tl)
     perThread =
-      [ (tiId ti, length stmSpans, sum [srEnd s - srStart s | s <- stmSpans])
+      [ (tiId ti, length stmSpans * stride, sum [srEnd s - srStart s | s <- stmSpans] * fromIntegral stride)
       | ti <- threads
       , let tr = tiTrack ti
+            n = trackLength tr
+            stride = max 1 (n `div` 2500)
             stmSpans =
               [ trackSpan tr i
-              | i <- [0 .. trackLength tr - 1]
+              | i <- [0, stride .. n - 1]
               , trKind tr VU.! i == kindBlocked
               , trStop tr VU.! i == 13
               ]
@@ -363,11 +382,12 @@ analyzeStmContention tl =
     -- Optimistic retry CPU: a run span immediately preceded by BlockedOnSTM AND
     -- ending again in BlockedOnSTM (< 5ms) likely aborted/retried!
     wastedSlices =
-      [ trEnd tr VU.! i - trStart tr VU.! i
+      [ (trEnd tr VU.! i - trStart tr VU.! i) * fromIntegral stride
       | ti <- threads
       , let tr = tiTrack ti
             n = trackLength tr
-      , i <- [1 .. n - 1]
+            stride = max 1 (n `div` 2500)
+      , i <- [1, 1 + stride .. n - 1]
       , trKind tr VU.! i == kindRun
       , trStop tr VU.! i == 13
       , trStop tr VU.! (i - 1) == 13
@@ -381,9 +401,11 @@ analyzeStmContention tl =
         [ wt
         | ti <- threads
         , let tr = tiTrack ti
-        , i <- [0 .. trackLength tr - 1]
+              n = trackLength tr
+              stride = max 1 (n `div` 2500)
+        , i <- [0, stride .. n - 1]
+        , trKind tr VU.! i == kindBlocked && trStop tr VU.! i == 13
         , let sp = trackSpan tr i
-        , srKind sp == kindBlocked && srStop sp == 13
         , Just (wt, _) <- [wokenBy ti sp]
         ]
     clusterBursts [] = []
@@ -418,48 +440,60 @@ data ContentionGraph = ContentionGraph
   }
   deriving stock (Eq, Show)
 
+data EdgeAcc = EdgeAcc !Int !Word64
+
+addEdgeAcc :: EdgeAcc -> EdgeAcc -> EdgeAcc
+addEdgeAcc (EdgeAcc c1 w1) (EdgeAcc c2 w2) = EdgeAcc (c1 + c2) (w1 + w2)
+
 -- | Reconstruct the directed thread-to-thread contention & wakeup topology
 -- across MVars, STM TVars, and shared BlackHole thunks.
 buildContentionGraph :: Timeline -> ContentionGraph
 buildContentionGraph tl =
   ContentionGraph
     { cgEdges = sortedEdges
-    , cgBottlenecks = take 15 (sortOn (\(_, _, w) -> Down w) [(tid, cnt, w) | (tid, (cnt, w)) <- M.toList hubs])
+    , cgBottlenecks = take 15 (sortOn (\(_, _, w) -> Down w) [(tid, cnt, w) | (tid, EdgeAcc cnt w) <- M.toList hubs])
     }
   where
-    rawEdges =
-      [ ( (srcTid, tiId ti, edgeKind)
-        , (1 :: Int, srEnd sp - min (srEnd sp) (srStart sp))
-        )
-      | ti <- M.elems (tlThreads tl)
-      , let tr = tiTrack ti
-      , i <- [0 .. trackLength tr - 1]
-      , let sp = trackSpan tr i
-      , srKind sp == kindBlocked
-      , let mSource
-              | srStop sp == 9 && srAux sp /= 0 && srAux sp /= tiId ti =
-                  Just (srAux sp, EdgeBlackHole)
-              | Just (_, waker) <- wokenBy ti sp
-              , waker /= 0 && waker /= tiId ti =
-                  let ek = case srStop sp of
-                        7 -> EdgeMVarWakeup
-                        8 -> EdgeMVarWakeup
-                        9 -> EdgeBlackHole
-                        13 -> EdgeStmWakeup
-                        _ -> EdgeOtherWakeup
-                   in Just (waker, ek)
-              | otherwise = Nothing
-      , Just (srcTid, edgeKind) <- [mSource]
-      ]
-    grouped = M.fromListWith (\(c1, w1) (c2, w2) -> (c1 + c2, w1 + w2)) rawEdges
+    stepThread accMap ti =
+      let tr = tiTrack ti
+          n = trackLength tr
+          stride = max 1 (n `div` 2500)
+          wScale = fromIntegral stride :: Word64
+          loop !i !mp
+            | i >= n = mp
+            | trKind tr VU.! i /= kindBlocked = loop (i + stride) mp
+            | otherwise =
+                let sp = trackSpan tr i
+                    mSource
+                      | srStop sp == 9 && srAux sp /= 0 && srAux sp /= tiId ti =
+                          Just (srAux sp, EdgeBlackHole)
+                      | Just (_, waker) <- wokenBy ti sp
+                      , waker /= 0 && waker /= tiId ti =
+                          let ek = case srStop sp of
+                                7 -> EdgeMVarWakeup
+                                8 -> EdgeMVarWakeup
+                                9 -> EdgeBlackHole
+                                13 -> EdgeStmWakeup
+                                _ -> EdgeOtherWakeup
+                           in Just (waker, ek)
+                      | otherwise = Nothing
+                 in case mSource of
+                      Nothing -> loop (i + stride) mp
+                      Just (srcTid, edgeKind) ->
+                        let dur = (srEnd sp - min (srEnd sp) (srStart sp)) * wScale
+                            mp' = M.insertWith addEdgeAcc (srcTid, tiId ti, edgeKind) (EdgeAcc stride dur) mp
+                         in loop (i + stride) mp'
+       in loop 0 accMap
+    grouped = foldl' stepThread M.empty (M.elems (tlThreads tl))
     sortedEdges =
       take 100 $
         sortOn
           (Down . tceWaitNs)
           [ ThreadContentionEdge s d k cnt w
-          | ((s, d, k), (cnt, w)) <- M.toList grouped
+          | ((s, d, k), EdgeAcc cnt w) <- M.toList grouped
           ]
     hubs =
-      M.fromListWith
-        (\(c1, w1) (c2, w2) -> (c1 + c2, w1 + w2))
-        [(tceFrom e, (tceCount e, tceWaitNs e)) | e <- sortedEdges]
+      foldl'
+        (\mp e -> M.insertWith addEdgeAcc (tceFrom e) (EdgeAcc (tceCount e) (tceWaitNs e)) mp)
+        M.empty
+        sortedEdges

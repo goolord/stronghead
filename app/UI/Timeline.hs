@@ -104,6 +104,7 @@ data TimelineState = TimelineState
     -- ^ Show a code track under each capability, from a profiled build's
     -- cost-centre samples.
   , tsCached :: !(IORef (Maybe ((Word64, Word64, Int), TimelineCached)))
+  , tsCritCache :: !(IORef (Maybe ((Int, Word32, Word64, Word64), CriticalPathResult)))
   }
 
 data TimelineCached = TimelineCached
@@ -117,6 +118,8 @@ data TimelineCached = TimelineCached
   , tlcRunnable :: ~RunnableStats
   , tlcGCHeatmap :: ~LatencyHeatmap
   , tlcRunHeatmap :: ~LatencyHeatmap
+  , tlcStmContention :: ~StmContentionReport
+  , tlcContentionGraph :: ~ContentionGraph
   }
 
 newTimelineState :: IO TimelineState
@@ -139,6 +142,7 @@ newTimelineState = do
   tsWindowSeen <- newIORef Nothing
   tsCode <- newVar True
   tsCached <- newIORef Nothing
+  tsCritCache <- newIORef Nothing
   pure TimelineState {..}
 
 cachedTimeline :: TimelineState -> Timeline -> IO TimelineCached
@@ -165,6 +169,8 @@ cachedTimeline st tl = do
               , tlcRunnable = runnableStats tl
               , tlcGCHeatmap = gcPauseHeatmap tl 36 10
               , tlcRunHeatmap = runnableHeatmap tl 36 10
+              , tlcStmContention = analyzeStmContention tl
+              , tlcContentionGraph = buildContentionGraph tl
               }
       writeIORef (tsCached st) (Just (key, c))
       pure c
@@ -1056,6 +1062,21 @@ threadsSection env st pal mm tl v sel marks = do
                           | srKind s == kindRun -> ["running " <> dur <> ", then " <> stopName (srStop s)]
                           | srKind s == kindBlocked -> [stopName (srStop s) <> " for " <> dur] ++ ownerLine tl (srAux s) ++ wakerLine tl ti s
                           | otherwise -> ["runnable for " <> dur <> " (" <> stopName (srStop s) <> ")"]
+    let mFocusTid =
+          focus <|> case sel of
+            Just (SelSpan (OnThread tid) _) -> Just tid
+            _ -> Nothing
+    mFocusCrit <- case mFocusTid of
+      Nothing -> pure Nothing
+      Just ftid -> liftIO $ do
+        let cKey = (tlEventCount tl, ftid, floorW (tvStart v), ceiling (tvEnd v))
+        prev <- readIORef (tsCritCache st)
+        case prev of
+          Just (k, res) | k == cKey -> pure (Just res)
+          _ -> do
+            let res = analyzeCriticalPath tl ftid (floorW (tvStart v)) (ceiling (tvEnd v))
+            writeIORef (tsCritCache st) (Just (cKey, res))
+            pure (Just res)
     resp <-
       canvasConfigured
         defaultCanvasConfig
@@ -1082,11 +1103,7 @@ threadsSection env st pal mm tl v sel marks = do
               _ -> pure ()
           -- Markers through the rows, causal critical-path arrows, the shared
           -- cursor and range, and a scroll indicator.
-          let mFocusTid =
-                focus <|> case sel of
-                  Just (SelSpan (OnThread tid) _) -> Just tid
-                  _ -> Nothing
-              rowMidY =
+          let rowMidY =
                 M.fromList
                   [ (tiId ti, y + 4 + fromIntegral idx * threadRowH - scrollY + threadRowH / 2)
                   | (idx, ti) <- zip [0 :: Int ..] threads
@@ -1095,8 +1112,7 @@ threadsSection env st pal mm tl v sel marks = do
             forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
               let mx = timeToX v px pw (fromIntegral (mkTime mk))
               drawStroke (V2 mx y) (V2 mx (y + h)) 1 (alpha 0.35 (pMarker pal))
-            for_ mFocusTid $ \ftid -> do
-              let cpr = analyzeCriticalPath tl ftid (floorW (tvStart v)) (ceiling (tvEnd v))
+            for_ mFocusCrit $ \cpr ->
               forM_ (take 64 (cpCausalEdges cpr)) $ \ce ->
                 case (M.lookup (ceFromThread ce) rowMidY, M.lookup (ceToThread ce) rowMidY) of
                   (Just y1, Just y2)
@@ -1459,7 +1475,7 @@ overview env st tl v = do
       fact "dud" (fmtInt (ssDud sp))
       fact "overflowed" (fmtInt (ssOverflowed sp))
       fact "GC'd" (fmtInt (ssGCd sp))
-  let stmRep = analyzeStmContention tl
+  let stmRep = tlcStmContention tlc
   scope $ when (stmBlockCount stmRep > 0) $ do
     separator
     sectionTitle "STM contention & retry bursts"
@@ -1472,7 +1488,7 @@ overview env st tl v = do
         linkText env (RThread rk tid) (fontSizeScale 0.88) (threadLabel tl tid)
         flex
         labelWith (fontMono . fontMuted . fontSizeScale 0.84) (fmtInt cnt <> " blocks · " <> fmtNs (fromIntegral waitNs))
-  let cg = buildContentionGraph tl
+  let cg = tlcContentionGraph tlc
   scope $ unless (null (cgBottlenecks cg)) $ do
     separator
     sectionTitle "Synchronization contention hubs"

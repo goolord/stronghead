@@ -887,29 +887,35 @@ data RunnableStats = RunnableStats
 runnableStats :: Timeline -> RunnableStats
 runnableStats tl =
   RunnableStats
-    { rnCount = len
-    , rnTotalNs = sum waits
+    { rnCount = totalCnt
+    , rnTotalNs = totalWaitNs
     , rnP50Ns = pct 0.50
     , rnP95Ns = pct 0.95
     , rnP99Ns = pct 0.99
-    , rnMaxNs = if null waits then 0 else last sorted
+    , rnMaxNs = maxWaitNs
     , rnMigrations = migs
     , rnSteals = steals
     }
   where
-    waits =
-      [ trEnd tr VU.! i - trStart tr VU.! i
-      | ti <- M.elems (tlThreads tl)
-      , let tr = tiTrack ti
-      , i <- [0 .. trackLength tr - 1]
-      , trKind tr VU.! i == kindRunnable
-      , trEnd tr VU.! i > trStart tr VU.! i
-      ]
-    sorted = sort waits
-    len = length sorted
+    collectThread (!accCnt, !accTot, !accMax, accSamples) ti =
+      let tr = tiTrack ti
+          n = trackLength tr
+          stride = max 1 (n `div` 2500)
+          wScale = fromIntegral stride :: Word64
+          loop !i !c !tot !mx sams
+            | i >= n = (c, tot, mx, sams)
+            | trKind tr VU.! i == kindRunnable && trEnd tr VU.! i > trStart tr VU.! i =
+                let d = trEnd tr VU.! i - trStart tr VU.! i
+                 in loop (i + stride) (c + stride) (tot + d * wScale) (max mx d) (d : sams)
+            | otherwise = loop (i + stride) c tot mx sams
+       in loop 0 accCnt accTot accMax accSamples
+    (totalCnt, totalWaitNs, maxWaitNs, sampleWaits) =
+      foldl' collectThread (0, 0, 0, []) (M.elems (tlThreads tl))
+    sortedVec = VU.fromList (sort sampleWaits)
+    len = VU.length sortedVec
     pct (q :: Double)
       | len == 0 = 0
-      | otherwise = fromMaybe 0 (sorted !? min (len - 1) (max 0 (round (fromIntegral (len - 1) * q))))
+      | otherwise = sortedVec VU.! min (len - 1) (max 0 (round (fromIntegral (len - 1) * q)))
     (migs, steals) =
       V.foldl'
         ( \(m, s) pts ->

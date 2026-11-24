@@ -246,7 +246,7 @@ executable stronghead-sample
         containers >=0.6 && <0.9,
         stronghead:agent,
         stronghead:probe
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4 -T"
+    ghc-options:      -threaded -rtsopts -finfo-table-map -fdistinct-constructor-tables "-with-rtsopts=-N4 -T"
     -- With the flag, the sample also runs ghc-debug-stub so the heap panel's
     -- live graph has something to connect to. The stub is Unix-only.
     if flag(ghc-debug) && !os(windows)
