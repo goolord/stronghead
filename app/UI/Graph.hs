@@ -32,8 +32,7 @@ import NanoUI.Backend
   , withFontMetrics
   , withMonoFontMetrics
   )
-import NanoUI.Draw.FrameSvg (FrameSvgConfig (..), defaultFrameSvgConfig, frameToSvg)
-import NanoUI.Internal.Context (setDrawExternalText, setDrawSquareGeometry)
+import NanoUI.Draw.FrameSvg (FrameSvgConfig (..), defaultFrameSvgConfig, enableSvgExport, frameToSvg)
 import NanoUI.Testing (newPixelContext)
 
 import Stronghead.Format (fmtBytesD, fmtSec, tshow)
@@ -113,8 +112,7 @@ renderUiFrameToSvg width height theme ui = do
   ctx0 <- newPixelContext
   let ctx = withMonoFontMetrics (withFontMetrics ctx0 (sansFm 16)) (monoFm 16)
   setTheme ctx theme
-  setDrawSquareGeometry ctx True
-  setDrawExternalText ctx True
+  enableSvgExport ctx
   let baseInp = emptyInput { inputWindowSize = Size width height, inputMousePos = V2 (-10) (-10) }
   -- Warm up frames so layout, stores, and variables settle
   void (runFrame ctx baseInp ui)
@@ -128,36 +126,18 @@ renderUiFrameToSvg width height theme ui = do
   svg <- frameToSvg cfg ctx baseInp drawData
   pure (cleanSvgText svg)
 
--- | Strips 'textLength="..." lengthAdjust="spacingAndGlyphs"' attributes so SVG text
+-- | Strips 'textLength="..." lengthAdjust="..."' attributes so SVG text
 -- elements render with natural typographic proportions. When an anchor-end tick was
 -- pre-shifted to a negative x coordinate by 'drawTextBox', or when text is a right-aligned
 -- byte amount (ending in " B", " KiB", " MiB", " GiB"), restores 'text-anchor="end"'
--- at the right edge (x + textLength). Also scopes canvas clip and gradient IDs across
--- multiple drawings (e.g. side-by-side diff panels) so IDs never collide, and enables
--- tabular numbers at the SVG root.
+-- at the right edge (x + textLength), and enables tabular numbers at the SVG root.
 cleanSvgText :: Text -> Text
 cleanSvgText txt =
   let withTabular = if "<svg " `T.isInfixOf` txt && not ("tabular-nums" `T.isInfixOf` txt)
                       then replaceFirst "<svg " "<svg style=\"font-variant-numeric: tabular-nums;\" " txt
                       else txt
-      scoped = scopeCanvasDefs withTabular
-   in processTextTags scoped
+   in processTextTags withTabular
  where
-  scopeCanvasDefs src =
-    let chunks = T.splitOn "<g><defs>" src
-     in case chunks of
-          [] -> src
-          (firstChunk : restChunks) ->
-            let scopedRest = zipWith scopeOne [1 :: Int ..] restChunks
-             in T.intercalate "<g><defs>" (firstChunk : scopedRest)
-
-  scopeOne k chunk =
-    let prefix = "c" <> tshow k <> "_"
-     in T.replace "id=\"clip_" ("id=\"" <> prefix <> "clip_")
-          (T.replace "url(#clip_" ("url(#" <> prefix <> "clip_")
-            (T.replace "id=\"grad_" ("id=\"" <> prefix <> "grad_")
-              (T.replace "url(#grad_" ("url(#" <> prefix <> "grad_") chunk)))
-
   replaceFirst target repl src =
     let (before, match) = T.breakOn target src
      in if T.null match

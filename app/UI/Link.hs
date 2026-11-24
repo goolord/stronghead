@@ -440,7 +440,7 @@ linkRow env ref selected f body = do
         | isHover ref = wash
         | otherwise = colorTransparent
   (_, area) <- mouseArea (fillW . tight) $
-    styled (panelStyle (background bg . hoverBackground (if lit then themeSelection th else wash) . borderWidth 0 . cornerRadius 4)) $
+    styled (panelStyle (hoverBackground (if lit then themeSelection th else wash) . background bg . borderWidth 0 . cornerRadius 4)) $
       panelWith (asRow . fillW . padXY 8 2 . gap 8 . f) body
   linked env ref area
 

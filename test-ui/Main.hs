@@ -36,8 +36,9 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, readoutDeltaWith, wasPaneFlashed)
+import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
+import UI.Graph (renderHpDiffSvg, renderHpSvg)
 import UI.Heap (atCursor, leakView, newHeapState)
 import UI.Debugger (DebugState (..), newDebugState, valueTree)
 import UI.Inspector
@@ -1207,6 +1208,17 @@ main = do
         Nothing -> False
     pure (not (or hasAnyOverflow))
   check "no scrollbar when table fits both axes across widths (1200 down to 400)" (and noScrollChecks)
+
+  putStrLn "theme styles and SVG graph export"
+  let qBtn = themeButton (quiet (strongheadTheme (Just AppearanceDark)))
+  check "quiet button keeps transparent resting fill and visible hover/press shades"
+    (colorA (styleBg qBtn) == 0 && colorA (styleHoverBg qBtn) > 0 && colorA (styleActiveBg qBtn) > 0)
+  hpSvg <- renderHpSvg Nothing Nothing curHp1
+  check "renderHpSvg emits SVG with shapes and heap text"
+    ("<svg " `T.isPrefixOf` hpSvg && "<path " `T.isInfixOf` hpSvg && "THUNK_2_0" `T.isInfixOf` hpSvg)
+  diffSvg <- renderHpDiffSvg Nothing Nothing baseHp curHp1
+  check "renderHpDiffSvg emits diff SVG with both panels"
+    ("<svg " `T.isPrefixOf` diffSvg && "Baseline" `T.isInfixOf` diffSvg && "Candidate" `T.isInfixOf` diffSvg)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

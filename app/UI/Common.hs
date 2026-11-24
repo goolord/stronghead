@@ -143,7 +143,6 @@ import Data.Text.Encoding qualified as TE
 import Data.Vector qualified as V
 import Stronghead.Format (tshow)
 import Data.Bits (shiftL, shiftR, (.|.))
-import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict qualified as M
 import Data.Word (Word64)
 import GHC.Float (castFloatToWord32)
@@ -152,8 +151,8 @@ import Data.IORef
 
 import NanoUI
 import NanoUI.Adornment qualified as A
-import NanoUI.Internal.Context (Context (..), CustomDrawingEntry (..), DrawingCacheState (..), intKey)
-import NanoUI.Internal.Layout.Arena (arenaCount, getNodeValue, getStyleIdx, getText, getWidgetId, lookupNodeByWidgetId, setStyleIdx)
+import NanoUI.Internal.Context (Context (..), CustomDrawingEntry (..), lookupCustomDrawingAt)
+import NanoUI.Internal.Layout.Arena (arenaCount, getNodeValue, getStyleIdx, getText, lookupNodeByWidgetId, setStyleIdx)
 import NanoUI.Internal.Monad (askContext, askFrameInput)
 import NanoUI.Path qualified as P
 
@@ -412,7 +411,7 @@ selectableRow selected f body = do
   let bg = if selected then themeSelection th else colorTransparent
       hover = if selected then themeSelection th else alpha 0.06 (inkText (ink th))
   (_, area) <- mouseArea (fillW . tight) $
-    styled (panelStyle (background bg . hoverBackground hover . borderWidth 0 . cornerRadius 4)) $
+    styled (panelStyle (hoverBackground hover . background bg . borderWidth 0 . cornerRadius 4)) $
       panelWith (asRow . fillW . padXY 8 2 . gap 8 . f) body
   pure (respClicked area)
 
@@ -496,7 +495,7 @@ toolGroup body = do
 quiet :: Theme -> Theme
 quiet th =
   let t = inkText (ink th)
-   in buttonStyle (background colorTransparent . borderWidth 0 . hoverBackground (alpha 0.08 t) . pressBackground (alpha 0.14 t)) th
+   in buttonStyle (hoverBackground (alpha 0.08 t) . pressBackground (alpha 0.14 t) . background colorTransparent . borderWidth 0) th
 
 quietButton :: Text -> NanoUI Bool
 quietButton = styled quiet . buttonWith alignMid
@@ -676,8 +675,6 @@ hashText = T.foldl' (\h c -> (h * 1099511628211) `xor` fromIntegral (ord c)) 146
 computePaneHash :: Context -> Text -> Int -> Int -> IO Int
 computePaneHash ctx title start end = do
   let na = ctxNodeArena ctx
-  dc <- readIORef (ctxDrawingCache ctx)
-  let customs = dcsCustomDrawings dc
   let initHash = fromIntegral (hashText title) :: Int
   let count = max 0 (end - start)
   let initAcc = (initHash `shiftL` 7) `xor` count
@@ -687,13 +684,11 @@ computePaneHash ctx title start end = do
             txt <- getText na i
             val <- getNodeValue na i
             stIdx <- getStyleIdx na i
-            wid <- getWidgetId na i
+            mCustom <- lookupCustomDrawingAt ctx i
             let hTxt = if T.null txt then 0 else fromIntegral (hashText txt) :: Int
             let hVal = fromIntegral (castFloatToWord32 val) :: Int
             let hSt = stIdx
-            let hCustom = case IM.lookup (intKey wid) customs of
-                  Nothing -> 0
-                  Just cde -> cdrContent cde
+            let hCustom = maybe 0 cdrContent mCustom
             let step = (hTxt * 1099511628211) `xor` (hVal * 1469598103934665603) `xor` (hSt * 2166136261) `xor` (hCustom * 16777619)
             let acc' = ((acc `shiftL` 5) .|. (acc `shiftR` 59)) `xor` step
             go acc' (i + 1)
