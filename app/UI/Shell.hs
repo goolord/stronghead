@@ -29,7 +29,7 @@ import Data.Sequence qualified as Seq
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
 import Data.Word (Word64)
 import System.Directory (doesDirectoryExist, doesFileExist, makeAbsolute)
-import System.FilePath (takeDirectory, takeExtension, takeFileName, (</>))
+import System.FilePath (dropExtension, takeDirectory, takeExtension, takeFileName, (</>))
 
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -44,6 +44,7 @@ import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
 import Stronghead.Dump (ModuleArtifacts (..), kindForPath)
 import Stronghead.Eventlog (LoadProgress (..))
 import Stronghead.Eventlog.Model (Timeline (..), summarize)
+import Stronghead.Flamegraph (fromProfFile)
 import Stronghead.Format (fmtBytes, fmtNs, tshow)
 import Stronghead.HeapProfile (HeapProfile (..))
 import Stronghead.Live (AgentInfo (..), Frame (..))
@@ -59,6 +60,7 @@ import UI.Code (colouringName)
 import UI.Common
 import UI.Core
 import UI.Debugger
+import UI.Graph (renderFlamegraphSvg, renderHpDiffSvg, renderHpSvg)
 import UI.Heap
 import UI.Inspector
 import UI.Link
@@ -483,7 +485,7 @@ appView app = do
           }
   navShortcuts app env
   inspectorSync env (appInspector app)
-  useFileDialog (appExport app) (firstPath (exportPins app env))
+  useFileDialog (appExport app) (firstPath (exportPins app env heapShown (taskOutcome (hlProf heap) >>= eitherToMaybe)))
   -- Every provider of panes, for whichever workbench holds them.
   let providers p site = case p of
         PTimeline -> timelinePanes env (appTimeline app) timeline site
@@ -740,18 +742,43 @@ askExport app =
   writeVar (appExport app) . Just
     =<< askSaveFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Markdown" "md", FileFilter "All files" "*"]}
 
--- | Write the pinboard's report, replacing the file only once the new one
--- is whole.
-exportPins :: App -> Env -> FilePath -> NanoUI ()
-exportPins app env path0 = do
+-- | Write the pinboard's Post-Mortem Dossier, writing companion SVG proof
+-- graphs alongside the Markdown when heap or cost-centre profiles are loaded.
+exportPins :: App -> Env -> Maybe HeapProfile -> Maybe ProfFile -> FilePath -> NanoUI ()
+exportPins app env mHp mProf path0 = do
   let path = if null (takeExtension path0) then path0 <> ".md" else path0
+      stem = dropExtension path
   pins <- readVar (busPins (appBus app))
   stamp <- liftIO (formatTime defaultTimeLocale "%Y-%m-%d %H:%M" <$> getZonedTime)
-  let report = pinsReport env ["Exported from Stronghead on " <> T.pack stamp <> "."] pins
+  imgs <- liftIO $ do
+    hpImg <- case (envBaseline env >>= baHeap, mHp) of
+      (Just baseHp, Just curHp) -> do
+        let svgPath = stem <> ".heap-diff.svg"
+        svg <- renderHpDiffSvg Nothing (Just 12) baseHp curHp
+        res <- saveTextFile "the heap diff SVG" svgPath svg
+        pure [("Heap Residency Diff (Baseline vs Current)", T.pack (takeFileName svgPath)) | isRight res]
+      (Nothing, Just curHp) -> do
+        let svgPath = stem <> ".heap.svg"
+        svg <- renderHpSvg Nothing (Just 12) curHp
+        res <- saveTextFile "the heap SVG" svgPath svg
+        pure [("Heap Residency Profile", T.pack (takeFileName svgPath)) | isRight res]
+      _ -> pure []
+    fgImg <- case mProf of
+      Just pf -> do
+        let svgPath = stem <> ".flamegraph.svg"
+        svg <- renderFlamegraphSvg Nothing (fromProfFile pf)
+        res <- saveTextFile "the flamegraph SVG" svgPath svg
+        pure [("Cost-Centre Flamegraph", T.pack (takeFileName svgPath)) | isRight res]
+      Nothing -> pure []
+    pure (hpImg ++ fgImg)
+  let report = pinsDossier env ["Exported from Stronghead on " <> T.pack stamp <> "."] imgs pins
   r <- liftIO (saveTextFile "the report" path report)
   writeVar (appMessage app) $ case r of
     Left e -> e
-    Right () -> "Saved the pins to " <> T.pack (takeFileName path)
+    Right () ->
+      "Saved post-mortem dossier to "
+        <> T.pack (takeFileName path)
+        <> if null imgs then "" else " (+" <> tshow (length imgs) <> " SVG proof graph" <> (if length imgs == 1 then "" else "s") <> ")"
 
 -- ---------------------------------------------------------------------------
 -- Sessions

@@ -70,9 +70,11 @@ import NanoUI.Path qualified as P
 
 import Stronghead.Clock
 import Stronghead.Debug
+import Stronghead.Debug.Anatomy
 import Stronghead.Diff (BandChange (..), BandFigures (..), BandStatus (..), Baseline (..), changeFor, diffHeap, figuresTitle, fmtChange)
 import Stronghead.Dump (nameKey)
-import Stronghead.Eventlog.Model (Timeline (..))
+import Stronghead.Eventlog.Model (BiographyBreakdown (..), Timeline (..), biographyBreakdown)
+import Stronghead.Flamegraph (diffFlameTrees, fromFoldedStacks, fromProfFile)
 import Stronghead.Format
 import Stronghead.HeapProfile
 import Stronghead.Join
@@ -83,6 +85,7 @@ import Stronghead.Run (runFromSocket, runKey, runKeysMatch)
 import Stronghead.Source (parseSrcLoc, renderSrcSpan, srcLocSpan)
 import UI.Clock
 import UI.Common
+import UI.Flamegraph (diffFlamegraphView, eraCohortHeatmapView, flamegraphView)
 import UI.Link
 import UI.Workspace
 
@@ -93,7 +96,7 @@ data HeapSource = FromEventlog | FromHpFile | FromGhcDebug
 data DbgConn = ConnSocket | ConnTcp | ConnFile
   deriving stock (Eq, Show, Enum, Bounded)
 
-data DbgTab = DbgSurvivors | DbgGraph | DbgBiggest
+data DbgTab = DbgSurvivors | DbgGraph | DbgBiggest | DbgAnatomy
   deriving stock (Eq, Show, Enum, Bounded)
 
 -- | A snapshot to take: a counter (so the same target can be snapshotted
@@ -181,12 +184,17 @@ data HeapState = HeapState
     -- ^ The latest snapshot's closures by source, for the code views.
   , hsDbgFind :: !(Var (Maybe Band))
     -- ^ A band whose closures the live graph lists.
+  , hsDbgSever :: !(Var (Maybe SeverResult))
+    -- ^ Latest counterfactual what-if sever simulation result.
   , hsCCSel :: !(Var (Maybe Int))
     -- ^ The cost centre a link opened the tree at.
+  , hsCCFlame :: !(Var Bool)
+  , hsCCZoom :: !(Var (Maybe Text))
   , hsCostTotals :: !(Var (Maybe (FilePath, [CostTotal])))
     -- ^ The @.prof@'s cost centres summed, once per file.
   , hsProfIndex :: !(Var (Maybe (FilePath, [(Int, CostCentre)], M.Map Text [CostCentre])))
   , hsLayersCache :: !(IORef (Maybe ((Text, Text, Int, Maybe Double, Set Text, Maybe Text, Int), [Layer], Double)))
+  , hsAnatomyCache :: !(IORef (Maybe ((Text, Int, Int), DominatorTree, HeapSkeleton, [DuplicateGroup])))
   , hsPanes :: !Workbench
   , hsDbgPanes :: !Workbench
   , hsCCPanes :: !Workbench
@@ -237,10 +245,14 @@ newHeapState = do
   hsDbgOpen <- newVar S.empty
   hsDbgSources <- newVar []
   hsDbgFind <- newVar Nothing
+  hsDbgSever <- newVar Nothing
   hsCCSel <- newVar Nothing
+  hsCCFlame <- newVar False
+  hsCCZoom <- newVar Nothing
   hsCostTotals <- newVar Nothing
   hsProfIndex <- newVar Nothing
   hsLayersCache <- newIORef Nothing
+  hsAnatomyCache <- newIORef Nothing
   hsPanes <- newWorkbench "heap" (panelPreset PHeap)
   hsDbgPanes <- newWorkbench "heap-graph" heapGraphPreset
   hsCCPanes <- newWorkbench "heap-costs" heapCostsPreset
@@ -883,6 +895,26 @@ leakView env st hp = do
       changes = maybe [] (`diffHeap` hp) (envBaseline env >>= baHeap)
       wereSuspects = [(c, bf) | c <- changes, Just bf <- [bcBase c], isJust (bfScore bf)]
   paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
+    scope $ for_ (biographyBreakdown hp) $ \bio -> do
+      th <- uiTheme
+      callout (if bioDominant bio == "use" then themeSuccess th else themeWarning th) $
+        columnWith (tight . fillW . gap 4) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            labelWith fontMedium ("LDV Biography breakdown (+RTS -hb) — dominant: " <> T.toUpper (bioDominant bio))
+            flex
+          rowWith (tight . gap 16 . wrap . fillW) $ do
+            fact "Lag (before 1st use)" (fmtBytesD (bioLagBytes bio))
+            fact "Drag (after last use)" (fmtBytesD (bioDragBytes bio))
+            fact "Void (never used)" (fmtBytesD (bioVoidBytes bio))
+            fact "Use (active)" (fmtBytesD (bioUseBytes bio))
+          hint $ case bioDominant bio of
+            "lag" -> "High LAG means data is allocated long before it is first demanded (lazy thunks or eager pre-allocation)."
+            "drag" -> "High DRAG means dead data stays reachable long after its last use (stale references, un-trimmed caches, CAF retention)."
+            "void" -> "High VOID means data is allocated and NEVER used before GC (wasted work or unforced fields)."
+            _ -> "Most live memory is actively in USE."
+    scope $ when (hpBreakdown hp == "era") $ do
+      eraCohortHeatmapView hp
+      separator
     scope $ unless (null wereSuspects) $ do
       sectionTitle "Since the baseline"
       hint "The baseline's leak suspects, and what became of them in the run on show."
@@ -1079,40 +1111,54 @@ costCentreTree env st = \case
     pal <- palette <$> uiTheme
     sel <- readVar (hsCCSel st)
     pIdx <- readVar (hsProfIndex st)
+    showFlame <- readVar (hsCCFlame st)
     forM_ (take 4 (drop 1 (pfHeader pf))) (labelWith (fontMuted . fontSizeScale 0.9) . T.strip)
-    filt <- T.toLower <$> readVar (hsCCFilter st)
-    openSet <- readVar (hsCCOpen st)
-    searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter cost centres", sicLayout = (fixedW 280) defaultLayout} (hsCCFilter st)
-    rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
-      colHeader fillW "cost centre"
-      colHeader (fixedW 70 . alignEnd) "entries"
-      colHeader (fixedW 60 . alignEnd) "time %"
-      colHeader (fixedW 60 . alignEnd) "alloc %"
-      colHeader (fixedW 150) "inherited time, alloc"
-    let flat = maybe (flattenCC (pfRoots pf)) (\(_, f, _) -> f) pIdx
-        matches cc = filt `T.isInfixOf` T.toLower (ccName cc <> " " <> ccModule cc)
-        rows
-          | T.null filt = visibleCC openSet 0 (pfRoots pf)
-          | otherwise = [(d, cc, False, False) | (d, cc) <- flat, matches cc]
-        palKey = fromIntegral (colorToWord32 (pText pal)) :: Float
-    paneVirtualRows (grow . tight . minH 160) id (take 2000 rows) $ \(depth, cc, hasKids, isOpen) -> withKey (ccNo cc) $ do
-      let it = realToFrac (ccInhTime cc / 100) :: Float
-          ia = realToFrac (ccInhAlloc cc / 100) :: Float
-      picked <- linkRow env (RCostCentre (ccModule cc) (ccName cc)) (sel == Just (ccNo cc)) id $ do
-        spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
-        cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
-        cell id (ccName cc)
-        cell (fillW . fontMuted . fontSizeScale 0.85) (ccModule cc)
-        numCell 70 id (fmtInt (ccEntries cc))
-        numCell 60 id (fmtFixed 1 (ccTime cc))
-        numCell 60 id (fmtFixed 1 (ccAlloc cc))
-        _ <- canvasKeyed (contentKey [it, ia, palKey]) (fixedWH 150 10 . alignMid) $ \(Rect x y w h) -> do
-          drawRoundedRect (Rect x y w (h / 2 - 1)) 1 (alpha 0.12 (pText pal))
-          drawRoundedRect (Rect x y (w * it) (h / 2 - 1)) 1 (pRun pal)
-          drawRoundedRect (Rect x (y + h / 2) (w * ia) (h / 2 - 1)) 1 (pAccent pal)
-        pure ()
-      when (picked && hasKids) $
-        writeVar (hsCCOpen st) (if isOpen then S.delete (ccNo cc) openSet else S.insert (ccNo cc) openSet)
+    rowWith (tight . gap 8 . alignMid . fillW) $ do
+      searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter cost centres", sicLayout = (fixedW 280) defaultLayout} (hsCCFilter st)
+      flex
+      whenM (buttonWith tight (if showFlame then "Show tree" else "Flamegraph")) (writeVar (hsCCFlame st) (not showFlame))
+    if showFlame
+      then do
+        flamegraphView (fromProfFile pf) (hsCCZoom st)
+        scope $ for_ (envBaseline env >>= baCosts) $ \baseCosts -> do
+          let curCosts = costTotals (pfRoots pf)
+              baseTree = fromFoldedStacks "Baseline cost centres" "percent" [([ctModule c <> "." <> ctName c], ctTime c) | c <- baseCosts]
+              curTree = fromFoldedStacks "Current cost centres" "percent" [([ctModule c <> "." <> ctName c], ctTime c) | c <- curCosts]
+          separator
+          diffFlamegraphView (diffFlameTrees baseTree curTree)
+      else do
+        filt <- T.toLower <$> readVar (hsCCFilter st)
+        openSet <- readVar (hsCCOpen st)
+        rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+          colHeader fillW "cost centre"
+          colHeader (fixedW 70 . alignEnd) "entries"
+          colHeader (fixedW 60 . alignEnd) "time %"
+          colHeader (fixedW 60 . alignEnd) "alloc %"
+          colHeader (fixedW 150) "inherited time, alloc"
+        let flat = maybe (flattenCC (pfRoots pf)) (\(_, f, _) -> f) pIdx
+            matches cc = filt `T.isInfixOf` T.toLower (ccName cc <> " " <> ccModule cc)
+            rows
+              | T.null filt = visibleCC openSet 0 (pfRoots pf)
+              | otherwise = [(d, cc, False, False) | (d, cc) <- flat, matches cc]
+            palKey = fromIntegral (colorToWord32 (pText pal)) :: Float
+        paneVirtualRows (grow . tight . minH 160) id (take 2000 rows) $ \(depth, cc, hasKids, isOpen) -> withKey (ccNo cc) $ do
+          let it = realToFrac (ccInhTime cc / 100) :: Float
+              ia = realToFrac (ccInhAlloc cc / 100) :: Float
+          picked <- linkRow env (RCostCentre (ccModule cc) (ccName cc)) (sel == Just (ccNo cc)) id $ do
+            spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
+            cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
+            cell id (ccName cc)
+            cell (fillW . fontMuted . fontSizeScale 0.85) (ccModule cc)
+            numCell 70 id (fmtInt (ccEntries cc))
+            numCell 60 id (fmtFixed 1 (ccTime cc))
+            numCell 60 id (fmtFixed 1 (ccAlloc cc))
+            _ <- canvasKeyed (contentKey [it, ia, palKey]) (fixedWH 150 10 . alignMid) $ \(Rect x y w h) -> do
+              drawRoundedRect (Rect x y w (h / 2 - 1)) 1 (alpha 0.12 (pText pal))
+              drawRoundedRect (Rect x y (w * it) (h / 2 - 1)) 1 (pRun pal)
+              drawRoundedRect (Rect x (y + h / 2) (w * ia) (h / 2 - 1)) 1 (pAccent pal)
+            pure ()
+          when (picked && hasKids) $
+            writeVar (hsCCOpen st) (if isOpen then S.delete (ccNo cc) openSet else S.insert (ccNo cc) openSet)
 
 visibleCC :: Set Int -> Int -> [CostCentre] -> [(Int, CostCentre, Bool, Bool)]
 visibleCC openSet depth ccs =
@@ -1137,6 +1183,7 @@ dbgTabName = \case
   DbgSurvivors -> "Surviving thunks"
   DbgGraph -> "Closure graph"
   DbgBiggest -> "Biggest retainers"
+  DbgAnatomy -> "Anatomy & What-If"
 
 ghcDebugView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
 ghcDebugView env bench st loaded logTl
@@ -1189,6 +1236,7 @@ ghcDebugView env bench st loaded logTl
           writeVar (hsDbgMarked st) M.empty
           writeVar (hsDbgSel st) Nothing
           writeVar (hsDbgOpen st) S.empty
+          writeVar (hsDbgSever st) Nothing
         flex
         scope $ case hlSnap loaded of
           Just (TaskRunning _) -> labelWith (alignMid . fontTone Warning) "Target paused: walking its heap…"
@@ -1250,6 +1298,7 @@ graphPanes env st = do
               DbgSurvivors -> dbgSurvivors env st history latest survivors marked
               DbgGraph -> dbgGraph env st sn latest marked
               DbgBiggest -> dbgBiggest env st sn latest marked
+              DbgAnatomy -> dbgAnatomy env st latest
 
 -- | Where a snapshot would be taken from, as the live graph's toolbar has
 -- it.
@@ -1496,6 +1545,84 @@ dbgBiggestAll env st sn snap marked = do
       numCell 70 id (fmtBytes (fromIntegral (cnSize n)))
       heldBar snap (cnId n)
     when picked $ reveal st snap (cnId n)
+
+cachedAnatomy :: HeapState -> HeapSnapshot -> IO (DominatorTree, HeapSkeleton, [DuplicateGroup])
+cachedAnatomy st snap = do
+  let key = (snapLabel snap, M.size (snapNodes snap), snapBytes snap)
+  cached <- readIORef (hsAnatomyCache st)
+  case cached of
+    Just (k, dt, skel, dups) | k == key -> pure (dt, skel, dups)
+    _ -> do
+      let dt = computeDominators snap
+          skel = buildHeapSkeleton snap dt
+          dups = auditDuplicates snap
+      writeIORef (hsAnatomyCache st) (Just (key, dt, skel, dups))
+      pure (dt, skel, dups)
+
+dbgAnatomy :: Env -> HeapState -> HeapSnapshot -> NanoUI ()
+dbgAnatomy env st snap = do
+  (dt, skel, dups) <- liftIO (cachedAnatomy st snap)
+  severRes <- readVar (hsDbgSever st)
+  sn <- readVar (hsDbgStored st)
+  th <- uiTheme
+  paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
+    hint "Topological heap anatomy: exact dominator retained bytes, automatically folded thunk/list spines, counterfactual what-if severing, and Merkle duplicate waste."
+    scope $ for_ severRes $ \sr ->
+      callout (themeSuccess th) $
+        columnWith (tight . fillW . gap 4) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            labelWith fontMedium
+              ( "What-if sever freed "
+                  <> fmtBytes (fromIntegral (srFreedBytes sr))
+                  <> " ("
+                  <> fmtPct (srFreedFraction sr)
+                  <> " of live heap, "
+                  <> fmtInt (srFreedClosures sr)
+                  <> " closures)"
+              )
+            flex
+            whenM (buttonWith (padXY 6 0 . tight) "Clear") (writeVar (hsDbgSever st) Nothing)
+          rowWith (tight . gap 12 . wrap . fillW) $
+            forM_ (take 6 (srTopFreed sr)) $ \(nm, cnt, bytes) ->
+              fact nm (fmtBytes (fromIntegral bytes) <> " (" <> fmtInt cnt <> ")")
+    sectionTitle ("Folded quotient spines (" <> tshow (length (hsSpines skel)) <> ")")
+    if null (hsSpines skel)
+      then hint "No homogeneous thunk or list spines detected."
+      else forM_ (take 12 (hsSpines skel)) $ \sp -> withKey ("sp" <> fmtClosureId (spHead sp)) $
+        panelWith (padXY 8 5 . gap 3 . fillW) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            cell (fillW . fontMono . if spKind sp == NThunk then fontTone Warning else id)
+              (spName sp <> " × " <> tshow (spDepth sp))
+            badge (if spKind sp == NThunk then Danger else Muted) (spType sp)
+            numCell 84 id (fmtBytes (fromIntegral (spRetainedBytes sp)))
+            whenM (buttonWith (padXY 6 0 . tight) "What-if sever") $
+              writeVar (hsDbgSever st) (Just (simulateSever snap (SeverClosure (spHead sp))))
+            whenM (buttonWith (padXY 6 0 . tight) "Reveal") (reveal st snap (spHead sp))
+          scope $ for_ (spAnchor sp) $ \anc ->
+            labelWith (fontMuted . fontSizeScale 0.82) ("anchored by " <> anc <> maybe "" (" · " <>) (spSource sp))
+    separator
+    sectionTitle ("Top exact dominators (" <> tshow (length (dtTopDominators dt)) <> ")")
+    forM_ (take 15 (dtTopDominators dt)) $ \(cid, retBytes) ->
+      for_ (M.lookup cid (snapNodes snap)) $ \n -> withKey ("dom" <> fmtClosureId cid) $
+        rowWith (tight . gap 8 . alignMid . fillW) $ do
+          picked <- linkRow env (RClosure sn cid) False fillW $ do
+            cell (fillW . fontMono . fontSizeScale 0.9) (nodeTitle n)
+            cell (fixedW 110 . fontMuted . fontSizeScale 0.85) (cnType n)
+            numCell 84 id (fmtBytes (fromIntegral retBytes))
+          when picked (reveal st snap cid)
+          whenM (buttonWith (padXY 6 0 . tight) "What-if sever") $
+            writeVar (hsDbgSever st) (Just (simulateSever snap (SeverClosure cid)))
+    separator
+    sectionTitle ("Merkle structural duplicate waste (" <> tshow (length dups) <> " groups)")
+    if null dups
+      then hint "No duplicated identical immutable sub-DAGs found."
+      else forM_ (take 12 dups) $ \dg -> withKey ("dup" <> tshow (dgHash dg)) $
+        rowWith (padXY 8 3 . tight . gap 8 . alignMid . fillW) $ do
+          cell (fillW . fontMono . fontSizeScale 0.9) (dgName dg <> " (" <> dgType dg <> ")")
+          numCell 56 fontMuted ("×" <> fmtInt (dgCount dg))
+          numCell 84 (fontTone Warning) (fmtBytes (fromIntegral (dgWasteBytes dg)) <> " waste")
+          scope $ for_ (listToMaybe (dgSample dg)) $ \cid ->
+            whenM (buttonWith (padXY 6 0 . tight) "Reveal") (reveal st snap cid)
 
 -- ---------------------------------------------------------------------------
 -- Lens

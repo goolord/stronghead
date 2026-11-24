@@ -8,6 +8,7 @@ module UI.Live
   , liveView
   , livePanes
   , LiveData (..)
+  , emptyLiveData
   , latestFrame
   , liveRun
   , liveLens
@@ -43,14 +44,27 @@ import NanoUI
 import Stronghead.Attach (AttachStep (..), attachKindName, probeAttach)
 import Stronghead.Debug (DebugTarget, ghcDebugEnabled, listSockets, pauseTarget)
 import Stronghead.Eventlog.Model (Timeline (..))
+import Stronghead.Flamegraph (fromLiveFolded)
 import Stronghead.Format
 import Stronghead.Live
 import Stronghead.Ref
 import Stronghead.Run (RunInfo (..), runFromHello, runKey, runKeysMatch, wallToProgram)
+import Stronghead.Source (parseSrcLoc, srcLocSpan)
 import UI.Clock
 import UI.Common
+import UI.Flamegraph (flamegraphView)
 import UI.Link
 import UI.Workspace
+
+data LiveSubTab = LiveThreadsList | LiveStacksView | LiveFlameView | LiveProbesView
+  deriving stock (Eq, Show, Enum, Bounded)
+
+liveSubTabName :: LiveSubTab -> Text
+liveSubTabName = \case
+  LiveThreadsList -> "Threads"
+  LiveStacksView -> "Stacks"
+  LiveFlameView -> "Flamegraph"
+  LiveProbesView -> "Probes"
 
 data LiveState = LiveState
   { lvHost :: !(Var Text)
@@ -87,6 +101,12 @@ data LiveState = LiveState
   , lvPause :: !(Var PauseState)
   , lvResume :: !(IORef (Maybe (IO ())))
     -- ^ Resumes the program a ghc-debug pause holds.
+  , lvBeaconsTask :: !(Task Int [AgentBeacon])
+  , lvBeaconsTick :: !(Var Int)
+  , lvSamplingStacks :: !(Var Bool)
+  , lvSubTab :: !(Var LiveSubTab)
+  , lvFlameZoom :: !(Var (Maybe Text))
+  , lvFlameStatus :: !(Var (Maybe Text))
   , lvCachedFrames :: !(IORef (Maybe ((Int, Maybe Double, Maybe Double), [Rates], [(Word64, Word64)], M.Map Int [Maybe Text], Double)))
   }
 
@@ -107,13 +127,20 @@ data PauseState = Running | Pausing | Paused | Resuming | PauseFailed !Text
 data LiveData = LiveData
   { ldHello :: !(Maybe (Text, Int, Int))
   , ldInfo :: !(Maybe AgentInfo)
-    -- ^ A v2 agent's info line. A frame without one first means a v1
+    -- ^ A v2/v3 agent's info line. A frame without one first means a v1
     -- agent.
   , ldOutbox :: !(Maybe Outbox)
   , ldFrames :: !(Seq Frame)
   , ldReplies :: !(M.Map Int Reply)
+  , ldStacks :: !(M.Map Int LiveThreadStack)
+  , ldFolded :: !(M.Map (Text, [LiveFrameEntry]) Int)
+  , ldProbes :: !(M.Map Text [LiveProbeNode])
+  , ldAlerts :: !(Seq LiveAlert)
   , ldClosed :: !(Maybe Text)
   }
+
+emptyLiveData :: LiveData
+emptyLiveData = LiveData Nothing Nothing Nothing Seq.empty M.empty M.empty M.empty M.empty Seq.empty Nothing
 
 latestFrame :: LiveData -> Maybe Frame
 latestFrame d = case ldFrames d of
@@ -145,6 +172,12 @@ newLiveState = do
   lvSecond <- newVar Nothing
   lvPause <- newVar Running
   lvResume <- newIORef Nothing
+  lvBeaconsTask <- newTask
+  lvBeaconsTick <- newVar 0
+  lvSamplingStacks <- newVar False
+  lvSubTab <- newVar LiveThreadsList
+  lvFlameZoom <- newVar Nothing
+  lvFlameStatus <- newVar Nothing
   lvCachedFrames <- newIORef Nothing
   pure LiveState {..}
 
@@ -163,13 +196,18 @@ liveLoad st = do
     if want
       then
         Just
-          <$> useStream (lvStream st) (T.unpack host, portN, attempt) (LiveData Nothing Nothing Nothing Seq.empty M.empty Nothing) (\update ->
+          <$> useStream (lvStream st) (T.unpack host, portN, attempt) emptyLiveData (\update ->
             connectLive (T.unpack host) portN $ \case
               LiveHello p pid caps -> update (\d -> d {ldHello = Just (p, pid, caps), ldClosed = Nothing})
               LiveInfo i -> update (\d -> d {ldInfo = Just i})
               LiveConnected box -> update (\d -> d {ldOutbox = Just box})
               LiveFrame f -> update (\d -> d {ldFrames = Seq.drop (Seq.length (ldFrames d) + 1 - keepFrames) (ldFrames d |> f)})
               LiveReply i r -> update (\d -> d {ldReplies = M.insert i r (ldReplies d)})
+              LiveStack ts -> update (\d -> d {ldStacks = M.insert (ltsTid ts) ts (ldStacks d)})
+              LiveFolded fs -> update (\d -> d {ldFolded = M.insertWith (+) (lfsStatus fs, lfsFrames fs) (lfsCount fs) (ldFolded d)})
+              LiveProbe pn -> update (\d -> d {ldProbes = M.insertWith (\new old -> if lpnId pn == 0 then new else old ++ new) (lpnProbe pn) [pn] (ldProbes d)})
+              LiveAlertEv al -> update (\d -> d {ldAlerts = Seq.drop (Seq.length (ldAlerts d) + 1 - 200) (ldAlerts d |> al)})
+              LiveEventlogChunk _ _ -> pure ()
               LiveClosed why -> update (\d -> d {ldClosed = Just why, ldOutbox = Nothing}))
       else pure Nothing
 
@@ -289,14 +327,36 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
   case mdata of
     Just d | not (Seq.null (ldFrames d)) -> scope (dashboard env bench st d logTl)
     _ | mixed -> scope (bnDraw bench (lvPanes st) (livePanes env st mdata logTl))
-    _ ->
+    _ -> do
+      tick <- readVar (lvBeaconsTick st)
+      mBeacons <- useTask (lvBeaconsTask st) tick discoverAgents
       scope $
-        emptyState
-          "Connect to a running program"
-          [ "Link the program with the stronghead:agent library and wrap main. Build it -threaded, run it with +RTS -T, then press Connect."
-          , "Connect finds the rest of the program by itself: run it with +RTS -l and the Timeline follows its eventlog as it is written, with -hT the heap panel follows its heap profile, and its working directory becomes a place to look for sources and dumps."
-          ]
-          ["import Stronghead.Agent", " ", "main = withAgent defaultAgentConfig $ do", "  ...", " ", "./prog +RTS -l -hT -i0.1 -T -RTS"]
+        columnWith (grow . tight . gap 12) $ do
+          case mBeacons of
+            Just bs@(_ : _) ->
+              columnWith (padAll 16 . padBottom 0 . tight . gap 6 . fillW) $ do
+                rowWith (tight . gap 8 . alignMid . fillW) $ do
+                  sectionTitle ("Discovered local Haskell processes (" <> tshow (length bs) <> ")")
+                  flex
+                  whenM (toolIconButton iconRefresh "Rescan") (modifyVar (lvBeaconsTick st) (+ 1))
+                forM_ bs $ \b -> withKey (abPath b) $
+                  panelWith (padAll 8 . fillW) $
+                    rowWith (tight . gap 12 . alignMid . fillW) $ do
+                      labelWith fontMedium (abProgram b)
+                      labelWith (fontMono . fontMuted) ("pid " <> tshow (abPid b))
+                      labelWith fontMono (abHost b <> ":" <> tshow (abPort b))
+                      labelWith (fillW . fontMuted . fontSizeScale 0.88) (abCwd b)
+                      whenM (styled primary (buttonWith tight "Connect")) $ do
+                        writeVar (lvHost st) (abHost b)
+                        writeVar (lvPort st) (tshow (abPort b))
+                        connect st
+            _ -> pure ()
+          emptyState
+            "Connect to a running program"
+            [ "Link the program with the stronghead:agent library and wrap main. Build it -threaded, run it with +RTS -T, then press Connect."
+            , "Connect finds the rest of the program by itself: run it with +RTS -l and the Timeline follows its eventlog as it is written, with -hT the heap panel follows its heap profile, and its working directory becomes a place to look for sources and dumps."
+            ]
+            ["import Stronghead.Agent", " ", "main = withAgent defaultAgentConfig $ do", "  ...", " ", "./prog +RTS -l -hT -i0.1 -T -RTS"]
 
 connect :: LiveState -> NanoUI ()
 connect st = do
@@ -477,23 +537,40 @@ livePanes env st mdata logTl site = case mdata of
                 chart "Threads" (pWakeup pal) rThreads (fmtFixed 0) False
         | pid == paneLiveThreads -> Just $
             pane ctx "Threads" (threadsHeader st counts) $ do
-              filt <- T.toLower <$> readVar (lvThreadFilter st)
-              focus <- readVar (lvFocus st)
-              let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
-                  palKey = colorToWord32 (pText pal)
-              rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
-                colHeader (fixedW 56 . alignEnd) "id"
-                colHeader fillW "label"
-                colHeader (fixedW 36 . alignEnd) "cap"
-                colHeader (fixedW historyW) ("last " <> fmtSec span'')
-                colHeader (fixedW 220) "status"
-              paneVirtualRows (grow . tight) id threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
-                let hist = M.findWithDefault [] (ltId t) history
-                numCell 56 fontMuted (tshow (ltId t))
-                cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
-                numCell 36 fontMuted (maybe "" tshow (ltCap t))
-                _ <- canvasKeyed (contentKeyOf [keyPart palKey, keyPart hist]) (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r hist)
-                cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
+              scope $ unless (Seq.null (ldAlerts d)) $ do
+                let recentAlerts = take 4 (reverse (toList (ldAlerts d)))
+                callout (themeWarning th) $
+                  columnWith (tight . fillW . gap 3) $ do
+                    labelWith (fontMedium . fontSizeScale 0.88) ("Live runtime alerts (" <> tshow (Seq.length (ldAlerts d)) <> ")")
+                    forM_ recentAlerts $ \al ->
+                      rowWith (tight . gap 8 . fillW . alignMid) $ do
+                        badge (if laKind al == "exc" then Danger else Warning) (laKind al)
+                        labelWith (fontMono . fontSizeScale 0.84) ("tid " <> tshow (laTid al))
+                        labelWith (fontMedium . fontSizeScale 0.86) (laTitle al)
+                        labelWith (fillW . fontMono . fontMuted . fontSizeScale 0.8) (T.take 120 (laDetail al))
+              subTab <- readVar (lvSubTab st)
+              case subTab of
+                LiveThreadsList -> do
+                  filt <- T.toLower <$> readVar (lvThreadFilter st)
+                  focus <- readVar (lvFocus st)
+                  let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
+                      palKey = colorToWord32 (pText pal)
+                  rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
+                    colHeader (fixedW 56 . alignEnd) "id"
+                    colHeader fillW "label"
+                    colHeader (fixedW 36 . alignEnd) "cap"
+                    colHeader (fixedW historyW) ("last " <> fmtSec span'')
+                    colHeader (fixedW 220) "status"
+                  paneVirtualRows (grow . tight) id threads $ \t -> withKey (ltId t) $ void $ linkRow env (RThread rk (fromIntegral (ltId t))) (focus == Just (ltId t)) (padXY 8 3 . gap 12) $ do
+                    let hist = M.findWithDefault [] (ltId t) history
+                    numCell 56 fontMuted (tshow (ltId t))
+                    cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
+                    numCell 36 fontMuted (maybe "" tshow (ltCap t))
+                    _ <- canvasKeyed (contentKeyOf [keyPart palKey, keyPart hist]) (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r hist)
+                    cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
+                LiveStacksView -> liveStacksView env st rk (ldStacks d)
+                LiveFlameView -> liveFlameView st (ldFolded d)
+                LiveProbesView -> liveProbesView env (ldProbes d)
         | otherwise -> Nothing
   _ -> pure $ \pid ctx ->
     if pid `elem` [paneLiveCharts, paneLiveThreads]
@@ -559,11 +636,85 @@ groupColour pal = \case
 
 threadsHeader :: LiveState -> [(Text, Int)] -> NanoUI ()
 threadsHeader st counts = do
-  searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW 220) defaultLayout}
-    (lvThreadFilter st)
+  rowWith (alignMid . tight) $
+    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} liveSubTabName (lvSubTab st)
+  subTab <- readVar (lvSubTab st)
+  scope $ when (subTab == LiveThreadsList) $
+    searchInputConfigured
+      defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW 180) defaultLayout}
+      (lvThreadFilter st)
   flex
   forM_ counts $ \(g, n) -> withKey g $ badge (groupTone g) (g <> " " <> tshow n)
+
+liveStacksView :: Env -> LiveState -> RunKey -> M.Map Int LiveThreadStack -> NanoUI ()
+liveStacksView env st rk stacks = do
+  focus <- readVar (lvFocus st)
+  if M.null stacks
+    then hint "No live stacks captured yet. Press Capture stacks in the Program toolbar (works on Windows/macOS/Linux via GHC.Stack.CloneStack; compile with -finfo-table-map for full source frames)."
+    else paneScroll (grow . tight) $ columnWith (tight . fillW . gap 8) $ do
+      let ordered = case focus >>= (`M.lookup` stacks) of
+            Just fts -> fts : [s | s <- M.elems stacks, ltsTid s /= ltsTid fts]
+            Nothing -> M.elems stacks
+      forM_ (take 32 ordered) $ \ts -> withKey ("stk" <> tshow (ltsTid ts)) $
+        panelWith (padAll 8 . gap 3 . fillW) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            linkText env (RThread rk (fromIntegral (ltsTid ts))) fontMedium ("Thread " <> tshow (ltsTid ts))
+            badge (groupTone (statusGroup (ltsStatus ts))) (ltsStatus ts)
+            flex
+            labelWith (fontMuted . fontSizeScale 0.82) (tshow (length (ltsFrames ts)) <> " frames")
+          if null (ltsFrames ts)
+            then hint "No decoded frames (compile target with -finfo-table-map for Haskell source locations)."
+            else forM_ (zip [0 :: Int ..] (take 24 (ltsFrames ts))) $ \(fi, f) -> withKey ("f" <> tshow fi) $
+              rowWith (tight . gap 8 . fillW . alignMid) $ do
+                numCell 24 fontMuted (tshow fi)
+                cell (fontMono . fontSizeScale 0.86) (if T.null (lfeFunction f) then lfeClosureType f else lfeFunction f)
+                cell (fontMono . fontMuted . fontSizeScale 0.82) (lfeModule f)
+                flex
+                case srcLocSpan (parseSrcLoc (lfeSrcLoc f)) of
+                  Just sp -> linkText env (RSource sp) (fontMono . fontMuted . fontSizeScale 0.8) (lfeSrcLoc f)
+                  Nothing -> labelWith (fontMono . fontMuted . fontSizeScale 0.8) (lfeSrcLoc f)
+
+liveFlameView :: LiveState -> M.Map (Text, [LiveFrameEntry]) Int -> NanoUI ()
+liveFlameView st folded = do
+  statusFilt <- readVar (lvFlameStatus st)
+  rowWith (tight . gap 6 . alignMid . fillW) $ do
+    labelWith (fontMuted . fontSizeScale 0.85) "Filter"
+    whenM (buttonWith (padXY 6 0 . tight) "All") (writeVar (lvFlameStatus st) Nothing)
+    whenM (buttonWith (padXY 6 0 . tight) "On-CPU (running)") (writeVar (lvFlameStatus st) (Just "running"))
+    whenM (buttonWith (padXY 6 0 . tight) "Off-CPU (MVar)") (writeVar (lvFlameStatus st) (Just "BlockedOnMVar"))
+    whenM (buttonWith (padXY 6 0 . tight) "Off-CPU (BlackHole)") (writeVar (lvFlameStatus st) (Just "BlockedOnBlackHole"))
+    flex
+    labelWith (fontMuted . fontSizeScale 0.82) (tshow (sum (M.elems folded)) <> " total samples")
+  flamegraphView (fromLiveFolded statusFilt folded) (lvFlameZoom st)
+
+liveProbesView :: Env -> M.Map Text [LiveProbeNode] -> NanoUI ()
+liveProbesView env probes =
+  if M.null probes
+    then hint "No ghc-heap probes captured yet. Register values with Stronghead.Probe.probeRef / probeTVar and press Read probes in the Program toolbar."
+    else paneScroll (grow . tight) $ columnWith (tight . fillW . gap 8) $
+      forM_ (M.toList probes) $ \(pName, nodes) -> withKey ("pr" <> pName) $
+        panelWith (padAll 8 . gap 3 . fillW) $ do
+          let thunkCnt = length (filter lpnIsThunk nodes)
+              totBytes = sum (map lpnBytes nodes)
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            labelWith (fontMedium . fontMono) pName
+            badge (if thunkCnt > 0 then Warning else Success) (tshow thunkCnt <> " thunks")
+            flex
+            labelWith (fontMono . fontMuted . fontSizeScale 0.84) (tshow (length nodes) <> " closures · " <> fmtBytes (fromIntegral totBytes))
+          forM_ (take 80 nodes) $ \n -> withKey ("pn" <> tshow (lpnId n)) $
+            rowWith (tight . gap 8 . fillW . alignMid) $ do
+              let depth = max 0 (min 12 (if lpnParent n < 0 then 0 else 1 + min 11 (lpnParent n)))
+              spacer (Fixed (fromIntegral depth * 10)) Fit
+              cell (fontMono . fontSizeScale 0.86 . if lpnIsThunk n then fontTone Warning else id)
+                (if T.null (lpnName n) then lpnType n else lpnName n)
+              badge (if lpnIsThunk n then Warning else Muted) (lpnType n)
+              scope $ unless (T.null (lpnDetail n)) $
+                labelWith (fontMono . fontMuted . fontSizeScale 0.8) (T.take 48 (lpnDetail n))
+              flex
+              case srcLocSpan (parseSrcLoc (lpnSource n)) of
+                Just sp -> linkText env (RSource sp) (fontMono . fontMuted . fontSizeScale 0.8) (lpnSource n)
+                Nothing -> labelWith (fontMono . fontMuted . fontSizeScale 0.8) (lpnSource n)
+              numCell 64 fontMuted (fmtBytes (fromIntegral (lpnBytes n)))
 
 statusGroup :: Text -> Text
 statusGroup s
@@ -625,11 +776,16 @@ commandsWhy = \case
 liveRemote :: Bus -> LiveState -> Maybe LiveData -> Maybe Timeline -> DebugHooks -> NanoUI [RemoteAction]
 liveRemote bus st mdata logTl hooks = do
   heapOn <- readVar (lvHeapOn st)
+  sampling <- readVar (lvSamplingStacks st)
   pause <- readVar (lvPause st)
   second <- readVar (lvSecond st)
   let cmdWhy = commandsWhy mdata
       info = mdata >>= ldInfo
       agent act = maybe (Right act) Left cmdWhy
+      v3Why = case info of
+        Just i | aiVersion i < 3 -> Just "requires stronghead:agent protocol v3"
+        _ -> cmdWhy
+      v3 act = maybe (Right act) Left v3Why
       heapWhy = case info of
         Just i | isNothing (aiHeapProfile i) -> Just "the program takes no heap profile: run it with +RTS -hT -i0.1"
         _ -> Nothing
@@ -658,6 +814,14 @@ liveRemote bus st mdata logTl hooks = do
             Nothing
             GroupAgent
             (withHeap (writeVar (lvHeapOn st) (Just (not on)) >> send' "Heap profiling" (CmdHeapProfiling (not on)) MomentAction))
+    , RemoteAction "Capture stacks" Nothing GroupAgent (v3 (writeVar (lvSubTab st) LiveStacksView >> send' "Capture stacks" CmdStacks MomentAction))
+    , RemoteAction
+        (if sampling then "Stop stack sampler" else "Sample stacks")
+        Nothing
+        GroupAgent
+        (v3 (unless sampling (writeVar (lvSubTab st) LiveFlameView) >> writeVar (lvSamplingStacks st) (not sampling) >> send' "Stack sampler" (CmdSampleStacks (if sampling then Nothing else Just 25)) MomentAction))
+    , RemoteAction "Read probes" Nothing GroupAgent (v3 (writeVar (lvSubTab st) LiveProbesView >> send' "Read probes" (CmdProbes Nothing) MomentAction))
+    , RemoteAction "Bump era" Nothing GroupAgent (v3 (send' "Bump era" CmdEraBump MomentAction))
     , RemoteAction "Snapshot" Nothing GroupDebug snapshot
     , RemoteAction
         "Census + snapshot"

@@ -54,9 +54,12 @@ library
     exposed-modules:
         Stronghead.Eventlog
         Stronghead.Eventlog.Model
+        Stronghead.Eventlog.CriticalPath
+        Stronghead.Flamegraph
         Stronghead.HeapProfile
         Stronghead.Prof
         Stronghead.Dump
+        Stronghead.Dump.Forensics
         Stronghead.Ghci
         Stronghead.Live
         Stronghead.Attach
@@ -71,10 +74,12 @@ library
         Stronghead.Diff
         Stronghead.Fuzzy
         Stronghead.Format
+        Stronghead.Lab
         Stronghead.Markdown
         Stronghead.TextFile
         Stronghead.Debug
         Stronghead.Debug.Graph
+        Stronghead.Debug.Anatomy
     build-depends:
         async >=2.2 && <2.3,
         base >=4.20 && <4.23,
@@ -101,8 +106,9 @@ library
             ghc-debug-convention ^>=0.8,
             time >=1.12 && <1.16
 
--- The drop-in agent a target program links to publish live RTS stats.
--- Deliberately tiny: base and network only.
+-- The drop-in agent a target program links to publish live RTS stats,
+-- CloneStack samples, span/allocation traces, exception taps, and probe hooks.
+-- Deliberately tiny: GHC boot libraries + network only.
 library agent
     import:           extensions, warnings
     visibility:       public
@@ -111,7 +117,23 @@ library agent
     build-depends:
         base >=4.20 && <4.23,
         bytestring >=0.11 && <0.13,
+        containers >=0.6 && <0.9,
+        directory ^>=1.3,
+        filepath >=1.4 && <1.6,
         network >=3.1 && <3.3
+
+-- Cross-platform in-process heap closure & thunk probing via ghc-heap and
+-- GHC.InfoProv (works on Windows, macOS, and Linux without ghc-debug-stub).
+library probe
+    import:           extensions, warnings
+    visibility:       public
+    hs-source-dirs:   probe
+    exposed-modules:  Stronghead.Probe
+    build-depends:
+        base >=4.20 && <4.23,
+        ghc-heap >=9.10 && <9.16,
+        stm >=2.5 && <2.6,
+        stronghead:agent
 
 -- The graphical user interface and headless SVG export library.
 library ui
@@ -128,6 +150,7 @@ library ui
         UI.Heap
         UI.Core
         UI.Debugger
+        UI.Flamegraph
         UI.Graph
         UI.Inspector
         UI.Link
@@ -186,9 +209,12 @@ executable stronghead
     main-is:          Main.hs
     build-depends:
         base >=4.20 && <4.23,
+        directory ^>=1.3,
+        filepath >=1.4 && <1.6,
         nano-ui ^>=0.2,
         nano-ui-sdl ^>=0.2,
         optparse-applicative >=0.18 && <0.20,
+        stronghead,
         stronghead:ui,
         text >=2.0 && <2.2
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N2 -A64m -I0"
@@ -214,7 +240,8 @@ executable stronghead-sample
     build-depends:
         base >=4.20 && <4.23,
         containers >=0.6 && <0.9,
-        stronghead:agent
+        stronghead:agent,
+        stronghead:probe
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N4 -T"
     -- With the flag, the sample also runs ghc-debug-stub so the heap panel's
     -- live graph has something to connect to. The stub is Unix-only.
@@ -264,6 +291,8 @@ test-suite stronghead-test
         stronghead,
         stronghead:agent,
         stronghead:mcp,
+        stronghead:probe,
+        stm >=2.5 && <2.6,
         text >=2.0 && <2.2,
         vector >=0.13 && <0.14
     ghc-options:      -threaded

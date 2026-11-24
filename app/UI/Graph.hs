@@ -9,6 +9,7 @@
 module UI.Graph
   ( renderHpSvg
   , renderHpDiffSvg
+  , renderFlamegraphSvg
   , renderUiFrameToSvg
   , heapPanelUi
   , heapDiffUi
@@ -35,9 +36,11 @@ import NanoUI.Backend
 import NanoUI.Draw.FrameSvg (FrameSvgConfig (..), defaultFrameSvgConfig, enableSvgExport, frameToSvg)
 import NanoUI.Testing (newPixelContext)
 
+import Stronghead.Flamegraph (FlameTree (..))
 import Stronghead.Format (fmtBytesD, fmtSec, tshow)
 import Stronghead.HeapProfile (Band (..), HeapProfile (..), Suspect (..), leakSuspects)
 import Stronghead.Run (runKey)
+import UI.Flamegraph (drawFlameTree)
 
 import UI.Clock (Marks (..), linearAxis)
 import UI.Common
@@ -413,3 +416,24 @@ renderHpDiffSvg mTheme mTopN baseHp curHp = do
   renderUiFrameToSvg 1200 1180 theme $ do
     mm <- monoMetrics 0.88
     heapDiffUi pal mm baseHp curHp topN
+
+-- | Renders a 'FlameTree' to a standalone SVG document using Stronghead's native
+-- flamegraph canvas renderer and @nano-ui-svg@.
+renderFlamegraphSvg :: Maybe String -> FlameTree -> IO Text
+renderFlamegraphSvg mTheme ft = do
+  let appearance = case mTheme of
+        Just "light" -> Just AppearanceLight
+        _            -> Just AppearanceDark
+      theme = strongheadTheme appearance
+      pal = palette theme
+  renderUiFrameToSvg 1100 540 theme $ do
+    mm <- monoMetrics 0.82
+    panelWith (padAll 12 . gap 8 . fillW . fillH) $ do
+      rowWith (tight . alignMid . gap 8 . fillW) $ do
+        labelWith (fontBold . fontSizeScale 1.05) (ftTitle ft)
+        flex
+        cardWith (padXY 10 3) $
+          labelWith (fontSizeScale 0.82 . fontBold) (tshow (round (ftTotal ft) :: Int) <> " " <> ftUnit ft)
+      void $ canvasConfigured
+        defaultCanvasConfig { canvasLayout = (fillW . grow) defaultLayout }
+        (\r -> drawFlameTree pal mm r ft)

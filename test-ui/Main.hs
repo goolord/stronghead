@@ -19,9 +19,11 @@ import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
 import Stronghead.Dump (CodeKind (..), parseCodeFile, tokenizeLine)
+import Stronghead.Eventlog.CriticalPath (gcPauseHeatmap)
+import Stronghead.Eventlog.Model (GCEvent (..), Marker (..), Timeline (..), emptyTimeline)
+import Stronghead.Flamegraph (diffFlameTrees, fromFoldedStacks)
 import Stronghead.Format (tshow)
-import Stronghead.Ghci (Value (..))
-import Stronghead.Eventlog.Model (Marker (..), Timeline (..), emptyTimeline)
+import Stronghead.Ghci (GhciBinding (..), StopInfo (..), ThunkTransition (..), Value (..), ValueXRay (..))
 import Stronghead.Join (Annotation (..), Lane (..), Shade (..), annotationAt)
 import Stronghead.Live
 import Stronghead.Next (Fact (..), Have (..), Step (..), StepDo (..), haveNothing, strongStep)
@@ -38,9 +40,10 @@ import UI.Clock
 import UI.Code
 import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
-import UI.Graph (renderHpDiffSvg, renderHpSvg)
+import UI.Flamegraph (diffFlamegraphView, eraCohortHeatmapView, flamegraphView, latencyHeatmapView)
+import UI.Graph (renderFlamegraphSvg, renderHpDiffSvg, renderHpSvg)
 import UI.Heap (atCursor, leakView, newHeapState)
-import UI.Debugger (DebugState (..), newDebugState, valueTree)
+import UI.Debugger (DebugState (..), debugPanes, newDebugState, valueTree)
 import UI.Inspector
 import UI.Link
 import UI.Live
@@ -391,7 +394,7 @@ main = do
   box <- newOutbox
   let info = AgentInfo 2 "/w" "/w/prog" ["prog"] (Just "hT") 100 True True
       frame0 = Frame 0 1000000000 True (M.fromList [("rts_stats", 1)]) []
-      d0 = LiveData (Just ("prog", 1, 4)) (Just info) (Just box) (Seq.fromList [frame0]) M.empty Nothing
+      d0 = emptyLiveData {ldHello = Just ("prog", 1, 4), ldInfo = Just info, ldOutbox = Just box, ldFrames = Seq.fromList [frame0]}
       hooks = DebugHooks (Left "built without ghc-debug") False Nothing
       rk = RunKey "prog:1"
       renv = Env rbus [] PLive (\_ -> pure ()) haveNothing Nothing
@@ -562,7 +565,7 @@ main = do
   writeVarIO (wrRules watchers) (setRules [Rule (BlockedOver 500) True [RespNotify, RespMark] 0 0.5])
   let wthread b = LiveThread 7 (if b then "BlockedOnMVar" else "running") "worker-7" Nothing
       wframe i = Frame (fromIntegral i * 0.25) (fromIntegral i * 250000000) True M.empty [wthread True]
-      wdata = LiveData (Just ("prog", 1, 1)) Nothing Nothing (Seq.fromList [wframe i | i <- [0 .. 4 :: Int]]) M.empty Nothing
+      wdata = emptyLiveData {ldHello = Just ("prog", 1, 1), ldFrames = Seq.fromList [wframe i | i <- [0 .. 4 :: Int]]}
       whooks = WatchHooks (Right (\t -> liftIO (modifyIORef' marks (t :)))) (Left "no census here") (Left "no ghc-debug target")
       wscene = do
         watchTick watchers whooks (Just wdata) Nothing False
@@ -1219,6 +1222,45 @@ main = do
   diffSvg <- renderHpDiffSvg Nothing Nothing baseHp curHp1
   check "renderHpDiffSvg emits diff SVG with both panels"
     ("<svg " `T.isPrefixOf` diffSvg && "Baseline" `T.isInfixOf` diffSvg && "Candidate" `T.isInfixOf` diffSvg)
+
+  putStrLn "flamegraph, heatmaps, laziness X-ray, and post-mortem dossier"
+  let ftA = fromFoldedStacks "On-CPU" "samples" [(["main", "worker", "parse"], 60), (["main", "flush"], 40)]
+      ftB = fromFoldedStacks "On-CPU" "samples" [(["main", "worker", "parse"], 25), (["main", "flush"], 75)]
+  fgSvg <- renderFlamegraphSvg Nothing ftA
+  check "renderFlamegraphSvg emits SVG with stack frame labels"
+    ("<svg " `T.isPrefixOf` fgSvg && "worker" `T.isInfixOf` fgSvg && "flush" `T.isInfixOf` fgSvg)
+  fgCtx <- newContext
+  fgZoom <- newVar Nothing
+  let hmTl = emptyTimeline {tlStart = 0, tlEnd = 10_000_000, tlGCs = V.fromList [GCEvent 1_000_000 1_500_000 0 0 1024 1, GCEvent 5_000_000 8_000_000 0 1 65536 2]}
+      eraHp = fromSamples "" "era" 0 (const Nothing) [(1, [("era 1", 4096), ("era 2", 1024)]), (2, [("era 1", 4096), ("era 2", 8192)])]
+      vizScene = columnWith (fixedWH 900 700 . tight . gap 6) $ do
+        flamegraphView ftA fgZoom
+        diffFlamegraphView (diffFlameTrees ftA ftB)
+        latencyHeatmapView (gcPauseHeatmap hmTl 16 8)
+        eraCohortHeatmapView eraHp
+  warmup2 fgCtx (withInput 900 700) vizScene >>= \_ -> pure ()
+  fgSpans <- collectTextSpans fgCtx
+  check "flamegraph, diff flamegraph, latency heatmap, and era cohort matrix render cleanly"
+    (hasText "On-CPU" fgSpans && hasText "regressed" fgSpans && hasText "Era cohort retention matrix" fgSpans)
+
+  xrCtx <- newContext
+  xrState <- newDebugState
+  writeVarIO (dsStop xrState) (Just (StopInfo "Main.go" (Just (SrcSpan "Main.hs" 10 1 10 20))))
+  writeVarIO (dsBindings xrState) [GhciBinding "acc" "Integer" (Just "_t1"), GhciBinding "done" "Int" (Just "42")]
+  writeVarIO (dsValues xrState) (M.fromList [("acc", VThunk "_t1" Nothing), ("done", VAtom "42")])
+  writeVarIO (dsXRay xrState) (M.fromList [("acc", ValueXRay "acc" (ThunkAging 4) 1 1), ("done", ValueXRay "done" ThunkCollapsed 0 1)])
+  writeVarIO (dsHistory xrState) [(-1, "Main.step", SrcSpan "Main.hs" 9 1 9 15)]
+  let xrScene = do
+        draw <- debugPanes (worldEnv w PDebugger) xrState (mkSourceIndex [] []) Nothing []
+        void (columnWith (fixedWH 800 500) (fromMaybe (pure ()) (draw paneDbgLocals floatingPane)))
+  warmup2 xrCtx (withInput 800 500) xrScene >>= \_ -> pure ()
+  xrSpans <- collectTextSpans xrCtx
+  check "debugger renders Laziness X-Ray badges and time-travel scrubber"
+    (hasText "unforced ×4" xrSpans && hasText "collapsed" xrSpans && hasText "Time-travel scrubber" xrSpans)
+
+  let dossierMd = pinsDossier (worldEnv w PHeap) ["Generated in test."] [("Heap Proof", "run.heap.svg")] [Pin thread "blocked on MVar"]
+  check "pinsDossier embeds proof graphs and pins"
+    ("Stronghead Post-Mortem Dossier" `T.isInfixOf` dossierMd && "![Heap Proof](run.heap.svg)" `T.isInfixOf` dossierMd)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

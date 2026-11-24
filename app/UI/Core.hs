@@ -39,6 +39,7 @@ import NanoUI hiding (Binding)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
 
 import Stronghead.Dump
+import Stronghead.Dump.Forensics qualified as Forensics
 import Stronghead.Format (fmtBytesD, fmtFixed, tshow)
 import Stronghead.Join
 import Stronghead.Next (Fact (..))
@@ -1028,8 +1029,28 @@ corePanes env st loaded sitePanes = do
           pane ctx (maybe "What the optimiser did" enKey selEntry) (pure ()) $
             paneScroll (grow . tight) $ columnWith (tight . gap 6 . fillW) $
               case selEntry of
-                Nothing -> hint "Select a binding to see what the optimiser did to it: worker/wrapper, inlining, boxing, and the closures STG allocates."
-                Just e -> notesBar st e core (rt e) (not (null lanes))
+                Nothing -> do
+                  hint "Select a binding to see what the optimiser did to it: worker/wrapper, inlining, boxing, STG closure captures, and optimization smells."
+                  let weights = M.fromList [(enKey e, max (rtTime (rt e)) (rtAlloc (rt e)) + rtTicky (rt e) / 1e6) | e <- es, max (rtTime (rt e)) (rtAlloc (rt e)) > 0 || rtTicky (rt e) > 0]
+                      smells = take 12 (Forensics.detectCoreSmells core stg weights)
+                  scope $ unless (null smells) $ do
+                    separator
+                    sectionTitle ("Module optimization smells (" <> tshow (length smells) <> ")")
+                    forM_ (zip [0 :: Int ..] smells) $ \(si, sm) -> withKey ("sm" <> tshow si) $
+                      panelWith (padXY 8 5 . gap 3 . fillW) $ do
+                        rowWith (tight . gap 8 . alignMid . fillW) $ do
+                          badge Warning (Forensics.smellKindTitle (Forensics.csKind sm))
+                          labelWith (fontMono . fontMedium . fillW) (Forensics.csBinding sm)
+                          whenM (buttonWith (padXY 6 0 . tight) ("@" <> tshow (Forensics.csLine sm + 1))) $ do
+                            select (Forensics.csBinding sm)
+                            let targetCv = case Forensics.csKind sm of
+                                  Forensics.SmellUpdateableLoopThunk -> vStg
+                                  Forensics.SmellPapCalls -> vStg
+                                  _ -> vCore
+                            scrollToLine targetCv (Forensics.csLine sm)
+                        labelWith (fontSizeScale 0.86 . fillW) (Forensics.csSummary sm)
+                        hint (Forensics.csRemediation sm)
+                Just e -> notesBar st e core stg (rt e) (not (null lanes))
       | pid `elem` codeTabIds -> Just (tabbedCodePane ctx pid)
       | otherwise -> Nothing
   where
@@ -1056,8 +1077,8 @@ entryBadges e haveCore = do
   scope $ when (allocs > 0) $ badge Danger ("let " <> tshow allocs)
   scope $ when (haveCore && null (enCore e) && not (null (enSrc e))) $ badge Muted "gone"
 
-notesBar :: CoreState -> Entry -> Maybe CodeFile -> Runtime -> Bool -> NanoUI ()
-notesBar st e core r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
+notesBar :: CoreState -> Entry -> Maybe CodeFile -> Maybe CodeFile -> Runtime -> Bool -> NanoUI ()
+notesBar st e core stg r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
   let (_, vCore, vStg) = csViews st
   rowWith (tight . gap 12 . wrap . fillW . alignMid) $ do
     labelWith (fontMedium . fontMono) (enKey e)
@@ -1104,6 +1125,37 @@ notesBar st e core r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
       whenM (buttonWith tight ("alloc @" <> tshow (l + 1))) $ do
         scrollToLine vStg l
         liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreStg 1)
+  let captures = [c | Just cf <- [stg], c <- Forensics.stgClosureCaptures cf, Forensics.scEnclosing c == enKey e, not (null (Forensics.scCaptured c))]
+  scope $ unless (null captures) $ do
+    separator
+    sectionTitle ("STG closure captures (" <> tshow (length captures) <> ")")
+    hint "Free variables statically retained inside closures allocated by this binding. Updateable thunks (\\u) keep all captured free variables alive until forced."
+    forM_ (take 16 captures) $ \c -> withKey ("cap" <> tshow (Forensics.scLine c) <> Forensics.scBinder c) $
+      rowWith (tight . gap 8 . alignMid . fillW) $ do
+        badge
+          (case Forensics.scFlag c of Forensics.StgUpdateable -> Danger; Forensics.StgSingleEntry -> Warning; _ -> Muted)
+          (case Forensics.scFlag c of Forensics.StgUpdateable -> "\\u thunk"; Forensics.StgSingleEntry -> "\\s thunk"; Forensics.StgReentrant -> "\\r fun"; Forensics.StgUnknown -> "closure")
+        cell (fontMono . fontSizeScale 0.86) (Forensics.scBinder c)
+        labelWith (fillW . fontMono . fontMuted . fontSizeScale 0.84) ("captures [" <> T.intercalate ", " (Forensics.scCaptured c) <> "]")
+        whenM (buttonWith (padXY 6 0 . tight) ("STG @" <> tshow (Forensics.scLine c + 1))) $ do
+          scrollToLine vStg (Forensics.scLine c)
+          liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) paneCoreStg 1)
+  let bindingWeight = max (rtTime r) (rtAlloc r) + rtTicky r / 1e6
+      weightMap = if haveRuntime && bindingWeight > 0 then M.singleton (enKey e) bindingWeight else M.empty
+      bindingSmells = [sm | sm <- Forensics.detectCoreSmells core stg weightMap, Forensics.csBinding sm == enKey e]
+  scope $ unless (null bindingSmells) $ do
+    separator
+    sectionTitle ("Optimization smells (" <> tshow (length bindingSmells) <> ")")
+    forM_ (zip [0 :: Int ..] bindingSmells) $ \(si, sm) -> withKey ("bsm" <> tshow si) $
+      columnWith (tight . gap 2 . fillW) $ do
+        rowWith (tight . gap 8 . alignMid . fillW) $ do
+          badge Warning (Forensics.smellKindTitle (Forensics.csKind sm))
+          labelWith (fontSizeScale 0.88 . fillW) (Forensics.csSummary sm)
+          whenM (buttonWith (padXY 6 0 . tight) ("@" <> tshow (Forensics.csLine sm + 1))) $ do
+            let isStgSmell = Forensics.csKind sm `elem` [Forensics.SmellUpdateableLoopThunk, Forensics.SmellPapCalls]
+            scrollToLine (if isStgSmell then vStg else vCore) (Forensics.csLine sm)
+            liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) (if isStgSmell then paneCoreStg else paneCoreCore) 1)
+        hint (Forensics.csRemediation sm)
 
 -- | The module the loaded files are of.
 moduleOf :: Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Text

@@ -67,6 +67,10 @@ data DebugState = DebugState
   , dsBindings :: !(Var [GhciBinding])
   , dsValues :: !(Var (M.Map Text Value))
     -- ^ Each binding's value as @:print@ shows it, its thunks named.
+  , dsPrevValues :: !(Var (M.Map Text Value))
+  , dsThunkAges :: !(Var (M.Map Text Int))
+  , dsXRay :: !(Var (M.Map Text ValueXRay))
+  , dsHistory :: !(Var [(Int, Text, SrcSpan)])
   , dsToggled :: !(Var (S.Set Text))
     -- ^ Value-tree nodes opened or closed by hand, by path.
   , dsBreaks :: !(Var (M.Map (FilePath, Int) Int))
@@ -94,6 +98,10 @@ newDebugState = do
   dsStop <- newVar Nothing
   dsBindings <- newVar []
   dsValues <- newVar M.empty
+  dsPrevValues <- newVar M.empty
+  dsThunkAges <- newVar M.empty
+  dsXRay <- newVar M.empty
+  dsHistory <- newVar []
   dsToggled <- newVar S.empty
   dsBreaks <- newVar M.empty
   dsSourcePath <- newVar Nothing
@@ -162,13 +170,20 @@ runIn st g cmds = do
     for_ (T.stripPrefix ":load " (T.strip c)) $ \f -> do
       writeVarIO (dsSourcePath st) (Just (resolve dir (T.strip f)))
       writeVarIO (dsBreaks st) M.empty
+    when (":history" `T.isPrefixOf` T.strip c) $
+      writeVarIO (dsHistory st) (parseHistory out)
     when (resumes c) $ do
       let stop = parseStop out
       writeVarIO (dsStop st) stop
       for_ (stop >>= stSpan) $ \s -> writeVarIO (dsSourcePath st) (Just (resolve dir (ssFile s)))
       if isJust stop
         then refreshLocals st g
-        else writeVarIO (dsBindings st) [] >> writeVarIO (dsValues st) M.empty
+        else do
+          writeVarIO (dsBindings st) []
+          writeVarIO (dsPrevValues st) M.empty
+          writeVarIO (dsValues st) M.empty
+          writeVarIO (dsThunkAges st) M.empty
+          writeVarIO (dsXRay st) M.empty
   alive <- ghciAlive g
   writeVarIO (dsRunning st) alive
 
@@ -187,7 +202,14 @@ refreshLocals st g = do
           pure [(gbName x, v) | (n, v) <- parsePrint out, n == gbName x]
       )
       (take 24 bs)
-  writeVarIO (dsValues st) (M.fromList vals)
+  prevVals <- readVarIO (dsValues st)
+  prevAges <- readVarIO (dsThunkAges st)
+  let newVals = M.fromList vals
+      (ages', xrays) = diffValueStep prevVals newVals prevAges
+  writeVarIO (dsPrevValues st) prevVals
+  writeVarIO (dsValues st) newVals
+  writeVarIO (dsThunkAges st) ages'
+  writeVarIO (dsXRay st) xrays
 
 isThunkBinding :: Text -> Bool
 isThunkBinding n = case T.stripPrefix "_t" n of
@@ -254,6 +276,11 @@ stopSession st wake = do
   writeVarIO (dsRunning st) False
   writeVarIO (dsStop st) Nothing
   writeVarIO (dsBindings st) []
+  writeVarIO (dsPrevValues st) M.empty
+  writeVarIO (dsValues st) M.empty
+  writeVarIO (dsThunkAges st) M.empty
+  writeVarIO (dsXRay st) M.empty
+  writeVarIO (dsHistory st) []
   appendConsole st ["<session stopped>"]
   wake
 
@@ -316,7 +343,7 @@ debugPanes env st ix source _ = do
   pure $ \pid ctx ->
     if
       | pid == paneDbgSource -> Just (sourcePane env st ix ctx source stop send)
-      | pid == paneDbgLocals -> Just (pane ctx "Local bindings" (pure ()) (bindingsPane st stop))
+      | pid == paneDbgLocals -> Just (pane ctx "Local bindings" (pure ()) (bindingsPane env st stop send))
       | pid == paneDbgBreaks -> Just (breaksPane env st ctx send)
       | pid == paneDbgConsole -> Just (consolePane env st ctx send)
       | otherwise -> Nothing
@@ -425,15 +452,31 @@ breaksPane env st ctx send = do
             cell (fillW . fontMono . fontSizeScale 0.9) (T.pack (takeFileName f) <> ":" <> tshow l)
           disabledWhen (not running) $ whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconTrash "Delete") (deleteBreak st send (Just f, l) n)
 
--- | The local bindings at the stop, each value an expandable tree.
-bindingsPane :: DebugState -> Maybe StopInfo -> NanoUI ()
-bindingsPane st stop = do
+-- | The local bindings at the stop, each value an expandable tree, plus
+-- Laziness X-Ray step transition badges and a clickable :history scrubber.
+bindingsPane :: Env -> DebugState -> Maybe StopInfo -> ([Text] -> NanoUI ()) -> NanoUI ()
+bindingsPane env st stop send = do
   bindings <- readVar (dsBindings st)
   values <- readVar (dsValues st)
+  xrays <- readVar (dsXRay st)
+  hist <- readVar (dsHistory st)
+  dir <- readVar (dsDir st)
   toggled <- readVar (dsToggled st)
   busy <- readVar (dsBusy st)
   wake <- askWake
   let force name deep = liftIO (forceValue st wake name deep)
+  scope $ unless (null hist) $ do
+    panelWith (padXY 8 5 . gap 4 . fillW) $ do
+      rowWith (tight . gap 6 . alignMid . fillW) $ do
+        labelWith (fontMedium . fontSizeScale 0.85) ("Time-travel scrubber (" <> tshow (length hist) <> " steps)")
+        flex
+        disabledWhen busy $ do
+          whenM (buttonWith (padXY 6 0 . tight) "← Back") (send [":back"])
+          whenM (buttonWith (padXY 6 0 . tight) "Forward →") (send [":forward"])
+      rowWith (tight . gap 4 . wrap . fillW) $
+        forM_ (take 16 hist) $ \(stepNo, fnName, sp) -> withKey ("hist" <> tshow stepNo) $ do
+          let spAbs = sp {ssFile = T.pack (resolve dir (ssFile sp))}
+          linkText env (RSource spAbs) (fontMono . fontSizeScale 0.8) ("#" <> tshow stepNo <> " " <> T.take 18 fnName)
   scope $ case (stop, bindings) of
     (Nothing, _) -> hint "Not stopped at a breakpoint. Set one in the gutter, then use Step into or Run."
     (Just _, []) -> hint "No local bindings at this location."
@@ -442,9 +485,17 @@ bindingsPane st stop = do
     forM_ bindings $ \b -> withKey (gbName b) $ panelWith (padXY 8 5 . gap 2 . fillW) $ do
       let value = maybe (parseValue <$> gbValue b) Just (M.lookup (gbName b) values)
           name = gbName b
+          mxr = M.lookup name xrays
       rowWith (tight . gap 6 . fillW) $ do
         cell (fontMono . fontMedium . alignMid) name
         cell (fontMono . fontMuted . fillW . fontSizeScale 0.9 . alignMid) (":: " <> gbType b)
+        scope $ case mxr of
+          Just xr -> case vxTransition xr of
+            ThunkCollapsed -> badge Success "collapsed"
+            ThunkSpawned -> badge Warning ("new thunk" <> if vxThunkCount xr > 1 then " ×" <> tshow (vxThunkCount xr) else "")
+            ThunkAging n | n >= 2 -> badge Danger ("unforced ×" <> tshow n)
+            _ -> pure ()
+          Nothing -> pure ()
         scope $ case value of
           Nothing -> badge Warning "thunk"
           Just (VThunk _ _) -> badge Warning "thunk"
@@ -455,7 +506,7 @@ bindingsPane st stop = do
           whenM (buttonWith (alignMid . padXY 6 0 . tight) "Force all") (force name True)
       scope $ for_ value $ \v -> valueTree st toggled busy force name v
   scope $ unless (null bindings) $
-    hint "Thunks are amber. Evaluate takes one to weak head normal form (seq), Force evaluates it all the way (:force); the values are printed again afterwards."
+    hint "Laziness X-Ray: green = thunk collapsed this step, amber = newly allocated thunk, red = aging unforced thunk across steps. Evaluate takes a thunk to WHNF (seq), Force evaluates it all the way (:force)."
 
 -- | A value as an expandable tree, styled like the closure graph: thunks
 -- amber, each one GHCi named (@_t3@) with buttons that force it in place.

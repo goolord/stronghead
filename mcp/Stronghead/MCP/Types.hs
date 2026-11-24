@@ -64,6 +64,42 @@ data StrongheadTool
       , theme :: !(Maybe Text)
       , top_n :: !(Maybe Int)
       }
+  | StrongheadHeapAnatomy
+      { snapshot_target :: !Text
+      , sever_closure :: !(Maybe Text)
+      , sever_type :: !(Maybe Text)
+      , top_n :: !(Maybe Int)
+      }
+  | StrongheadCriticalPath
+      { path :: !Text
+      , thread_id :: !(Maybe Int)
+      , span_name :: !(Maybe Text)
+      }
+  | StrongheadCoreSmells
+      { dumps_dir :: !Text
+      , prof_path :: !(Maybe Text)
+      , baseline_dumps :: !(Maybe Text)
+      , filter_binding :: !(Maybe Text)
+      , top_n :: !(Maybe Int)
+      }
+  | StrongheadLiveStacks
+      { host :: !(Maybe Text)
+      , port :: !(Maybe Int)
+      , include_probes :: !(Maybe Bool)
+      , timeout_ms :: !(Maybe Int)
+      }
+  | StrongheadRtsSweep
+      { exe :: !Text
+      , args :: !(Maybe Text)
+      , grid :: !(Maybe Text)
+      }
+  | StrongheadAssertBudget
+      { spec :: !Text
+      , eventlog_path :: !(Maybe Text)
+      , hp_path :: !(Maybe Text)
+      , baseline_path :: !(Maybe Text)
+      , dump_path :: !(Maybe Text)
+      }
   deriving stock (Show, Eq)
 
 -- | Descriptions for tools and arguments used by 'deriveToolHandlerWithDescription'.
@@ -136,6 +172,49 @@ toolDescriptions =
       before/after diff layouts for issue reports and proof of fixes.
       """
     )
+  , ( "StrongheadHeapAnatomy"
+    , """
+      Runs topological heap anatomy on a ghc-debug snapshot or live ghc-debug target:
+      exact dominator retained bytes, folded quotient thunk/list spines, Merkle structural
+      duplicate waste, and optional counterfactual 'what-if' severing simulation.
+      """
+    )
+  , ( "StrongheadCriticalPath"
+    , """
+      Traces the causal critical path across Haskell threads, MVars, BlackHoles, STW GC
+      pauses, and runnable queues in an .eventlog, plus STW rendezvous straggler blame,
+      runnable latency percentiles, parallel sparks, non-moving GC, and OS MemReturn.
+      """
+    )
+  , ( "StrongheadCoreSmells"
+    , """
+      Runs compiler-to-runtime forensics across GHC Core and STG dumps: detects
+      runtime-weighted optimization smells (dictionary passing, broken fusion, boxed loops,
+      updateable loop thunks, PAP calls), extracts static STG closure free-variable captures,
+      and optionally performs alpha-normalized semantic Core diffs vs a baseline dump dir.
+      """
+    )
+  , ( "StrongheadLiveStacks"
+    , """
+      Connects to a running Haskell program linking Stronghead.Agent v3 (auto-discovering
+      local agent beacons when host/port are omitted) and retrieves live cross-platform
+      GHC.Stack.CloneStack thread backtraces and registered ghc-heap value probes.
+      """
+    )
+  , ( "StrongheadRtsSweep"
+    , """
+      Runs an automated RTS parameter sweep across a compiled Haskell binary (+RTS flags),
+      ingests each run's eventlog, and computes the empirical Pareto frontier across
+      throughput (duration), p99 GC pause latency, and peak heap footprint.
+      """
+    )
+  , ( "StrongheadAssertBudget"
+    , """
+      Evaluates a declarative .stronghead-spec performance budget (file path or inline
+      key=value rules) against eventlog, heap profile, baseline, and Core dump artifacts
+      for automated CI regression gating.
+      """
+    )
   , ("path", "Path to the profiling artifact (.hp or .eventlog)")
   , ("dump_path", "Path to GHC dump directory or dump file (.dump-simpl, .dump-stg-final)")
   , ("top_n", "Maximum number of top suspects to return (default: 5)")
@@ -154,7 +233,7 @@ toolDescriptions =
   , ("target", "Snapshot file path or host:port for live ghc-debug session")
   , ("command", "Command to execute")
   , ("host", "Agent host (default: '127.0.0.1')")
-  , ("port", "Agent port (default: 9100)")
+  , ("port", "Agent port (default: 4777)")
   , ("text", "Marker text (required if command is 'mark')")
   , ("timeout_ms", "Timeout in milliseconds (default: 3000)")
   , ("issue_type", "Type of issue: 'leak', 'contention', 'gc_pressure', 'hot_path', or 'general'")
@@ -164,4 +243,19 @@ toolDescriptions =
   , ("repl_cmd", "Command to start GHCi (default: 'cabal repl')")
   , ("output_path", "Optional file path where the generated SVG graph will be saved (.svg)")
   , ("theme", "Graph theme: 'classic' (hp2ps PostScript look), 'dark' (Stronghead dark mode), or 'light' (modern light)")
+  , ("sever_closure", "Optional hex closure address to simulate severing in counterfactual what-if analysis")
+  , ("sever_type", "Optional closure type or name to simulate severing globally in counterfactual what-if analysis")
+  , ("snapshot_target", "Snapshot file path, host:port, or Unix socket path for ghc-debug heap anatomy")
+  , ("thread_id", "Optional Haskell thread ID for causal critical-path attribution")
+  , ("span_name", "Optional withSpan marker name to trace critical path for its slowest occurrence")
+  , ("dumps_dir", "Path to GHC dump directory or single .dump-simpl / .dump-stg-final file")
+  , ("filter_binding", "Optional binding name to filter smells, captures, and semantic Core diffs")
+  , ("prof_path", "Optional .prof file path to weight Core/STG optimization smells by runtime hotness")
+  , ("include_probes", "Whether to also query registered ghc-heap value probes (default: true)")
+  , ("exe", "Path to the compiled Haskell executable to sweep")
+  , ("args", "Optional whitespace-separated program arguments passed before +RTS")
+  , ("grid", "Optional comma-separated RTS flag combinations (e.g. '-A16m,-A64m,-A64m -xn')")
+  , ("spec", "Path to a .stronghead-spec file or inline key=value budget rules")
+  , ("eventlog_path", "Optional .eventlog path to check against the runtime budget")
+  , ("hp_path", "Optional .hp heap profile path to check against the runtime budget")
   ]

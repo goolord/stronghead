@@ -50,7 +50,7 @@ handleTool _ctx tool = do
 
       StrongheadLiveControl cmd mHost mPort mText mTimeout -> do
         let host = maybe "127.0.0.1" T.unpack mHost
-            port = fromMaybe 9100 mPort
+            port = fromMaybe 4777 mPort
             timeout = fromMaybe 3000 mTimeout
         Tools.liveControl cmd host port mText timeout
 
@@ -63,6 +63,24 @@ handleTool _ctx tool = do
 
       StrongheadRenderGraph p mBase mOut mTheme mTopN -> do
         Tools.renderGraph (T.unpack p) (fmap T.unpack mBase) (fmap T.unpack mOut) (fmap T.unpack mTheme) mTopN
+
+      StrongheadHeapAnatomy tgt mSevClos mSevType mTopN -> do
+        Tools.heapAnatomy (T.unpack tgt) mSevClos mSevType (fromMaybe 10 mTopN)
+
+      StrongheadCriticalPath p mTid mSpan -> do
+        Tools.criticalPathReport (T.unpack p) (fmap fromIntegral mTid) mSpan
+
+      StrongheadCoreSmells dPath mProf mBaseD mBind mTopN -> do
+        Tools.coreSmellsReport (T.unpack dPath) (fmap T.unpack mProf) (fmap T.unpack mBaseD) mBind (fromMaybe 15 mTopN)
+
+      StrongheadLiveStacks mHost mPort mProbes mTimeout -> do
+        Tools.liveStacksReport (fmap T.unpack mHost) mPort (fromMaybe True mProbes) (fromMaybe 3000 mTimeout)
+
+      StrongheadRtsSweep exePath mArgs mGrid -> do
+        Tools.rtsSweepReport (T.unpack exePath) mArgs mGrid
+
+      StrongheadAssertBudget specInput mEv mHp mBase mDump -> do
+        Tools.assertBudgetReport specInput (fmap T.unpack mEv) (fmap T.unpack mHp) (fmap T.unpack mBase) (fmap T.unpack mDump)
 
 -- | Run the MCP server over standard input and output (stdio).
 runServer :: IO ()
@@ -127,6 +145,12 @@ printTools = do
         , ("stronghead_recommend_next_steps", "Prescriptive compiler and RTS flags for leaks, contention, and hot paths")
         , ("stronghead_ghci_eval", "Evaluate thunk trees and bindings in GHCi")
         , ("stronghead_render_graph", "Render publication-quality nano-ui heap graphs and PNG screenshots for issue reports and proof of fixes")
+        , ("stronghead_heap_anatomy", "Compute exact dominators, quotient heap spines, Merkle duplicates, and counterfactual what-if severing")
+        , ("stronghead_critical_path", "Trace causal cross-thread critical path, STW sync stragglers, runnable latency p99, sparks, and non-moving GC")
+        , ("stronghead_core_smells", "Detect runtime-weighted Core/STG optimization smells, static STG closure captures, and semantic Core diffs")
+        , ("stronghead_live_stacks", "Capture live cross-platform CloneStack backtraces and ghc-heap value probes from a running agent")
+        , ("stronghead_rts_sweep", "Sweep RTS flags against a binary and compute the empirical Pareto frontier")
+        , ("stronghead_assert_budget", "Evaluate a declarative .stronghead-spec performance budget against profiling artifacts")
         ]
   forM_ tools $ \(name, desc) -> do
     putStrLn ("* " <> name <> ":")

@@ -33,7 +33,7 @@ import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.List (sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Word (Word32, Word64, Word8)
 import GHC.Clock (getMonotonicTime)
@@ -48,8 +48,9 @@ import GHC.RTS.Events
 import GHC.RTS.Events.Incremental (Decoder (..), decodeEventLog)
 
 import Stronghead.Eventlog.Model
-import Stronghead.Format (readHex, tshow)
+import Stronghead.Format (readDecimal, readHex, tshow)
 import Stronghead.HeapProfile (HeapProfile (..), InfoProv (..), closureTypeKind, fromSamples)
+import Stronghead.Live (percentDecode)
 import Stronghead.Run
 import Stronghead.Source (parseSrcLoc)
 
@@ -119,6 +120,14 @@ data Builder = Builder
   , bTickySums :: !(M.Map Word64 [(Word64, Word64, Word64, Word64)])
     -- ^ Each counter's samples: time, entries, allocation, allocated.
     -- Newest first.
+  , bSparks :: !SparkStats
+  , bHasSparkCounters :: !Bool
+  , bConcOpen :: !(M.Map ConcGCKind Word64)
+  , bConcDone :: ![ConcGCPhase]
+  , bNonmoving :: !NonmovingStats
+  , bMemReturns :: ![MemReturnPoint]
+  , bGCReqs :: ![(Word64, Int)]
+    -- ^ @(time, cap)@ of @RequestParGC@ / @RequestSeqGC@ events.
   , bCount :: !Int
   , bMin :: !Word64
   , bMax :: !Word64
@@ -126,7 +135,30 @@ data Builder = Builder
 
 emptyBuilder :: Builder
 emptyBuilder =
-  Builder IM.empty IM.empty [] [] [] [] [] (HeapB Nothing IM.empty Nothing [] M.empty) [] emptyRunInfo [] M.empty M.empty 0 maxBound 0
+  Builder
+    IM.empty
+    IM.empty
+    []
+    []
+    []
+    []
+    []
+    (HeapB Nothing IM.empty Nothing [] M.empty)
+    []
+    emptyRunInfo
+    []
+    M.empty
+    M.empty
+    emptySparkStats
+    False
+    M.empty
+    []
+    emptyNonmovingStats
+    []
+    []
+    0
+    maxBound
+    0
 
 -- ---------------------------------------------------------------------------
 -- Folding events
@@ -157,6 +189,29 @@ capEvent b c t = \case
           _ -> onThread tid (\tb -> tb {tbFinished = if code == 5 then Just t else tbFinished tb}) b
   StartGC -> onCap (\cb -> (closeOpen t 1 0 cb) {cbOpen = OpenGC t}) b
   EndGC -> onCap (closeOpen t 0 0) b
+  RequestParGC -> b {bGCReqs = (t, c) : bGCReqs b}
+  RequestSeqGC -> b {bGCReqs = (t, c) : bGCReqs b}
+  SparkCounters {sparksCreated, sparksDud, sparksOverflowed, sparksConverted, sparksFizzled, sparksGCd, sparksRemaining} ->
+    b
+      { bSparks =
+          let prev = bSparks b
+           in SparkStats
+                { ssCreated = max (ssCreated prev) sparksCreated
+                , ssDud = max (ssDud prev) sparksDud
+                , ssOverflowed = max (ssOverflowed prev) sparksOverflowed
+                , ssConverted = max (ssConverted prev) sparksConverted
+                , ssFizzled = max (ssFizzled prev) sparksFizzled
+                , ssGCd = max (ssGCd prev) sparksGCd
+                , ssRemaining = sparksRemaining
+                }
+      , bHasSparkCounters = True
+      }
+  SparkCreate -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssCreated = ssCreated (bSparks b) + 1}}
+  SparkDud -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssDud = ssDud (bSparks b) + 1}}
+  SparkOverflow -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssOverflowed = ssOverflowed (bSparks b) + 1}}
+  SparkRun -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssConverted = ssConverted (bSparks b) + 1}}
+  SparkFizzle -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssFizzled = ssFizzled (bSparks b) + 1}}
+  SparkGC -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssGCd = ssGCd (bSparks b) + 1}}
   CreateThread tid -> onThread tid (\tb -> tb {tbCreated = Just t}) b
   ThreadLabel tid lbl -> onThread tid (\tb -> tb {tbLabel = Just lbl}) b
   MigrateThread tid _ -> addPoint pointMigrate tid
@@ -227,8 +282,41 @@ globalEvent b t = \case
   HeapProfSampleCostCentre {heapProfResidency, heapProfStack} -> heap $ \h ->
     let names = [maybe ("cc" <> tshow i) (\cc -> cciModule cc <> "." <> cciLabel cc) (IM.lookup (fromIntegral i) (hbCostCentres h)) | i <- VU.toList heapProfStack]
      in addBand (T.intercalate "/" names) heapProfResidency h
+  MemReturn {current, needed, returned} ->
+    b {bMemReturns = MemReturnPoint t current needed returned : bMemReturns b}
+  ConcMarkBegin -> b {bConcOpen = M.insert ConcMark t (bConcOpen b)}
+  ConcMarkEnd {concMarkedObjectCount} -> closeConc ConcMark concMarkedObjectCount b
+  ConcSyncBegin -> b {bConcOpen = M.insert ConcSync t (bConcOpen b)}
+  ConcSyncEnd -> closeConc ConcSync 0 b
+  ConcSweepBegin -> b {bConcOpen = M.insert ConcSweep t (bConcOpen b)}
+  ConcSweepEnd -> closeConc ConcSweep 0 b
+  ConcUpdRemSetFlush {} ->
+    let nm = bNonmoving b
+     in b {bNonmoving = nm {nmRemSetFlushes = nmRemSetFlushes nm + 1}}
+  NonmovingHeapCensus {nonmovingCensusActiveSegs, nonmovingCensusFilledSegs, nonmovingCensusLiveBlocks} ->
+    let nm = bNonmoving b
+     in b
+          { bNonmoving =
+              nm
+                { nmActiveSegs = fromIntegral nonmovingCensusActiveSegs
+                , nmFilledSegs = fromIntegral nonmovingCensusFilledSegs
+                , nmLiveBlocks = fromIntegral nonmovingCensusLiveBlocks
+                }
+          }
+  NonmovingPrunedSegments {nonmovingPrunedSegments, nonmovingFreeSegments} ->
+    let nm = bNonmoving b
+     in b
+          { bNonmoving =
+              nm
+                { nmPrunedSegments = nmPrunedSegments nm + fromIntegral nonmovingPrunedSegments
+                , nmFreeSegments = fromIntegral nonmovingFreeSegments
+                }
+          }
   _ -> b
   where
+    closeConc k objs bb = case M.lookup k (bConcOpen bb) of
+      Just s | t >= s -> bb {bConcOpen = M.delete k (bConcOpen bb), bConcDone = ConcGCPhase k s t objs : bConcDone bb}
+      _ -> bb {bConcOpen = M.delete k (bConcOpen bb)}
     info k v = b {bInfo = (k, v) : filter ((/= k) . fst) (bInfo b)}
     run f bb = bb {bRun = f (bRun bb)}
     heap f = b {bHeap = f (bHeap b)}
@@ -268,11 +356,11 @@ snapshot b
         , tlCaps = tracks
         , tlCapPoints = V.fromList [VU.fromList (sortOn (\(x, _, _) -> x) (cbPoints cb)) | cb <- caps]
         , tlThreads = M.fromList [(fromIntegral tid, threadInfo end tid tb) | (tid, tb) <- IM.toList threads]
-        , tlGCs = V.fromList (gcClusters (sortOn fst gcSpans) (sortOn (\(GCStat x _ _ _) -> x) (bGCStats b)))
+        , tlGCs = V.fromList gcs
         , tlAlloc = series (bAlloc b)
         , tlLive = series (bLive b)
         , tlHeapSize = series (bSize b)
-        , tlMarkers = V.fromList (sortOn mkTime (bMarkers b))
+        , tlMarkers = V.fromList sortedMarkers
         , tlHeapProfile = heapProfile b start
         , tlInfo = reverse (bInfo b)
         , tlRun = bRun b
@@ -283,6 +371,13 @@ snapshot b
         , tlCodeRuns = mkCodeRuns period nCaps samples
         , tlSampleCounts = IM.fromListWith (+) [(fromIntegral i, 1) | s <- V.toList samples, Just i <- [psStack s VU.!? 0]]
         , tlTicky = V.fromList (sortOn (Down . tcAlloc) ticky)
+        , tlSparks = bSparks b
+        , tlConcGC = V.fromList (sortOn cgpStart (bConcDone b))
+        , tlNonmoving = bNonmoving b
+        , tlMemReturns = V.fromList (sortOn mrTime (bMemReturns b))
+        , tlGCSyncLags = V.fromList (computeGCSyncLags tracks gcs (sortOn fst (bGCReqs b)))
+        , tlUserSpans = V.fromList (extractUserSpans tracks sortedMarkers)
+        , tlAlerts = V.fromList (extractTraceAlerts sortedMarkers)
         , tlEventCount = bCount b
         }
   where
@@ -291,6 +386,8 @@ snapshot b
     nCaps = if IM.null (bCaps b) then 0 else fst (IM.findMax (bCaps b)) + 1
     caps = [IM.findWithDefault emptyCap i (bCaps b) | i <- [0 .. nCaps - 1]]
     tracks = V.fromList [mkTrack (sortOn srStart (reverse (cbSpans (closeOpen end 0 0 cb)))) | cb <- caps]
+    gcs = gcClusters (sortOn fst gcSpans) (sortOn (\(GCStat x _ _ _) -> x) (bGCStats b))
+    sortedMarkers = sortOn mkTime (bMarkers b)
     costCentres = hbCostCentres (bHeap b)
     -- A sample belongs to the thread running on its capability then.
     samples =
@@ -383,6 +480,92 @@ heapProfile b start = case hbDone h of
     h = bHeap b
     ipe label = readHex label >>= (`M.lookup` hbIPE h)
 
+-- | Compute per-collection STW rendezvous lag by finding the earliest GC
+-- request/entry timestamp across capabilities and the latest capability to
+-- enter GC within each collection window, then blaming the thread running on
+-- that slowest capability right before it stopped for GC.
+computeGCSyncLags :: V.Vector Track -> [GCEvent] -> [(Word64, Int)] -> [GCSyncLag]
+computeGCSyncLags tracks gcs reqs =
+  [ GCSyncLag idx (gcStart g) (gcEnd g) lag firstCap lastCap straggler
+  | (idx, g) <- zip [0 :: Int ..] gcs
+  , let capEntries =
+          [ (trStart tr VU.! i, c, stragglerBefore tr i)
+          | (c, tr) <- zip [0 :: Int ..] (V.toList tracks)
+          , Just i <- [firstGCIn tr (gcStart g) (gcEnd g)]
+          ]
+        -- Also include any RequestParGC/RequestSeqGC shortly before gcStart
+        reqWindowStart = if gcStart g > 500000000 then gcStart g - 500000000 else 0
+        earlyReqs = [(t, c) | (t, c) <- reqs, t >= reqWindowStart, t <= gcEnd g]
+  , not (null capEntries)
+  , let (firstEntryT, firstEntryCap, _) = foldl1 (\a@(t1, _, _) b@(t2, _, _) -> if t1 <= t2 then a else b) capEntries
+        (lastEntryT, lastCap, straggler) = foldl1 (\a@(t1, _, _) b@(t2, _, _) -> if t1 >= t2 then a else b) capEntries
+        (firstT, firstCap) = case earlyReqs of
+          (rt, rc) : _ | rt < firstEntryT -> (rt, rc)
+          _ -> (firstEntryT, firstEntryCap)
+        lag = if lastEntryT > firstT then lastEntryT - firstT else 0
+  , lag > 0
+  ]
+  where
+    firstGCIn tr a b =
+      let i0 = firstSpanEndingAfter tr a
+          n = trackLength tr
+          go i
+            | i >= n || trStart tr VU.! i > b = Nothing
+            | trKind tr VU.! i == kindGC && trEnd tr VU.! i >= a = Just i
+            | otherwise = go (i + 1)
+       in go i0
+    stragglerBefore tr i
+      | i > 0 && trKind tr VU.! (i - 1) == kindRun = Just (trThread tr VU.! (i - 1))
+      | otherwise = Nothing
+
+-- | Pair @sh:span:begin@ and @sh:span:end@ markers emitted by
+-- 'Stronghead.Agent.withSpan' into structured waterfall intervals.
+extractUserSpans :: V.Vector Track -> [Marker] -> [UserSpan]
+extractUserSpans tracks markers = sortOn usStart (snd (foldl' step (M.empty, []) markers))
+  where
+    runningAt mCap t = case mCap >>= (tracks V.!?) of
+      Just tr | Just i <- spanIndexAt tr t, trKind tr VU.! i == kindRun -> trThread tr VU.! i
+      _ -> 0
+    step (open, done) m = case T.words (mkText m) of
+      ["sh:span:begin", sidTxt, parentTxt, nameTxt]
+        | Just sid <- readDecimal sidTxt
+        , Just par <- readDecimal parentTxt ->
+            let tid = runningAt (mkCap m) (mkTime m)
+             in (M.insert sid (par, percentDecode nameTxt, tid, mkCap m, mkTime m) open, done)
+      ["sh:span:end", sidTxt, allocTxt, _nameTxt]
+        | Just sid <- readDecimal sidTxt
+        , Just alloc <- readDecimal allocTxt
+        , Just (par, nm, tid, mcap, t0) <- M.lookup sid open ->
+            let tid' = if tid /= 0 then tid else runningAt (mkCap m) (mkTime m)
+                sp = UserSpan sid par nm tid' mcap t0 (max t0 (mkTime m)) alloc
+             in (M.delete sid open, sp : done)
+      _ -> (open, done)
+
+-- | Extract @sh:alloc-spike@ and @sh:exc@ trace alerts from markers.
+extractTraceAlerts :: [Marker] -> [TraceAlert]
+extractTraceAlerts = mapMaybe parseAlert
+  where
+    parseAlert m = case T.words (mkText m) of
+      "sh:alloc-spike" : nameTxt : allocTxt : budgetTxt : rest ->
+        Just
+          ( TraceAlert
+              (mkTime m)
+              (mkCap m)
+              "alloc-spike"
+              (percentDecode nameTxt <> " allocated " <> allocTxt <> " B (budget " <> budgetTxt <> " B)")
+              (T.unwords rest)
+          )
+      "sh:exc" : tyTxt : detailTxt ->
+        Just
+          ( TraceAlert
+              (mkTime m)
+              (mkCap m)
+              "exception"
+              (percentDecode tyTxt)
+              (percentDecode (T.unwords detailTxt))
+          )
+      _ -> Nothing
+
 -- ---------------------------------------------------------------------------
 -- Streaming
 
@@ -462,6 +645,11 @@ forceTimeline tl = do
   V.mapM_ evaluate (tlGCs tl)
   V.mapM_ evaluate (tlMarkers tl)
   V.mapM_ evaluate (tlCodeRuns tl)
+  V.mapM_ evaluate (tlConcGC tl)
+  V.mapM_ evaluate (tlMemReturns tl)
+  V.mapM_ evaluate (tlGCSyncLags tl)
+  V.mapM_ evaluate (tlUserSpans tl)
+  V.mapM_ evaluate (tlAlerts tl)
   _ <- evaluate (IM.size (tlSampleCounts tl))
   mapM_ evaluate (tlThreads tl)
   for_ (tlHeapProfile tl) \hp -> evaluate hp >> V.mapM_ evaluate (hpBands hp) >> evaluate (length (hpSuspects hp)) >> pure ()

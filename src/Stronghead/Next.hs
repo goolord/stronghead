@@ -167,6 +167,12 @@ data Fact
     -- ^ For a range: the last census inside it.
   | FactTopSuspect !Ref
     -- ^ The leading leak suspect of the profile on show.
+  | FactSTWStraggler !Ref !Word64
+    -- ^ Thread that delayed stop-the-world GC rendezvous by this many ns.
+  | FactBiography !Text !Double
+    -- ^ Dominant LDV biography phase (@lag@, @drag@, or @void@) and mean bytes.
+  | FactCoreSmell !Text !Text
+    -- ^ Runtime-weighted Core/STG optimization smell kind and short description.
   deriving stock (Eq, Ord, Show)
 
 -- ---------------------------------------------------------------------------
@@ -216,8 +222,18 @@ nextSteps have ref facts = case ref of
 -- and where to stop.
 leakSteps :: Have -> Ref -> [Fact] -> [Step]
 leakSteps have ref facts =
-  provenance ++ (if suspect then snapshots ++ held ++ breakStep else [])
+  provenance ++ bioSteps ++ (if suspect then snapshots ++ held ++ breakStep else [])
   where
+    bioSteps =
+      [ Step ("Fix " <> phase <> " biography") (bioReason phase bytes) (StepLoad DHeapSource) (bytes > 0)
+      | FactBiography phase bytes <- facts
+      , phase `elem` ["lag", "drag", "void"]
+      ]
+    bioReason phase bytes = case phase of
+      "lag" -> fmtBytesD bytes <> " sits in lag (allocated long before first use): push allocation closer to demand or force thunks eagerly"
+      "drag" -> fmtBytesD bytes <> " sits in drag (retained long after last use): break the outer retainer or drop stale references"
+      "void" -> fmtBytesD bytes <> " is void (allocated and never used): make unused record fields strict or avoid building dead values"
+      _ -> fmtBytesD bytes <> " in " <> phase
     leak = listToMaybe [(s, n) | FactLeak s n <- facts]
     suspect = isJust leak
     strong = maybe False ((>= 0.6) . fst) leak
@@ -350,8 +366,16 @@ bindingSteps have ref _ _ facts = case badges of
 -- | A range: how much was collection, who allocated, and what survived.
 pressureSteps :: Have -> Ref -> [Fact] -> [Step]
 pressureSteps have ref facts =
-  analyse ++ allocators ++ census ++ survival
+  stwSteps ++ analyse ++ allocators ++ census ++ survival
   where
+    stwSteps =
+      [ Step
+          "Inspect GC rendezvous straggler"
+          ("delayed stop-the-world GC sync by " <> fmtNs (fromIntegral lagNs) <> ": often an unsafe FFI call or non-allocating tight loop")
+          (StepGo tRef)
+          (lagNs >= 5000000)
+      | FactSTWStraggler tRef lagNs <- facts
+      ]
     gc = listToMaybe [(s, n) | FactGC s n <- facts]
     heavy = maybe False ((>= 0.15) . fst) gc
     alloc = listToMaybe [(a, l0, l1) | FactAllocation a l0 l1 <- facts]

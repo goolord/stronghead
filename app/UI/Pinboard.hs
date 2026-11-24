@@ -8,6 +8,7 @@
 module UI.Pinboard
   ( pinboardPane
   , pinsReport
+  , pinsDossier
   , pinReport
   ) where
 
@@ -82,4 +83,17 @@ pinReport env p =
 -- | The board as Markdown, with @intro@ lines under the title.
 pinsReport :: Env -> [Text] -> [Pin] -> Text
 pinsReport env intro pins = pinsMarkdown "Stronghead pins" intro (map (pinReport env) pins)
+
+-- | A Post-Mortem Dossier: the pinboard Markdown report enriched with embedded
+-- companion SVG proof graphs (heap residency, before/after diff, flamegraph).
+pinsDossier :: Env -> [Text] -> [(Text, Text)] -> [Pin] -> Text
+pinsDossier env intro images pins =
+  let base = pinsMarkdown "Stronghead Post-Mortem Dossier" intro (map (pinReport env) pins)
+      imgBlock =
+        if null images
+          then ""
+          else
+            "\n## Proof Graphs\n\n"
+              <> T.unlines ["### " <> caption <> "\n\n![" <> caption <> "](" <> relPath <> ")\n" | (caption, relPath) <- images]
+   in base <> imgBlock
 

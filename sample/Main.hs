@@ -23,6 +23,7 @@ import Debug.Trace (traceEventIO, traceMarkerIO)
 import GHC.Clock (getMonotonicTime)
 import GHC.Conc (labelThread)
 import Stronghead.Agent
+import Stronghead.Probe (probeRef)
 import System.Environment (getArgs)
 #ifdef GHC_DEBUG_STUB
 import GHC.Debug.Stub (withGhcDebug, withGhcDebugTCP)
@@ -56,6 +57,8 @@ main = withDebugStub $ withAgent defaultAgentConfig $ do
   shared <- newMVar (0 :: Int)
   leak <- newIORef (0 :: Integer)
   cache <- newIORef M.empty
+  probeRef "leaky-accumulator" leak
+  probeRef "unbounded-cache" cache
   finished <- newEmptyMVar
   let spawn name body = do
         t <- forkIO (untilDeadline body >> putMVar finished ())
@@ -64,9 +67,10 @@ main = withDebugStub $ withAgent defaultAgentConfig $ do
   -- Contended workers: each does its pure work while holding the shared
   -- MVar, so the others queue up behind it.
   forM_ [1 .. 6 :: Int] $ \i -> spawn ("worker-" <> show i) $ \iter -> do
-    modifyMVar_ shared $ \n -> do
-      x <- evaluate (length (show [1 .. 2000 + i * 100 + iter `mod` 7]))
-      pure (n + x `mod` 7)
+    withSpan ("worker-job-" <> show i) $
+      modifyMVar_ shared $ \n -> do
+        x <- evaluate (length (show [1 .. 2000 + i * 100 + iter `mod` 7]))
+        pure (n + x `mod` 7)
     yield
 
   -- The leak: modifyIORef (not modifyIORef') builds (+) thunks forever.
@@ -83,10 +87,12 @@ main = withDebugStub $ withAgent defaultAgentConfig $ do
 
   -- A pure, allocation-heavy CPU burner: lots of short-lived garbage.
   spawn "map-builder" $ \iter ->
-    void (evaluate (M.size (M.fromList [(i, i * iter) | i <- [1 .. 20000 :: Int]])))
+    withAllocGuard "map-builder-burst" (4 * 1024 * 1024) $
+      void (evaluate (M.size (M.fromList [(i, i * iter) | i <- [1 .. 20000 :: Int]])))
 
   forM_ [1 .. seconds] $ \s -> do
     threadDelay 1000000
+    _ <- bumpEra
     traceMarkerIO ("second " <> show s)
     traceEventIO ("tick " <> show s)
 

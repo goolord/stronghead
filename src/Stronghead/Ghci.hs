@@ -29,6 +29,10 @@ module Stronghead.Ghci
   , renderValue
   , valueThunks
   , valueHasThunks
+  , valueThunkCount
+  , ThunkTransition (..)
+  , ValueXRay (..)
+  , diffValueStep
   , candidateLines
   , haskellString
   ) where
@@ -44,6 +48,8 @@ import Data.Bifunctor (first)
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, isUpper)
 import Data.Either (fromRight)
 import Data.Either.Extra (eitherToMaybe)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as M
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Void (Void)
 import System.IO
@@ -451,13 +457,67 @@ valueThunks = \case
 
 -- | Whether any part of a value is unevaluated, named or not.
 valueHasThunks :: Value -> Bool
-valueHasThunks = \case
-  VThunk _ _ -> True
-  VCon _ fs -> any valueHasThunks fs
-  VRecord _ fs -> any (valueHasThunks . snd) fs
-  VList xs t -> any valueHasThunks (xs ++ maybe [] pure t)
-  VTuple xs -> any valueHasThunks xs
-  VAtom _ -> False
+valueHasThunks = (> 0) . valueThunkCount
+
+-- | Total number of unevaluated thunk nodes inside a ':print' 'Value' tree.
+valueThunkCount :: Value -> Int
+valueThunkCount = \case
+  VThunk _ _ -> 1
+  VCon _ fs -> sum (map valueThunkCount fs)
+  VRecord _ fs -> sum (map (valueThunkCount . snd) fs)
+  VList xs t -> sum (map valueThunkCount xs) + maybe 0 valueThunkCount t
+  VTuple xs -> sum (map valueThunkCount xs)
+  VAtom _ -> 0
+
+-- | What happened to a binding's laziness across a debugger step.
+data ThunkTransition
+  = ThunkCollapsed
+    -- ^ Was unevaluated (or had more thunks) and just collapsed into WHNF.
+  | ThunkSpawned
+    -- ^ Newly appeared unevaluated thunk (or gained new thunks).
+  | ThunkAging !Int
+    -- ^ Still unevaluated across @n@ consecutive stops.
+  | ThunkEvaluated
+    -- ^ Fully evaluated with no thunks.
+  deriving stock (Eq, Show)
+
+data ValueXRay = ValueXRay
+  { vxBinding :: !Text
+  , vxTransition :: !ThunkTransition
+  , vxThunkCount :: !Int
+  , vxPrevThunkCount :: !Int
+  }
+  deriving stock (Eq, Show)
+
+-- | Compare previous and current ':print' binding maps, advancing consecutive
+-- unforced-thunk step counters so 'UI.Debugger' can highlight collapsed thunks
+-- (green), newly spawned thunks (amber), and aging unforced thunks (red).
+diffValueStep
+  :: Map Text Value
+  -- ^ Previous stop's values.
+  -> Map Text Value
+  -- ^ Current stop's values.
+  -> Map Text Int
+  -- ^ Previous consecutive-unforced-step ages per binding.
+  -> (Map Text Int, Map Text ValueXRay)
+diffValueStep prevVals curVals prevAges =
+  let step name curVal =
+        let curCnt = valueThunkCount curVal
+            mPrev = M.lookup name prevVals
+            prevCnt = maybe 0 valueThunkCount mPrev
+            prevAge = M.findWithDefault 0 name prevAges
+            (age', trans)
+              | curCnt == 0 && prevCnt > 0 = (0, ThunkCollapsed)
+              | curCnt == 0 = (0, ThunkEvaluated)
+              | curCnt < prevCnt = (1, ThunkCollapsed)
+              | isNothing' mPrev || curCnt > prevCnt = (1, ThunkSpawned)
+              | otherwise = let a = prevAge + 1 in (a, ThunkAging a)
+         in (age', ValueXRay name trans curCnt prevCnt)
+      pairs = M.mapWithKey step curVals
+   in (M.map fst pairs, M.map snd pairs)
+  where
+    isNothing' Nothing = True
+    isNothing' (Just _) = False
 
 -- | Source lines that plausibly hold a breakpoint site: expressions, not
 -- blank lines, comments, imports, pragmas or bare type signatures.

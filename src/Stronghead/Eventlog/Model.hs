@@ -71,6 +71,21 @@ module Stronghead.Eventlog.Model
     -- * Ticky
   , TickyCounter (..)
   , tickyBetween
+    -- * Extended runtime diagnostics (sparks, non-moving GC, MemReturn, STW lag, spans, LDV)
+  , SparkStats (..)
+  , emptySparkStats
+  , ConcGCKind (..)
+  , ConcGCPhase (..)
+  , NonmovingStats (..)
+  , emptyNonmovingStats
+  , MemReturnPoint (..)
+  , GCSyncLag (..)
+  , UserSpan (..)
+  , TraceAlert (..)
+  , RunnableStats (..)
+  , runnableStats
+  , BiographyBreakdown (..)
+  , biographyBreakdown
   ) where
 
 import Data.IntMap.Strict (IntMap)
@@ -92,7 +107,7 @@ import GHC.RTS.Events (ThreadStopStatus (..))
 
 import Stronghead.Clock (partitionPoint)
 import Stronghead.Format (tshow)
-import Stronghead.HeapProfile (HeapProfile (..))
+import Stronghead.HeapProfile (Band (..), HeapProfile (..))
 import Stronghead.Run (RunInfo, emptyRunInfo)
 import Stronghead.Source (SrcLoc)
 
@@ -401,12 +416,55 @@ data Timeline = Timeline
   , tlTicky :: !(V.Vector TickyCounter)
     -- ^ A ticky build's counters (@-ticky@, @+RTS -lT@), most allocation
     -- first.
+  , tlSparks :: !SparkStats
+    -- ^ Parallel Haskell spark conversion, dud, fizzle, GC, and overflow totals.
+  , tlConcGC :: !(V.Vector ConcGCPhase)
+    -- ^ Non-moving GC (@+RTS -xn@) concurrent mark, sync, and sweep phases.
+  , tlNonmoving :: !NonmovingStats
+    -- ^ Non-moving GC segment census and remembered-set flush counts.
+  , tlMemReturns :: !(V.Vector MemReturnPoint)
+    -- ^ OS memory retention vs returned megablocks (@MemReturn@ events).
+  , tlGCSyncLags :: !(V.Vector GCSyncLag)
+    -- ^ Per-collection stop-the-world rendezvous stagger & straggler blame.
+  , tlUserSpans :: !(V.Vector UserSpan)
+    -- ^ Structured @withSpan@ request/phase waterfalls with per-thread allocs.
+  , tlAlerts :: !(V.Vector TraceAlert)
+    -- ^ Structured @sh:alloc-spike@ and @sh:exc@ trace alerts.
   , tlEventCount :: !Int
   }
   deriving stock (Show)
 
 emptyTimeline :: Timeline
-emptyTimeline = Timeline 0 0 V.empty V.empty M.empty V.empty VU.empty VU.empty VU.empty V.empty Nothing [] emptyRunInfo IM.empty M.empty V.empty 0 V.empty IM.empty V.empty 0
+emptyTimeline =
+  Timeline
+    0
+    0
+    V.empty
+    V.empty
+    M.empty
+    V.empty
+    VU.empty
+    VU.empty
+    VU.empty
+    V.empty
+    Nothing
+    []
+    emptyRunInfo
+    IM.empty
+    M.empty
+    V.empty
+    0
+    V.empty
+    IM.empty
+    V.empty
+    emptySparkStats
+    V.empty
+    emptyNonmovingStats
+    V.empty
+    V.empty
+    V.empty
+    V.empty
+    0
 
 -- | A cost centre as the eventlog defines it.
 data CostCentreInfo = CostCentreInfo
@@ -720,3 +778,176 @@ tickyBetween tl a b =
     , let in' = [(e, al) | (t, e, al) <- VU.toList (tcSeries c), t > a, t <= b]
     , any (\(e, al) -> e > 0 || al > 0) in'
     ]
+
+-- ---------------------------------------------------------------------------
+-- Extended runtime diagnostics
+
+-- | Aggregate spark lifecycle statistics for parallel Haskell (@par@ /
+-- @Strategies@ / @Eval@).
+data SparkStats = SparkStats
+  { ssCreated :: !Word64
+  , ssDud :: !Word64
+  , ssOverflowed :: !Word64
+  , ssConverted :: !Word64
+  , ssFizzled :: !Word64
+  , ssGCd :: !Word64
+  , ssRemaining :: !Word64
+  }
+  deriving stock (Eq, Show)
+
+emptySparkStats :: SparkStats
+emptySparkStats = SparkStats 0 0 0 0 0 0 0
+
+data ConcGCKind = ConcMark | ConcSync | ConcSweep
+  deriving stock (Eq, Ord, Show, Enum, Bounded)
+
+-- | One concurrent phase of GHC's non-moving GC (@+RTS -xn@).
+data ConcGCPhase = ConcGCPhase
+  { cgpKind :: !ConcGCKind
+  , cgpStart :: !Word64
+  , cgpEnd :: !Word64
+  , cgpMarkedObjects :: !Word32
+  }
+  deriving stock (Eq, Show)
+
+data NonmovingStats = NonmovingStats
+  { nmRemSetFlushes :: !Int
+  , nmPrunedSegments :: !Word64
+  , nmFreeSegments :: !Word64
+  , nmLiveBlocks :: !Word64
+  , nmActiveSegs :: !Word64
+  , nmFilledSegs :: !Word64
+  }
+  deriving stock (Eq, Show)
+
+emptyNonmovingStats :: NonmovingStats
+emptyNonmovingStats = NonmovingStats 0 0 0 0 0 0
+
+-- | One @MemReturn@ sample (in megablocks, 1 MiB each).
+data MemReturnPoint = MemReturnPoint
+  { mrTime :: !Word64
+  , mrCurrent :: !Word32
+  , mrNeeded :: !Word32
+  , mrReturned :: !Word32
+  }
+  deriving stock (Eq, Show)
+
+-- | Stop-the-world GC rendezvous stagger: the delay between the first
+-- capability pausing/requesting GC and the last capability stopping, plus
+-- the straggler thread that was running on that slowest capability.
+data GCSyncLag = GCSyncLag
+  { slCollection :: !Int
+  , slStart :: !Word64
+  , slEnd :: !Word64
+  , slSyncWaitNs :: !Word64
+  , slFirstCap :: !Int
+  , slLastCap :: !Int
+  , slStragglerThread :: !(Maybe Word32)
+  }
+  deriving stock (Eq, Show)
+
+-- | A paired @withSpan@ request/phase waterfall interval carrying exact
+-- per-thread allocated bytes.
+data UserSpan = UserSpan
+  { usId :: !Word64
+  , usParent :: !Word64
+  , usName :: !Text
+  , usThread :: !Word32
+  , usCap :: !(Maybe Int)
+  , usStart :: !Word64
+  , usEnd :: !Word64
+  , usAllocBytes :: !Word64
+  }
+  deriving stock (Eq, Show)
+
+-- | Structured trace alert emitted by @withAllocGuard@ or @withExceptionTap@.
+data TraceAlert = TraceAlert
+  { taTime :: !Word64
+  , taCap :: !(Maybe Int)
+  , taKind :: !Text
+  , taTitle :: !Text
+  , taDetail :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | Global scheduler runnable-queue latency & work-stealing telemetry.
+data RunnableStats = RunnableStats
+  { rnCount :: !Int
+  , rnTotalNs :: !Word64
+  , rnP50Ns :: !Word64
+  , rnP95Ns :: !Word64
+  , rnP99Ns :: !Word64
+  , rnMaxNs :: !Word64
+  , rnMigrations :: !Int
+  , rnSteals :: !Int
+  }
+  deriving stock (Eq, Show)
+
+-- | Compute runnable-queue wait latency percentiles across all threads.
+runnableStats :: Timeline -> RunnableStats
+runnableStats tl =
+  RunnableStats
+    { rnCount = len
+    , rnTotalNs = sum waits
+    , rnP50Ns = pct 0.50
+    , rnP95Ns = pct 0.95
+    , rnP99Ns = pct 0.99
+    , rnMaxNs = if null waits then 0 else last sorted
+    , rnMigrations = migs
+    , rnSteals = steals
+    }
+  where
+    waits =
+      [ trEnd tr VU.! i - trStart tr VU.! i
+      | ti <- M.elems (tlThreads tl)
+      , let tr = tiTrack ti
+      , i <- [0 .. trackLength tr - 1]
+      , trKind tr VU.! i == kindRunnable
+      , trEnd tr VU.! i > trStart tr VU.! i
+      ]
+    sorted = sort waits
+    len = length sorted
+    pct (q :: Double)
+      | len == 0 = 0
+      | otherwise = fromMaybe 0 (sorted !? min (len - 1) (max 0 (round (fromIntegral (len - 1) * q))))
+    (migs, steals) =
+      V.foldl'
+        ( \(m, s) pts ->
+            VU.foldl'
+              (\(!mm, !ss) (_, k, _) -> (mm + fromEnum (k == pointMigrate), ss + fromEnum (k == pointSteal)))
+              (m, s)
+              pts
+        )
+        (0 :: Int, 0 :: Int)
+        (tlCapPoints tl)
+
+-- | LDV biography breakdown (@+RTS -hb@): Lag (allocated long before first
+-- use), Drag (retained long after last use), Void (never used), Use (active).
+data BiographyBreakdown = BiographyBreakdown
+  { bioLagBytes :: !Double
+  , bioDragBytes :: !Double
+  , bioVoidBytes :: !Double
+  , bioUseBytes :: !Double
+  , bioDominant :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | Interpret a @-hb@ biography heap profile by summing mean residency across
+-- Lag, Drag, Void, and Use bands.
+biographyBreakdown :: HeapProfile -> Maybe BiographyBreakdown
+biographyBreakdown hp
+  | hpBreakdown hp /= "biography" = Nothing
+  | otherwise =
+      let meanOf b =
+            let vs = bandValues b
+                n = VU.length vs
+             in if n == 0 then 0 else VU.sum vs / fromIntegral n
+          findBio k = sum [meanOf b | b <- V.toList (hpBands hp), T.toLower (bandName b) == k]
+          lag = findBio "lag"
+          drag = findBio "drag"
+          void' = findBio "void"
+          use = findBio "use"
+          dominant = fst $ foldl' (\best cur -> if snd cur > snd best then cur else best) ("use", use) [("lag", lag), ("drag", drag), ("void", void')]
+       in if lag + drag + void' + use <= 0
+            then Nothing
+            else Just (BiographyBreakdown lag drag void' use dominant)

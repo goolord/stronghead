@@ -45,6 +45,7 @@ import Stronghead.Clock (stepTime)
 import Stronghead.Diff (Baseline (..), fmtChange)
 import Stronghead.Dump (nameKey)
 import Stronghead.Eventlog
+import Stronghead.Eventlog.CriticalPath
 import Stronghead.Eventlog.Model
 import Stronghead.Format
 import Stronghead.HeapProfile (HeapProfile (..))
@@ -55,6 +56,7 @@ import Stronghead.Run (runKey, runKeysMatch)
 import Stronghead.Source (renderSrcLoc, renderSrcSpan, srcLocSpan)
 import UI.Clock
 import UI.Common
+import UI.Flamegraph (latencyHeatmapView)
 import UI.Link
 import UI.Workspace
 
@@ -101,6 +103,9 @@ data TimelineCached = TimelineCached
   , tlcCodeProfile :: ~CodeProfile
   , tlcTicky :: ~[(TickyCounter, TickyName, Text)]
   , tlcGCStarts :: !(VU.Vector Word64)
+  , tlcRunnable :: ~RunnableStats
+  , tlcGCHeatmap :: ~LatencyHeatmap
+  , tlcRunHeatmap :: ~LatencyHeatmap
   }
 
 newTimelineState :: IO TimelineState
@@ -145,6 +150,9 @@ cachedTimeline st tl = do
               , tlcCodeProfile = codeProfile tl (const True) (tlStart tl) (tlEnd tl)
               , tlcTicky = tickyNames tl
               , tlcGCStarts = VU.fromListN (V.length (tlGCs tl)) [gcStart g | g <- V.toList (tlGCs tl)]
+              , tlcRunnable = runnableStats tl
+              , tlcGCHeatmap = gcPauseHeatmap tl 36 10
+              , tlcRunHeatmap = runnableHeatmap tl 36 10
               }
       writeIORef (tsCached st) (Just (key, c))
       pure c
@@ -1113,6 +1121,11 @@ spanInspector env st tl ref i = do
       rowWith (padTop 4 . tight . gap 6) $ do
         whenM (button "Zoom to slice") (zoomTo st tl (srStart s) (srEnd s))
         scope $ unless (srKind s == kindGC) $ whenM (button "Highlight thread") (writeVar (tsFocusThread st) (Just tid))
+      scope $ when (srKind s /= kindGC && srEnd s > srStart s) $ do
+        let cpr = analyzeCriticalPath tl tid (srStart s) (srEnd s)
+        when (cpBlockerCpuNs cpr > 0 || cpGCNs cpr > 0 || cpRunnableNs cpr > 0) $ do
+          separator
+          criticalPathCard env st tl cpr
       -- What the profiler saw running: on the capability, or wherever the
       -- thread ran.
       scope $ when (hasSamples && (srKind s == kindRun || srKind s == kindGC)) $ do
@@ -1311,6 +1324,107 @@ overview env st tl v = do
     tickyRows env (take 8 [(x, tcEntries c, tcAlloc c) | x@(c, _, _) <- tlcTicky tlc])
   sectionTitle "Program"
   forM_ (tlInfo tl) $ \(k, val) -> kv k (T.take 300 val)
+  scope $ unless (V.null (tlGCs tl)) $ do
+    separator
+    latencyHeatmapView (tlcGCHeatmap tlc)
+  let lags = take 6 (sortOn (Down . slSyncWaitNs) [l | l <- V.toList (tlGCSyncLags tl), slSyncWaitNs l > 0])
+  scope $ unless (null lags) $ do
+    separator
+    sectionTitle "STW rendezvous stragglers"
+    hint "Delay between the first capability pausing for GC and the last capability stopping. High sync wait points to a straggler thread in a tight non-allocating loop or unsafe FFI call."
+    forM_ lags $ \l -> withKey ("lag" <> tshow (slCollection l)) $
+      rowWith (tight . gap 8 . fillW . alignMid) $ do
+        numCell 72 (if slSyncWaitNs l > 5_000_000 then fontTone Danger else id) (fmtNs (fromIntegral (slSyncWaitNs l)))
+        cell (fontMuted . fontSizeScale 0.85) ("cap " <> tshow (slFirstCap l) <> " → " <> tshow (slLastCap l))
+        flex
+        case slStragglerThread l of
+          Just tid -> linkText env (RThread rk tid) (fontSizeScale 0.88) (threadLabel tl tid)
+          Nothing -> labelWith (fontMuted . fontSizeScale 0.85) "unknown straggler"
+  let rns = tlcRunnable tlc
+  scope $ when (rnCount rns > 0) $ do
+    separator
+    sectionTitle "Scheduler runnable latency"
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      fact "p50" (fmtNs (fromIntegral (rnP50Ns rns)))
+      fact "p95" (fmtNs (fromIntegral (rnP95Ns rns)))
+      fact "p99" (fmtNs (fromIntegral (rnP99Ns rns)))
+      fact "max" (fmtNs (fromIntegral (rnMaxNs rns)))
+      fact "migrations" (fmtInt (rnMigrations rns))
+      fact "steals" (fmtInt (rnSteals rns))
+    latencyHeatmapView (tlcRunHeatmap tlc)
+  let sp = tlSparks tl
+  scope $ when (ssCreated sp > 0) $ do
+    separator
+    sectionTitle "Parallel sparks (par / Strategies)"
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      fact "created" (fmtInt (ssCreated sp))
+      fact "converted" (fmtInt (ssConverted sp))
+      fact "fizzled" (fmtInt (ssFizzled sp))
+      fact "dud" (fmtInt (ssDud sp))
+      fact "overflowed" (fmtInt (ssOverflowed sp))
+      fact "GC'd" (fmtInt (ssGCd sp))
+  let conc = tlConcGC tl
+      nm = tlNonmoving tl
+  scope $ when (not (V.null conc) || nmRemSetFlushes nm > 0) $ do
+    separator
+    sectionTitle "Non-moving concurrent GC (+RTS -xn)"
+    let totalConcNs = V.foldl' (\acc p -> acc + (cgpEnd p - cgpStart p)) (0 :: Word64) conc
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      fact "concurrent phases" (fmtInt (V.length conc))
+      fact "concurrent time" (fmtNs (fromIntegral totalConcNs))
+      fact "upd-rem-set flushes" (fmtInt (nmRemSetFlushes nm))
+      fact "pruned segs" (fmtInt (nmPrunedSegments nm))
+      fact "live blocks" (fmtInt (nmLiveBlocks nm))
+  scope $ unless (V.null (tlMemReturns tl)) $ do
+    let latestMr = V.last (tlMemReturns tl)
+    separator
+    sectionTitle "OS memory return (MADV_FREE / MemReturn)"
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      fact "current" (tshow (mrCurrent latestMr) <> " MiB")
+      fact "needed" (tshow (mrNeeded latestMr) <> " MiB")
+      fact "returned" (tshow (mrReturned latestMr) <> " MiB")
+  scope $ unless (V.null (tlUserSpans tl)) $ do
+    let slowest = take 10 (sortOn (\u -> Down (usEnd u - usStart u)) (V.toList (tlUserSpans tl)))
+    separator
+    sectionTitle ("Instrumented spans (" <> fmtInt (V.length (tlUserSpans tl)) <> ")")
+    forM_ slowest $ \u -> withKey ("us" <> tshow (usId u)) $ do
+      picked <- selectableRow False id $ do
+        cell (fillW . fontMono . fontSizeScale 0.88) (usName u)
+        numCell 72 id (fmtNs (fromIntegral (usEnd u - usStart u)))
+        numCell 78 fontMuted (fmtBytes (usAllocBytes u))
+      when picked $ do
+        writeVar (tsFocusThread st) (Just (usThread u))
+        analyseRange env st tl (usStart u) (usEnd u)
+        zoomToRange st tl (usStart u) (usEnd u)
+  scope $ unless (V.null (tlAlerts tl)) $ do
+    separator
+    sectionTitle ("Runtime alerts (" <> fmtInt (V.length (tlAlerts tl)) <> ")")
+    forM_ (take 10 (V.toList (tlAlerts tl))) $ \a -> withKey ("al" <> tshow (taTime a)) $ do
+      picked <- selectableRow False id $ do
+        badge (if taKind a == "exc" then Danger else Warning) (taKind a)
+        cell (fillW . fontSizeScale 0.88) (taTitle a)
+        numCell 76 fontMuted (fmtNs (fromIntegral (taTime a - tlStart tl)))
+      when picked $ do
+        setCursor (envBus env) rk (taTime a)
+        centreOn st tl (taTime a)
+
+criticalPathCard :: Env -> TimelineState -> Timeline -> CriticalPathResult -> NanoUI ()
+criticalPathCard env st tl cpr = do
+  let rk = runKey (tlRun tl)
+      tot = max 1 (fromIntegral (cpEnd cpr - cpStart cpr) :: Double)
+      pctOf ns = fmtPct (fromIntegral ns / tot)
+  sectionTitle ("Causal critical path (" <> threadLabel tl (cpTargetThread cpr) <> ")")
+  rowWith (tight . gap 12 . wrap . fillW) $ do
+    fact "own CPU" (fmtNs (fromIntegral (cpOwnCpuNs cpr)) <> " (" <> pctOf (cpOwnCpuNs cpr) <> ")")
+    fact "blocker CPU" (fmtNs (fromIntegral (cpBlockerCpuNs cpr)) <> " (" <> pctOf (cpBlockerCpuNs cpr) <> ")")
+    fact "STW GC" (fmtNs (fromIntegral (cpGCNs cpr)) <> " (" <> pctOf (cpGCNs cpr) <> ")")
+    fact "runnable wait" (fmtNs (fromIntegral (cpRunnableNs cpr)) <> " (" <> pctOf (cpRunnableNs cpr) <> ")")
+    fact "external/IO" (fmtNs (fromIntegral (cpExternalNs cpr)) <> " (" <> pctOf (cpExternalNs cpr) <> ")")
+  scope $ for_ (cpTopBlocker cpr) $ \(btid, bns, reason) -> do
+    kvLink env "Top blocker" (RThread rk btid) (threadLabel tl btid <> " · " <> fmtNs (fromIntegral bns) <> " (" <> reason <> ")")
+    whenM (buttonWith (padXY 6 0 . tight) "Focus blocker thread") (writeVar (tsFocusThread st) (Just btid))
+  scope $ unless (null (cpCausalEdges cpr)) $
+    labelWith (fontMuted . fontSizeScale 0.82) (tshow (length (cpCausalEdges cpr)) <> " causal wakeup / blackhole hops traced")
 
 -- | Show what happened in a range in the inspector, and make it the range
 -- every time view shades.
@@ -1340,6 +1454,13 @@ rangeInspector env st tl a b = do
   rowWith (padTop 4 . tight . gap 6) $ do
     whenM (button "Zoom to range") (zoomToRange st tl a b)
     whenM (button "Clear range") (writeVar (busRange (envBus env)) Nothing >> writeVar (tsSel st) Nothing)
+  focusTid <- readVar (tsFocusThread st)
+  let cpTid = case focusTid of
+        Just tid -> Just tid
+        Nothing -> fst <$> listToMaybe (rsThreads rs)
+  scope $ for_ cpTid $ \tid -> do
+    separator
+    criticalPathCard env st tl (analyzeCriticalPath tl tid a b)
   sectionTitle "Collections"
   kv "Collections, major" (fmtInt (length (rsCollections rs)) <> ", " <> fmtInt (rsMajor rs))
   kv "Time paused" (fmtNs (fromIntegral (rsPauseTotal rs)) <> "  (" <> fmtPct (fromIntegral (rsPauseTotal rs) / max 1 dur) <> ")")

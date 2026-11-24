@@ -10,10 +10,21 @@ module Stronghead.MCP.Tools
   , eventlogSummary
   , diffRuns
   , retainerPath
+  , formatSnapshotRetainers
   , liveControl
   , recommendNextSteps
   , ghciEval
   , renderGraph
+    -- * MCP v2 diagnostic engines
+  , heapAnatomy
+  , formatHeapAnatomy
+  , criticalPathReport
+  , formatCriticalPath
+  , coreSmellsReport
+  , formatCoreSmells
+  , liveStacksReport
+  , rtsSweepReport
+  , assertBudgetReport
     -- * Helpers
   , loadProfile
   ) where
@@ -22,15 +33,17 @@ import Control.Concurrent (newEmptyMVar, putMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (withAsync)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM, forM_, unless, when)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (sort, sortOn)
 import Data.Map.Strict qualified as M
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Ord (Down (..))
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
+import Data.Word (Word32)
 import Numeric (showFFloat)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.FilePath (takeBaseName, takeDirectory, takeFileName, (</>))
@@ -41,12 +54,45 @@ import UI.Graph
   , renderHpSvg
   )
 
+import Stronghead.Debug
+  ( ClosureNode (..)
+  , DebugTarget (..)
+  , HeapSnapshot (..)
+  , defaultSnapshotOptions
+  , describePath
+  , fmtClosureId
+  , ghcDebugEnabled
+  , nodeTitle
+  , parseHostPort
+  , takeSnapshot
+  )
+import Stronghead.Debug qualified as Dbg
+import Stronghead.Debug.Anatomy
+  ( DominatorTree (..)
+  , DuplicateGroup (..)
+  , HeapSkeleton (..)
+  , SeverResult (..)
+  , SeverTarget (..)
+  , SpineFinding (..)
+  , auditDuplicates
+  , buildHeapSkeleton
+  , computeDominators
+  , simulateSever
+  )
 import Stronghead.Diff
   ( BandChange (..)
   , BandFigures (..)
   , BandStatus (..)
+  , BindingChange (..)
+  , CostChange (..)
+  , diffBindings
+  , diffCosts
   , diffHeap
+  , fmtChange
+  , loadBindingSummaries
   )
+import Stronghead.Join (CostTotal (..), costTotals)
+import Stronghead.Prof (ProfFile (..), loadProf)
 import Stronghead.Dump
   ( Binding (..)
   , CodeFile (..)
@@ -58,15 +104,39 @@ import Stronghead.Dump
   , loadCodeFile
   , nameKey
   )
+import Stronghead.Dump.Forensics qualified as Forensics
 import Stronghead.Eventlog (loadEventlog)
+import Stronghead.Eventlog.CriticalPath
+  ( CriticalPathResult (..)
+  , analyzeCriticalPath
+  , analyzeSpanCriticalPath
+  )
 import Stronghead.Eventlog.Model
   ( GCEvent (..)
+  , GCSyncLag (..)
   , Marker (..)
+  , MemReturnPoint (..)
+  , NonmovingStats (..)
+  , RunnableStats (..)
+  , SparkStats (..)
   , Summary (..)
   , ThreadInfo (..)
   , Timeline (..)
+  , TraceAlert (..)
+  , UserSpan (..)
+  , runnableStats
   , stopName
   , summarize
+  , threadName
+  )
+import Stronghead.Lab
+  ( SweepConfig (..)
+  , defaultSweepGrid
+  , evaluateBudget
+  , formatBudgetMarkdown
+  , parseBudgetSpec
+  , renderParetoMarkdown
+  , runRtsSweep
   )
 import Stronghead.Format
   ( fmtBytes
@@ -76,6 +146,7 @@ import Stronghead.Format
   , fmtNs
   , fmtPct
   , fmtSec
+  , readHex
   , tshow
   )
 import Stronghead.Ghci qualified as Ghci
@@ -120,12 +191,17 @@ import Stronghead.Markdown
   , whenJust
   )
 import Stronghead.Live
-  ( Command (..)
+  ( AgentBeacon (..)
+  , Command (..)
   , Frame (..)
   , LiveEvent (..)
+  , LiveFrameEntry (..)
+  , LiveProbeNode (..)
   , LiveThread (..)
+  , LiveThreadStack (..)
   , Reply (..)
   , connectLive
+  , discoverAgents
   , sendCommand
   , stat
   )
@@ -518,78 +594,188 @@ formatRuntimeAdviceMD sm threads = do
 -- 4. Diff Runs
 
 diffRuns :: FilePath -> FilePath -> Maybe FilePath -> Maybe FilePath -> IO (Either Text Text)
-diffRuns basePath curPath _mBaseDumps _mCurDumps = do
-  rBase <- loadProfile basePath
-  rCur <- loadProfile curPath
-  case (rBase, rCur) of
-    (Left e, _) -> pure (Left ("Failed to load baseline: " <> T.pack e))
-    (_, Left e) -> pure (Left ("Failed to load current: " <> T.pack e))
-    (Right bHp, Right cHp) -> pure (Right (formatRunDiff bHp cHp basePath curPath))
+diffRuns basePath curPath mBaseDumps mCurDumps = do
+  let isEventlog p = ".eventlog" `T.isSuffixOf` T.pack p
+      isProf p = ".prof" `T.isSuffixOf` T.pack p
+  mBindingDiff <- case (mBaseDumps, mCurDumps) of
+    (Just bd, Just cd) -> do
+      bOk <- doesDirectoryExist bd
+      cOk <- doesDirectoryExist cd
+      if bOk && cOk
+        then do
+          bs <- loadBindingSummaries bd
+          cs <- loadBindingSummaries cd
+          pure (Just (diffBindings bs cs))
+        else pure Nothing
+    _ -> pure Nothing
+  if isProf basePath && isProf curPath
+    then do
+      rBase <- loadProf basePath
+      rCur <- loadProf curPath
+      case (rBase, rCur) of
+        (Left e, _) -> pure (Left ("Failed to load baseline .prof: " <> T.pack e))
+        (_, Left e) -> pure (Left ("Failed to load current .prof: " <> T.pack e))
+        (Right bp, Right cp) ->
+          pure (Right (formatMultiRunDiff Nothing Nothing (Just (diffCosts (costTotals (pfRoots bp)) (costTotals (pfRoots cp)))) mBindingDiff basePath curPath))
+    else
+      if isEventlog basePath && isEventlog curPath
+        then do
+          rBase <- loadEventlog basePath
+          rCur <- loadEventlog curPath
+          case (rBase, rCur) of
+            (Left e, _) -> pure (Left ("Failed to load baseline eventlog: " <> T.pack e))
+            (_, Left e) -> pure (Left ("Failed to load current eventlog: " <> T.pack e))
+            (Right bTl, Right cTl) ->
+              let mHpPair = (,) <$> tlHeapProfile bTl <*> tlHeapProfile cTl
+               in pure (Right (formatMultiRunDiff (Just (bTl, cTl)) mHpPair Nothing mBindingDiff basePath curPath))
+        else do
+          rBase <- loadProfile basePath
+          rCur <- loadProfile curPath
+          case (rBase, rCur) of
+            (Left e, _) -> pure (Left ("Failed to load baseline: " <> T.pack e))
+            (_, Left e) -> pure (Left ("Failed to load current: " <> T.pack e))
+            (Right bHp, Right cHp) ->
+              pure (Right (formatMultiRunDiff Nothing (Just (bHp, cHp)) Nothing mBindingDiff basePath curPath))
 
-formatRunDiff :: HeapProfile -> HeapProfile -> FilePath -> FilePath -> Text
-formatRunDiff bHp cHp basePath curPath = renderMD do
+formatMultiRunDiff
+  :: Maybe (Timeline, Timeline)
+  -> Maybe (HeapProfile, HeapProfile)
+  -> Maybe [CostChange]
+  -> Maybe [BindingChange]
+  -> FilePath
+  -> FilePath
+  -> Text
+formatMultiRunDiff mTimelines mHeaps mCosts mBindings basePath curPath = renderMD do
   h1 "Stronghead Profiling Run Comparison"
   fieldCode "Baseline (Run A)" (T.pack (takeFileName basePath))
   fieldCode "Current  (Run B)" (T.pack (takeFileName curPath))
 
-  h2 "Overall Metric Deltas"
-  tableAligned
-    [ (AlignLeft, "Metric")
-    , (AlignRight, "Baseline")
-    , (AlignRight, "Current")
-    , (AlignRight, "Delta")
-    , (AlignCenter, "Status")
-    ]
-    [ [ bold "Peak Residency"
-      , fmtBytesD bPeak
-      , fmtBytesD cPeak
-      , bold ((if peakDelta <= 0 then "" else "+") <> fmtBytesD peakDelta <> " (" <> fmtPct peakPctDelta <> ")")
-      , verdictBadge peakPctDelta
+  forM_ mTimelines \(bTl, cTl) -> do
+    let bSm = summarize bTl
+        cSm = summarize cTl
+        bP99 = gcPausePercentile 0.99 (tlGCs bTl)
+        cP99 = gcPausePercentile 0.99 (tlGCs cTl)
+    h2 "Eventlog Runtime Deltas"
+    tableAligned
+      [ (AlignLeft, "Metric")
+      , (AlignRight, "Baseline")
+      , (AlignRight, "Current")
+      , (AlignRight, "Change")
       ]
-    ]
-  hr
-
-  h2 "Heap Band Status Diffs"
-  tableAligned
-    [ (AlignLeft, "Band Name")
-    , (AlignRight, "Baseline Peak")
-    , (AlignRight, "Current Peak")
-    , (AlignRight, "Delta")
-    , (AlignCenter, "Change Status")
-    ]
-    [ [ code (bandTitle ch)
-      , maybe "-" (fmtBytesD . bfPeak) (bcBase ch)
-      , maybe "-" (fmtBytesD . bfPeak) (bcCur ch)
-      , fmtBytesD delta
-      , bold (statusTitle (bcStatus ch))
+      [ ["Duration", fmtSec (smDuration bSm), fmtSec (smDuration cSm), fmtChange (smDuration bSm) (smDuration cSm)]
+      , ["GC CPU Share", fmtPct (smGCFrac bSm), fmtPct (smGCFrac cSm), fmtChange (smGCFrac bSm) (smGCFrac cSm)]
+      , ["GC Collections", fmtInt (smGCCount bSm) <> " (" <> fmtInt (smMajorGCs bSm) <> " major)", fmtInt (smGCCount cSm) <> " (" <> fmtInt (smMajorGCs cSm) <> " major)", fmtChange (fromIntegral (smGCCount bSm)) (fromIntegral (smGCCount cSm))]
+      , ["GC Pause p99", fmtNs bP99, fmtNs cP99, fmtChange bP99 cP99]
+      , ["Max GC Pause", fmtNs (smGCPauseMax bSm), fmtNs (smGCPauseMax cSm), fmtChange (smGCPauseMax bSm) (smGCPauseMax cSm)]
+      , ["Total Allocated", fmtBytes (smAllocated bSm), fmtBytes (smAllocated cSm), fmtChange (fromIntegral (smAllocated bSm)) (fromIntegral (smAllocated cSm))]
+      , ["Peak Live Residency", fmtBytes (smPeakLive bSm), fmtBytes (smPeakLive cSm), fmtChange (fromIntegral (smPeakLive bSm)) (fromIntegral (smPeakLive cSm))]
       ]
-    | ch <- take 15 changes
-    , let bVal = maybe 0 bfPeak (bcBase ch)
-          cVal = maybe 0 bfPeak (bcCur ch)
-          delta = cVal - bVal
-    ]
+    hr
 
-  h2 "Empirical Optimization Verdict"
-  if
-    | peakPctDelta <= -0.10 ->
-        tip "VERIFIED OPTIMIZATION"
-          [ "Peak residency decreased by " <> fmtPct (negate peakPctDelta) <> "."
-          , "Any space leaks present in baseline were significantly reduced or eliminated."
+  forM_ mHeaps \(bHp, cHp) -> do
+    let bPeak = if VU.null (hpTotals bHp) then 0 else VU.maximum (hpTotals bHp)
+        cPeak = if VU.null (hpTotals cHp) then 0 else VU.maximum (hpTotals cHp)
+        peakDelta = cPeak - bPeak
+        peakPctDelta = if bPeak > 0 then peakDelta / bPeak else 0
+        changes = diffHeap bHp cHp
+    h2 "Overall Metric Deltas"
+    tableAligned
+      [ (AlignLeft, "Metric")
+      , (AlignRight, "Baseline")
+      , (AlignRight, "Current")
+      , (AlignRight, "Delta")
+      , (AlignCenter, "Status")
+      ]
+      [ [ bold "Peak Residency"
+        , fmtBytesD bPeak
+        , fmtBytesD cPeak
+        , bold ((if peakDelta <= 0 then "" else "+") <> fmtBytesD peakDelta <> " (" <> fmtPct peakPctDelta <> ")")
+        , verdictBadge peakPctDelta
+        ]
+      ]
+    hr
+
+    h2 "Heap Band Status Diffs"
+    tableAligned
+      [ (AlignLeft, "Band Name")
+      , (AlignRight, "Baseline Peak")
+      , (AlignRight, "Current Peak")
+      , (AlignRight, "Delta")
+      , (AlignCenter, "Change Status")
+      ]
+      [ [ code (bandTitle ch)
+        , maybe "-" (fmtBytesD . bfPeak) (bcBase ch)
+        , maybe "-" (fmtBytesD . bfPeak) (bcCur ch)
+        , fmtBytesD delta
+        , bold (statusTitle (bcStatus ch))
+        ]
+      | ch <- take 15 changes
+      , let bVal = maybe 0 bfPeak (bcBase ch)
+            cVal = maybe 0 bfPeak (bcCur ch)
+            delta = cVal - bVal
+      ]
+
+    h2 "Empirical Optimization Verdict"
+    if
+      | peakPctDelta <= -0.10 ->
+          tip "VERIFIED OPTIMIZATION"
+            [ "Peak residency decreased by " <> fmtPct (negate peakPctDelta) <> "."
+            , "Any space leaks present in baseline were significantly reduced or eliminated."
+            ]
+      | peakPctDelta >= 0.10 ->
+          warning "REGRESSION DETECTED"
+            [ "Peak residency increased by " <> fmtPct peakPctDelta <> "."
+            , "Investigate newly grown bands above."
+            ]
+      | otherwise ->
+          note "NO SIGNIFICANT RESIDENCY DELTA"
+            [ "Peak residency remained within +/- 10% of baseline." ]
+
+  forM_ mCosts \changes -> do
+    h2 "Cost-Centre Deltas (.prof)"
+    if null changes
+      then para "No cost-centre changes detected."
+      else
+        tableAligned
+          [ (AlignLeft, "Cost Centre")
+          , (AlignRight, "Base Time %")
+          , (AlignRight, "Cur Time %")
+          , (AlignRight, "Base Alloc %")
+          , (AlignRight, "Cur Alloc %")
           ]
-    | peakPctDelta >= 0.10 ->
-        warning "REGRESSION DETECTED"
-          [ "Peak residency increased by " <> fmtPct peakPctDelta <> "."
-          , "Investigate newly grown bands above."
+          [ [ code (cgModule ch <> "." <> cgName ch)
+            , maybe "-" (fmtFixed 1 . ctInhTime) (cgBase ch)
+            , maybe "-" (fmtFixed 1 . ctInhTime) (cgCur ch)
+            , maybe "-" (fmtFixed 1 . ctInhAlloc) (cgBase ch)
+            , maybe "-" (fmtFixed 1 . ctInhAlloc) (cgCur ch)
+            ]
+          | ch <- take 20 changes
           ]
-    | otherwise ->
-        note "NO SIGNIFICANT RESIDENCY DELTA"
-          [ "Peak residency remained within +/- 10% of baseline." ]
+
+  forM_ mBindings \changes -> do
+    h2 "Core & STG Binding Diffs"
+    if null changes
+      then para "No Core/STG optimization changes detected between dump directories."
+      else
+        tableAligned
+          [ (AlignLeft, "Module")
+          , (AlignLeft, "Binding")
+          , (AlignLeft, "Changes")
+          ]
+          [ [ code (bgModule ch)
+            , code (bgKey ch)
+            , T.intercalate "; " (bgChanges ch)
+            ]
+          | ch <- take 25 changes
+          ]
   where
-    bPeak = if VU.null (hpTotals bHp) then 0 else VU.maximum (hpTotals bHp)
-    cPeak = if VU.null (hpTotals cHp) then 0 else VU.maximum (hpTotals cHp)
-    peakDelta = cPeak - bPeak
-    peakPctDelta = if bPeak > 0 then peakDelta / bPeak else 0
-    changes = diffHeap bHp cHp
+    gcPausePercentile :: Double -> V.Vector GCEvent -> Double
+    gcPausePercentile q gcs
+      | V.null gcs = 0
+      | otherwise =
+          let pauses = sort [fromIntegral (gcEnd g - gcStart g) :: Double | g <- V.toList gcs, gcEnd g >= gcStart g]
+              len = length pauses
+           in if len == 0 then 0 else pauses !! min (len - 1) (max 0 (round (fromIntegral (len - 1) * q)))
 
     verdictBadge pct
       | pct <= -0.20 = "GREATLY IMPROVED"
@@ -615,16 +801,81 @@ formatRunDiff bHp cHp basePath curPath = renderMD do
 retainerPath :: Maybe Text -> Maybe Text -> Maybe FilePath -> IO Text
 retainerPath mAddr mBand mTarget = do
   case mTarget of
-    Just targetPath -> do
-      isFile <- doesFileExist targetPath
-      if isFile
-        then pure ("Loaded snapshot '" <> T.pack targetPath <> "'. Retainer path analysis ready.")
-        else pure (guidanceGhcDebug mAddr mBand)
-    Nothing -> pure (guidanceGhcDebug mAddr mBand)
+    Nothing -> pure (guidanceGhcDebug mAddr mBand Nothing)
+    Just targetStr
+      | not ghcDebugEnabled ->
+          pure (guidanceGhcDebug mAddr mBand (Just "This build of Stronghead has no `ghc-debug` support enabled. Rebuild with `cabal build -f ghc-debug`."))
+      | otherwise -> do
+          isFile <- doesFileExist targetStr
+          let dbgTarget
+                | isFile = DebugSnapshotFile targetStr
+                | Just (h, p) <- parseHostPort (T.pack targetStr) = DebugTCP h p
+                | otherwise = DebugUnix targetStr
+          res <- takeSnapshot defaultSnapshotOptions dbgTarget
+          case res of
+            Left err -> pure (guidanceGhcDebug mAddr mBand (Just ("Snapshot failed for `" <> T.pack targetStr <> "`: " <> T.pack err)))
+            Right snap -> pure (formatSnapshotRetainers mAddr mBand snap)
 
-guidanceGhcDebug :: Maybe Text -> Maybe Text -> Text
-guidanceGhcDebug mAddr mBand =
+-- | Pure retainer-path formatter over a 'HeapSnapshot', selecting closures by
+-- hex address, band/type/name substring, or top held closures when unspecified.
+formatSnapshotRetainers :: Maybe Text -> Maybe Text -> HeapSnapshot -> Text
+formatSnapshotRetainers mAddr mBand snap = renderMD do
+  h1 "Stronghead Retainer Path Analysis"
+  fieldCode "Snapshot" (snapLabel snap)
+  field "Reachable Closures" (fmtInt (M.size (snapNodes snap)))
+  field "Total Snapshot Bytes" (fmtBytes (fromIntegral (snapBytes snap)))
+  when (snapTruncated snap) do
+    warning "Snapshot Truncated" ["Closure traversal reached the configured closure cap; some deep retainers may be omitted."]
+  hr
+  case targets of
+    [] -> do
+      para "No matching closures found in snapshot."
+      whenJust mAddr \a -> fieldCode "Requested Address" a
+      whenJust mBand \b -> fieldCode "Requested Band" b
+    matches -> do
+      h2 ("Retainer Chains (" <> tshow (length matches) <> " matched)")
+      forM_ matches \cid -> do
+        let path = Dbg.retainerPath snap cid
+            heldBytes = M.findWithDefault 0 cid (snapHeld snap)
+            mNode = M.lookup cid (snapNodes snap)
+            title = maybe (fmtClosureId cid) nodeTitle mNode
+        h3 (title <> " (" <> code (fmtClosureId cid) <> ")")
+        field "Subtree Held" (fmtBytes (fromIntegral heldBytes))
+        field "Summary" (describePath path)
+        codeBlock_ (renderChain path)
+  where
+    targets = case mAddr >>= readHex of
+      Just cid | M.member cid (snapNodes snap) -> [cid]
+      _ -> case mBand of
+        Just b
+          | not (T.null (T.strip b)) ->
+              let q = T.toLower (T.strip b)
+                  matched =
+                    [ cnId n
+                    | n <- M.elems (snapNodes snap)
+                    , q `T.isInfixOf` T.toLower (cnName n)
+                        || q `T.isInfixOf` T.toLower (cnType n)
+                        || maybe False (T.isInfixOf q . T.toLower) (cnSource n)
+                    ]
+               in take 5 (sortOn (\i -> Down (M.findWithDefault 0 i (snapHeld snap))) matched)
+        _ -> take 5 (snapBiggest snap)
+
+    renderChain [] = "(not reachable from GC roots)"
+    renderChain nodes =
+      T.unlines
+        [ T.replicate (idx * 2) " "
+            <> (if idx == 0 then "Root " else "└─ ")
+            <> "[" <> cnType n <> "] "
+            <> cnName n
+            <> maybe "" (\s -> " (" <> s <> ")") (cnSource n)
+            <> "  (" <> fmtClosureId (cnId n) <> ", " <> fmtBytes (fromIntegral (cnSize n)) <> ")"
+        | (idx, n) <- zip [0 :: Int ..] nodes
+        ]
+
+guidanceGhcDebug :: Maybe Text -> Maybe Text -> Maybe Text -> Text
+guidanceGhcDebug mAddr mBand mNote =
   let target = fromMaybe "unspecified" (mAddr <> fmap (\b -> " (band: " <> b <> ")") mBand)
+      noteBlock = maybe "" (\n -> "\n> **Note:** " <> n <> "\n") mNote
    in T.concat
         [ """
           # Stronghead Retainer Path Analysis (`ghc-debug`)
@@ -632,6 +883,7 @@ guidanceGhcDebug mAddr mBand =
           **Target Closure:** 
           """
         , target
+        , noteBlock
         , """
 
 
@@ -683,7 +935,8 @@ liveControl cmdStr host port mText timeoutMs = do
       "mark" -> Right (CmdMark (fromMaybe "mark" txt))
       "flush" -> Right CmdFlush
       "get_stats" -> Right CmdFlush
-      _ -> Left ("Unknown live command: " <> s <> ". Must be one of: gc, census, heap_profiling_on, heap_profiling_off, mark, flush, get_stats")
+      "era_bump" -> Right CmdEraBump
+      _ -> Left ("Unknown live command: " <> s <> ". Must be one of: gc, census, heap_profiling_on, heap_profiling_off, mark, flush, get_stats, era_bump")
 
 sendLiveCommand :: String -> Int -> Command -> Int -> IO (Either Text (Reply, Maybe Frame))
 sendLiveCommand host port cmd timeoutMs = do
@@ -929,3 +1182,392 @@ renderGraph hpPath mBaseline mOutPath mTheme mTopN = do
                         <> "Generated bespoke publication-quality SVG heap graph for issue reporting:\n\n"
                         <> "![" <> T.pack (takeFileName outSvg) <> "](" <> T.pack outSvg <> ")\n\n"
                         <> diffTable
+
+-- ---------------------------------------------------------------------------
+-- 10. Topological Heap Anatomy & Counterfactual What-If Severing
+
+heapAnatomy :: String -> Maybe Text -> Maybe Text -> Int -> IO (Either Text Text)
+heapAnatomy rawTarget mSevClos mSevType topN = do
+  if not ghcDebugEnabled
+    then pure (Left "Stronghead was built without ghc-debug support (-f ghc-debug).")
+    else do
+      isFile <- doesFileExist rawTarget
+      let dbgTarget
+            | isFile = DebugSnapshotFile rawTarget
+            | Just (h, p) <- parseHostPort (T.pack rawTarget) = DebugTCP h p
+            | otherwise = DebugUnix rawTarget
+      res <- takeSnapshot defaultSnapshotOptions dbgTarget
+      pure case res of
+        Left err -> Left ("Failed to take/load heap snapshot: " <> T.pack err)
+        Right snap -> Right (formatHeapAnatomy snap mSevClos mSevType topN)
+
+formatHeapAnatomy :: HeapSnapshot -> Maybe Text -> Maybe Text -> Int -> Text
+formatHeapAnatomy snap mSevClos mSevType topN =
+  let dt = computeDominators snap
+      skel = buildHeapSkeleton snap dt
+      dups = auditDuplicates snap
+      mSever = case (mSevClos >>= readHex, mSevType) of
+        (Just cid, _) -> Just (simulateSever snap (SeverClosure cid))
+        (Nothing, Just ty) | not (T.null (T.strip ty)) -> Just (simulateSever snap (SeverType (T.strip ty)))
+        _ -> Nothing
+   in renderMD do
+        h1 ("Stronghead Topological Heap Anatomy: " <> snapLabel snap)
+        field "Reachable Closures" (fmtInt (M.size (snapNodes snap)))
+        field "Total Bytes" (fmtBytes (fromIntegral (snapBytes snap)))
+        field "GC Roots" (fmtInt (length (snapRoots snap)))
+        whenJust mSever \sr -> do
+          h2 "Counterfactual What-If Severing Result"
+          field "Before" (fmtBytes (fromIntegral (srBeforeBytes sr)))
+          field "After" (fmtBytes (fromIntegral (srAfterBytes sr)))
+          field "Freed" (bold (fmtBytes (fromIntegral (srFreedBytes sr))) <> " (" <> fmtPct (srFreedFraction sr) <> ", " <> fmtInt (srFreedClosures sr) <> " closures)")
+          unless (null (srTopFreed sr)) $
+            tableAligned
+              [(AlignLeft, "Freed Closure"), (AlignRight, "Count"), (AlignRight, "Bytes")]
+              [[code nm, fmtInt cnt, fmtBytes (fromIntegral b)] | (nm, cnt, b) <- take topN (srTopFreed sr)]
+        h2 ("Folded Quotient Spines (" <> tshow (length (hsSpines skel)) <> ")")
+        if null (hsSpines skel)
+          then para "No homogeneous thunk or list spines detected."
+          else
+            tableAligned
+              [(AlignLeft, "Spine"), (AlignLeft, "Type"), (AlignRight, "Depth"), (AlignRight, "Retained"), (AlignLeft, "Anchor")]
+              [ [ code (spName sp)
+                , code (spType sp)
+                , tshow (spDepth sp)
+                , fmtBytes (fromIntegral (spRetainedBytes sp))
+                , fromMaybe "-" (spAnchor sp)
+                ]
+              | sp <- take topN (hsSpines skel)
+              ]
+        h2 ("Top Exact Dominators (Top " <> tshow topN <> ")")
+        tableAligned
+          [(AlignLeft, "Address"), (AlignLeft, "Closure"), (AlignLeft, "Type"), (AlignRight, "Exclusively Retained")]
+          [ [ code (fmtClosureId cid)
+            , maybe (fmtClosureId cid) nodeTitle (M.lookup cid (snapNodes snap))
+            , maybe "-" cnType (M.lookup cid (snapNodes snap))
+            , fmtBytes (fromIntegral retB)
+            ]
+          | (cid, retB) <- take topN (dtTopDominators dt)
+          ]
+        h2 ("Merkle Structural Duplicate Waste (" <> tshow (length dups) <> " groups)")
+        if null dups
+          then para "No duplicated identical immutable sub-DAGs detected."
+          else
+            tableAligned
+              [(AlignLeft, "Closure"), (AlignLeft, "Type"), (AlignRight, "Copies"), (AlignRight, "Reclaimable Waste")]
+              [ [ code (dgName dg)
+                , code (dgType dg)
+                , fmtInt (dgCount dg)
+                , fmtBytes (fromIntegral (dgWasteBytes dg))
+                ]
+              | dg <- take topN dups
+              ]
+
+-- ---------------------------------------------------------------------------
+-- 11. Causal Critical Path & Extended Eventlog Diagnostics
+
+criticalPathReport :: FilePath -> Maybe Word32 -> Maybe Text -> IO (Either Text Text)
+criticalPathReport evPath mTid mSpanName = do
+  eTl <- loadEventlog evPath
+  pure case eTl of
+    Left err -> Left ("Failed to load eventlog: " <> T.pack err)
+    Right tl -> Right (formatCriticalPath evPath tl mTid mSpanName)
+
+formatCriticalPath :: FilePath -> Timeline -> Maybe Word32 -> Maybe Text -> Text
+formatCriticalPath evPath tl mTid mSpanName =
+  let rns = runnableStats tl
+      sp = tlSparks tl
+      conc = tlConcGC tl
+      nm = tlNonmoving tl
+      lags = take 8 (sortOn (Down . slSyncWaitNs) [l | l <- V.toList (tlGCSyncLags tl), slSyncWaitNs l > 0])
+      mTargetSpan = case mSpanName of
+        Just q ->
+          let ql = T.toLower (T.strip q)
+              matched = sortOn (\u -> Down (usEnd u - usStart u)) [u | u <- V.toList (tlUserSpans tl), ql `T.isInfixOf` T.toLower (usName u)]
+           in listToMaybe matched
+        Nothing ->
+          listToMaybe (sortOn (\u -> Down (usEnd u - usStart u)) (V.toList (tlUserSpans tl)))
+      mCpr = case (mTid, mTargetSpan) of
+        (Just tid, _) -> Just ("Thread " <> tshow tid, analyzeCriticalPath tl tid (tlStart tl) (tlEnd tl))
+        (Nothing, Just u) -> Just ("Span " <> usName u, analyzeSpanCriticalPath tl u)
+        (Nothing, Nothing) ->
+          case sortOn (Down . tiRunTime) (M.elems (tlThreads tl)) of
+            ti : _ -> Just (threadName ti, analyzeCriticalPath tl (tiId ti) (tlStart tl) (tlEnd tl))
+            [] -> Nothing
+   in renderMD do
+        h1 ("Stronghead Causal Critical Path & Runtime Diagnostics: " <> T.pack (takeFileName evPath))
+        whenJust mCpr \(lbl, cpr) -> do
+          let tot = max 1 (fromIntegral (cpEnd cpr - cpStart cpr) :: Double)
+              pctOf ns = fmtPct (fromIntegral ns / tot)
+          h2 ("Critical Path Attribution: " <> lbl)
+          field "Window" (fmtNs (fromIntegral (cpEnd cpr - cpStart cpr)))
+          field "Own CPU" (fmtNs (fromIntegral (cpOwnCpuNs cpr)) <> " (" <> pctOf (cpOwnCpuNs cpr) <> ")")
+          field "Blocker CPU" (fmtNs (fromIntegral (cpBlockerCpuNs cpr)) <> " (" <> pctOf (cpBlockerCpuNs cpr) <> ")")
+          field "STW GC" (fmtNs (fromIntegral (cpGCNs cpr)) <> " (" <> pctOf (cpGCNs cpr) <> ")")
+          field "Runnable Queue Wait" (fmtNs (fromIntegral (cpRunnableNs cpr)) <> " (" <> pctOf (cpRunnableNs cpr) <> ")")
+          field "External / IO Wait" (fmtNs (fromIntegral (cpExternalNs cpr)) <> " (" <> pctOf (cpExternalNs cpr) <> ")")
+          field "Causal Wakeup/Blackhole Hops" (tshow (length (cpCausalEdges cpr)))
+          whenJust (cpTopBlocker cpr) \(btid, bns, reason) ->
+            field "Top Blocker Thread" (bold ("Thread " <> tshow btid) <> " (" <> fmtNs (fromIntegral bns) <> " via " <> reason <> ")")
+        unless (null lags) $ do
+          h2 "STW Rendezvous Stragglers"
+          tableAligned
+            [(AlignRight, "GC #"), (AlignRight, "Sync Wait"), (AlignLeft, "Caps"), (AlignLeft, "Straggler Thread")]
+            [ [ tshow (slCollection l)
+              , fmtNs (fromIntegral (slSyncWaitNs l))
+              , tshow (slFirstCap l) <> " -> " <> tshow (slLastCap l)
+              , maybe "unknown" (\t -> "Thread " <> tshow t) (slStragglerThread l)
+              ]
+            | l <- lags
+            ]
+        when (rnCount rns > 0) $ do
+          h2 "Scheduler Runnable Latency"
+          field "p50 / p95 / p99 / max" (fmtNs (fromIntegral (rnP50Ns rns)) <> " / " <> fmtNs (fromIntegral (rnP95Ns rns)) <> " / " <> fmtNs (fromIntegral (rnP99Ns rns)) <> " / " <> fmtNs (fromIntegral (rnMaxNs rns)))
+          field "Migrations / Steals" (fmtInt (rnMigrations rns) <> " / " <> fmtInt (rnSteals rns))
+        when (ssCreated sp > 0) $ do
+          h2 "Parallel Sparks"
+          field "Created / Converted / Fizzled / Dud / Overflow / GC'd"
+            (T.intercalate " / " (map fmtInt [ssCreated sp, ssConverted sp, ssFizzled sp, ssDud sp, ssOverflowed sp, ssGCd sp]))
+        when (not (V.null conc) || nmRemSetFlushes nm > 0) $ do
+          h2 "Non-Moving Concurrent GC (+RTS -xn)"
+          field "Concurrent Phases" (fmtInt (V.length conc))
+          field "Upd-Rem-Set Flushes" (fmtInt (nmRemSetFlushes nm))
+          field "Pruned Segments / Live Blocks" (fmtInt (nmPrunedSegments nm) <> " / " <> fmtInt (nmLiveBlocks nm))
+        unless (V.null (tlMemReturns tl)) $ do
+          let mr = V.last (tlMemReturns tl)
+          h2 "OS Memory Return (MemReturn)"
+          field "Current / Needed / Returned (MiB)" (tshow (mrCurrent mr) <> " / " <> tshow (mrNeeded mr) <> " / " <> tshow (mrReturned mr))
+        unless (V.null (tlUserSpans tl)) $ do
+          h2 ("User Spans (" <> fmtInt (V.length (tlUserSpans tl)) <> ")")
+          tableAligned
+            [(AlignLeft, "Span"), (AlignRight, "Thread"), (AlignRight, "Duration"), (AlignRight, "Allocated")]
+            [ [code (usName u), tshow (usThread u), fmtNs (fromIntegral (usEnd u - usStart u)), fmtBytes (usAllocBytes u)]
+            | u <- take 12 (sortOn (\u -> Down (usEnd u - usStart u)) (V.toList (tlUserSpans tl)))
+            ]
+        unless (V.null (tlAlerts tl)) $ do
+          h2 ("Runtime Alerts (" <> fmtInt (V.length (tlAlerts tl)) <> ")")
+          forM_ (take 10 (V.toList (tlAlerts tl))) \a ->
+            bullet (bold ("[" <> taKind a <> "] ") <> taTitle a <> " — " <> taDetail a)
+
+-- ---------------------------------------------------------------------------
+-- 12. Compiler-to-Runtime Forensics (Core Smells, STG Captures, Semantic Diff)
+
+coreSmellsReport :: FilePath -> Maybe FilePath -> Maybe FilePath -> Maybe Text -> Int -> IO (Either Text Text)
+coreSmellsReport dumpPath mProfPath mBaseDumps mBinding topN = do
+  isDir <- doesDirectoryExist dumpPath
+  isFile <- doesFileExist dumpPath
+  if not isDir && not isFile
+    then pure (Left ("Dump path not found: " <> T.pack dumpPath))
+    else do
+      weights <- case mProfPath of
+        Nothing -> pure M.empty
+        Just pp -> do
+          ePf <- loadProf pp
+          pure case ePf of
+            Left _ -> M.empty
+            Right pf ->
+              M.fromListWith (+)
+                [ (nameKey (ctName ct), ctTime ct + ctAlloc ct)
+                | ct <- costTotals (pfRoots pf)
+                ]
+      arts <-
+        if isDir
+          then discoverArtifacts dumpPath
+          else case kindForPath dumpPath of
+            Just KindCore -> pure [ModuleArtifacts (T.pack (takeBaseName dumpPath)) Nothing (Just dumpPath) Nothing]
+            Just KindStg -> pure [ModuleArtifacts (T.pack (takeBaseName dumpPath)) Nothing Nothing (Just dumpPath)]
+            _ -> pure []
+      loadedMods <- forM arts \ma -> do
+        mCore <- maybe (pure Nothing) (\p -> either (const Nothing) Just <$> loadCodeFile KindCore p) (maCore ma)
+        mStg <- maybe (pure Nothing) (\p -> either (const Nothing) Just <$> loadCodeFile KindStg p) (maStg ma)
+        pure (maModule ma, mCore, mStg)
+      let allSmells = concatMap (\(_, mc, ms) -> Forensics.detectCoreSmells mc ms weights) loadedMods
+          allCaptures = concatMap (\(_, _, ms) -> maybe [] Forensics.stgClosureCaptures ms) loadedMods
+          qBind = fmap (nameKey . T.strip) mBinding
+          filteredSmells = maybe allSmells (\b -> filter (\s -> nameKey (Forensics.csBinding s) == b) allSmells) qBind
+          filteredCaptures = maybe allCaptures (\b -> filter (\c -> Forensics.scEnclosing c == b) allCaptures) qBind
+      semDiffs <- case (mBaseDumps, qBind) of
+        (Just baseDir, Just bKey) -> do
+          baseOk <- doesDirectoryExist baseDir
+          if not baseOk
+            then pure []
+            else do
+              bArts <- discoverArtifacts baseDir
+              concat <$> forM bArts \ba ->
+                case (maCore ba, listToMaybe [mc | (m, Just mc, _) <- loadedMods, m == maModule ba]) of
+                  (Just bp, Just curCf) -> do
+                    eBase <- loadCodeFile KindCore bp
+                    pure case eBase of
+                      Right baseCf -> maybe [] pure (Forensics.semanticBindingDiff baseCf curCf bKey)
+                      Left _ -> []
+                  _ -> pure []
+        _ -> pure []
+      optLogs <- if isDir then Forensics.discoverOptLogs dumpPath else pure []
+      pure (Right (formatCoreSmells dumpPath filteredSmells filteredCaptures semDiffs (concatMap snd optLogs) topN))
+
+formatCoreSmells
+  :: FilePath
+  -> [Forensics.CoreSmell]
+  -> [Forensics.StgClosureCapture]
+  -> [Forensics.SemanticBindingDiff]
+  -> [Forensics.OptLogEntry]
+  -> Int
+  -> Text
+formatCoreSmells dumpPath smells captures semDiffs optLogs topN = renderMD do
+  h1 ("Stronghead Compiler-to-Runtime Forensics: " <> T.pack (takeFileName dumpPath))
+  field "Optimization Smells Detected" (tshow (length smells))
+  field "STG Closures with Free-Variable Captures" (tshow (length (filter (not . null . Forensics.scCaptured) captures)))
+  unless (null optLogs) $
+    field "Simplifier Log Entries" (tshow (length optLogs))
+  h2 ("Top Optimization Smells (Top " <> tshow topN <> ")")
+  if null smells
+    then para "No Core/STG optimization smells detected."
+    else forM_ (take topN smells) \sm -> do
+      h3 (Forensics.smellKindTitle (Forensics.csKind sm) <> " in " <> code (Forensics.csModule sm <> "." <> Forensics.csBinding sm))
+      field "Line" (tshow (Forensics.csLine sm + 1))
+      field "Weight" (fmtFixed 2 (Forensics.csWeight sm))
+      para (Forensics.csSummary sm)
+      field "Remediation" (Forensics.csRemediation sm)
+  let nonEmptyCaps = filter (not . null . Forensics.scCaptured) captures
+  unless (null nonEmptyCaps) $ do
+    h2 ("Static STG Closure Captures (Top " <> tshow topN <> ")")
+    tableAligned
+      [(AlignLeft, "Enclosing"), (AlignLeft, "Binder"), (AlignLeft, "Flag"), (AlignLeft, "Captured FVs")]
+      [ [ code (Forensics.scEnclosing c)
+        , code (Forensics.scBinder c)
+        , code case Forensics.scFlag c of
+            Forensics.StgUpdateable -> "\\u"
+            Forensics.StgSingleEntry -> "\\s"
+            Forensics.StgReentrant -> "\\r"
+            Forensics.StgUnknown -> "?"
+        , code (T.intercalate ", " (Forensics.scCaptured c))
+        ]
+      | c <- take topN nonEmptyCaps
+      ]
+  forM_ semDiffs \sd -> do
+    h2 ("Alpha-Normalized Semantic Core Diff: " <> code (Forensics.sbdModule sd <> "." <> Forensics.sbdKey sd))
+    field "Added / Removed Lines"
+      (tshow (Forensics.sbdAdded sd) <> " / " <> tshow (Forensics.sbdRemoved sd))
+    let changed =
+          [ case dl of
+              Forensics.DiffAdd t -> "+ " <> t
+              Forensics.DiffDel t -> "- " <> t
+              Forensics.DiffSame t -> "  " <> t
+          | dl <- Forensics.sbdLines sd
+          , case dl of Forensics.DiffSame _ -> False; _ -> True
+          ]
+    unless (null changed) $ codeBlock "diff" (T.unlines (take 60 changed))
+
+-- ---------------------------------------------------------------------------
+-- 13. Live Cross-Platform CloneStack & ghc-heap Probes (Agent v3)
+
+liveStacksReport :: Maybe String -> Maybe Int -> Bool -> Int -> IO (Either Text Text)
+liveStacksReport mHost mPort includeProbes timeoutMs = do
+  targetPair <- case (mHost, mPort) of
+    (Nothing, Nothing) -> do
+      beacons <- discoverAgents
+      pure case beacons of
+        b : _ -> Right (T.unpack (abHost b), abPort b, Just (abProgram b, abPid b))
+        [] -> Right ("127.0.0.1", 4777, Nothing)
+    _ -> pure (Right (fromMaybe "127.0.0.1" mHost, fromMaybe 4777 mPort, Nothing))
+  case targetPair of
+    Left err -> pure (Left err)
+    Right (host, port, mDiscovered) -> do
+      stacksRef <- newIORef ([] :: [LiveThreadStack])
+      probesRef <- newIORef ([] :: [LiveProbeNode])
+      doneVar <- newEmptyMVar
+      let wantReplyId = if includeProbes then (2 :: Int) else 1
+          onEvent = \case
+            LiveConnected box -> do
+              sendCommand box 1 CmdStacks
+              when includeProbes (sendCommand box 2 (CmdProbes Nothing))
+            LiveStack ts -> modifyIORef' stacksRef (ts :)
+            LiveProbe pn -> modifyIORef' probesRef (pn :)
+            LiveReply rid _ | rid == wantReplyId -> void (try @SomeException (putMVar doneVar (Right ())))
+            LiveClosed msg -> void (try @SomeException (putMVar doneVar (Left msg)))
+            _ -> pure ()
+          void m = m >> pure ()
+      res <- withAsync (connectLive host port onEvent) \_ ->
+        withAsync (threadDelay (timeoutMs * 1000) >> void (try @SomeException (putMVar doneVar (Right ())))) \_ ->
+          takeMVar doneVar
+      stacks <- reverse <$> readIORef stacksRef
+      probes <- reverse <$> readIORef probesRef
+      case res of
+        Left err | null stacks && null probes ->
+          pure (Left ("Could not reach Stronghead.Agent v3 at " <> T.pack host <> ":" <> tshow port <> " (" <> err <> ")."))
+        _ ->
+          pure $ Right $ renderMD do
+            h1 ("Stronghead Live Stacks & Probes (" <> T.pack host <> ":" <> tshow port <> ")")
+            whenJust mDiscovered \(prog, pid) ->
+              field "Auto-Discovered Process" (prog <> " (pid " <> tshow pid <> ")")
+            h2 ("Live Thread Stacks (" <> tshow (length stacks) <> " threads)")
+            if null stacks
+              then para "No thread stacks returned (ensure target links stronghead:agent v3 and compiles with -finfo-table-map)."
+              else forM_ (take 24 stacks) \ts -> do
+                h3 ("Thread " <> tshow (ltsTid ts) <> " (" <> ltsStatus ts <> ")")
+                if null (ltsFrames ts)
+                  then para "No decoded frames."
+                  else codeBlock_ $ T.unlines
+                    [ tshow idx <> ": "
+                        <> (if T.null (lfeFunction f) then lfeClosureType f else lfeFunction f)
+                        <> (if T.null (lfeModule f) then "" else " [" <> lfeModule f <> "]")
+                        <> (if T.null (lfeSrcLoc f) then "" else " @ " <> lfeSrcLoc f)
+                    | (idx, f) <- zip [0 :: Int ..] (take 25 (ltsFrames ts))
+                    ]
+            when includeProbes $ do
+              h2 ("In-Process ghc-heap Probes (" <> tshow (length probes) <> " closure nodes)")
+              if null probes
+                then para "No registered probes. Use Stronghead.Probe.probeRef / probeTVar to inspect live values without ghc-debug-stub."
+                else
+                  tableAligned
+                    [(AlignLeft, "Probe"), (AlignLeft, "Name"), (AlignLeft, "Type"), (AlignCenter, "Thunk?"), (AlignRight, "Bytes"), (AlignLeft, "Source")]
+                    [ [ code (lpnProbe pn)
+                      , code (if T.null (lpnName pn) then lpnType pn else lpnName pn)
+                      , code (lpnType pn)
+                      , if lpnIsThunk pn then bold "THUNK" else "-"
+                      , fmtBytes (fromIntegral (lpnBytes pn))
+                      , lpnSource pn
+                      ]
+                    | pn <- take 50 probes
+                    ]
+
+-- ---------------------------------------------------------------------------
+-- 14. Automated RTS Pareto Sweep
+
+rtsSweepReport :: FilePath -> Maybe Text -> Maybe Text -> IO (Either Text Text)
+rtsSweepReport exePath mArgs mGrid = do
+  let progArgs = maybe [] (words . T.unpack) mArgs
+      grid = case mGrid of
+        Nothing -> defaultSweepGrid
+        Just g
+          | T.null (T.strip g) -> defaultSweepGrid
+          | otherwise ->
+              let parsed = filter (not . null) (map (words . T.unpack . T.strip) (T.splitOn "," g))
+               in if null parsed then defaultSweepGrid else parsed
+  res <- runRtsSweep (SweepConfig exePath progArgs grid Nothing)
+  pure (fmap renderParetoMarkdown res)
+
+-- ---------------------------------------------------------------------------
+-- 15. Declarative Performance Budget Gate (.stronghead-spec)
+
+assertBudgetReport
+  :: Text
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> IO (Either Text Text)
+assertBudgetReport specInput mEvPath mHpPath mBasePath mDumpPath = do
+  isFile <- doesFileExist (T.unpack specInput)
+  specTxt <- if isFile then TIO.readFile (T.unpack specInput) else pure specInput
+  let spec = parseBudgetSpec specTxt
+  mTl <- case mEvPath of
+    Nothing -> pure Nothing
+    Just p -> either (const Nothing) Just <$> loadEventlog p
+  mHp <- case mHpPath of
+    Nothing -> pure Nothing
+    Just p -> either (const Nothing) Just <$> loadProfile p
+  mBaseHp <- case mBasePath of
+    Nothing -> pure Nothing
+    Just p -> either (const Nothing) Just <$> loadProfile p
+  res <- evaluateBudget spec mTl mHp mBaseHp mDumpPath
+  pure (Right (formatBudgetMarkdown res))

@@ -14,6 +14,7 @@ import Data.IntMap.Strict qualified as IM
 import Data.List ((!?))
 import Data.Map.Strict qualified as M
 import Data.Maybe (isJust, isNothing, listToMaybe, mapMaybe)
+import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
@@ -23,19 +24,39 @@ import GHC.RTS.Events (EventInfo (..), HeapProfBreakdown (..), HeapProfFlags (..
 import GHC.RTS.Events qualified as E
 import Network.Socket qualified as N
 import Network.Socket.ByteString qualified as NB
-import Stronghead.Agent (AgentConfig (..), defaultAgentConfig, startAgent)
+import Stronghead.Agent
+  ( AgentConfig (..)
+  , ProbeNode (..)
+  , bumpEra
+  , defaultAgentConfig
+  , getEra
+  , startAgent
+  , startAgentListening
+  , unregisterProbe
+  , withAllocGuard
+  , withEra
+  , withExceptionTap
+  , withSpan
+  )
+import Stronghead.Probe (defaultProbeOptions, inspectValue, probeRef)
 import Stronghead.Attach
 import Stronghead.Clock
 import Stronghead.Debug
+import Stronghead.Debug.Anatomy
 import Stronghead.Diff
 import Stronghead.Dump
+import Stronghead.Dump.Forensics
+import Stronghead.Dump.Forensics qualified as Forensics
 import Stronghead.Eventlog (emptyBuilder, feedEvent, snapshot)
+import Stronghead.Eventlog.CriticalPath
 import Stronghead.Eventlog.Model
+import Stronghead.Flamegraph
 import Stronghead.Format (fmtTick)
 import Stronghead.Fuzzy
 import Stronghead.Ghci
 import Stronghead.HeapProfile
 import Stronghead.Join
+import Stronghead.Lab
 import Stronghead.Live
 import Stronghead.Markdown qualified as MD
 import Stronghead.Next
@@ -51,9 +72,11 @@ import Stronghead.Watch
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath (pathSeparator, (</>))
+import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 main :: IO ()
 main = do
+  hSetBuffering stdout LineBuffering
   failures <- newIORef (0 :: Int)
   let check name ok = do
         putStrLn ((if ok then "  ok   " else "  FAIL ") <> name)
@@ -819,6 +842,29 @@ main = do
     Right txt -> "UNCHANGED" `T.isInfixOf` txt && "Overall Metric Deltas" `T.isInfixOf` txt
     Left _ -> False
 
+  diffEvRes <- MCPTools.diffRuns "stronghead-sample.eventlog" "stronghead-sample.eventlog" Nothing Nothing
+  check "mcp: diff runs supports eventlog runtime deltas" $ case diffEvRes of
+    Right txt -> "Eventlog Runtime Deltas" `T.isInfixOf` txt && "GC Pause p99" `T.isInfixOf` txt
+    Left _ -> False
+
+  let retSnap =
+        mkSnapshot
+          "test-snap"
+          False
+          [0x10]
+          [ ClosureNode 0x10 "TSO" NThread "thread 1" Nothing 64 [0x20] Nothing []
+          , ClosureNode 0x20 "MUT_VAR_CLEAN" NMutable "leakRef" (Just "Main.hs:10:1") 24 [0x30] Nothing []
+          , ClosureNode 0x30 "THUNK_2_0" NThunk "acc" (Just "Main.hs:22:5") 4096 [] Nothing []
+          ]
+      retByAddr = MCPTools.formatSnapshotRetainers (Just "0x30") Nothing retSnap
+      retByBand = MCPTools.formatSnapshotRetainers Nothing (Just "THUNK_2_0") retSnap
+  check "mcp: retainerPath formats real snapshot chain by address" $
+    "Root [TSO] thread 1" `T.isInfixOf` retByAddr && "[MUT_VAR_CLEAN] leakRef" `T.isInfixOf` retByAddr && "[THUNK_2_0] acc" `T.isInfixOf` retByAddr
+  check "mcp: retainerPath matches by band/type" $
+    "Retainer Chains (1 matched)" `T.isInfixOf` retByBand && "0x30" `T.isInfixOf` retByBand
+  check "mcp: live control port description matches default agent port 4777" $
+    lookup "port" MCPTypes.toolDescriptions == Just "Agent port (default: 4777)"
+
   stepsLeak <- MCPTools.recommendNextSteps "leak" (Just "THUNK_2_0") (Just "sample/Main.hs")
   check "mcp: recommend steps gives provenance flags for space leak" $
     "-finfo-table-map" `T.isInfixOf` stepsLeak && "+RTS -l -hi -i0.1 -RTS" `T.isInfixOf` stepsLeak
@@ -846,6 +892,228 @@ main = do
   check "markdown: renders table with alignment" ("| Col1 | Col2 |\n| :--- | ---: |\n| A | 1 |\n| B | 2 |" `T.isInfixOf` doc)
   check "markdown: renders alert" ("> [!WARNING] Caution Header\n> Body line 1\n> Body line 2" `T.isInfixOf` doc)
   check "markdown: renders code block" ("```haskell\nmain = pure ()\n```" `T.isInfixOf` doc)
+
+  putStrLn "eventlog critical path & extended GC/spark diagnostics"
+  let extEvents =
+        [ (100, Just 0, RunThread 10)
+        , (100, Just 1, RunThread 20)
+        , (100, Just 0, UserMarker "sh:span:begin 1 0 http.checkout")
+        , (200, Just 0, StopThread 10 BlockedOnMVar)
+        , (500, Just 1, WakeupThread 10 0)
+        , (500, Just 1, StopThread 20 ThreadYielding)
+        , (520, Just 0, RunThread 10)
+        , (600, Just 0, UserMarker "sh:span:end 1 65536 http.checkout")
+        , (600, Just 0, StopThread 10 ThreadYielding)
+        -- STW rendezvous lag: cap 0 requests & enters GC at 700, cap 1 keeps running thread 30 until 750
+        , (680, Just 1, RunThread 30)
+        , (700, Just 0, RequestParGC)
+        , (700, Just 0, StartGC)
+        , (750, Just 1, StopThread 30 HeapOverflow)
+        , (750, Just 1, StartGC)
+        , (800, Just 0, EndGC)
+        , (800, Just 1, EndGC)
+        , (800, Nothing, GCStatsGHC 0 1 1024 0 0 0 2 0 Nothing)
+        -- Non-moving GC, MemReturn, SparkCounters, TraceAlert
+        , (820, Nothing, ConcMarkBegin)
+        , (860, Nothing, ConcMarkEnd 4096)
+        , (870, Nothing, ConcUpdRemSetFlush 0)
+        , (880, Nothing, NonmovingHeapCensus 64 4 2 100)
+        , (890, Nothing, NonmovingPrunedSegments 3 5)
+        , (900, Nothing, MemReturn 0 120 40 80)
+        , (910, Just 0, SparkCounters 100 10 2 60 15 13 0)
+        , (920, Just 0, UserMarker "sh:exc ErrorCall boom")
+        ]
+      extTl = snapshot (foldl' (\b (t, c, s) -> feedEvent b (E.Event t s c)) emptyBuilder extEvents)
+  check "extended: UserSpan paired with exact alloc bytes" $
+    case V.toList (tlUserSpans extTl) of
+      [sp] -> usName sp == "http.checkout" && usAllocBytes sp == 65536 && usThread sp == 10 && usStart sp == 100 && usEnd sp == 600
+      _ -> False
+  check "extended: critical path follows MVar wakeup to blocking thread 20" $
+    case V.toList (tlUserSpans extTl) of
+      [sp] ->
+        let cp = analyzeSpanCriticalPath extTl sp
+         in cpOwnCpuNs cp == 180
+              && cpBlockerCpuNs cp == 300
+              && cpRunnableNs cp == 20
+              && fmap (\(tid, _, _) -> tid) (cpTopBlocker cp) == Just 20
+              && length (cpCausalEdges cp) == 1
+      _ -> False
+  check "extended: STW sync lag blames straggler thread 30 on cap 1" $
+    case V.toList (tlGCSyncLags extTl) of
+      [lag] -> slSyncWaitNs lag == 50 && slFirstCap lag == 0 && slLastCap lag == 1 && slStragglerThread lag == Just 30
+      _ -> False
+  check "extended: non-moving GC phases & stats parsed" $
+    V.length (tlConcGC extTl) == 1
+      && cgpKind (tlConcGC extTl V.! 0) == ConcMark
+      && cgpMarkedObjects (tlConcGC extTl V.! 0) == 4096
+      && nmRemSetFlushes (tlNonmoving extTl) == 1
+      && nmPrunedSegments (tlNonmoving extTl) == 3
+  check "extended: MemReturn, SparkStats, and TraceAlerts parsed" $
+    V.length (tlMemReturns extTl) == 1
+      && mrReturned (tlMemReturns extTl V.! 0) == 80
+      && ssConverted (tlSparks extTl) == 60
+      && ssOverflowed (tlSparks extTl) == 2
+      && V.length (tlAlerts extTl) == 1
+      && taKind (tlAlerts extTl V.! 0) == "exception"
+  let rn = runnableStats extTl
+      hm = gcPauseHeatmap extTl 4 4
+  check "extended: runnableStats and gcPauseHeatmap populated" $
+    rnCount rn >= 1 && hmSampleCount hm == 1 && hmMaxCount hm == 1
+  let bioHp = fromSamples "prog +RTS -hb" "biography" 0 (const Nothing) [(1.0, [("lag", 100), ("drag", 800), ("void", 50), ("use", 200)])]
+  check "extended: LDV biography classifies dominant drag phase" $
+    fmap bioDominant (biographyBreakdown bioHp) == Just "drag"
+
+  putStrLn "compiler-to-runtime forensics (STG captures, smells, semantic diff, opt logs)"
+  let stgSample =
+        T.unlines
+          [ "Rec {"
+          , "Main.loop [Occ=LoopBreaker] :: Int -> Int"
+          , "[GblId, Arity=1] ="
+          , "    \\r [x_s1a] let {"
+          , "      sat_s7qA [Occ=Once1] :: Int"
+          , "      [LclId] = [bigMap_s4x cfg_s4y] \\u [] Main.work bigMap_s4x cfg_s4y;"
+          , "    } in stg_ap_p_fast sat_s7qA x_s1a;"
+          , "end Rec }"
+          ]
+      stgCf = parseCodeFile KindStg "Main.dump-stg-final" stgSample
+      caps = stgClosureCaptures stgCf
+      rets = staticRetainersOf stgCf "bigMap"
+  check "forensics: STG closure captures extract free vars and \\u flag" $
+    any (\c -> scFlag c == StgUpdateable && "bigMap_s4x" `elem` scCaptured c && "cfg_s4y" `elem` scCaptured c) caps
+  check "forensics: staticRetainersOf finds updateable thunk retaining bigMap" $
+    length rets == 1 && fmap scFlag (listToMaybe rets) == Just StgUpdateable
+  let coreSmellSample =
+        T.unlines
+          [ "Rec {"
+          , "Main.hot [Occ=LoopBreaker] :: forall a. Num a => a -> a"
+          , "[GblId, Arity=2] ="
+          , "  \\ ($dNum_a1b :: Num a) (n_s2c :: a) ->"
+          , "    case build n_s2c of { I# x -> I# x }"
+          , "end Rec }"
+          ]
+      coreSmellCf = parseCodeFile KindCore "Main.dump-simpl" coreSmellSample
+      smells = detectCoreSmells (Just coreSmellCf) (Just stgCf) (M.fromList [("hot", 80.0), ("loop", 50.0)])
+  check "forensics: detects dict passing, broken fusion, boxed loop, updateable thunk, and PAP" $
+    all (\k -> any ((== k) . Forensics.csKind) smells) [SmellDictPassing, SmellBrokenFusion, SmellBoxedLoop, SmellUpdateableLoopThunk, SmellPapCalls]
+  let coreBefore = parseCodeFile KindCore "Main.dump-simpl" "Main.f = \\ (x_a1b :: Int) -> I# x_a1b\n"
+      coreAfter = parseCodeFile KindCore "Main.dump-simpl" "Main.f = \\ (x_z9k :: Int) -> I# x_z9k\n"
+      coreChanged = parseCodeFile KindCore "Main.dump-simpl" "Main.f = \\ (x_z9k :: Int#) -> x_z9k\n"
+  check "forensics: alpha-normalized diff ignores pure unique renumbering" $
+    fmap (\d -> (sbdAdded d, sbdRemoved d)) (semanticBindingDiff coreBefore coreAfter "f") == Just (0, 0)
+  check "forensics: alpha-normalized diff reports real Core change" $
+    fmap (\d -> sbdAdded d > 0 && sbdRemoved d > 0) (semanticBindingDiff coreBefore coreChanged "f") == Just True
+  let optEntries = parseOptLog "Rule fired: map/map\nConsidering inlining: 'foo'\nNot inlining bar (size)\nSPEC $sgo\n"
+  check "forensics: opt log parser extracts rule, inline, miss, and spec" $
+    map olKind optEntries == [OptRuleFired, OptInlined, OptNotInlined, OptSpecialised]
+
+  putStrLn "topological heap anatomy (dominators, skeletons, severing, Merkle dedup, diff)"
+  -- Graph with shared diamond + 4-deep thunk spine + duplicate Text payloads:
+  -- Root 1 (64B) -> Node 2 (100B, IORef) -> Thunk spine 3 -> 4 -> 5 -> 6 (each 1000B)
+  -- Root 1 -> Node 7 (50B) -> Shared 9 (500B), and Node 2 -> Shared 9 (500B)
+  -- Duplicate Text nodes 10, 11, 12 (each 200B, identical ARR_WORDS) under Node 7
+  let anatNodes =
+        [ ClosureNode 1 "TSO" NThread "thread 1" Nothing 64 [2, 7] Nothing []
+        , ClosureNode 2 "MUT_VAR_CLEAN" NMutable "accRef" (Just "Main.hs:10") 100 [3, 9] Nothing []
+        , ClosureNode 3 "THUNK_2_0" NThunk "acc" (Just "Main.hs:74") 1000 [4] Nothing []
+        , ClosureNode 4 "THUNK_2_0" NThunk "acc" (Just "Main.hs:74") 1000 [5] Nothing []
+        , ClosureNode 5 "THUNK_2_0" NThunk "acc" (Just "Main.hs:74") 1000 [6] Nothing []
+        , ClosureNode 6 "THUNK_2_0" NThunk "acc" (Just "Main.hs:74") 1000 [] Nothing []
+        , ClosureNode 7 "CONSTR_2_0" NConstr "Cache" (Just "Main.hs:30") 50 [9, 10, 11, 12] Nothing []
+        , ClosureNode 9 "ARR_WORDS" NArray "sharedBuf" (Just "Main.hs:40") 500 [] Nothing []
+        , ClosureNode 10 "ARR_WORDS" NArray "jsonMime" (Just "Parser.hs:12") 200 [] Nothing []
+        , ClosureNode 11 "ARR_WORDS" NArray "jsonMime" (Just "Parser.hs:12") 200 [] Nothing []
+        , ClosureNode 12 "ARR_WORDS" NArray "jsonMime" (Just "Parser.hs:12") 200 [] Nothing []
+        ]
+      anatSnap = mkSnapshot "anat-1" False [1] anatNodes
+      dt = computeDominators anatSnap
+      skel = buildHeapSkeleton anatSnap dt
+      sev2 = simulateSever anatSnap (SeverClosure 2)
+      sevEdge = simulateSever anatSnap (SeverInfoEdge "accRef" "acc")
+      dups = auditDuplicates anatSnap
+      sieved = applySieve anatSnap dt S.empty (emptySieve {svKinds = [NThunk], svMinDomBytes = 2500})
+  -- Crucial dominator property: Shared node 9 is dominated by Root 1, NOT Node 2!
+  check "anatomy: shared diamond node dominated by Root 1, not Node 2" $
+    M.lookup 9 (dtIdom dt) == Just 1 && domRetained dt 2 == 4100
+  -- Mathematical invariant: cutting closure x frees EXACTLY domRetained dt x!
+  check "anatomy: exact invariant simulateSever(SeverClosure x) == domRetained(x)" $
+    all (\cid -> srFreedBytes (simulateSever anatSnap (SeverClosure cid)) == domRetained dt cid) [2, 3, 4, 7, 9]
+  check "anatomy: SeverInfoEdge accRef->acc frees the 4000B thunk spine" $
+    srFreedBytes sevEdge == 4000 && srFreedClosures sevEdge == 4 && srFreedBytes sev2 == 4100
+  check "anatomy: quotient skeleton folds 4-deep thunk spine automatically" $
+    any (\sp -> spName sp == "acc" && spDepth sp == 4 && spRetainedBytes sp == 4000) (hsSpines skel)
+  check "anatomy: Merkle dedup audit flags 3x identical jsonMime (400B waste)" $
+    any (\d -> dgName d == "jsonMime" && dgCount d == 3 && dgWasteBytes d == 400) dups
+  check "anatomy: closure sieve filters thunks retaining >= 2500B" $
+    map (cnId . fst) sieved == [3, 4]
+  let anatSnap2 = mkSnapshot "anat-2" False [1] (anatNodes ++ [ClosureNode 13 "ARR_WORDS" NArray "jsonMime" (Just "Parser.hs:12") 200 [] Nothing []])
+      sdiff = diffSnapshots anatSnap (mkSnapshot "anat-2" False [1] (ClosureNode 7 "CONSTR_2_0" NConstr "Cache" (Just "Main.hs:30") 50 [9, 10, 11, 12, 13] Nothing [] : filter ((/= 7) . cnId) (M.elems (snapNodes anatSnap2))))
+  check "anatomy: cross-snapshot structural diff reports jsonMime growth" $
+    any (\d -> sdName d == "jsonMime" && sdBaseCount d == 3 && sdCurCount d == 4) sdiff
+
+  putStrLn "flamegraphs, open exports, laziness X-ray & experimentation lab"
+  let ftBase = fromFoldedStacks "base" "samples" [(["main", "parse", "decode"], 10), (["main", "render"], 5)]
+      ftCur = fromFoldedStacks "cur" "samples" [(["main", "parse", "decode"], 25), (["main", "render"], 2)]
+      dft = diffFlameTrees ftBase ftCur
+      foldedOut = exportFolded ftCur
+      speedOut = exportSpeedscopeJson "cur" ftCur
+      chromeOut = exportChromeTraceJson extTl
+  check "flamegraph: builds tree & computes differential delta" $
+    ftTotal ftCur == 27 && dftCurTotal dft - dftBaseTotal dft == 12
+  check "flamegraph: exports folded, Speedscope JSON, and Chrome Trace JSON" $
+    "main;parse;decode 25" `T.isInfixOf` foldedOut
+      && "speedscope.app/file-format-schema.json" `T.isInfixOf` speedOut
+      && "\"http.checkout\"" `T.isInfixOf` chromeOut
+  let (ages1, xr1) = diffValueStep M.empty (M.fromList [("acc", VThunk "_t1" (Just "Int")), ("x", VAtom "5")]) M.empty
+      (ages2, xr2) = diffValueStep (M.fromList [("acc", VThunk "_t1" (Just "Int"))]) (M.fromList [("acc", VThunk "_t1" (Just "Int"))]) ages1
+      (_ages3, xr3) = diffValueStep (M.fromList [("acc", VThunk "_t1" (Just "Int"))]) (M.fromList [("acc", VAtom "42")]) ages2
+  check "laziness X-ray: tracks ThunkSpawned -> ThunkAging 2 -> ThunkCollapsed" $
+    fmap vxTransition (M.lookup "acc" xr1) == Just ThunkSpawned
+      && fmap vxTransition (M.lookup "x" xr1) == Just ThunkEvaluated
+      && fmap vxTransition (M.lookup "acc" xr2) == Just (ThunkAging 2)
+      && fmap vxTransition (M.lookup "acc" xr3) == Just ThunkCollapsed
+  let p1 = SweepPoint ["-A16m"] 2.0 0.25 40e6 50e6 100000 500000 1000000 False
+      p2 = SweepPoint ["-A64m"] 1.2 0.10 15e6 20e6 100000 400000 1000000 False -- dominates p1!
+      p3 = SweepPoint ["-A64m", "-xn"] 1.5 0.08 2e6 4e6 120000 600000 1000000 False -- best latency!
+      pareto = computePareto [p1, p2, p3]
+  check "lab: Pareto frontier drops dominated config and picks throughput & latency winners" $
+    length (psFrontier pareto) == 2
+      && fmap spFlags (psBestThroughput pareto) == Just ["-A64m"]
+      && fmap spFlags (psBestLatency pareto) == Just ["-A64m", "-xn"]
+  let spec = parseBudgetSpec "# comment\nmax-gc-cpu-pct = 20\nmax-stw-sync-ms = 0.00001\nmax-leak-score = 0.9\n"
+  bRes <- evaluateBudget spec (Just extTl) Nothing Nothing Nothing
+  check "lab: .stronghead-spec budget gate detects STW sync failure and renders JUnit XML" $
+    not (brPassed bRes)
+      && "<failure" `T.isInfixOf` formatBudgetJUnit bRes
+      && "FAIL" `T.isInfixOf` formatBudgetMarkdown bRes
+
+  putStrLn "MCP v2 diagnostic tool engines"
+  let anatMd = MCPTools.formatHeapAnatomy anatSnap (Just "0x2") Nothing 5
+      cpMd = MCPTools.formatCriticalPath "ext.eventlog" extTl Nothing (Just "checkout")
+      smellMd = MCPTools.formatCoreSmells "dumps" smells caps [] [] 5
+  check "MCP v2: formatHeapAnatomy reports dominators, spines, duplicates, and what-if sever" $
+    "Counterfactual What-If Severing Result" `T.isInfixOf` anatMd
+      && "Folded Quotient Spines" `T.isInfixOf` anatMd
+      && "jsonMime" `T.isInfixOf` anatMd
+  check "MCP v2: formatCriticalPath reports critical path, STW straggler, sparks, non-moving GC" $
+    "Critical Path Attribution" `T.isInfixOf` cpMd
+      && "STW Rendezvous Stragglers" `T.isInfixOf` cpMd
+      && "Parallel Sparks" `T.isInfixOf` cpMd
+      && "Non-Moving Concurrent GC" `T.isInfixOf` cpMd
+  check "MCP v2: formatCoreSmells reports optimization smells and STG captures" $
+    "Top Optimization Smells" `T.isInfixOf` smellMd
+      && "Static STG Closure Captures" `T.isInfixOf` smellMd
+  budgetRes <- MCPTools.assertBudgetReport "max-leak-score = 0.9\nmax-gc-cpu-pct = 50" Nothing Nothing Nothing Nothing
+  check "MCP v2: assertBudgetReport succeeds on inline spec" $
+    either (const False) ("PASS" `T.isInfixOf`) budgetRes
+  check "MCP v2: toolDescriptions covers all 6 new v2 tools" $
+    all (\k -> isJust (lookup k MCPTypes.toolDescriptions))
+      [ "StrongheadHeapAnatomy"
+      , "StrongheadCriticalPath"
+      , "StrongheadCoreSmells"
+      , "StrongheadLiveStacks"
+      , "StrongheadRtsSweep"
+      , "StrongheadAssertBudget"
+      ]
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
@@ -1085,25 +1353,55 @@ stgText =
 -- client reads as it was.
 agentChecks :: (String -> Bool -> IO ()) -> IO ()
 agentChecks check = do
-  let cfg port = defaultAgentConfig {agentPort = port, agentIntervalMs = 50, agentFlushEventlog = False}
-  agent <- startAgent (cfg 47771)
-  (events, client) <- listen 47771
+  let cfg port = defaultAgentConfig {agentPort = port, agentIntervalMs = 50, agentFlushEventlog = False, agentDiscoverable = False}
+  (ephemeralPort, agent) <- startAgentListening (cfg 0)
+  check "v3 agent: ephemeral port 0 binds a real port" (ephemeralPort > 0)
+  (events, client) <- listen ephemeralPort
   box <- waitFor events (\case LiveConnected b -> Just b; _ -> Nothing)
   hello <- waitFor events (\case LiveHello _ pid _ -> Just pid; _ -> Nothing)
   info <- waitFor events (\case LiveInfo i -> Just i; _ -> Nothing)
   frame <- waitFor events (\case LiveFrame f -> Just f; _ -> Nothing)
-  check "v2 agent: hello" (maybe False (> 0) hello)
-  check "v2 agent: info line" (fmap aiVersion info == Just 2 && fmap aiCommands info == Just True && maybe False (not . T.null . aiCwd) info && maybe False (not . null . aiArgs) info)
-  check "v2 agent: no heap profile or eventlog in this test" (fmap aiHeapProfile info == Just Nothing && fmap aiEventlog info == Just False)
-  check "v2 agent: threads carry capabilities" (maybe False (any (isJust . ltCap) . frThreads) frame)
+  check "v3 agent: hello" (maybe False (> 0) hello)
+  check "v3 agent: info line" (fmap aiVersion info == Just 3 && fmap aiCommands info == Just True && maybe False (not . T.null . aiCwd) info && maybe False (not . null . aiArgs) info)
+  check "v3 agent: no heap profile or eventlog in this test" (fmap aiHeapProfile info == Just Nothing && fmap aiEventlog info == Just False)
+  check "v3 agent: threads carry capabilities" (maybe False (any (isJust . ltCap) . frThreads) frame)
+  -- Cross-platform ghc-heap probe on a lazy IORef (not forced!)
+  let lazyVal :: Int
+      lazyVal = foldl (+) 0 [1 .. 50 :: Int]
+  probeIORef <- newIORef lazyVal
+  probeRef "test-lazy" probeIORef
+  nodesDirect <- inspectValue defaultProbeOptions lazyVal
+  check "probe: ghc-heap inspects lazy value without forcing" (not (null nodesDirect) && any pnIsThunk nodesDirect)
   for_ box $ \b -> do
     sendCommand b 1 (CmdMark "test mark")
     sendCommand b 2 CmdGC
     sendCommand b 3 (CmdHeapProfiling False)
     sendCommand b 4 CmdFlush
-  replies <- mapM (\i -> waitFor events (\case LiveReply j r | j == i -> Just r; _ -> Nothing)) [1, 2, 3, 4]
-  -- Without +RTS -T the agent can't say when.
-  check "v2 agent: commands answered, unstamped without +RTS -T" (all (== Just (ReplyOk Nothing)) replies)
+    sendCommand b 5 CmdStacks
+    sendCommand b 6 (CmdProbes (Just "test-lazy"))
+    sendCommand b 7 CmdEraBump
+  replies <- mapM (\i -> waitFor events (\case LiveReply j r | j == i -> Just r; _ -> Nothing)) [1 .. 7]
+  check "v3 agent: commands answered, unstamped without +RTS -T" (all (== Just (ReplyOk Nothing)) replies)
+  stackEv <- waitFor events (\case LiveStack s -> Just s; _ -> Nothing)
+  probeEv <- waitFor events (\case LiveProbe p | lpnProbe p == "test-lazy" -> Just p; _ -> Nothing)
+  check "v3 agent: CloneStack snapshot returns live thread stack" (isJust stackEv)
+  check "v3 agent: remote probe returns ghc-heap closure nodes" (isJust probeEv)
+  -- Zero-overhead span, alloc guard alert, exception tap alert, and eras
+  spanVal <- withSpan "unit-span" (pure (42 :: Int))
+  check "v3 agent: withSpan returns value cleanly" (spanVal == 42)
+  withAllocGuard "spike-test" 1024 (void (readIORef probeIORef >>= \v -> pure $! length (show [v .. v + 5000])))
+  spikeAlert <- waitFor events (\case LiveAlertEv a | laKind a == "alloc-spike" -> Just a; _ -> Nothing)
+  check "v3 agent: withAllocGuard broadcasts alloc-spike alert" (isJust spikeAlert)
+  excCaught <- try @SomeException (withExceptionTap (error "boom-test" :: IO ()))
+  excAlert <- waitFor events (\case LiveAlertEv a | laKind a == "exception" -> Just a; _ -> Nothing)
+  check "v3 agent: withExceptionTap rethrows and broadcasts alert" (isLeft excCaught && isJust excAlert)
+  e0 <- getEra
+  e1 <- bumpEra
+  eIn <- withEra 77 getEra
+  eAfter <- getEra
+  check "v3 agent: era helpers update and restore RTS user_era" (e1 == e0 + 1 && eIn == 77 && eAfter == e1)
+  unregisterProbe "test-lazy"
+  check "v3 client: base64 decode roundtrip" (decodeBase64 "SGVsbG8h" == "Hello!")
   stop client
   -- Commands turned off.
   closed <- startAgent (cfg 47772) {agentAcceptCommands = Just False}
@@ -1115,9 +1413,9 @@ agentChecks check = do
   check "commands turned off: the info line says so" (fmap aiCommands info2 == Just False)
   check "commands turned off: refused" (case refused of Just (ReplyError e) -> "turned off" `T.isInfixOf` e; _ -> False)
   stop client2
-  -- A v1 client reading a v2 agent: the lines it knows are as they were,
+  -- A v1 client reading a v3 agent: the lines it knows are as they were,
   -- and the rest start with a letter it skips.
-  raw <- rawLines 47771
+  raw <- rawLines ephemeralPort
   let kinds = map (takeWhile (/= ' ')) raw
   check "v1 client: hello first, as before" (case raw of h : _ -> length (words h) == 4 && take 2 h == "H "; [] -> False)
   check "v1 client: only lines it knows or skips" (all (`elem` ["H", "I", "S", "T", "C", "E"]) kinds && "T" `elem` kinds && "E" `elem` kinds)
