@@ -40,6 +40,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import NanoUI
+import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
+import NanoUI.Shortcut qualified as K
 
 import Stronghead.Dump (CodeFile (..), CodeKind (..), lineTokens, loadCodeFile, nameKey)
 import Stronghead.Format (tshow)
@@ -56,6 +58,8 @@ data DebugState = DebugState
   { dsCommand :: !(Var Text)
   , dsDir :: !(Var Text)
   , dsFile :: !(Var Text)
+  , dsDirDialog :: !(Var (Maybe FileDialogId))
+  , dsFileDialog :: !(Var (Maybe FileDialogId))
   , dsExpr :: !(Var Text)
   , dsSession :: !(IORef (Maybe Ghci))
   , dsRunning :: !(Var Bool)
@@ -89,6 +93,8 @@ newDebugState = do
   dsCommand <- newVar "ghci"
   dsDir <- newVar ""
   dsFile <- newVar ""
+  dsDirDialog <- newVar Nothing
+  dsFileDialog <- newVar Nothing
   dsExpr <- newVar "main"
   dsSession <- newIORef Nothing
   dsRunning <- newVar False
@@ -289,47 +295,78 @@ stopSession st wake = do
 
 debugView :: Env -> Bench -> DebugState -> SourceIndex -> Maybe (Either String CodeFile) -> NanoUI ()
 debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
+  useFileDialog (dsDirDialog st) (firstPath (writeVar (dsDir st) . T.pack))
+  useFileDialog (dsFileDialog st) $ firstPath $ \p -> do
+    dir <- T.strip <$> readVar (dsDir st)
+    if T.null dir
+      then do
+        writeVar (dsDir st) (T.pack (takeDirectory p))
+        writeVar (dsFile st) (T.pack (takeFileName p))
+      else writeVar (dsFile st) (T.pack (makeRelative (T.unpack dir) p))
   wake <- askWake
   running <- readVar (dsRunning st)
   busy <- readVar (dsBusy st)
   stop <- readVar (dsStop st)
   let send cmds = liftIO (runCommands st wake cmds)
       input placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
-  toolStrip $ disabledWhen running $ do
+      tipBtn ic lbl tip = do
+        r <- iconButtonWith' alignMid ic lbl
+        tooltip r tip
+        pure (respClicked r)
+      stepping = running && not busy && isJust stop
+      whenStepping f = if stepping then f else id
+  when stepping $ do
+    whenM (shortcut (K.key (KeyF 5))) (send [":continue"])
+    whenM (shortcut (K.key (KeyF 10))) (send [":steplocal"])
+    whenM (shortcut (K.key (KeyF 11))) (send [":step"])
+    whenM (shortcut (K.shift <> K.key (KeyF 11))) (send [":stepout"])
+  toolStripWrap $ disabledWhen running $ do
     toolLabel "Run"
-    input "ghci  or  cabal repl" (fixedW 160) (dsCommand st)
+    input "ghci  or  cabal repl" (fixedW 150) (dsCommand st)
     toolLabel "in"
-    input "working directory" (minW 240 . fillW) (dsDir st)
+    rowWith (tight . gap 4 . alignMid . minW 180 . fillW) $ do
+      input "working directory" fillW (dsDir st)
+      dirBrowse <- iconButtonWith' (alignMid . padXY 6 4 . tight) iconFolderOpen ""
+      tooltip dirBrowse "Browse working directory…"
+      when (respClicked dirBrowse) $
+        writeVar (dsDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
     toolLabel "and load"
-    input "src/Main.hs" (fixedW 200) (dsFile st)
-  toolStrip $ do
+    rowWith (tight . gap 4 . alignMid) $ do
+      input "src/Main.hs" (fixedW 180) (dsFile st)
+      fileBrowse <- iconButtonWith' (alignMid . padXY 6 4 . tight) iconFile ""
+      tooltip fileBrowse "Browse Haskell source file…"
+      when (respClicked fileBrowse) $
+        writeVar (dsFileDialog st) . Just
+          =<< askOpenFileDialog
+            defaultFileDialogOptions
+              { dialogFilters = [FileFilter "Haskell source" "hs;lhs", FileFilter "All files" "*"]
+              }
+  toolStripWrap $ do
     scope $
       if running
         then whenM (toolIconButton iconStop "Stop session") (liftIO (stopSession st wake))
         else disabledWhen busy $ whenM (styled primary (toolIconButton iconPlay "Start session")) (liftIO (startSession st wake))
     scope $ when busy (rowWith (alignMid . tight) spinner)
     disabledWhen (not running || busy) $ toolGroup $ do
-      input "expression, e.g. main" (fixedW 170) (dsExpr st)
+      input "expression, e.g. main" (fixedW 160) (dsExpr st)
       expr <- T.strip <$> readVar (dsExpr st)
-      whenM (toolIconButton iconStepInto "Step into") (send [":step " <> expr])
-      whenM (toolIconButton iconTrace "Trace") (send [":trace " <> expr])
-      whenM (toolIconButton iconBolt "Run") (send [expr])
+      whenM (tipBtn iconStepInto "Step into" "Evaluate expression stopping at the first step (:step)") (send [":step " <> expr])
+      whenM (tipBtn iconTrace "Trace" "Evaluate expression recording history for time-travel (:trace)") (send [":trace " <> expr])
+      whenM (tipBtn iconBolt "Run" "Evaluate expression until a breakpoint is hit") (send [expr])
     -- Continue and Abandon take their colour only when they can act.
-    let stepping = running && not busy && isJust stop
-        whenStepping f = if stepping then f else id
     disabledWhen (not stepping) $ do
       toolGroup $ do
-        whenM (toolIconButton iconStep "Step") (send [":step"])
-        whenM (toolIconButton iconStepOver "Step over") (send [":steplocal"])
-        whenM (toolIconButton iconStepOut "Step out") (send [":stepout"])
-        whenM (toolIconButton iconStepModule "Step module") (send [":stepmodule"])
-        whenM (styled (whenStepping success) (toolIconButton iconContinue "Continue")) (send [":continue"])
+        whenM (tipBtn iconStep "Step" "Step into next expression (F11)") (send [":step"])
+        whenM (tipBtn iconStepOver "Step over" "Step within current binding (:steplocal, F10)") (send [":steplocal"])
+        whenM (tipBtn iconStepOut "Step out" "Step out of current function (:stepout, Shift+F11)") (send [":stepout"])
+        whenM (tipBtn iconStepModule "Step module" "Step within current module (:stepmodule)") (send [":stepmodule"])
+        whenM (styled (whenStepping success) (tipBtn iconContinue "Continue" "Resume execution until next breakpoint (F5)")) (send [":continue"])
       toolGroup $ do
-        whenM (toolIconButton iconBack "Back") (send [":back"])
-        whenM (toolIconButton iconForward "Forward") (send [":forward"])
-        whenM (toolIconButton iconHistory "History") (send [":history"])
+        whenM (tipBtn iconBack "Back" "Step backwards through traced history (:back)") (send [":back"])
+        whenM (tipBtn iconForward "Forward" "Step forwards through traced history (:forward)") (send [":forward"])
+        whenM (tipBtn iconHistory "History" "Show traced call history (:history)") (send [":history"])
       flex
-      whenM (styled (whenStepping destructive) (toolIconButton iconAbandon "Abandon")) (send [":abandon"])
+      whenM (styled (whenStepping destructive) (tipBtn iconAbandon "Abandon" "Abandon current evaluation (:abandon)")) (send [":abandon"])
   bnDraw bench (dsPanes st) (debugPanes env st ix source)
 
 -- | The Debugger's panes, for whichever workbench holds them: the source
@@ -359,6 +396,7 @@ sourcePane env st ix ctx source stop send = do
   dir <- readVar (dsDir st)
   path <- readVar (dsSourcePath st)
   breaks <- readVar (dsBreaks st)
+  running <- readVar (dsRunning st)
   mm <- monoMetrics 0.9
   th <- uiTheme
   let pal = palette th
@@ -384,11 +422,16 @@ sourcePane env st ix ctx source stop send = do
         paneMeta (maybe "no module loaded" (T.pack . takeFileName) path)
         scope $ unless (T.null (laneLegend notes)) $ paneMeta (laneLegend notes)
         flex
-        scope $ for_ stop $ \s -> do
-          labelWith (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) "Stopped in"
-          linkText env (stopBinding (stName s)) (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) (stName s)
-          for_ (stSpan s) $ \sp ->
-            linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (shortFileName (ssFile sp) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
+        scope $ case stop of
+          Just s -> do
+            statusDot Warning
+            labelWith (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) "Stopped in"
+            linkText env (stopBinding (stName s)) (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) (stName s)
+            for_ (stSpan s) $ \sp ->
+              linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (shortFileName (ssFile sp) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
+          Nothing -> when running $ do
+            statusDot Success
+            paneMeta "Running"
   ev <- paneWith tight ctx "Source" header $ do
     scope $ case source of
       Just (Left e) -> columnWith (padXY 12 6) $ labelWith (fontTone Danger) (T.pack e)
@@ -481,8 +524,8 @@ bindingsPane env st stop send = do
     (Nothing, _) -> hint "Not stopped at a breakpoint. Set one in the gutter, then use Step into or Run."
     (Just _, []) -> hint "No local bindings at this location."
     _ -> pure ()
-  paneScroll (grow . tight) $ columnWith (tight . fillW . gap 4) $
-    forM_ bindings $ \b -> withKey (gbName b) $ panelWith (padXY 8 5 . gap 2 . fillW) $ do
+  paneScroll (grow . tight) $ columnWith (tight . fillW . gap 6 . padBottom 10) $
+    forM_ bindings $ \b -> withKey (gbName b) $ panelWith (padXY 10 7 . gap 3 . fillW) $ do
       let value = maybe (parseValue <$> gbValue b) Just (M.lookup (gbName b) values)
           name = gbName b
           mxr = M.lookup name xrays

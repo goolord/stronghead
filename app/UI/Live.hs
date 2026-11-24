@@ -302,10 +302,18 @@ rates fs =
 liveView :: Env -> Bench -> LiveState -> Maybe LiveData -> Maybe Timeline -> [RemoteAction] -> (FilePath -> NanoUI ()) -> NanoUI ()
 liveView env bench st mdata logTl remote followEventlog = columnWith (tight . gap 0 . grow) $ do
   want <- readVar (lvWant st)
-  toolStrip $ do
+  th <- uiTheme
+  let i = ink th
+      mDotTone = case mdata of
+        Just d | isJust (ldClosed d) -> Just Danger
+        Just d | not (Seq.null (ldFrames d)) -> Just Success
+        _ | want -> Just Warning
+        _ -> Nothing
+  toolStripWrap $ do
+    scope $ for_ mDotTone statusDot
     toolLabel "Agent"
-    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 150) defaultLayout} (lvHost st)
-    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 72) defaultLayout} (lvPort st)
+    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 140) defaultLayout} (lvHost st)
+    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 68) defaultLayout} (lvPort st)
     if want
       then whenM (toolIconButton iconUnlink "Disconnect") (writeVar (lvWant st) False)
       else whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
@@ -316,7 +324,7 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
     flex
     toolGroup $ do
       toolLabel "Eventlog"
-      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (alignMid . fixedW 240) defaultLayout} (lvEventlog st)
+      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (alignMid . minW 180 . fixedW 220) defaultLayout} (lvEventlog st)
       path <- readVar (lvEventlog st)
       disabledWhen (T.null (T.strip path)) $
         whenM (toolIconButton iconTrace "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
@@ -330,6 +338,10 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
     _ -> do
       tick <- readVar (lvBeaconsTick st)
       mBeacons <- useTask (lvBeaconsTask st) tick discoverAgents
+      let cardStyle = panelStyle (background (inkPane i) . borderWidth 1 . borderColor (inkRule i) . cornerRadius 6)
+          emptyActions = do
+            whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
+            whenM (toolIconButton iconRefresh "Rescan processes") (modifyVar (lvBeaconsTick st) (+ 1))
       scope $
         columnWith (grow . tight . gap 12) $ do
           case mBeacons of
@@ -340,23 +352,26 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
                   flex
                   whenM (toolIconButton iconRefresh "Rescan") (modifyVar (lvBeaconsTick st) (+ 1))
                 forM_ bs $ \b -> withKey (abPath b) $
-                  panelWith (padAll 8 . fillW) $
-                    rowWith (tight . gap 12 . alignMid . fillW) $ do
-                      labelWith fontMedium (abProgram b)
-                      labelWith (fontMono . fontMuted) ("pid " <> tshow (abPid b))
-                      labelWith fontMono (abHost b <> ":" <> tshow (abPort b))
-                      labelWith (fillW . fontMuted . fontSizeScale 0.88) (abCwd b)
-                      whenM (styled primary (buttonWith tight "Connect")) $ do
-                        writeVar (lvHost st) (abHost b)
-                        writeVar (lvPort st) (tshow (abPort b))
-                        connect st
+                  styled cardStyle $
+                    panelWith (padXY 12 8 . fillW) $ themed th $
+                      rowWith (tight . gap 12 . alignMid . fillW) $ do
+                        statusDot Success
+                        labelWith fontMedium (abProgram b)
+                        labelWith (fontMono . fontMuted) ("pid " <> tshow (abPid b))
+                        labelWith fontMono (abHost b <> ":" <> tshow (abPort b))
+                        labelWith (fillW . fontMuted . fontSizeScale 0.88) (abCwd b)
+                        whenM (styled primary (buttonWith tight "Connect")) $ do
+                          writeVar (lvHost st) (abHost b)
+                          writeVar (lvPort st) (tshow (abPort b))
+                          connect st
             _ -> pure ()
-          emptyState
+          emptyStateWith
             "Connect to a running program"
             [ "Link the program with the stronghead:agent library and wrap main. Build it -threaded, run it with +RTS -T, then press Connect."
             , "Connect finds the rest of the program by itself: run it with +RTS -l and the Timeline follows its eventlog as it is written, with -hT the heap panel follows its heap profile, and its working directory becomes a place to look for sources and dumps."
             ]
             ["import Stronghead.Agent", " ", "main = withAgent defaultAgentConfig $ do", "  ...", " ", "./prog +RTS -l -hT -i0.1 -T -RTS"]
+            emptyActions
 
 connect :: LiveState -> NanoUI ()
 connect st = do
@@ -368,17 +383,19 @@ connect st = do
 -- | The actions, as a toolbar under the connection's, with what went wrong
 -- last.
 actionStrip :: LiveState -> [RemoteAction] -> NanoUI ()
-actionStrip st remote = toolStrip $ do
-  toolLabel "Program"
-  forM_ (zip [0 :: Int ..] (groupsOf remote)) $ \(gi, grp) -> withKey gi $ do
-    scope $ when (gi > 0) (toolGroup (pure ()))
-    forM_ grp $ \a -> withKey (raLabel a) $
-      actionIconButton alignMid (remoteIcon (raLabel a)) (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
-  flex
-  msg <- readVar (lvMessage st)
-  scope $ unless (T.null msg) $ do
-    labelWith (alignMid . fontSizeScale 0.88 . fontTone Warning) (T.take 120 msg)
-    whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
+actionStrip st remote = do
+  th <- uiTheme
+  toolStripWrap $ do
+    toolLabel "Program"
+    forM_ (zip [0 :: Int ..] (groupsOf remote)) $ \(gi, grp) -> withKey gi $ do
+      scope $ when (gi > 0) (box (fixedWH 1 20 . alignMid) (inkRule (ink th)))
+      forM_ grp $ \a -> withKey (raLabel a) $
+        actionIconButton alignMid (remoteIcon (raLabel a)) (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
+    flex
+    msg <- readVar (lvMessage st)
+    scope $ unless (T.null msg) $ do
+      labelWith (alignMid . fontSizeScale 0.88 . fontTone Warning) (T.take 120 msg)
+      whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
   where
     groupsOf as = filter (not . null) [[a | a <- as, raGroup a == g] | g <- [GroupAgent, GroupDebug]]
     remoteIcon = \case
@@ -430,22 +447,37 @@ dashboard env bench st d logTl = do
   scope $ when (not statsOn) $
     columnWith (padBottom 8 . padXY 8 0 . tight . fillW) $
       callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
+  let lastPauseNs = stat "gc_elapsed_ns" lastF
+      gcCpuShare = stat "gc_cpu_ns" lastF / max 1 (stat "cpu_ns" lastF)
+      prodTone p
+        | p < 0.70 = Just Danger
+        | p < 0.85 = Just Warning
+        | p >= 0.90 = Just Success
+        | otherwise = Nothing
+      pauseTone
+        | lastPauseNs > 100e6 = Just Danger
+        | lastPauseNs > 20e6 = Just Warning
+        | otherwise = Nothing
+      gcTone
+        | gcCpuShare > 0.25 = Just Danger
+        | gcCpuShare > 0.10 = Just Warning
+        | otherwise = Nothing
   columnWith (padBottom 8 . tight . fillW) $
-    readout $
+    readoutToned $
       concat
-        [ [ ("allocation rate", fmtRate (rAlloc r))
-          , ("live after last GC", fmtBytesD (rLive r))
-          , ("memory in use", fmtBytesD (rMem r))
-          , ("collections per second", fmtFixed 1 (rGCs r))
-          , ("productivity", fmtPct (rProductivity r))
+        [ [ readoutItem "allocation rate" (fmtRate (rAlloc r))
+          , readoutItem "live after last GC" (fmtBytesD (rLive r))
+          , readoutItem "memory in use" (fmtBytesD (rMem r))
+          , readoutItem "collections / s" (fmtFixed 1 (rGCs r))
+          , (readoutItem "productivity" (fmtPct (rProductivity r))) {roTone = prodTone (rProductivity r)}
           ]
         | Just r <- [latest]
         ]
-        ++ [ ("last pause", fmtNs (stat "gc_elapsed_ns" lastF))
-           , ("max live", fmtBytesD (stat "max_live_bytes" lastF))
-           , ("major GCs", fmtInt (round (stat "major_gcs" lastF) :: Int))
-           , ("GC CPU", fmtPct (stat "gc_cpu_ns" lastF / max 1 (stat "cpu_ns" lastF)))
-           , ("threads", tshow (length (frThreads lastF)))
+        ++ [ (readoutItem "last pause" (fmtNs lastPauseNs)) {roTone = pauseTone}
+           , readoutItem "max live" (fmtBytesD (stat "max_live_bytes" lastF))
+           , readoutItem "major GCs" (fmtInt (round (stat "major_gcs" lastF) :: Int))
+           , (readoutItem "GC CPU" (fmtPct gcCpuShare)) {roTone = gcTone}
+           , readoutItem "threads" (tshow (length (frThreads lastF)))
            ]
   bnDraw bench (lvPanes st) (livePanes env st (Just d) logTl)
 
@@ -504,8 +536,14 @@ livePanes env st mdata logTl site = case mdata of
           when (xb - xa >= 2) $ do
             drawRect (Rect xa y (xb - xa) h) (alpha 0.06 (pText pal))
             drawTextWith (mmFont mm) (V2 (xa + 4) (y + 22)) AlignStart AlignMiddle (gapLabel g) (pMuted pal)
+        nearestPt target pts = case pts of
+          [] -> Nothing
+          p0 : rest -> Just (foldl' (\best p -> if abs (fst p - target) < abs (fst best - target) then p else best) p0 rest)
         chart title color f fmtY fill' =
           columnWith (tight . gap 4 . fillW . fillH) $ do
+            let pts = series f
+                ymax = maximum (1e-9 : map snd pts)
+            inp <- askInput
             labelWith (fontMuted . fontSizeScale 0.88) title
             resp <-
               canvasConfigured
@@ -514,10 +552,23 @@ livePanes env st mdata logTl site = case mdata of
                   , canvasTrackPointer = True
                   , canvasCursor = if onClock then Just (\_ _ _ -> UiCursorCrosshair) else Nothing
                   }
-                $ \r -> do
-                  drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color (series f) fill']
+                $ \r@(Rect _ y _ h) -> do
+                  drawLineChart pal (mmFont mm) r span' fmtY [ChartSeries title color pts fill']
                   when onClock (drawGaps (axisOf r) (inner r))
                   drawMarks pal (axisOf r) (inner r) marks
+                  let mouse = inputMousePos inp
+                  when (rectContains r mouse) $
+                    for_ (nearestPt (chartXTime r span' (v2X mouse)) pts) $ \(ptT, ptV) -> do
+                      let cx = chartTimeX r span' ptT
+                          cy = y + h - 4 - realToFrac (ptV / ymax) * (h - 20)
+                      withClip r $ do
+                        drawStroke (V2 cx (y + 2)) (V2 cx (y + h - 4)) 1 (alpha 0.45 (pText pal))
+                        drawCircle (V2 cx cy) 3.5 color
+                        drawStrokeCircle (V2 cx cy) 3.5 1.2 (inkPane (ink th))
+            when (respHovered resp) $ do
+              let tHover = chartXTime (respRect resp) span' (v2X (inputMousePos inp))
+              for_ (nearestPt tHover pts) $ \(ptT, ptV) ->
+                tooltip resp (title <> ": " <> fmtY ptV <> " at " <> fmtSec ptT)
             when onClock $ do
               void (timeGestures env (axisOf (respRect resp)) resp ScrubDrag)
               canvasLinks env resp (momentAt (axisOf (respRect resp)) marks . v2X)
@@ -677,12 +728,15 @@ liveStacksView env st rk stacks = do
 liveFlameView :: LiveState -> M.Map (Text, [LiveFrameEntry]) Int -> NanoUI ()
 liveFlameView st folded = do
   statusFilt <- readVar (lvFlameStatus st)
-  rowWith (tight . gap 6 . alignMid . fillW) $ do
+  let filtBtn lbl val =
+        whenM (styled (if statusFilt == val then primary else id) (buttonWith (padXY 8 2 . tight) lbl)) $
+          writeVar (lvFlameStatus st) val
+  rowWith (tight . gap 6 . alignMid . fillW . wrap) $ do
     labelWith (fontMuted . fontSizeScale 0.85) "Filter"
-    whenM (buttonWith (padXY 6 0 . tight) "All") (writeVar (lvFlameStatus st) Nothing)
-    whenM (buttonWith (padXY 6 0 . tight) "On-CPU (running)") (writeVar (lvFlameStatus st) (Just "running"))
-    whenM (buttonWith (padXY 6 0 . tight) "Off-CPU (MVar)") (writeVar (lvFlameStatus st) (Just "BlockedOnMVar"))
-    whenM (buttonWith (padXY 6 0 . tight) "Off-CPU (BlackHole)") (writeVar (lvFlameStatus st) (Just "BlockedOnBlackHole"))
+    filtBtn "All" Nothing
+    filtBtn "On-CPU (running)" (Just "running")
+    filtBtn "Off-CPU (MVar)" (Just "BlockedOnMVar")
+    filtBtn "Off-CPU (BlackHole)" (Just "BlockedOnBlackHole")
     flex
     labelWith (fontMuted . fontSizeScale 0.82) (tshow (sum (M.elems folded)) <> " total samples")
   flamegraphView (fromLiveFolded statusFilt folded) (lvFlameZoom st)

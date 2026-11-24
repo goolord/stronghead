@@ -16,6 +16,7 @@ import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM_, join, unless, void, when)
+import Data.Char (isDigit)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Either.Extra (eitherToMaybe)
 import Data.Foldable (asum, for_)
@@ -68,6 +69,7 @@ data CoreState = CoreState
   , csHovers :: !(Var (Maybe Text), Var (Maybe Text), Var (Maybe Text))
     -- ^ The name under the pointer in each code pane: source, Core, STG.
   , csHideTypeable :: !(Var Bool)
+  , csHideLifted :: !(Var Bool)
   , csFilter :: !(Var Text)
   , csSelected :: !(Var (Maybe Text))
   , csHot :: !(Var (Maybe Text))
@@ -136,6 +138,7 @@ newCoreState = do
   hg <- newVar Nothing
   let csHovers = (hs, hc, hg)
   csHideTypeable <- newVar True
+  csHideLifted <- newVar True
   csFilter <- newVar ""
   csSelected <- newVar Nothing
   csHot <- newVar Nothing
@@ -482,24 +485,34 @@ badgeText e haveCore =
     boxes = sum (map (length . nBoxing . bdNotes) (enCore e))
     allocs = sum (map (length . nAllocs . bdNotes) (enStg e))
 
+isLiftedBinding :: Text -> Bool
+isLiftedBinding k =
+  case T.stripPrefix "lvl" k of
+    Just rest | T.all isDigit rest -> True
+    _ -> any (`T.isPrefixOf` k) ["sat_", "$d", "$f", "$c", "$s", "$dm"]
+
 coreView :: Env -> Bench -> CoreState -> CoreLoaded -> NanoUI ()
 coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (csDirDialog st) (firstPath (openDumpDir st))
   useFileDialog (csFileDialog st) (mapM_ (openCodeFile st))
   let arts = fromMaybe [] (clArtifacts loaded)
-  toolStrip $ do
-    whenM (toolIconButton iconFolderOpen "Open dump folder…") $
-      writeVar (csDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
-    whenM (toolIconButton iconFile "Open files…") $
-      writeVar (csFileDialog st) . Just
-        =<< askOpenFileDialog
-          defaultFileDialogOptions
-            { dialogAllowMany = True
-            , dialogFilters = [FileFilter "Dumps and source" "dump-simpl;dump-stg-final;dump-stg;hs", FileFilter "All files" "*"]
-            }
+      askDir = writeVar (csDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
+      askFiles =
+        writeVar (csFileDialog st) . Just
+          =<< askOpenFileDialog
+            defaultFileDialogOptions
+              { dialogAllowMany = True
+              , dialogFilters = [FileFilter "Dumps and source" "dump-simpl;dump-stg-final;dump-stg;hs", FileFilter "All files" "*"]
+              }
+      openButtons = do
+        whenM (styled primary (toolIconButton iconFolderOpen "Open dump folder…")) askDir
+        whenM (toolIconButton iconFile "Open files…") askFiles
+  toolStripWrap $ do
+    whenM (toolIconButton iconFolderOpen "Open dump folder…") askDir
+    whenM (toolIconButton iconFile "Open files…") askFiles
     scope $ unless (null arts) $ toolGroup $ do
       toolLabel "Module"
-      selectWith (alignMid . minW 220) (map maModule arts) (csModule st)
+      selectWith (alignMid . minW 200) (map maModule arts) (csModule st)
       i <- readVar (csModule st)
       current <- readVar (csLoadedModule st)
       -- Load whichever module the picker shows (the first one after a
@@ -532,8 +545,8 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
     | mixed -> scope (bnDraw bench (csPanes st) (corePanes env st loaded))
     | isJust root && isNothing (clArtifacts loaded) -> scope $ emptyState "Searching for dumps…" [] []
     | isJust root && clArtifacts loaded == Just [] && isNothing core && isNothing stg && isNothing src ->
-        scope $ emptyState "No dumps in that folder" ["No .dump-simpl or .dump-stg-final files were found under it. Build with -ddump-to-file, then open the folder again."] dumpCommands
-    | isNothing core && isNothing stg && isNothing src -> scope intro
+        scope $ emptyStateWith "No dumps in that folder" ["No .dump-simpl or .dump-stg-final files were found under it. Build with -ddump-to-file, then open the folder again."] dumpCommands openButtons
+    | isNothing core && isNothing stg && isNothing src -> scope (intro openButtons)
     | otherwise -> scope (bnDraw bench (csPanes st) (corePanes env st loaded))
 
 dumpCommands :: [Text]
@@ -542,15 +555,16 @@ dumpCommands =
   , "cabal build --ghc-options=\"-ddump-simpl -ddump-stg-final -ddump-to-file\""
   ]
 
-intro :: NanoUI ()
-intro =
-  emptyState
+intro :: NanoUI () -> NanoUI ()
+intro actions =
+  emptyStateWith
     "Open a folder of Core and STG dumps, or a source file"
     [ "Compile with the dumps written to files, then open the folder. Each module's source, Core and STG are found and paired."
     , "Cabal puts the dumps next to the object files under dist-newstyle/. Sources are found beside the dumps, in the project the folder is in, and under the project root set in Settings."
     , "Any source line another panel links to opens here too, annotated with what the runtime saw of it."
     ]
     dumpCommands
+    actions
 
 -- | Cached full entry list and key map for the currently loaded files.
 cachedEntries :: CoreState -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> IO ([Entry], M.Map Text Entry)
@@ -579,6 +593,7 @@ corePanes env st loaded sitePanes = do
   let (groups, actives) = reconcileTabGroups hostPanes groups0 actives0
   hideU <- readVar (csHideUniques st)
   hideT <- readVar (csHideTypeable st)
+  hideL <- readVar (csHideLifted st)
   colouring <- readVar (csColouring st)
   filt <- T.toLower <$> readVar (csFilter st)
   selected <- readVar (csSelected st)
@@ -661,11 +676,13 @@ corePanes env st loaded sitePanes = do
         ByHeap -> sortOn (Down . rtHeap . rt)
         ByEntries -> sortOn (Down . rtEntries . rt)
         ByTicky -> sortOn (Down . rtTicky . rt)
+      hasLifted = any (isLiftedBinding . enKey) es
       shown =
         sorted
           [ e
           | e <- es
           , T.null filt || filt `T.isInfixOf` T.toLower (enKey e)
+          , not hideL || not (T.null filt) || not (isLiftedBinding (enKey e))
           , not hotBoxed || null lanes || (isHot e && boxedOrAlloc e)
           ]
       selEntry = selected >>= (`M.lookup` byKey)
@@ -826,6 +843,9 @@ corePanes env st loaded sitePanes = do
         let metaContent = rowWith (alignMid . tight . gap 8 . padRight 6) $ do
               paneMeta (maybe (if activeKind == KindSource then "not found: set the project root in Settings" else "not loaded") (T.pack . takeFileName . cfPath) activeMcf)
               scope $ unless (T.null (laneLegend activeNotes)) $ paneMeta (laneLegend activeNotes)
+              scope $ for_ (pcGrid ctx) $ \g -> when (pgcMaximized g) $ do
+                res <- themed th (quietIconButton' iconMinimize "Restore" "Restore pane layout (or double-click header)")
+                when (respClicked res) (pgcRestore g)
               for_ (pcMenu ctx) (themed th . paneMenuWithVar menuOpen)
             trailingMeta = case pcGrid ctx of
               Just g -> paneDragHandle g tight (themed th metaContent)
@@ -993,8 +1013,10 @@ corePanes env st loaded sitePanes = do
   pure $ \pid ctx ->
     if
       | pid == paneCoreBindings -> Just $
-          pane ctx "Bindings" (paneMeta (tshow (length shown))) $ do
+          pane ctx "Bindings" (paneMeta (if length shown == length es then tshow (length shown) else tshow (length shown) <> " / " <> tshow (length es))) $ do
             searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter bindings", sicLayout = fillW defaultLayout} (csFilter st)
+            scope $ when hasLifted $
+              checkboxWith (fillW . fontSizeScale 0.86) "Hide compiler lifted" (csHideLifted st)
             scope $ unless (null lanes) $ do
               checkboxWith fillW "Hot and boxed only" (csHotBoxed st)
               rowWith (padXY 8 0 . tight . gap 6 . fillW) $ do
@@ -1027,7 +1049,7 @@ corePanes env st loaded sitePanes = do
                 when picked (select (enKey e))
       | pid == paneCoreNotes -> Just $
           pane ctx (maybe "What the optimiser did" enKey selEntry) (pure ()) $
-            paneScroll (grow . tight) $ columnWith (tight . gap 6 . fillW) $
+            paneScroll (grow . tight) $ columnWith (tight . gap 6 . fillW . padBottom 10) $
               case selEntry of
                 Nothing -> do
                   hint "Select a binding to see what the optimiser did to it: worker/wrapper, inlining, boxing, STG closure captures, and optimization smells."
@@ -1037,7 +1059,7 @@ corePanes env st loaded sitePanes = do
                     separator
                     sectionTitle ("Module optimization smells (" <> tshow (length smells) <> ")")
                     forM_ (zip [0 :: Int ..] smells) $ \(si, sm) -> withKey ("sm" <> tshow si) $
-                      panelWith (padXY 8 5 . gap 3 . fillW) $ do
+                      panelWith (padXY 10 7 . gap 4 . fillW) $ do
                         rowWith (tight . gap 8 . alignMid . fillW) $ do
                           badge Warning (Forensics.smellKindTitle (Forensics.csKind sm))
                           labelWith (fontMono . fontMedium . fillW) (Forensics.csBinding sm)

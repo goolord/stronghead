@@ -23,8 +23,8 @@ import NanoUI
 
 import Stronghead.Eventlog.CriticalPath (LatencyHeatmap (..))
 import Stronghead.Flamegraph
-import Stronghead.Format (fmtBytesD, fmtFixed, fmtInt, fmtNs, fmtPct, readDecimal, tshow)
-import Stronghead.HeapProfile (Band (..), HeapProfile (..))
+import Stronghead.Format (fmtBytesD, fmtFixed, fmtInt, fmtNs, fmtPct, fmtSec, readDecimal, tshow)
+import Stronghead.HeapProfile (Band (..), HeapProfile (..), hpOffsets)
 import UI.Common
 
 -- ---------------------------------------------------------------------------
@@ -37,8 +37,10 @@ flamegraphView ft zoomVar = do
   th <- uiTheme
   mm <- monoMetrics 0.82
   zoomed <- readVar zoomVar
+  inp <- askInput
   let pal = palette th
       viewTree = maybe ft (\target -> fromMaybe ft (zoomInto target ft)) zoomed
+      mouse = inputMousePos inp
   columnWith (tight . fillW . fillH . gap 6) $ do
     rowWith (tight . gap 8 . alignMid . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) (ftTitle viewTree)
@@ -53,20 +55,28 @@ flamegraphView ft zoomVar = do
     if null (ftRoots viewTree) || ftTotal viewTree <= 0
       then hint "No stack samples available for this view."
       else do
+        sid <- currentId
+        prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
+        let hoverRect = if rectContains prev mouse then fst <$> findHit mouse (layoutFlame prev viewTree) else Nothing
         resp <-
           canvasConfigured
             defaultCanvasConfig
               { canvasLayout = (fillW . grow . minH 180) defaultLayout
               , canvasTrackPointer = True
+              , canvasCursor = Just (\_ _ _ -> UiCursorPointer)
               }
-            (\r -> drawFlameTree pal mm r viewTree)
-        inp <- askInput
+            $ \r -> do
+              drawFlameTree pal mm r viewTree
+              case hoverRect of
+                Just (Rect hx hy hw hh) ->
+                  drawStrokeRoundedRect (Rect (hx + 0.5) (hy + 0.5) (max 1 (hw - 2)) (max 1 (hh - 2))) 2 1.5 (pText pal)
+                Nothing -> pure ()
         let boxes = layoutFlame (respRect resp) viewTree
-            hit = if respHovered resp then findHit (inputMousePos inp) boxes else Nothing
+            hit = if respHovered resp then findHit mouse boxes else Nothing
         case hit of
           Just (_, n) -> do
             let pct = if ftTotal viewTree > 0 then fnTotal n / ftTotal viewTree else 0
-            tooltip resp (fnName n <> "\ntotal: " <> fmtFixed 1 (fnTotal n) <> " (" <> fmtPct pct <> "), self: " <> fmtFixed 1 (fnSelf n))
+            tooltip resp (fnName n <> "\ntotal: " <> fmtFixed 1 (fnTotal n) <> " (" <> fmtPct pct <> "), self: " <> fmtFixed 1 (fnSelf n) <> "\nClick to zoom")
             when (respClicked resp) (writeVar zoomVar (Just (fnName n)))
           Nothing -> pure ()
 
@@ -76,7 +86,9 @@ diffFlamegraphView :: DiffFlameTree -> NanoUI ()
 diffFlamegraphView dft = do
   th <- uiTheme
   mm <- monoMetrics 0.82
+  inp <- askInput
   let pal = palette th
+      mouse = inputMousePos inp
   columnWith (tight . fillW . fillH . gap 6) $ do
     rowWith (tight . gap 8 . alignMid . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) (dftTitle dft)
@@ -86,19 +98,26 @@ diffFlamegraphView dft = do
     if null (dftRoots dft)
       then hint "No differential flamegraph frames available."
       else do
+        sid <- currentId
+        prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
+        let hoverRect = if rectContains prev mouse then fst <$> findHit mouse (layoutDiffFlame prev dft) else Nothing
         resp <-
           canvasConfigured
             defaultCanvasConfig
               { canvasLayout = (fillW . grow . minH 180) defaultLayout
               , canvasTrackPointer = True
               }
-            (\r -> drawDiffFlameTree pal mm r dft)
-        inp <- askInput
+            $ \r -> do
+              drawDiffFlameTree pal mm r dft
+              case hoverRect of
+                Just (Rect hx hy hw hh) ->
+                  drawStrokeRoundedRect (Rect (hx + 0.5) (hy + 0.5) (max 1 (hw - 2)) (max 1 (hh - 2))) 2 1.5 (pText pal)
+                Nothing -> pure ()
         let boxes = layoutDiffFlame (respRect resp) dft
-            hit = if respHovered resp then findHit (inputMousePos inp) boxes else Nothing
+            hit = if respHovered resp then findHit mouse boxes else Nothing
         case hit of
           Just (_, n) ->
-            tooltip resp (dfnName n <> "\nbase: " <> fmtFixed 1 (dfnBaseTotal n) <> " -> cur: " <> fmtFixed 1 (dfnCurTotal n) <> " (delta " <> (if dfnDelta n >= 0 then "+" else "") <> fmtFixed 1 (dfnDelta n) <> ")")
+            tooltip resp (dfnName n <> "\nbase: " <> fmtFixed 1 (dfnBaseTotal n) <> " → cur: " <> fmtFixed 1 (dfnCurTotal n) <> " (delta " <> (if dfnDelta n >= 0 then "+" else "") <> fmtFixed 1 (dfnDelta n) <> ")")
           Nothing -> pure ()
 
 -- | Render a 'FlameTree' onto a @nano-ui@ canvas (usable live or in SVG export).
@@ -209,7 +228,9 @@ latencyHeatmapView :: LatencyHeatmap -> NanoUI ()
 latencyHeatmapView hm = do
   th <- uiTheme
   mm <- monoMetrics 0.8
+  inp <- askInput
   let pal = palette th
+      mouse = inputMousePos inp
   columnWith (tight . fillW . gap 4) $ do
     rowWith (tight . gap 8 . alignMid . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.9) (hmTitle hm)
@@ -219,16 +240,33 @@ latencyHeatmapView hm = do
     if hmSampleCount hm == 0
       then hint "No samples in this latency heatmap."
       else do
-        _ <-
+        resp <-
           canvasConfigured
-            defaultCanvasConfig {canvasLayout = (fillW . fixedH 132) defaultLayout}
+            defaultCanvasConfig
+              { canvasLayout = (fillW . fixedH 132) defaultLayout
+              , canvasTrackPointer = True
+              }
             (\r -> drawLatencyHeatmap pal mm r hm)
-        pure ()
+        let Rect rx ry rw rh = respRect resp
+            padL = 68 :: Float
+            plotX = rx + padL
+            plotW = max 1 (rw - padL - 6)
+            plotH = max 1 (rh - 8)
+            tb = max 1 (hmTimeBins hm)
+            vb = max 1 (hmValueBins hm)
+            V2 mx my = mouse
+        when (respHovered resp && mx >= plotX && mx <= plotX + plotW && my >= ry + 4 && my <= ry + 4 + plotH) $ do
+          let tIdx = max 0 (min (tb - 1) (floor ((mx - plotX) / (plotW / fromIntegral tb))))
+              vIdx = max 0 (min (vb - 1) (vb - 1 - floor ((my - (ry + 4)) / (plotH / fromIntegral vb))))
+              cnt = hmCounts hm VU.! (tIdx * vb + vIdx)
+              loNs = hmMinNs hm + (hmMaxNs hm - hmMinNs hm) * (fromIntegral vIdx / fromIntegral vb)
+              hiNs = hmMinNs hm + (hmMaxNs hm - hmMinNs hm) * (fromIntegral (vIdx + 1) / fromIntegral vb)
+          tooltip resp ("Bucket " <> fmtNs loNs <> " – " <> fmtNs hiNs <> "\n" <> fmtInt cnt <> (if cnt == 1 then " sample" else " samples"))
 
 drawLatencyHeatmap :: Palette -> MonoMetrics -> Rect -> LatencyHeatmap -> CanvasM ()
 drawLatencyHeatmap pal mm r@(Rect rx ry rw rh) hm = withClip r $ do
   drawRect r (pTrackBg pal)
-  let padL = 64 :: Float
+  let padL = 68 :: Float
       plotX = rx + padL
       plotW = max 1 (rw - padL - 6)
       plotH = max 1 (rh - 8)
@@ -242,7 +280,7 @@ drawLatencyHeatmap pal mm r@(Rect rx ry rw rh) hm = withClip r $ do
       let cnt = hmCounts hm VU.! (tIdx * vb + vIdx)
       when (cnt > 0) $ do
         let intensity = log (1 + fromIntegral cnt) / log (1 + fromIntegral maxC) :: Double
-            col = blendColor (alpha 0.25 (pAccent pal)) (colorRGB 245 110 55) (realToFrac intensity)
+            col = blendColor (alpha 0.35 (pAccent pal)) (colorRGB 245 110 55) (realToFrac intensity)
             x = plotX + fromIntegral tIdx * cw
             y = ry + 4 + fromIntegral (vb - 1 - vIdx) * ch
         drawRect (Rect x y (max 1 (cw - 0.5)) (max 1 (ch - 0.5))) col
@@ -259,7 +297,11 @@ eraCohortHeatmapView :: HeapProfile -> NanoUI ()
 eraCohortHeatmapView hp = do
   th <- uiTheme
   mm <- monoMetrics 0.8
+  inp <- askInput
   let pal = palette th
+      light = themeAppearance th == AppearanceLight
+      lowCol = if light then colorRGB 178 210 245 else colorRGB 38 78 112
+      mouse = inputMousePos inp
       eraBands =
         sortOn fst
           [ (eraNum, b)
@@ -269,6 +311,7 @@ eraCohortHeatmapView hp = do
           ]
       nTimes = VU.length (hpTimes hp)
       maxVal = maximum (1 : [bandPeak b | (_, b) <- eraBands])
+      rows = take 48 eraBands
   columnWith (tight . fillW . fillH . gap 6) $ do
     rowWith (tight . gap 8 . alignMid . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) "Era cohort retention matrix (+RTS -he)"
@@ -277,16 +320,18 @@ eraCohortHeatmapView hp = do
     if null eraBands || nTimes == 0
       then hint "No era cohorts found. Run with +RTS -l -he -i0.1 and call Stronghead.Agent.bumpEra per request or phase."
       else do
-        _ <-
+        resp <-
           canvasConfigured
-            defaultCanvasConfig {canvasLayout = (fillW . grow . minH 180) defaultLayout}
+            defaultCanvasConfig
+              { canvasLayout = (fillW . grow . minH 180) defaultLayout
+              , canvasTrackPointer = True
+              }
             $ \r@(Rect rx ry rw rh) -> withClip r $ do
               drawRect r (pTrackBg pal)
               let padL = 56 :: Float
                   px = rx + padL
                   pw = max 1 (rw - padL - 8)
                   ph = max 1 (rh - 8)
-                  rows = take 48 eraBands
                   nRows = max 1 (length rows)
                   cw = pw / fromIntegral (max 1 nTimes)
                   ch = ph / fromIntegral nRows
@@ -298,6 +343,21 @@ eraCohortHeatmapView hp = do
                   let v = if ti < VU.length (bandValues band) then bandValues band VU.! ti else 0
                   when (v > 0) $ do
                     let frac = sqrt (v / maxVal)
-                        col = blendColor (colorRGB 38 78 112) (colorRGB 245 108 48) (realToFrac frac)
+                        col = blendColor lowCol (colorRGB 245 108 48) (realToFrac frac)
                     drawRect (Rect (px + fromIntegral ti * cw) y (max 1 (cw - 0.5)) (max 1 (ch - 0.5))) col
-        pure ()
+        let Rect rx ry rw rh = respRect resp
+            padL = 56 :: Float
+            px = rx + padL
+            pw = max 1 (rw - padL - 8)
+            ph = max 1 (rh - 8)
+            nRows = max 1 (length rows)
+            V2 mx my = mouse
+        when (respHovered resp && mx >= px && mx <= px + pw && my >= ry + 4 && my <= ry + 4 + ph) $ do
+          let ti = max 0 (min (nTimes - 1) (floor ((mx - px) / (pw / fromIntegral (max 1 nTimes)))))
+              ri = max 0 (min (nRows - 1) (floor ((my - (ry + 4)) / (ph / fromIntegral nRows))))
+          case drop ri rows of
+            (eraNum, band) : _ -> do
+              let v = if ti < VU.length (bandValues band) then bandValues band VU.! ti else 0
+                  tSec = if ti < VU.length (hpOffsets hp) then hpOffsets hp VU.! ti else 0
+              tooltip resp ("era " <> tshow eraNum <> " at " <> fmtSec tSec <> "\n" <> fmtBytesD v <> " live")
+            [] -> pure ()

@@ -73,14 +73,29 @@ import UI.Timeline
 import UI.Watchers
 import UI.Workspace
 
--- | How to drive the panel, for the status bar.
-panelHint :: Panel -> T.Text
-panelHint = \case
-  PTimeline -> "Wheel to zoom, drag to pan, click or drag the ruler for the cursor, Shift+drag for a range, [ ] step collections"
-  PHeap -> "Drag the chart to move the cursor, wheel to zoom, drag the time axis to pan, Shift+drag for a range, [ ] step censuses"
-  PCore -> "Hover a name to find it in every pane, click it to jump to its binding; click a bar or a note to go to what it measures"
-  PDebugger -> "Click the gutter to set or clear a breakpoint"
-  PLive -> "Click or drag a chart to move the cursor, Shift+drag for a range; samples arrive four times a second"
+-- | How to drive the panel, for the status bar (full & compact variants).
+panelHint :: Bool -> Panel -> T.Text
+panelHint compact = \case
+  PTimeline ->
+    if compact
+      then "Wheel zoom · drag pan · Shift+drag range · [ ] GCs"
+      else "Wheel to zoom, drag to pan, click or drag the ruler for the cursor, Shift+drag for a range, [ ] step collections"
+  PHeap ->
+    if compact
+      then "Drag cursor · wheel zoom · Shift+drag range · [ ] censuses"
+      else "Drag the chart to move the cursor, wheel to zoom, drag the time axis to pan, Shift+drag for a range, [ ] step censuses"
+  PCore ->
+    if compact
+      then "Hover name to cross-highlight · click to jump"
+      else "Hover a name to find it in every pane, click it to jump to its binding; click a bar or a note to go to what it measures"
+  PDebugger ->
+    if compact
+      then "Click gutter for breakpoints · F5/F10/F11 step"
+      else "Click the gutter to set or clear a breakpoint · F5 continue · F10 step over · F11 step into"
+  PLive ->
+    if compact
+      then "Click/drag chart for cursor · Shift+drag range"
+      else "Click or drag a chart to move the cursor, Shift+drag for a range; samples arrive four times a second"
 
 tabNamed :: T.Text -> Panel
 tabNamed = fromMaybe PTimeline . panelNamed
@@ -101,6 +116,7 @@ data App = App
   , appStartTab :: !(Maybe Panel)
     -- ^ A panel asked for on the command line wins over the files' panels.
   , appSettingsOpen :: !(Var Bool)
+  , appShortcutsOpen :: !(Var Bool)
   , appTheme :: !(Var ThemeChoice)
   , appScale :: !(Var UiScale)
   , appRestoreWindow :: !(Var Bool)
@@ -219,6 +235,7 @@ newApp settings Options {..} = do
   appMessage <- newVar ""
   let appStartTab = tabNamed <$> optTab
   appSettingsOpen <- newVar False
+  appShortcutsOpen <- newVar False
   appTheme <- newVar (cfgTheme settings)
   appScale <- newVar (cfgScale settings)
   appRestoreWindow <- newVar (cfgRestoreWindow settings)
@@ -525,33 +542,45 @@ appView app = do
     goTo env r
 
   th <- uiTheme
+  winW <- windowWidth
   let i = ink th
+      compactHeader = winW < 1180
+      headerBtn ic fullLabel tip =
+        let lbl = if compactHeader then "" else fullLabel
+            btnMod = if compactHeader then alignMid . padXY 7 4 else alignMid . padXY 8 4
+         in do
+              resp <- styled quiet (iconButtonWith' btnMod ic lbl)
+              tooltip resp (if compactHeader then fullLabel <> " — " <> tip else tip)
+              pure resp
   columnWith (tight . grow . gap 0) $ do
     styled (panelStyle (background (inkGround i) . borderWidth 0 . cornerRadius 0)) $
       -- As tall as the tabs and a margin above them, so the wordmark, the
       -- tabs' labels and the commands share one centre line and the active
-      -- tab still opens onto the toolbar below.
-      panelWith (asRow . fillW . padLeft 20 . padRight 8 . padTop 8 . padBottom 0 . gap 18) . themed th $ do
+      -- folder tab joins the toolbar below without a seam.
+      panelWith (asRow . fillW . padLeft (if compactHeader then 12 else 20) . padRight 8 . padTop 8 . padBottom 0 . gap (if compactHeader then 10 else 18)) . themed th $ do
         labelWith (alignMid . fontSemiBold . fontSizeScale 1.08) "Stronghead"
         history env
         navBar (appTab app)
         flex
         -- The file on show, when there is room beside the buttons.
-        winW <- windowWidth
-        scope $ when (winW >= 1640) (document app active)
-        do
-          resp <- quietIconButton' iconLayers "Sources" "What each run has, and how to add the rest"
-          when (respClicked resp) (modifyVar (appSourcesOpen app) not)
-          sourcesOpen <- readVar (appSourcesOpen app)
-          sources <- if sourcesOpen then sourcesOf app timeline0 heap0 core live0 links else pure []
-          sourcesPopover env (appSourcesOpen app) (respRect resp) sources (linkRuns app) (unlinkRun app)
-        do
-          resp <- quietIconButton' iconLayout "Workspace" "Add a pane to this panel, use another arrangement, save or open the session"
-          when (respClicked resp) (modifyVar (appPanesOpen app) not)
-          panesPopover app active (respRect resp)
-        whenM (respClicked <$> quietIconButton' iconSearch "Go to…" "Find a thread, binding, cost centre, band or command (Ctrl+K)") (openPalette (appPalette app))
-        whenM (respClicked <$> quietIconButton' iconSettings "Settings" "Theme, scale, defaults and the editor command (Ctrl+,)") (writeVar (appSettingsOpen app) True)
-        whenM (quietIconButton iconFolderOpen "Open…") (askOpen app)
+        scope $ when (winW >= 1560) (document app active)
+        rowWith (alignMid . tight . gap 3) $ do
+          do
+            resp <- headerBtn iconLayers "Sources" "What each run has, and how to add the rest"
+            when (respClicked resp) (modifyVar (appSourcesOpen app) not)
+            sourcesOpen <- readVar (appSourcesOpen app)
+            sources <- if sourcesOpen then sourcesOf app timeline0 heap0 core live0 links else pure []
+            sourcesPopover env (appSourcesOpen app) (respRect resp) sources (linkRuns app) (unlinkRun app)
+          do
+            resp <- headerBtn iconLayout "Workspace" "Add a pane to this panel, use another arrangement, save or open the session"
+            when (respClicked resp) (modifyVar (appPanesOpen app) not)
+            panesPopover app active (respRect resp)
+          do
+            resp <- styled quiet (iconButtonWith' (alignMid . padXY 8 4) iconSearch "Go to…")
+            tooltip resp "Find a thread, binding, cost centre, band or command (Ctrl+K)"
+            when (respClicked resp) (openPalette (appPalette app))
+          whenM (respClicked <$> headerBtn iconSettings "Settings" "Theme, scale, defaults and the editor command (Ctrl+,)") (writeVar (appSettingsOpen app) True)
+          whenM (respClicked <$> headerBtn iconFolderOpen "Open…" "Open an eventlog, heap profile, cost-centre profile, dump, or session") (askOpen app)
     columnWith (tight . grow . gap 0) . withKey (fromEnum active) $ case active of
       PTimeline -> timelineView env bench (appTimeline app) timeline
       PHeap -> heapView env bench (appHeap app) heap logTl
@@ -560,8 +589,9 @@ appView app = do
       PLive -> liveView env bench (appLive app) live logTl remote $ \p -> do
         openEventlog (appTimeline app) p True
         writeVar (appTab app) PTimeline
-    statusBar app env active timeline live heap hooks baseline
+    statusBar app env active winW timeline live heap hooks baseline
   settingsModal app
+  shortcutsModal app
   markPrompt bus (appLive app) live
   paletteView env (appPalette app) (commands app env active markNow)
   poppedWindows app shellPanes providers
@@ -583,25 +613,28 @@ askOpen app =
 -- | Back and forward through the places links went to, each with a tooltip
 -- naming where it leads.
 history :: Env -> NanoUI ()
-history env = rowWith (alignMid . tight . gap 2) $ do
-  let bus = envBus env
-      step label locs go = do
-        resp <- disabledWhen (null locs) (styled quiet (buttonWith' (alignMid . padXY 8 2 . tight) label))
-        for_ (take 1 locs) $ \loc -> tooltip resp (describe loc)
-        when (respClicked resp) (go env)
-      describe (Location p r) = panelTitle p <> maybe "" ((": " <>) . refTitle env) r
-  back <- readVar (busBack bus)
-  forward <- readVar (busForward bus)
-  step "←" back goBack
-  step "→" forward goForward
+history env =
+  rowWith (alignMid . tight . gap 2) $ do
+    let bus = envBus env
+        step label fallback locs go = do
+          resp <- disabledWhen (null locs) (styled quiet (buttonWith' (alignMid . padXY 6 2 . tight) label))
+          tooltip resp (maybe fallback describe (listToMaybe locs))
+          when (respClicked resp) (go env)
+        describe (Location p r) = panelTitle p <> maybe "" ((": " <>) . refTitle env) r
+    back <- readVar (busBack bus)
+    forward <- readVar (busForward bus)
+    step "←" "Back (Alt+Left)" back goBack
+    step "→" "Forward (Alt+Right)" forward goForward
 
 -- | Window-wide navigation: the palette, history, the panels by number,
--- and Esc to drop the focus.
+-- shortcuts reference, and Esc to drop the focus.
 navShortcuts :: App -> Env -> NanoUI ()
 navShortcuts app env = do
   let pressed = anyM shortcut
       digit n = K.cmdOrCtrl <> K.key (intToDigit n)
   whenM (pressed [K.cmdOrCtrl <> K.key 'k']) (openPalette (appPalette app))
+  whenM (pressed [K.cmdOrCtrl <> K.key ',']) (writeVar (appSettingsOpen app) True)
+  whenM (pressed [K.key (KeyF 1), K.shift <> K.key '/']) (modifyVar (appShortcutsOpen app) not)
   inp <- askInput
   back <- pressed [K.alt <> K.key KeyLeft]
   forward <- pressed [K.alt <> K.key KeyRight]
@@ -617,6 +650,8 @@ commands app env active markNow =
   [Hit "panel" (panelTitle p) ("Ctrl+" <> tshow n) (HitRun (writeVar (appTab app) p)) | (n, p) <- zip [1 :: Int ..] [minBound .. maxBound]]
     ++ [ Hit "command" "Open file…" "" (HitRun (askOpen app))
        , Hit "command" "Settings" "Ctrl+," (HitRun (writeVar (appSettingsOpen app) True))
+       , Hit "command" "Keyboard shortcuts" "F1" (HitRun (writeVar (appShortcutsOpen app) True))
+       , Hit "command" "Toggle theme (Light / Dark)" "" (HitRun (toggleTheme app))
        , Hit "command" "Back" "Alt+Left" (HitRun (goBack env))
        , Hit "command" "Forward" "Alt+Right" (HitRun (goForward env))
        , Hit "command" "Clear the focus" "Esc" (HitRun (setFocus env Nothing))
@@ -631,6 +666,15 @@ commands app env active markNow =
        ]
     ++ [Hit "arrangement" ("Arrange: " <> panelTitle p) "this panel" (HitRun (useArrangement app active (panelPreset p))) | p <- [minBound .. maxBound]]
     ++ [Hit "arrangement" ("Arrange: " <> prName pr) "this panel" (HitRun (useArrangement app active (prTree pr))) | pr <- userPresets]
+
+toggleTheme :: App -> NanoUI ()
+toggleTheme app = do
+  cur <- readVar (appTheme app)
+  sys <- systemAppearance
+  let next = case choiceAppearance cur sys of
+        Just AppearanceLight -> ThemeDark
+        _ -> ThemeLight
+  writeVar (appTheme app) next
 
 -- ---------------------------------------------------------------------------
 -- Workspaces
@@ -993,20 +1037,26 @@ document app active = scope $ case active of
 -- eventlog, the agent, the ghc-debug target, GHCi) opens its panel on a
 -- click and has a menu on a right-click. On the right, the cursor's time,
 -- the focus, and how to drive the active panel.
-statusBar :: App -> Env -> Panel -> Maybe LoadProgress -> Maybe LiveData -> HeapLoaded -> DebugHooks -> BaselineLoaded -> NanoUI ()
-statusBar app env active timeline live heap hooks baseline = do
+statusBar :: App -> Env -> Panel -> Float -> Maybe LoadProgress -> Maybe LiveData -> HeapLoaded -> DebugHooks -> BaselineLoaded -> NanoUI ()
+statusBar app env active winW timeline live heap hooks baseline = do
   th <- uiTheme
   let i = ink th
       tl = appTimeline app
       lv = appLive app
       hs = appHeap app
       dbg = appDebug app
+      compactStatus = winW < 1340
   busy <- readVar (dsBusy dbg)
   ghci <- readVar (dsRunning dbg)
   msg <- readVar (appMessage app)
   path <- readVar (tsPath tl)
   styled (panelStyle (background (inkGround i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
-    panelWith (asRow . fillW . fixedH 28 . padXY 14 0 . gap 14) $ themed th $ do
+    panelWith (asRow . fillW . fixedH 30 . padXY 12 0 . gap 12) $ themed th $ do
+      -- Show active document name on the left whenever it isn't shown in the header.
+      scope $ when (winW < 1560) $ do
+        docName <- activeDocumentName app active
+        for_ docName $ \nm ->
+          labelWith (alignMid . fontMono . fontMuted . fontSizeScale 0.82) (T.take 36 nm)
       scope $ for_ timeline $ \p -> do
         let file = maybe "the eventlog" (T.pack . takeFileName) path
             toTimeline = writeVar (appTab app) PTimeline
@@ -1018,15 +1068,15 @@ statusBar app env active timeline live heap hooks baseline = do
               whenM (menuItem "Show in Timeline") toTimeline
         unless (lpDone p) $ do
           let frac = if lpTotal p > 0 then fromIntegral (lpBytes p) / fromIntegral (lpTotal p) else 0 :: Double
-          progressBarWith (fixedW 120 . alignMid) 6 (realToFrac frac)
-          connection Nothing ("Reading " <> file <> ", " <> fmtBytes (fromIntegral (lpBytes p))) toTimeline menu
-        when (lpFollowing p && lpDone p) $ connection Nothing ("Following " <> file) toTimeline menu
-        for_ (lpError p) $ \e -> connection (Just Danger) ("Eventlog decoding stopped: " <> T.take 100 e) toTimeline menu
+          progressBarWith (fixedW 100 . alignMid) 6 (realToFrac frac)
+          connection (Just Warning) ("Reading " <> file <> ", " <> fmtBytes (fromIntegral (lpBytes p))) toTimeline menu
+        when (lpFollowing p && lpDone p) $ connection (Just Success) ("Following " <> file) toTimeline menu
+        for_ (lpError p) $ \e -> connection (Just Danger) ("Eventlog decoding stopped: " <> T.take 80 e) toTimeline menu
       scope $ for_ live $ \d -> do
         let toLive = writeVar (appTab app) PLive
             reconnect = modifyVar (lvAttempt lv) (+ 1)
         for_ (ldHello d) $ \(p, pid, _) -> when (isNothing (ldClosed d)) $
-          connection Nothing ("Live: " <> p <> ", pid " <> tshow pid) toLive $ do
+          connection (Just Success) ("Live: " <> p <> ", pid " <> tshow pid) toLive $ do
             menuHeader (p <> ", pid " <> tshow pid)
             whenM (menuItem "Disconnect") (writeVar (lvWant lv) False)
             whenM (menuItem "Reconnect") reconnect
@@ -1043,7 +1093,7 @@ statusBar app env active timeline live heap hooks baseline = do
             state
               | snapshotRunning heap = "ghc-debug: taking a snapshot…"
               | otherwise = "ghc-debug: " <> targetName t
-        connection Nothing state toGraph $ do
+        connection (Just (if snapshotRunning heap then Warning else Success)) state toGraph $ do
           menuHeader (targetName t)
           case dhSnapshot hooks of
             Right snap | not (dhBusy hooks) -> whenM (menuItem "Take snapshot") (void snap)
@@ -1053,26 +1103,53 @@ statusBar app env active timeline live heap hooks baseline = do
       scope $ when (ghci || busy) $ do
         let toDebugger = writeVar (appTab app) PDebugger
         wake <- askWake
-        connection Nothing (if busy then "GHCi is working…" else "GHCi session running") toDebugger $ do
+        connection (Just (if busy then Warning else Success)) (if busy then "GHCi is working…" else "GHCi session running") toDebugger $ do
           whenM (menuItem "Stop the session") (liftIO (stopSession dbg wake))
           whenM (menuItem "Restart the session") (liftIO (stopSession dbg wake >> startSession dbg wake))
           whenM (menuItem "Show in Debugger") toDebugger
       watchStatus env (appWatchers app)
       baselineStatus (appBaseline app) baseline
       scope $ unless (T.null msg) $ do
-        labelWith (alignMid . fontSizeScale 0.85 . fontTone Warning) msg
+        labelWith (alignMid . fontSizeScale 0.84 . fontTone Warning) (T.take 90 msg)
         whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")
       flex
       cursor <- readVar (busCursor (envBus env))
       scope $ for_ cursor $ \(rk, t) -> do
-        labelWith (alignMid . fontMuted . fontSizeScale 0.85) "Cursor"
-        rowWith (alignMid . tight) $ linkText env (RInstant rk t) (fontSizeScale 0.85) (fmtNs (fromIntegral t))
+        labelWith (alignMid . fontMuted . fontSizeScale 0.82) "Cursor"
+        rowWith (alignMid . tight) $ linkText env (RInstant rk t) (fontSizeScale 0.82 . fontMono) (fmtNs (fromIntegral t))
       focus <- readVar (busFocus (envBus env))
       scope $ for_ focus $ \r -> do
-        labelWith (alignMid . fontMuted . fontSizeScale 0.85) "Focus"
-        rowWith (alignMid . tight) $ linkText env r (fontSizeScale 0.85) (T.take 60 (refTitle env r))
-        whenM (buttonWith (alignMid . padXY 6 0 . tight) "Clear") (setFocus env Nothing)
-      labelWith (alignMid . fontMuted . fontSizeScale 0.85) (panelHint active)
+        labelWith (alignMid . fontMuted . fontSizeScale 0.82) "Focus"
+        rowWith (alignMid . tight) $ linkText env r (fontSizeScale 0.82) (T.take (if compactStatus then 32 else 52) (refTitle env r))
+        whenM (buttonWith (alignMid . padXY 5 0 . tight) "Clear") (setFocus env Nothing)
+      scope $ when (winW >= 1060) $
+        labelWith (alignMid . fontMuted . fontSizeScale 0.82) (panelHint compactStatus active)
+      do
+        resp <- styled quiet (iconButtonWith' (alignMid . padXY 5 1 . tight) iconKeyboard "")
+        tooltip resp "Keyboard shortcuts (? or F1)"
+        when (respClicked resp) (modifyVar (appShortcutsOpen app) not)
+
+activeDocumentName :: App -> Panel -> NanoUI (Maybe T.Text)
+activeDocumentName app active = case active of
+  PTimeline -> fmap (T.pack . takeFileName) <$> readVar (tsPath (appTimeline app))
+  PHeap -> do
+    source <- readVar (hsSource (appHeap app))
+    case source of
+      FromHpFile -> fmap (T.pack . takeFileName) <$> readVar (hsHpPath (appHeap app))
+      FromEventlog -> fmap (T.pack . takeFileName) <$> readVar (tsPath (appTimeline app))
+      FromGhcDebug -> pure (Just "ghc-debug live graph")
+  PCore -> do
+    (s, c, g) <- readVar (csPaths (appCore app))
+    pure (T.pack . takeFileName <$> (c <|> g <|> s))
+  PDebugger -> fmap (T.pack . takeFileName) <$> readVar (dsSourcePath (appDebug app))
+  PLive -> do
+    want <- readVar (lvWant (appLive app))
+    if not want
+      then pure Nothing
+      else do
+        host <- readVar (lvHost (appLive app))
+        port <- readVar (lvPort (appLive app))
+        pure (Just (host <> ":" <> port))
 
 -- | A live source in the status bar: a click opens its panel, a
 -- right-click its menu.
@@ -1083,7 +1160,9 @@ connection tone txt open menu = do
   mouse <- uiMousePos
   let under = maybe False (`rectContains` mouse) prev
   (_, area) <- withCursorShape UiCursorPointer $ mouseArea (alignMid . tight) $
-    labelWith (alignMid . fontSizeScale 0.85 . maybe id fontTone tone . (if under then fontUnderline else id)) txt
+    rowWith (alignMid . tight . gap 5) $ do
+      scope $ for_ tone statusDot
+      labelWith (alignMid . fontSizeScale 0.82 . (if tone == Just Danger then fontTone Danger else id) . (if under then fontUnderline else id)) txt
   when (respClicked area) open
   tooltip area "Click to open, right-click for more"
   void (contextMenu area menu)
@@ -1222,6 +1301,60 @@ navBar v =
     boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v
 
 -- ---------------------------------------------------------------------------
+-- Keyboard shortcuts modal
+
+shortcutsModal :: App -> NanoUI ()
+shortcutsModal app =
+  modalWith (fixedW 820) (appShortcutsOpen app) "Keyboard shortcuts" $ do
+    let item keys desc =
+          rowWith (fillW . tight . gap 8 . alignMid) $ do
+            rowWith (fixedW 136 . tight . gap 4 . alignMid) $
+              forM_ keys $ \k -> kbdBadge k
+            labelWith (fillW . fontSizeScale 0.88) desc
+        group title rows =
+          columnWith (fillW . tight . gap 5) $ do
+            labelWith (fontSemiBold . fontSizeScale 0.92 . padTop 4) title
+            forM_ rows (uncurry item)
+    columnWith (fillW . tight . gap 12) $ do
+      rowWith (fillW . tight . gap 24) $ do
+        columnWith (fillW . tight . gap 10 . alignTop) $ do
+          group "Global & navigation"
+            [ (["Ctrl+K"], "Open command palette")
+            , (["Ctrl+1–5"], "Switch panel (Timeline … Live)")
+            , (["Alt+←", "Alt+→"], "Navigate history back / forward")
+            , (["Esc"], "Clear focus / close modal")
+            , (["Ctrl+,"], "Open Settings")
+            , (["Ctrl+=", "Ctrl+-"], "Zoom interface scale in / out")
+            , (["Ctrl+0"], "Reset interface scale to Auto")
+            , (["?", "F1"], "Toggle keyboard shortcuts")
+            ]
+          group "Cross-panel links"
+            [ (["Click"], "Focus entity across all panes")
+            , (["Ctrl+Click"], "Jump to entity's home panel")
+            , (["Right-Click"], "Open entity actions, Pin, Break")
+            , (["Double-Click"], "Maximize / restore pane header")
+            ]
+        columnWith (fillW . tight . gap 10 . alignTop) $ do
+          group "Timeline & shared clock"
+            [ (["Wheel"], "Zoom around pointer")
+            , (["Drag"], "Pan time axis (or scrub ruler)")
+            , (["Shift+Drag"], "Select time range to analyse")
+            , (["Shift+Click"], "Clear selected range")
+            , (["[", "]"], "Step prev / next GC or census")
+            , (["Shift+[", "Shift+]"], "Step censuses on Timeline")
+            , (["M"], "Post a live marker to the agent")
+            ]
+          group "Debugger (GHCi)"
+            [ (["F5"], "Continue execution")
+            , (["F10"], "Step over (:steplocal)")
+            , (["F11"], "Step into (:step)")
+            , (["Shift+F11"], "Step out (:stepout)")
+            ]
+      fillRow $ do
+        flex
+        whenM (styled primary (toolIconButton iconCheck "Done")) (writeVar (appShortcutsOpen app) False)
+
+-- ---------------------------------------------------------------------------
 -- Settings
 
 zoomIn, zoomOut, zoomReset, openSettings :: [K.Shortcut]
@@ -1245,7 +1378,7 @@ settingsShortcuts app = do
 
 settingsModal :: App -> NanoUI ()
 settingsModal app =
-  modalWith (fixedW 620) (appSettingsOpen app) "Settings" $ do
+  modalWith (fixedW 640) (appSettingsOpen app) "Settings" $ do
     zoom <- currentZoom
     scale <- readVar (appScale app)
     let auto = if scale == ScaleAuto then Just zoom else Nothing
@@ -1256,42 +1389,45 @@ settingsModal app =
         core = appCore app
         lastPath = takeDirectory (appSettingsPath app) </> ("last" <> sessionExtension)
     columnWith (fillW . tight . gap 8) $ do
-      sectionTitle "Appearance"
-      settingRow "Theme" $
-        boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} themeChoiceName (appTheme app)
-      settingRow "Interface scale" $ enumSelectWith (alignMid . fixedW 230) (uiScaleLabel auto) (appScale app)
-      settingNote $
-        chords [zoomIn, zoomOut] <> " step the scale; " <> chords [zoomReset] <> " follows the display again."
-      sectionTitle "Startup"
-      settingRow "Open on" $
-        selectWith
-          (alignMid . fixedW 230)
-          ("The panel last used" : map panelTitle [minBound .. maxBound])
-          (zoomVar (maybe 0 ((+ 1) . fromEnum)) (\i _ -> if i <= 0 then Nothing else Just (toEnum (i - 1))) (appStartPanel app))
-      settingRow "" $ checkboxWith alignMid "Reopen the window where it was, at the size it was" (appRestoreWindow app)
-      settingRow "" $ checkboxWith alignMid "Reopen the last session on start" (appReopenLast app)
-      settingNote ("The session is saved on quit to " <> T.pack lastPath <> ". Files on the command line open instead.")
-      sectionTitle "Live"
-      settingRow "Agent address" $ do
-        input (fixedW 170) (lvHost (appLive app))
-        toolLabel ":"
-        input (fixedW 80) (lvPort (appLive app))
-      sectionTitle "Debugger"
-      settingRow "GHCi command" $ input (fixedW 260) (dsCommand (appDebug app))
-      sectionTitle "Core & STG"
-      settingRow "Colouring" $
-        boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring core)
-      settingRow "" $ do
-        checkboxWith alignMid "Hide uniques" (csHideUniques core)
-        checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable core)
-      settingNote "The Core & STG toolbar changes these too; the last choice is kept."
-      sectionTitle "Source"
-      settingRow "Project root" $ inputHint "folder whose sources the panels link to" fillW (csProjectRoot core)
-      settingNote "Sources are also found beside the dumps, in the project the dump folder is in, and under the debugger's directory."
-      settingRow "Editor command" $ inputHint "code -g {file}:{line}:{col}" fillW (csEditor core)
-      settingNote "Run by \"Open in editor\" on any source line; {file}, {line} and {col} are filled in."
-      columnWith (padTop 12 . fillW . tight . gap 8) $ do
-        labelWith (fillW . fontMuted . fontSizeScale 0.85) ("Saved to " <> T.pack (appSettingsPath app))
+      void . bareScrollArea (fillW . maxH 540) $
+        columnWith (fillW . tight . gap 8 . padRight 8) $ do
+          sectionTitle "Appearance"
+          settingRow "Theme" $
+            boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} themeChoiceName (appTheme app)
+          settingRow "Interface scale" $ enumSelectWith (alignMid . fixedW 230) (uiScaleLabel auto) (appScale app)
+          settingNote $
+            chords [zoomIn, zoomOut] <> " step the scale; " <> chords [zoomReset] <> " follows the display again."
+          sectionTitle "Startup"
+          settingRow "Open on" $
+            selectWith
+              (alignMid . fixedW 230)
+              ("The panel last used" : map panelTitle [minBound .. maxBound])
+              (zoomVar (maybe 0 ((+ 1) . fromEnum)) (\i _ -> if i <= 0 then Nothing else Just (toEnum (i - 1))) (appStartPanel app))
+          settingRow "" $ checkboxWith alignMid "Reopen the window where it was, at the size it was" (appRestoreWindow app)
+          settingRow "" $ checkboxWith alignMid "Reopen the last session on start" (appReopenLast app)
+          settingNote ("The session is saved on quit to " <> T.pack lastPath <> ". Files on the command line open instead.")
+          sectionTitle "Live"
+          settingRow "Agent address" $ do
+            input (fixedW 170) (lvHost (appLive app))
+            toolLabel ":"
+            input (fixedW 80) (lvPort (appLive app))
+          sectionTitle "Debugger"
+          settingRow "GHCi command" $ input (fixedW 260) (dsCommand (appDebug app))
+          sectionTitle "Core & STG"
+          settingRow "Colouring" $
+            boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring core)
+          settingRow "" $ do
+            checkboxWith alignMid "Hide uniques" (csHideUniques core)
+            checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable core)
+          settingNote "The Core & STG toolbar changes these too; the last choice is kept."
+          sectionTitle "Source"
+          settingRow "Project root" $ inputHint "folder whose sources the panels link to" fillW (csProjectRoot core)
+          settingNote "Sources are also found beside the dumps, in the project the dump folder is in, and under the debugger's directory."
+          settingRow "Editor command" $ inputHint "code -g {file}:{line}:{col}" fillW (csEditor core)
+          settingNote "Run by \"Open in editor\" on any source line; {file}, {line} and {col} are filled in."
+      separator
+      columnWith (padTop 4 . fillW . tight . gap 8) $ do
+        labelWith (fillW . fontMuted . fontSizeScale 0.82) ("Saved to " <> T.pack (appSettingsPath app))
         fillRow $ do
           flex
           whenM (toolIconButton iconHistory "Reset to defaults") (resetSettings app)
@@ -1325,8 +1461,9 @@ settingRow name controls =
     rowWith (alignMid . fillW . tight . gap 8) controls
 
 -- | A line of explanation under a setting, indented to its controls.
+-- Uses a column container so nano-ui wraps long paths and prose cleanly.
 settingNote :: T.Text -> NanoUI ()
-settingNote t = rowWith (padLeft 142 . fillW . tight) (labelWith (fillW . fontMuted . fontSizeScale 0.85) t)
+settingNote t = columnWith (padLeft 142 . fillW . tight) (labelWith (fillW . fontMuted . fontSizeScale 0.84) t)
 
 -- | A dropdown over a bounded enum, with a layout.
 enumSelectWith :: (Bounded a, Enum a) => (Layout -> Layout) -> (a -> T.Text) -> Var a -> NanoUI ()

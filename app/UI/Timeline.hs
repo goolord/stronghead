@@ -69,6 +69,15 @@ data Sel
   | SelRange !Word64 !Word64
   deriving stock (Eq, Show)
 
+data ThreadSort = SortById | SortByActive | SortByBlocked
+  deriving stock (Eq, Show, Enum, Bounded)
+
+threadSortName :: ThreadSort -> Text
+threadSortName = \case
+  SortById -> "ID"
+  SortByActive -> "Active"
+  SortByBlocked -> "Blocked"
+
 data TimelineState = TimelineState
   { tsPath :: !(Var (Maybe FilePath))
   , tsFollow :: !(Var Bool)
@@ -78,6 +87,7 @@ data TimelineState = TimelineState
   , tsSel :: !(Var (Maybe Sel))
   , tsThreadScroll :: !(Var Float)
   , tsThreadFilter :: !(Var Text)
+  , tsThreadSort :: !(Var ThreadSort)
   , tsPressAt :: !(Var (Maybe V2))
   , tsDialog :: !(Var (Maybe FileDialogId))
   , tsFocusThread :: !(Var (Maybe Word32))
@@ -117,6 +127,7 @@ newTimelineState = do
   tsSel <- newVar Nothing
   tsThreadScroll <- newVar 0
   tsThreadFilter <- newVar ""
+  tsThreadSort <- newVar SortById
   tsPressAt <- newVar Nothing
   tsDialog <- newVar Nothing
   tsFocusThread <- newVar Nothing
@@ -292,10 +303,11 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
   useFileDialog (tsDialog st) . firstPath $ \p -> openEventlog st p False
   path <- readVar (tsPath st)
   let loaded = mprog >>= lpTimeline
+  let askOpenLog =
+        writeVar (tsDialog st) . Just
+          =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "GHC eventlog" "eventlog", FileFilter "All files" "*"]}
   toolStrip $ do
-    whenM (toolIconButton iconFolderOpen "Open eventlog…") $
-      writeVar (tsDialog st) . Just
-        =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "GHC eventlog" "eventlog", FileFilter "All files" "*"]}
+    whenM (toolIconButton iconFolderOpen "Open eventlog…") askOpenLog
     checkboxWith alignMid "Follow as it is written" (tsFollow st)
     flex
     scope $ for_ loaded $ \tl -> do
@@ -313,11 +325,12 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
     Nothing -> scope $ case path of
       Just p -> emptyState ("Reading " <> T.pack (takeFileName p)) ["The timeline appears as soon as the first scheduler events are decoded."] []
       Nothing ->
-        emptyState
+        emptyStateWith
           "Open an eventlog"
-          [ "Open a .eventlog file, drop one on the window, or pass it on the command line. Record one by running a -threaded program with +RTS -l:"
+          [ "Open a .eventlog file, drag and drop one onto the window, or pass it on the command line. Record one by running a -threaded program with +RTS -l:"
           ]
           ["ghc -threaded -rtsopts -eventlog Main.hs", "./Main +RTS -l -N4 -hT -RTS"]
+          (whenM (styled primary (toolIconButton iconFolderOpen "Open eventlog…")) askOpenLog)
     Just tl
       | V.null (tlCaps tl) ->
           scope $ emptyState "No scheduler events yet" ["This eventlog has no capability events. Was the program run with +RTS -l?"] []
@@ -337,18 +350,27 @@ body env bench st tl mprog = do
   let base = envBaseline env >>= baSummary
       vs f = (\b -> fmtChange (f b) (f summary) <> " vs baseline") <$> base
       rate sm = fromIntegral (smAllocated sm) / max 1e-9 (smDuration sm)
-  columnWith (padBottom 8 . tight . fillW) $
-    readoutDeltaWith
-      [ ("duration", fmtSec (smDuration summary), vs smDuration, id)
-      , ("mutator", fmtPct (smMutatorFrac summary), vs smMutatorFrac, id)
-      , ("GC time", fmtPct (smGCFrac summary), vs smGCFrac, id)
-      , ("collections, " <> fmtInt (smMajorGCs summary) <> " major", fmtInt (smGCCount summary), vs (fromIntegral . smGCCount), fixedW 144)
-      , ("longest pause", fmtNs (smGCPauseMax summary), vs smGCPauseMax, id)
-      , ("allocated", fmtBytes (smAllocated summary), vs (fromIntegral . smAllocated), id)
-      , ("allocation rate", fmtRate (rate summary), vs rate, id)
-      , ("peak live", fmtBytes (smPeakLive summary), vs (fromIntegral . smPeakLive), id)
-      , ("threads", fmtInt (smThreads summary), Nothing, id)
-      , ("events", fmtInt (tlEventCount tl), Nothing, id)
+      mutTone
+        | smMutatorFrac summary < 0.50 = Just Danger
+        | otherwise = Nothing
+      gcTone
+        | smGCFrac summary >= 0.25 = Just Danger
+        | otherwise = Nothing
+      pauseTone
+        | smGCPauseMax summary >= 100e6 = Just Danger
+        | otherwise = Nothing
+  columnWith (padBottom 4 . tight . fillW) $
+    readoutToned
+      [ ReadoutItem "duration" (fmtSec (smDuration summary)) (vs smDuration) Nothing id
+      , ReadoutItem "mutator" (fmtPct (smMutatorFrac summary)) (vs smMutatorFrac) mutTone id
+      , ReadoutItem "GC time" (fmtPct (smGCFrac summary)) (vs smGCFrac) gcTone id
+      , ReadoutItem ("collections, " <> fmtInt (smMajorGCs summary) <> " major") (fmtInt (smGCCount summary)) (vs (fromIntegral . smGCCount)) Nothing (fixedW 144)
+      , ReadoutItem "longest pause" (fmtNs (smGCPauseMax summary)) (vs smGCPauseMax) pauseTone id
+      , ReadoutItem "allocated" (fmtBytes (smAllocated summary)) (vs (fromIntegral . smAllocated)) Nothing id
+      , ReadoutItem "allocation rate" (fmtRate (rate summary)) (vs rate) Nothing id
+      , ReadoutItem "peak live" (fmtBytes (smPeakLive summary)) (vs (fromIntegral . smPeakLive)) Nothing id
+      , ReadoutItem "threads" (fmtInt (smThreads summary)) Nothing Nothing id
+      , ReadoutItem "events" (fmtInt (tlEventCount tl)) Nothing Nothing id
       ]
   bnDraw bench (tsPanes st) (timelinePanes env st mprog)
 
@@ -383,7 +405,7 @@ timelinePanes env st mprog _ = case mprog >>= lpTimeline of
                   Just (SelRange _ _) -> "Range"
             paneWith tight ctx title (inspectorActions env st tl sel marks) $
               paneScroll (grow . tight) $
-                columnWith (padAll 12 . gap 6 . fillW) (inspector env st tl v sel)
+                columnWith (padLRTB 12 12 10 20 . gap 6 . fillW) (inspector env st tl v sel)
         | otherwise -> Nothing
   _ -> pure $ \pid ctx ->
     if pid `elem` [paneTlCaps, paneTlThreads, paneTlOverview, paneTlMarkers]
@@ -669,11 +691,14 @@ drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
         else drawStroke (V2 mx (rectY (rRuler rows) + 18)) (V2 mx (rectY (rRuler rows) + rulerH)) 1 (alpha 0.6 (pMuted pal))
   let Rect _ gy _ _ = rGC rows
       Rect _ my' _ _ = rMem rows
+      maxPause = V.foldl' (\m g -> max m (fromIntegral (gcEnd g - gcStart g) :: Double)) 0 (tlGCs tl)
+      peakHeap = VU.foldl' (\m (_, b) -> max m b) 0 (tlHeapSize tl)
+      peakLive = VU.foldl' (\m (_, b) -> max m b) 0 (tlLive tl)
   label' (gy + 12) "GC pauses"
-  sub (gy + 30) "log scale"
+  sub (gy + 30) (if maxPause > 0 then "max " <> fmtNs maxPause else "log scale")
   drawGCStrip pal v (rGC rows) tl sel
   label' (my' + 12) "Heap"
-  sub (my' + 30) "size, live"
+  sub (my' + 30) (if peakLive > 0 && peakHeap > 0 then fmtBytes peakLive <> " / " <> fmtBytes peakHeap else "size, live")
   drawMemStrip pal v (rMem rows) tl
   -- The shared cursor and range, down the whole plot, with a handle on the
   -- ruler to drag.
@@ -942,10 +967,14 @@ drawTooltip pal mm (Rect rx ry rw rh) hx hy ls = do
 
 threadsHeader :: TimelineState -> Palette -> Timeline -> NanoUI ()
 threadsHeader st pal tl = do
+  winW <- windowWidth
   paneMeta (fmtInt (M.size (tlThreads tl)))
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW 220 . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW (if winW < 1200 then 160 else 200) . padXY 0 0) defaultLayout}
     (tsThreadFilter st)
+  scope $ when (winW >= 1220) $
+    rowWith (alignMid . tight) $
+      boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} threadSortName (tsThreadSort st)
   flex
   legendDot (pRun pal) "running"
   legendDot (pBlocked pal) "blocked"
@@ -955,14 +984,20 @@ threadsSection :: Env -> TimelineState -> Palette -> MonoMetrics -> Timeline -> 
 threadsSection env st pal mm tl v sel marks = do
   do
     filt <- T.toLower <$> readVar (tsThreadFilter st)
+    sortBy' <- readVar (tsThreadSort st)
     focus <- readVar (tsFocusThread st)
     (isFocus, isHover) <- isFocusOrHover env
     let rk = runKey (tlRun tl)
-    let threads =
+        blockedTotal ti = sum [ns | (c, ns) <- M.toList (tiBlocked ti), stopIsBlocked c]
+        filtered =
           [ ti
           | ti <- M.elems (tlThreads tl)
           , T.null filt || filt `T.isInfixOf` T.toLower (threadName ti)
           ]
+        threads = case sortBy' of
+          SortById -> filtered
+          SortByActive -> sortOn (\ti -> (Down (tiRunTime ti), tiId ti)) filtered
+          SortByBlocked -> sortOn (\ti -> (Down (blockedTotal ti), tiId ti)) filtered
         nRows = length threads
         contentH = fromIntegral nRows * threadRowH + 8
     scrollY0 <- readVar (tsThreadScroll st)
@@ -980,7 +1015,13 @@ threadsSection env st pal mm tl v sel marks = do
               tw = floorW t
               tol = round (4 * viewWidth v / realToFrac (plotW prevRect))
           if v2X mouse < plotX prevRect
-            then Nothing
+            then
+              let bt = blockedTotal ti
+               in Just . (v2X mouse,v2Y mouse,) $
+                    [ threadName ti
+                    , "running " <> fmtNs (fromIntegral (tiRunTime ti)) <> " · blocked " <> fmtNs (fromIntegral bt)
+                    , "scheduled " <> fmtInt (tiRuns ti) <> " times"
+                    ]
             else Just . (v2X mouse,v2Y mouse,) $
               ("t = " <> fmtNs (t - fromIntegral (tlStart tl)))
                 : threadName ti
@@ -1265,7 +1306,6 @@ overview env st tl v = do
   tlc <- liftIO (cachedTimeline st tl)
   let rk = runKey (tlRun tl)
       bus = envBus env
-  hint "Click a slice on a capability, a thread row or the GC strip to inspect it. Shift+drag selects a range to analyse."
   kv "Window" (fmtNs (viewWidth v))
   cursor <- readVar (busCursor bus)
   scope $ case cursor of
@@ -1286,33 +1326,38 @@ overview env st tl v = do
         whenM (button "Clear range") (writeVar (busRange bus) Nothing)
     _ -> pure ()
   sectionTitle "Longest GC pauses"
+  winW <- windowWidth
   let gcs = tlcTopGCs tlc
+      showKind = winW >= 1220
+      pauseColW = if showKind then 92 else 86
+      atColW = if showKind then 92 else 82
   tableRows $ do
-    rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
-      colHeader (fixedW 72 . alignEnd) "pause"
-      colHeader fillW "collection"
-      colHeader (fixedW 84 . alignEnd) "at"
+    rowWith (padXY 8 0 . tight . gap 6 . fillW) $ do
+      colHeader (fixedW pauseColW . alignEnd) "pause"
+      if showKind then colHeader fillW "collection" else flex
+      colHeader (fixedW atColW . alignEnd) "at"
     forM_ gcs $ \(i, g) -> withKey i $ do
-      picked <- linkRow env (RCollection rk i) False id $ do
-        numCell 72 id (fmtNs (fromIntegral (gcEnd g - gcStart g)))
-        cell (fillW . fontMuted) (if gcGen g >= 1 then "major" else "minor")
-        numCell 84 fontMuted (fmtNs (fromIntegral (gcStart g - tlStart tl)))
+      let dur = fromIntegral (gcEnd g - gcStart g) :: Double
+      picked <- linkRow env (RCollection rk i) False (padXY 8 3) $ do
+        numCell pauseColW (if dur >= 100e6 then fontTone Danger else id) (fmtNs dur)
+        if showKind then cell (fillW . fontMuted) (if gcGen g >= 1 then "major" else "minor") else flex
+        numCell atColW fontMuted (fmtNs (fromIntegral (gcStart g - tlStart tl)))
       when picked $ do
         writeVar (tsSel st) (Just (SelGC i))
         zoomTo st tl (gcStart g) (gcEnd g)
   sectionTitle "Most blocked threads"
   tableRows $ forM_ (tlcWorstBlocked tlc) $ \(ti, bt, top) -> withKey (tiId ti) $ do
-    picked <- linkRow env (RThread rk (tiId ti)) False id $ do
+    picked <- linkRow env (RThread rk (tiId ti)) False (padXY 8 3) $ do
       columnWith (tight . gap 0 . fillW . alignMid) $ do
         labelWith fillW (threadName ti)
-        scope $ for_ top $ \(c, _) -> labelWith (fillW . fontMuted . fontSizeScale 0.85) (stopName c)
-      numCell 72 id (fmtNs (fromIntegral bt))
+        scope $ for_ top $ \(c, _) -> labelWith (fillW . fontMuted . fontSizeScale 0.82) (stopName c)
+      numCell 94 id (fmtNs (fromIntegral bt))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
   sectionTitle "Busiest threads"
   tableRows $ forM_ (tlcBusiest tlc) $ \ti -> withKey (tiId ti) $ do
-    picked <- linkRow env (RThread rk (tiId ti)) False id $ do
+    picked <- linkRow env (RThread rk (tiId ti)) False (padXY 8 3) $ do
       cell fillW (threadName ti)
-      numCell 72 id (fmtNs (fromIntegral (tiRunTime ti)))
+      numCell 94 id (fmtNs (fromIntegral (tiRunTime ti)))
     when picked (writeVar (tsFocusThread st) (Just (tiId ti)))
   scope $ unless (V.null (tlProfSamples tl)) $ do
     let cp = tlcCodeProfile tlc
@@ -1324,6 +1369,7 @@ overview env st tl v = do
     tickyRows env (take 8 [(x, tcEntries c, tcAlloc c) | x@(c, _, _) <- tlcTicky tlc])
   sectionTitle "Program"
   forM_ (tlInfo tl) $ \(k, val) -> kv k (T.take 300 val)
+  hint "Tip: click any slice, thread row or GC pause to inspect; Shift+drag selects a range."
   scope $ unless (V.null (tlGCs tl)) $ do
     separator
     latencyHeatmapView (tlcGCHeatmap tlc)
@@ -1539,12 +1585,15 @@ stepCursor env st tl gcStarts v = do
 
 markersHeader :: TimelineState -> Timeline -> NanoUI ()
 markersHeader st tl = do
+  winW <- windowWidth
   let nMarkers = V.foldl' (\acc m -> if mkIsMarker m then acc + 1 else acc) (0 :: Int) (tlMarkers tl)
-  paneMetaWith (fixedW 32) (fmtInt nMarkers)
+      compact = winW < 1220
+  paneMetaWith (fixedW (if compact then 24 else 32)) (fmtInt nMarkers)
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . fillW . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . minW 52 . fillW . padXY 0 0) defaultLayout}
     (tsMarkerFilter st)
-  checkboxWith alignMid "Events" (tsMarkerEvents st)
+  (_, evArea) <- mouseArea alignMid $ checkboxWith alignMid (if compact then "All" else "Events") (tsMarkerEvents st)
+  when compact (tooltip evArea "Include all runtime events (markers and RTS events)")
 
 -- | Every marker in the log, as links; clicking one moves the cursor to it.
 markersList :: Env -> TimelineState -> Timeline -> NanoUI ()

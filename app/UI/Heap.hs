@@ -351,38 +351,56 @@ heapView env bench st loaded logTl = columnWith (tight . gap 0 . grow) $ do
   source <- readVar (hsSource st)
   hpPath <- readVar (hsHpPath st)
   let hpResult = taskOutcome (hlHp loaded)
-  toolStrip $ do
+  let askOpenHp =
+        writeVar (hsHpDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Heap profile" "hp"]}
+      askOpenProf =
+        writeVar (hsProfDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Cost-centre profile" "prof"]}
+  toolStripWrap $ do
     toolLabel "Source"
     rowWith (alignMid . tight) $
       boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} (\case FromEventlog -> "Eventlog samples"; FromHpFile -> ".hp file"; FromGhcDebug -> "Live graph (ghc-debug)") (hsSource st)
     scope $ unless (source == FromGhcDebug) $ toolGroup $ do
-      whenM (toolIconButton iconFolderOpen "Open heap profile…") $
-        writeVar (hsHpDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Heap profile" "hp"]}
-      whenM (toolIconButton iconFolderOpen "Open cost-centre profile…") $
-        writeVar (hsProfDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "Cost-centre profile" "prof"]}
+      whenM (toolIconButton iconFolderOpen "Open heap profile…") askOpenHp
+      whenM (toolIconButton iconFolderOpen "Open cost-centre profile…") askOpenProf
     flex
   let profile = case source of
-        FromGhcDebug -> Left ("", [], [])
+        FromGhcDebug -> Left ("", [], [], pure ())
         FromEventlog ->
           maybe
-            (Left ("No heap samples in the eventlog", ["Open an eventlog recorded with heap profiling on, or switch the source to a .hp file."], ["./Main +RTS -l -hT -i0.1 -RTS"]))
+            ( Left
+                ( "No heap samples in the eventlog"
+                , ["Open an eventlog recorded with heap profiling on, or switch the source to a .hp file."]
+                , ["./Main +RTS -l -hT -i0.1 -RTS"]
+                , do
+                    whenM (styled primary (toolIconButton iconFolderOpen "Open heap profile…")) askOpenHp
+                    whenM (toolIconButton iconFolderOpen "Open cost-centre profile…") askOpenProf
+                )
+            )
             Right
             fromLog
         FromHpFile -> case (hpPath, hpResult) of
-          (Nothing, _) -> Left ("Open a heap profile", ["Open the .hp file a program writes when run with heap profiling on, or drop one on the window."], ["./Main +RTS -hT -i0.1 -RTS", "./Main +RTS -hc -RTS      (profiled build: by cost centre)"])
-          (_, Nothing) -> Left ("Reading the heap profile…", [], [])
-          (_, Just (Left e)) -> Left ("Could not read the heap profile", [T.pack e], [])
+          (Nothing, _) ->
+            Left
+              ( "Open a heap profile"
+              , ["Open the .hp file a program writes when run with heap profiling on, or drop one on the window."]
+              , ["./Main +RTS -hT -i0.1 -RTS", "./Main +RTS -hc -RTS      (profiled build: by cost centre)"]
+              , do
+                  whenM (styled primary (toolIconButton iconFolderOpen "Open heap profile…")) askOpenHp
+                  whenM (toolIconButton iconFolderOpen "Open cost-centre profile…") askOpenProf
+              )
+          (_, Nothing) -> Left ("Reading the heap profile…", [], [], pure ())
+          (_, Just (Left e)) -> Left ("Could not read the heap profile", [T.pack e], [], whenM (toolIconButton iconFolderOpen "Open another…") askOpenHp)
           (_, Just (Right hp)) -> Right hp
   mixed <- bnMixed bench (hsPanes st)
   let panes = heapPanes env st loaded logTl
   case profile of
     _ | source == FromGhcDebug -> scope (ghcDebugView env bench st loaded logTl)
     _ | mixed && either (const True) (VU.null . hpTimes) profile -> scope (bnDraw bench (hsPanes st) panes)
-    Left (title, body, commands) -> scope $
+    Left (title, body, commands, actions) -> scope $
       -- The cost-centre tree does not need a heap profile.
       if isJust (hlProf loaded)
         then bnDraw bench (hsCCPanes st) panes
-        else emptyState title body commands
+        else emptyStateWith title body commands actions
     Right hp
       | VU.null (hpTimes hp) -> scope (emptyState "The heap profile has no samples" ["The program may have exited before the first census. Take censuses more often with -i0.05."] [])
       | otherwise -> scope (profileView env bench st loaded logTl hp)
@@ -538,14 +556,18 @@ profileView env bench st loaded logTl hp = do
   let base = envBaseline env >>= baHeap
       peakOf p = if VU.null (hpTotals p) then 0 else VU.maximum (hpTotals p)
       suspects = length (leakSuspects hp)
-  columnWith (padBottom 8 . tight . fillW) $
-    readoutDelta
-      [ ("censuses", tshow (VU.length times), Nothing)
-      , ("profiled", fmtSec (maybe 0 snd (VU.unsnoc times)), Nothing)
-      , ("peak total", fmtBytesD (peakOf hp), (\b -> fmtChange (peakOf b) (peakOf hp) <> " vs baseline") <$> base)
-      , ("cursor at" <> approx, fmtSec (times VU.! cursorIx), Nothing)
-      , ("live at cursor", fmtBytesD (hpTotals hp VU.! cursorIx), Nothing)
-      , ("leak suspects", tshow suspects, (\b -> tshow (length (leakSuspects b)) <> " in the baseline") <$> base)
+      suspectTone
+        | suspects >= 2 = Just Danger
+        | suspects == 1 = Just Warning
+        | otherwise = Just Success
+  columnWith (padBottom 4 . tight . fillW) $
+    readoutToned
+      [ ReadoutItem "censuses" (tshow (VU.length times)) Nothing Nothing id
+      , ReadoutItem "profiled" (fmtSec (maybe 0 snd (VU.unsnoc times))) Nothing Nothing id
+      , ReadoutItem "peak total" (fmtBytesD (peakOf hp)) ((\b -> fmtChange (peakOf b) (peakOf hp) <> " vs baseline") <$> base) Nothing id
+      , ReadoutItem ("cursor at" <> approx) (fmtSec (times VU.! cursorIx)) Nothing Nothing id
+      , ReadoutItem "live at cursor" (fmtBytesD (hpTotals hp VU.! cursorIx)) Nothing Nothing id
+      , ReadoutItem "leak suspects" (tshow suspects) ((\b -> tshow (length (leakSuspects b)) <> " in the baseline") <$> base) suspectTone id
       ]
   bnDraw bench (hsPanes st) (heapPanes env st loaded logTl)
 
@@ -608,15 +630,18 @@ profilePanes env st loaded logTl hp site = do
   pure $ \pid ctx ->
     if
       | pid == paneHeapChart -> Just $ do
-          let actions = do
+          winW <- windowWidth
+          let compact = winW < 1260
+              veryCompact = winW < 1120
+              actions = do
                 paneMeta $
                   if
                     | source /= FromHpFile -> "Program time"
-                    | cmExact clock -> "Program time, paired with the eventlog's censuses"
-                    | otherwise -> "Approximate: a .hp file keeps its own clock"
+                    | cmExact clock -> if compact then "Paired time" else "Program time, paired with the eventlog's censuses"
+                    | otherwise -> if compact then "Approx. clock" else "Approximate: a .hp file keeps its own clock"
                 scope $ when (following && source == FromEventlog) $
                   if tracking
-                    then paneMeta "· following the newest census"
+                    then paneMeta (if compact then "· live" else "· following the newest census")
                     else whenM (buttonWith (alignMid . padXY 8 2 . tight) "Follow the latest") (writeVar (hsTracking st) True)
                 flex
                 scope $ for_ solo $ \s -> whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
@@ -624,10 +649,12 @@ profilePanes env st loaded logTl hp site = do
                 scope $ when (cwOwn cw && not (cwLocked cw)) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Fit") fitView
                 scope $
                   if placed && cwLocked cw
-                    then paneMeta "On the Timeline's axis"
-                    else disabledWhen (not (cwLockable cw)) $ checkboxWith alignMid "Lock to Timeline" (hsLock st)
-                labelWith (alignMid . fontMuted . fontSizeScale 0.85) ("Top " <> tshow topN <> " bands")
-                sliderWith (alignMid . fixedW 110) 3 30 (hsTopN st)
+                    then paneMeta (if veryCompact then "Timeline axis" else "On the Timeline's axis")
+                    else disabledWhen (not (cwLockable cw)) $ do
+                      (_, lockArea) <- mouseArea alignMid $ checkboxWith alignMid (if veryCompact then "Lock" else "Lock to Timeline") (hsLock st)
+                      when veryCompact (tooltip lockArea "Lock heap time window to Timeline")
+                labelWith (alignMid . fontMuted . fontSizeScale 0.85) (if veryCompact then "Top " <> tshow topN else "Top " <> tshow topN <> " bands")
+                sliderWith (alignMid . fixedW (if compact then 68 else 104)) 3 30 (hsTopN st)
           paneWith (padAll 8) ctx "Residency" actions $ do
             inp <- askInput
             let mouse = inputMousePos inp
@@ -676,7 +703,8 @@ profilePanes env st loaded logTl hp site = do
                 flex
                 rowWith (alignMid . tight) $
                   boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabName (hsTab st)
-          pane ctx (analysisTitle tab) actions $ case tab of
+          winW <- windowWidth
+          pane ctx (analysisTitle (winW < 1180) tab) actions $ case tab of
             AtCursor -> atCursor env st hp cursorIx
             Leaks -> leakView env st hp
             Retention -> retentionView env st hp cursorIx
@@ -696,17 +724,17 @@ stepCensus st hp v i = do
     for_ own $ \_ -> unless (t >= tvStart v && t <= tvEnd v) $
       writeVar (hsView st) (Just (TimeView (t - viewWidth v / 2) (t + viewWidth v / 2)))
 
-analysisTitle :: HeapTab -> Text
-analysisTitle = \case
-  AtCursor -> "Census at the cursor"
-  Leaks -> "Leak suspects"
-  Retention -> "Retention tree"
+analysisTitle :: Bool -> HeapTab -> Text
+analysisTitle compact = \case
+  AtCursor -> if compact then "Census" else "Census at the cursor"
+  Leaks -> if compact then "Leaks" else "Leak suspects"
+  Retention -> if compact then "Retention" else "Retention tree"
   CostCentres -> "Cost centres"
 
 -- | The plot inside the chart canvas: room on the left for the bytes axis
 -- and below for the time axis.
 chartPlot :: Rect -> Rect
-chartPlot (Rect x y w h) = Rect (x + 72) (y + 8) (max 10 (w - 80)) (max 10 (h - 30))
+chartPlot (Rect x y w h) = Rect (x + 88) (y + 10) (max 10 (w - 98)) (max 10 (h - 32))
 
 -- | Program time across the plot, through the profile's clock.
 chartAxis :: RunKey -> ClockMap -> TimeView -> Rect -> Axis
@@ -742,9 +770,11 @@ drawChart pal mm hp ls ymax v cursorIx axis marks r hover = do
       font = mmFont mm
   -- Grid and axes.
   let ystep = niceStep (ymax / 4)
+  drawStroke (V2 px (sy 0)) (V2 (px + pw) (sy 0)) 1 (pGrid pal)
+  drawTextWith font (V2 (px - 8) (sy 0)) AlignEnd AlignMiddle "0 B" (pMuted pal)
   forM_ (takeWhile (<= ymax) [ystep, 2 * ystep ..]) $ \b -> do
     drawStroke (V2 px (sy b)) (V2 (px + pw) (sy b)) 1 (pGrid pal)
-    drawTextWith font (V2 (px - 6) (sy b)) AlignEnd AlignMiddle (fmtBytesD b) (pMuted pal)
+    drawTextWith font (V2 (px - 8) (sy b)) AlignEnd AlignMiddle (fmtBytesD b) (pMuted pal)
   -- Time ticks, labelled from the start of the run.
   let o0 = tvStart v / 1e9 - hpStart hp
       o1 = tvEnd v / 1e9 - hpStart hp
@@ -792,14 +822,14 @@ legend env st hp hidden solo = do
             isHidden = S.member name hidden
             c = bandColor i name
             ck = contentKeyOf [keyPart isHidden, keyPart (colorToWord32 c)]
-        rowWith (padLeft 6 . tight . gap 4 . fillW) $ do
+        rowWith (padXY 8 0 . gap 8 . tight . fillW) $ do
           sw <- canvasKeyed ck (fixedWH 12 12 . alignMid) $ \r ->
             if isHidden then drawStrokeRoundedRect r 3 1.5 c else drawRoundedRect r 3 c
           tooltip sw (if isHidden then "Show this band; click a name to show it alone" else "Hide this band; click a name to show it alone")
           when (respClicked sw) $ writeVar (hsHidden st) (if isHidden then S.delete name hidden else S.insert name hidden)
-          picked <- linkRow env (RBand name) (solo == Just name) id $ do
+          picked <- linkRow env (RBand name) (solo == Just name) (padXY 8 3 . gap 8) $ do
             cell (fillW . fontSizeScale 0.9 . (if isHidden then fontMuted else id)) (T.take 60 (bandTitle b))
-            numCell 72 (fontMuted . fontSizeScale 0.85) (fmtBytesD (bandPeak b))
+            numCell 82 (fontMuted . fontSizeScale 0.85) (fmtBytesD (bandPeak b))
           when picked $ writeVar (hsSolo st) (if solo == Just name then Nothing else Just name)
 
 -- ---------------------------------------------------------------------------
@@ -812,6 +842,13 @@ shorten maxLen t
 
 numSortKey :: RealFloat a => Int -> a -> Text
 numSortKey decimals val = T.justifyRight 20 '0' (T.pack (showFFloat (Just decimals) val ""))
+
+softTable :: NanoUI a -> NanoUI a
+softTable body = do
+  th <- uiTheme
+  let light = themeAppearance th == AppearanceLight
+      stripeBtn = if light then colorRGB 254 254 254 else colorRGB 38 38 38
+  styled (buttonStyle (background stripeBtn)) body
 
 atCursor :: Env -> HeapState -> HeapProfile -> Int -> NanoUI ()
 atCursor env st hp i = do
@@ -834,30 +871,30 @@ atCursor env st hp i = do
               let c = bandColor k (bandName b)
                   title = bandTitle b
               in Cell (Just title) (shorten 20 title) $ Just $
-                   rowWith (tight . fillW . fillH . alignMid . gap 6) $ do
+                   rowWith (padXY 8 0 . gap 8 . tight . fillW . fillH . alignMid) $ do
                      _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 c)
                      picked <- linkText' env (RBand (bandName b)) (fillW . alignMid . fontSizeScale 0.92) title
                      when picked $ writeVar (hsSolo st) (Just (bandName b))
           , headed "kind" $ \(_, b) ->
               let kName = kindName (bandKind b)
               in cellSort kName $ cellWidget $
-                   rowWith (tight . fillW . fillH . alignMid) $
+                   rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                      labelWith (alignMid . kindTone (bandKind b) . fillW) kName
           , headed "residency" $ \(_, b) ->
               let val = bandValues b VU.! i
               in Cell
                    (Just (numSortKey 0 val))
                    (tshow (round val :: Integer))
-                   (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                   (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                       labelWith (alignMid . fontMono . alignEnd . fillW) (fmtBytesD val))
-          , headed "since previous" $ \(_, b) ->
+          , headed "Δ previous" $ \(_, b) ->
               let d = bandDelta b i
                   stTone = if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted
                   txt = (if d > 0 then "+" else "") <> fmtBytesD d
               in Cell
                    (Just (numSortKey 0 (d + 1e15)))
                    (tshow (round (abs d) :: Integer))
-                   (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                   (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                       labelWith (alignMid . fontMono . stTone . alignEnd . fillW) txt)
           , headed "share" $ \(_, b) ->
               let val = bandValues b VU.! i
@@ -865,14 +902,14 @@ atCursor env st hp i = do
               in Cell
                    (Just (numSortKey 4 sh))
                    (tshow (round (sh * 10000) :: Integer))
-                   (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                   (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                       labelWith (alignMid . fontMono . fontMuted . alignEnd . fillW) (fmtPct sh))
           ]
         cfg = defaultTableConfig
-          { tableColSizes = [ColStretch, ColFixed 72, ColFixed 96, ColFixed 116, ColFixed 64]
+          { tableColSizes = [ColStretch, ColFixed 78, ColFixed 114, ColFixed 118, ColFixed 80]
           , tableSqueeze = True
           }
-    tableConfigured cfg (grow . tight . fillW . fillH) "atCursor" cols rawRows sortVar
+    softTable $ tableConfigured cfg (grow . tight . fillW . fillH) "atCursor" cols rawRows sortVar
 kindName :: BandKind -> Text
 kindName = \case
   KindThunk -> "thunk"
@@ -924,7 +961,7 @@ leakView env st hp = do
                 let title = figuresTitle bf
                     name = maybe (bfName bf) bfName (bcCur c)
                 in Cell (Just title) (shorten 20 title) $ Just $
-                     rowWith (tight . fillW . fillH . alignMid) $ do
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $ do
                        picked <- linkText' env (RBand name) (fillW . alignMid . fontSizeScale 0.92) title
                        when picked $ writeVar (hsSolo st) (Just name)
             , headed "peak before" $ \(_, bf) ->
@@ -933,7 +970,7 @@ leakView env st hp = do
                 in Cell
                      (Just (numSortKey 0 peak))
                      (tshow (round peak :: Integer))
-                     (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                         labelWith (alignMid . fontMono . fontMuted . alignEnd . fillW) txt)
             , headed "peak now" $ \(c, _) ->
                 let mPeak = bcCur c >>= (Just . bfPeak)
@@ -942,7 +979,7 @@ leakView env st hp = do
                 in Cell
                      (Just (numSortKey 0 (max 0 sortKey)))
                      (tshow (round (max 0 sortKey) :: Integer))
-                     (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                         labelWith (alignMid . fontMono . alignEnd . fillW) txt)
             , headed "status" $ \(c, bf) ->
                 let (stTone, stText) = case bcStatus c of
@@ -950,7 +987,7 @@ leakView env st hp = do
                       BandShrank -> (Success, "much smaller (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")")
                       _ -> (Warning, "still there (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")" <> maybe "" (const ", still a suspect") (bcCur c >>= bfScore))
                 in Cell (Just stText) (shorten 20 stText) $ Just $
-                     rowWith (tight . fillW . fillH . alignMid) $
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                        labelWith (alignMid . fontTone stTone . fillW) stText
             ]
           cfg = defaultTableConfig
@@ -958,39 +995,44 @@ leakView env st hp = do
             , tableSqueeze = True
             }
           tableMaxH = 9 * 29 + 6
-      tableConfigured cfg (maxH tableMaxH) "wereSuspects" suspectCols wereSuspects sortVar
+      softTable $ tableConfigured cfg (maxH tableMaxH) "wereSuspects" suspectCols wereSuspects sortVar
       separator
     scope $
       if null suspects
         then hint "No band grows steadily across censuses. If memory still climbs, profile by retainer (-hr) or cost centre (-hc), or take censuses more often (-i0.05)."
         else hint "Bands whose residency keeps climbing census after census. Every census follows a major GC, so a band that never shrinks is data the program keeps alive."
+    soloNow <- readVar (hsSolo st)
     forM_ suspects $ \s -> do
       let b = hpBands hp V.! susBand s
           c = bandColor (susBand s) (bandName b)
           vs = bandValues b
           sparkKey = contentKeyOf [keyPart (colorToWord32 c), keyPart (VU.length vs), keyPart (maybe 0 snd (VU.unsnoc vs))]
-      withKey (bandName b) $ panelWith (padAll 10 . gap 4 . fillW) $ do
-        rowWith (tight . gap 8 . alignMid . fillW) $ do
-          _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 12 12) (\r -> drawRoundedRect r 3 c)
-          linkText env (RBand (bandName b)) (fillW . fontMedium) (bandName b)
-          badge (if susScore s > 0.7 then Danger else Warning) ("leak score " <> fmtFixed 2 (susScore s))
-          scope $ when (bandKind b == KindThunk) $ badge Warning "unforced thunks"
-          whenM (buttonWith tight "Isolate") (writeVar (hsSolo st) (Just (bandName b)))
-        rowWith (tight . gap 16 . wrap . fillW) $ do
-          fact "grew" ("×" <> fmtFixed 1 (susGrowth s))
-          fact "rate" (fmtRate (susSlope s))
-          fact "censuses survived, never shrinking" (tshow (susSurvived s))
-          fact "monotone" (fmtPct (susMonotone s))
-          fact "peak" (fmtBytesD (bandPeak b))
-        _ <- canvasKeyed sparkKey (fillW . fixedH 36) $ \r -> sparkBand r c vs
-        scope $ for_ (bandProv b) $ \ip -> provenance env ip
-        scope $ unless (null changes) $ for_ (changeFor changes (bandName b)) $ \ch ->
-          labelWith (fontMuted . fontSizeScale 0.85 . fillW) $ case bcBase ch of
-            Nothing -> "New since the baseline."
-            Just bf ->
-              "In the baseline: peak " <> fmtBytesD (bfPeak bf) <> maybe ", not a suspect" (\sc -> ", leak score " <> fmtFixed 2 sc) (bfScore bf)
-                <> "; peak now " <> fmtChange (bfPeak bf) (bandPeak b) <> "."
-        hint (diagnose hp b s)
+          sevTone = if susScore s > 0.7 then Danger else Warning
+          isSoloed = soloNow == Just (bandName b)
+      withKey (bandName b) $
+        panelWith (padAll 12 . gap 6 . fillW) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 12 12 . alignMid) (\r -> drawRoundedRect r 3 c)
+            linkText env (RBand (bandName b)) (fillW . fontSemiBold) (bandName b)
+            badge sevTone ("leak score " <> fmtFixed 2 (susScore s))
+            scope $ when (bandKind b == KindThunk) $ badge Warning "unforced thunks"
+            whenM (styled (if isSoloed then primary else id) (buttonWith (alignMid . padXY 8 2 . tight) (if isSoloed then "Isolated" else "Isolate"))) $
+              writeVar (hsSolo st) (if isSoloed then Nothing else Just (bandName b))
+          rowWith (tight . gap 16 . wrap . fillW) $ do
+            fact "grew" ("×" <> fmtFixed 1 (susGrowth s))
+            fact "rate" (fmtRate (susSlope s))
+            fact "censuses survived" (tshow (susSurvived s))
+            fact "monotone" (fmtPct (susMonotone s))
+            fact "peak" (fmtBytesD (bandPeak b))
+          _ <- canvasKeyed sparkKey (fillW . fixedH 36) $ \r -> sparkBand r c vs
+          scope $ for_ (bandProv b) $ \ip -> provenance env ip
+          scope $ unless (null changes) $ for_ (changeFor changes (bandName b)) $ \ch ->
+            labelWith (fontMuted . fontSizeScale 0.85 . fillW) $ case bcBase ch of
+              Nothing -> "New since the baseline."
+              Just bf ->
+                "In the baseline: peak " <> fmtBytesD (bfPeak bf) <> maybe ", not a suspect" (\sc -> ", leak score " <> fmtFixed 2 sc) (bfScore bf)
+                  <> "; peak now " <> fmtChange (bfPeak bf) (bandPeak b) <> "."
+          hint (diagnose hp b s)
     scope $ unless (null thunkBands) $ do
       separator
       sectionTitle "Thunk accumulator sentinel"
@@ -1001,7 +1043,7 @@ leakView env st hp = do
             [ headed "thunk band" $ \b ->
                 let name = bandName b
                 in Cell (Just name) (shorten 20 name) $ Just $
-                     rowWith (tight . fillW . fillH . alignMid) $ do
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $ do
                        picked <- linkText' env (RBand name) (fillW . alignMid . fontSizeScale 0.92) name
                        when picked $ writeVar (hsSolo st) (Just name)
             , headed "residency" $ \b ->
@@ -1010,7 +1052,7 @@ leakView env st hp = do
                 in Cell
                      (Just (numSortKey 0 val))
                      (tshow (round val :: Integer))
-                     (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                         labelWith (alignMid . fontMono . alignEnd . fillW) (fmtBytesD val))
             , headed "growing streak" $ \b ->
                 let vs = VU.take nAnalysed (bandValues b)
@@ -1021,15 +1063,15 @@ leakView env st hp = do
                 in Cell
                      (Just (numSortKey 0 (fromIntegral streak :: Double)))
                      (tshow streak)
-                     (Just $ rowWith (tight . fillW . fillH . alignMid) $
+                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                         labelWith (alignMid . (if streak >= 5 then fontTone Danger else fontMuted) . fillW) sText)
             ]
           tcfg = defaultTableConfig
-            { tableColSizes = [ColStretch, ColFixed 100, ColFixed 180]
+            { tableColSizes = [ColStretch, ColFixed 112, ColFixed 188]
             , tableSqueeze = True
             }
           tTableMaxH = 9 * 29 + 6
-      tableConfigured tcfg (maxH tTableMaxH) "thunkBands" thunkCols thunkBands thunkSortVar
+      softTable $ tableConfigured tcfg (maxH tTableMaxH) "thunkBands" thunkCols thunkBands thunkSortVar
 
 -- | Where a band's closures come from, with the site and the binding as
 -- links.

@@ -12,7 +12,7 @@ module UI.Pinboard
   , pinReport
   ) where
 
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, when)
 import Data.List (find)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -33,9 +33,7 @@ pinboardPane env export ctx = do
         paneMeta (tshow (length pins))
         flex
         disabledWhen (null pins) $ do
-          copy <- iconButtonWith' (alignMid . padXY 8 2 . tight) iconCopy "Copy report"
-          tooltip copy "The pins as Markdown, on the clipboard"
-          when (respClicked copy) (void (setClipboard (pinsReport env [] pins)))
+          copyFeedbackButton (alignMid . padXY 8 2 . tight) "Copy report" (pinsReport env [] pins)
           whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconSave "Export…") export
   paneWith tight ctx "Pinboard" header $
     if null pins

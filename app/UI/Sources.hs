@@ -45,10 +45,14 @@ data Source = Source
 -- run a source named itself.
 sourcesPopover :: Env -> Var Bool -> Rect -> [Source] -> ([Source] -> RunInfo -> NanoUI ()) -> (RunKey -> NanoUI ()) -> NanoUI ()
 sourcesPopover env open anchor sources link unlink =
-  popupWith open (defaultPopupConfig (AnchorRect anchor)) (fixedW 720 . maxH 640 . padAll 0) $
-    void . bareScrollArea fillW $
-      columnWith (fillW . padAll 12 . tight . gap 10) $ do
-        labelWith (fontMedium . fontSizeScale 1.05) "Data sources"
+  popupWith open (defaultPopupConfig (AnchorRect anchor)) (fixedW 740 . maxH 660 . padAll 0) $
+    void . bareScrollArea (fillW . maxH 660) $
+      columnWith (fillW . padLRTB 14 14 14 20 . tight . gap 10) $ do
+        rowWith (fillW . tight . gap 8 . alignMid) $ do
+          labelWith (fontSemiBold . fontSizeScale 1.05) "Data sources"
+          flex
+          scope $ unless (null sources) $
+            labelWith (fontMuted . fontSizeScale 0.84) (tshow (length sources) <> " loaded")
         let timed = [s | s <- sources, srcRun s /= emptyRunInfo]
             codeOnly = [s | s <- sources, srcRun s == emptyRunInfo]
             grouped = groupRuns (map srcRun timed)
@@ -61,10 +65,10 @@ sourcesPopover env open anchor sources link unlink =
           let info = foldMap srcRun members
               mine = nubOrd (concatMap srcData members)
               probable = ProbablySameRun `elem` ms
-          columnWith (fillW . gap 4 . padTop 4 . tight) $ do
-            rowWith (fillW . tight . gap 8) $ do
-              labelWith (alignMid . fontMedium) (runTitle info)
-              scope $ when probable $ badge Muted "matched by program name: no pid on one side, times approximate"
+          panelWith (fillW . padAll 10 . gap 6 . tight) $ do
+            rowWith (fillW . tight . gap 8 . alignMid) $ do
+              labelWith (alignMid . fontSemiBold) (runTitle info)
+              scope $ when probable $ badge Warning "matched by program name: no pid on one side, times approximate"
               flex
               scope $ when (ri > 0) $ for_ (listToMaybe runs) $ \firstRun ->
                 let target = foldMap srcRun firstRun
@@ -72,13 +76,13 @@ sourcesPopover env open anchor sources link unlink =
             forM_ (zip [0 :: Int ..] members) $ \(si, s) -> withKey si (sourceRow env s unlink)
             missing (filter (`notElem` mine) [DTimeline, DHeapCensus, DHeapSource, DCostCentres, DLive, DLiveStats, DLiveGraph]) (riProgram info)
         scope $ unless (null codeOnly) $
-          columnWith (fillW . gap 4 . padTop 4 . tight) $ do
-            labelWith (alignMid . fontMedium) "Not tied to a run (joined by code)"
+          panelWith (fillW . padAll 10 . gap 6 . tight) $ do
+            labelWith (alignMid . fontSemiBold) "Not tied to a run (joined by code)"
             forM_ (zip [0 :: Int ..] codeOnly) $ \(si, s) -> withKey si (sourceRow env s unlink)
         let missingCode = filter (`notElem` have) [DDumps, DDebugger]
         scope $ unless (null missingCode) $ missing missingCode Nothing
-        columnWith (fillW . gap 4 . padTop 6 . tight) $ do
-          labelWith (fontMedium . fontSizeScale 0.92) "Everything at once"
+        panelWith (fillW . padAll 10 . gap 6 . tight) $ do
+          labelWith (fontSemiBold . fontSizeScale 0.92) "Everything at once"
           let prog = fromMaybe "<your-program>" (listToMaybe [p | s <- timed, Just p <- [riProgram (srcRun s)]])
           recipe "build" ("cabal build " <> prog <> " --ghc-options=\"-finfo-table-map -fdistinct-constructor-tables -ddump-simpl -ddump-stg-final -ddump-to-file\"")
           recipe "run" (prog <> " +RTS -l -hi -i0.1 -T -RTS")
@@ -88,23 +92,25 @@ runTitle ri = fromMaybe "an unknown program" (riProgram ri) <> maybe "" (\p -> "
 
 sourceRow :: Env -> Source -> (RunKey -> NanoUI ()) -> NanoUI ()
 sourceRow env s unlink =
-  rowWith (fillW . gap 8 . padLeft 12 . tight) $ do
-    (_, area) <- withCursorShape UiCursorPointer $ mouseArea tight $ labelWith (alignBaseline . fixedW 130) (srcKind s)
+  rowWith (fillW . gap 8 . padLeft 6 . tight . alignMid) $ do
+    (_, area) <- withCursorShape UiCursorPointer $ mouseArea tight $
+      labelWith (alignMid . fixedW 130 . fontMedium . fontSizeScale 0.9) (srcKind s)
     when (respClicked area) (envSwitch env (srcPanel s))
     tooltip area ("Open " <> panelTitle (srcPanel s))
-    columnWith (fillW . tight . gap 0) $ do
+    columnWith (fillW . tight . gap 1) $ do
       labelWith (fillW . fontMono . fontSizeScale 0.85) (T.take 90 (srcDetail s))
-      labelWith (fillW . fontMuted . fontSizeScale 0.85) (T.intercalate "; " (map datumAdds (srcData s)))
-    scope $ when (srcLinked s) $ whenM (buttonWith (alignBaseline . padXY 6 0 . tight) "Unlink") (unlink (srcOrigin s))
+      labelWith (fillW . fontMuted . fontSizeScale 0.82) (T.intercalate "; " (map datumAdds (srcData s)))
+    scope $ when (srcLinked s) $ whenM (buttonWith (alignMid . padXY 6 2 . tight) "Unlink") (unlink (srcOrigin s))
 
 -- | What a run lacks, each with what it would add and how to get it.
 missing :: [Datum] -> Maybe Text -> NanoUI ()
 missing ds prog = scope $ unless (null ds) $
-  columnWith (fillW . gap 6 . padLeft 12 . padTop 2 . tight) $ do
-    labelWith (fontMuted . fontSizeScale 0.85) "Missing"
+  columnWith (fillW . gap 6 . padLeft 6 . padTop 4 . tight) $ do
+    separator
+    labelWith (fontMuted . fontMedium . fontSizeScale 0.82) ("Available to add (" <> tshow (length ds) <> ")")
     forM_ ds $ \d -> withKey (fromEnum d) $
       columnWith (fillW . tight . gap 2) $ do
-        labelWith (fillW . fontSizeScale 0.88) (datumTitle d <> ": " <> datumAdds d)
+        labelWith (fillW . fontSizeScale 0.86) (datumTitle d <> ": " <> datumAdds d)
         let (build, run) = datumRecipe d
         scope $ for_ build $ \b -> recipe "build" b
         scope $ for_ run $ \r -> recipe "run" (maybe "" (<> " ") (if isNothing build then prog else Nothing) <> r)
@@ -112,7 +118,7 @@ missing ds prog = scope $ unless (null ds) $
 -- | A line to copy, after what it is for.
 recipe :: Text -> Text -> NanoUI ()
 recipe what t =
-  rowWith (fillW . gap 6 . padLeft 12 . tight) $ do
-    labelWith (alignMid . fixedW 40 . fontMuted . fontSizeScale 0.82) what
+  rowWith (fillW . gap 6 . padLeft 10 . tight . alignMid) $ do
+    labelWith (alignMid . fixedW 38 . fontMuted . fontSizeScale 0.8) what
     columnWith (alignMid . fillW . tight) $ labelWith (fillW . fontMono . fontSizeScale 0.82) t
-    whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconCopy "Copy") (void (setClipboard t))
+    copyFeedbackButton (alignMid . padXY 6 2 . tight) "Copy" t

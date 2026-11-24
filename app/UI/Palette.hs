@@ -9,10 +9,12 @@ module UI.Palette
   , paletteView
   ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.Text qualified as T
 import NanoUI
+import NanoUI.Adornment qualified as A
+import Stronghead.Format (tshow)
 import Stronghead.Fuzzy (fuzzyRank)
 import UI.Common
 import UI.Link
@@ -48,7 +50,8 @@ paletteView env pl commands =
         textInputConfigured'
           defaultTextInputConfig
             { ticPlaceholder = "Threads, bindings, cost centres, bands, closures, markers, commands…"
-            , ticLayout = fillW defaultLayout
+            , ticLayout = (fillW . gap 6) defaultLayout
+            , ticAdornments = A.leading (A.icon iconSearch)
             }
           (plQuery pl)
       fresh <- readVar (plFresh pl)
@@ -57,7 +60,9 @@ paletteView env pl commands =
         requestFocus (respId resp)
       query <- readVar (plQuery pl)
       let hits = commands ++ concatMap lensHits (envLenses env)
-          ranked = map snd (take shown (fuzzyRank query (\h -> hitLabel h <> " " <> hitKind h) hits))
+          allRanked = fuzzyRank query (\h -> hitLabel h <> " " <> hitKind h) hits
+          totalMatches = length allRanked
+          ranked = map snd (take shown allRanked)
           n = length ranked
       idx0 <- readVar (plIndex pl)
       up <- keyPressed KeyUp
@@ -67,7 +72,8 @@ paletteView env pl commands =
             | down = (idx0 + 1) `mod` n
             | up = (idx0 - 1) `mod` n
             | otherwise = min idx0 (n - 1)
-      when (idx /= idx0) (writeVar (plIndex pl) idx)
+          idxMoved = idx /= idx0
+      when idxMoved (writeVar (plIndex pl) idx)
       enter <- keyPressed KeyEnter
       let run h = do
             writeVar (plOpen pl) False
@@ -76,14 +82,31 @@ paletteView env pl commands =
               HitRun act -> act
       when ((respSubmitted resp || enter) && n > 0) $
         for_ (take 1 (drop idx ranked)) run
+      rowWith (fillW . tight . gap 8 . alignMid) $ do
+        labelWith (fontMuted . fontSizeScale 0.8) $
+          if T.null (T.strip query)
+            then tshow totalMatches <> " available"
+            else tshow totalMatches <> (if totalMatches == 1 then " match" else " matches") <> (if totalMatches > shown then " (showing top " <> tshow shown <> ")" else "")
+        flex
+        scope $ unless (T.null query) $
+          whenM (styled quiet (buttonWith (padXY 6 1 . tight . fontSizeScale 0.8) "Clear")) (writeVar (plQuery pl) "")
       scope $
         if n == 0
-          then hint ("Nothing matches “" <> query <> "”.")
-          else paneScroll (fixedH 420 . tight) $ columnWith (tight . fillW . gap 0) $
-            forM_ (zip [0 :: Int ..] ranked) $ \(i, h) -> withKey i $ do
-              picked <- selectableRow (i == idx) id $ do
-                cell (fixedW 110 . fontMuted . fontSizeScale 0.85) (hitKind h)
-                cell (fontSizeScale 0.95) (T.take 70 (hitLabel h))
-                cell (fillW . fontMuted . fontSizeScale 0.85) (T.take 70 (hitDetail h))
-              when picked (run h)
-      labelWith (fontMuted . fontSizeScale 0.8) "Enter to go, ↑ ↓ to choose, Esc to close"
+          then columnWith (padAll 20 . fillW) $
+            hint ("Nothing matches “" <> query <> "”.")
+          else do
+            (scrollWid, ()) <- paneScrollArea (fixedH 380 . tight) $ columnWith (tight . fillW . gap 0 . padRight 6) $
+              forM_ (zip [0 :: Int ..] ranked) $ \(i, h) -> withKey i $ do
+                picked <- selectableRow (i == idx) (padXY 8 4 . alignMid) $ do
+                  cell (fixedW 92 . fontMuted . fontSizeScale 0.82) (hitKind h)
+                  cell (fontSizeScale 0.94 . (if i == idx then fontMedium else id)) (T.take 64 (hitLabel h))
+                  flex
+                  let det = hitDetail h
+                  scope $ unless (T.null det) $
+                    cell (fontMono . fontMuted . fontSizeScale 0.82) (T.take 56 det)
+                when picked (run h)
+            when (idxMoved && (up || down)) $ do
+              let rowH = 28 :: Float
+                  targetY = max 0 (fromIntegral idx * rowH - 150)
+              scrollToUi scrollWid (V2 0 targetY) ScrollInstant
+      labelWith (fontMuted . fontSizeScale 0.8 . padTop 2) "Enter to open · ↑↓ to choose · Esc to close"

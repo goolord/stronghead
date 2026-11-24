@@ -15,6 +15,7 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import NanoUI
+import NanoUI.Backend (FontMetrics (fmAdvance))
 import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
@@ -38,7 +39,7 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
+import UI.Common (Ink (..), TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, ink, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
 import UI.Flamegraph (diffFlamegraphView, eraCohortHeatmapView, flamegraphView, latencyHeatmapView)
 import UI.Graph (renderFlamegraphSvg, renderHpDiffSvg, renderHpSvg)
@@ -49,6 +50,8 @@ import UI.Link
 import UI.Live
 import UI.Palette
 import UI.Pinboard
+import UI.Settings (Settings (..), defaultSettings)
+import UI.Shell (Options (..), appView, defaultOptions, newApp)
 import UI.Sources
 import UI.Timeline (markersHeader, newTimelineState)
 import UI.Watchers
@@ -1261,6 +1264,70 @@ main = do
   let dossierMd = pinsDossier (worldEnv w PHeap) ["Generated in test."] [("Heap Proof", "run.heap.svg")] [Pin thread "blocked on MVar"]
   check "pinsDossier embeds proof graphs and pins"
     ("Stronghead Post-Mortem Dossier" `T.isInfixOf` dossierMd && "![Heap Proof](run.heap.svg)" `T.isInfixOf` dossierMd)
+
+  putStrLn "UI/UX polish regressions (right-aligned menus, untruncated headers, responsive header, shortcuts, warm ink)"
+  -- Pane menu stays pinned to the far right even with empty trailing content.
+  menuCtx <- newContext
+  menuBench <- newWorkbench "menu-test" (Pane paneInspector)
+  menuPopped <- newVar []
+  let menuScene =
+        void $ columnWith (fixedWH 700 400) $
+          workspace [BenchPlace "M" menuBench] menuPopped menuBench $ \pid ctx ->
+            if pid == paneInspector
+              then Just (pane ctx "Inspector" (pure ()) (void (label "empty body")))
+              else Nothing
+  warmup2 menuCtx (withInput 700 400) menuScene >>= \_ -> pure ()
+  menuSpans <- collectTextSpans menuCtx
+  let menuXs = [rectX r | (r, t, _, _, _) <- menuSpans, t == "⋯"]
+  check "pane menu is pinned to the right edge even with empty trailing header" (any (> 620) menuXs)
+
+  -- At cursor table headers remain untruncated under realistic 15pt font metrics.
+  let ttfMetrics c = withFontMetrics c ((ctxFontMetrics c) {fmLineHeight = 20, fmAscent = 15, fmAdvance = const 7.5})
+  acTtfCtx <- ttfMetrics <$> newContext
+  acTtfState <- newHeapState
+  _ <- renderAtCursor 1200 600 acTtfCtx acTtfState
+  _ <- renderAtCursor 1200 600 acTtfCtx acTtfState
+  acTtfSpans <- collectTextSpans acTtfCtx
+  ac500Ctx <- ttfMetrics <$> newContext
+  ac500State <- newHeapState
+  _ <- renderAtCursor 500 600 ac500Ctx ac500State
+  _ <- renderAtCursor 500 600 ac500Ctx ac500State
+  ac500Spans <- collectTextSpans ac500Ctx
+  check "at cursor headers (residency, delta previous, share) are untruncated at 1200px"
+    (hasText "residency" acTtfSpans && hasText "Δ previous" acTtfSpans && hasText "share" acTtfSpans)
+  check "at cursor headers remain untruncated at 500px"
+    (hasText "residency" ac500Spans && hasText "Δ previous" ac500Spans && hasText "share" ac500Spans)
+
+  -- Top shell header fits without clipping at 960px, 1100px, and 1500px under 15pt font metrics.
+  appRes <- newApp (defaultSettings {cfgRestoreWindow = False, cfgReopenSession = False}) (defaultOptions {optPersist = False})
+  for_ [960 :: Float, 1100, 1500] $ \winW -> do
+    shCtx <- ttfMetrics <$> newContext
+    let shInp = withInput winW 640
+    warmup2 shCtx shInp (appView appRes) >>= \_ -> pure ()
+    shSpans <- collectTextSpans shCtx
+    let hdrOverflow = [t | (Rect x y bw _, t, _, _, _) <- shSpans, y < 44, x + bw > winW + 0.5]
+    check ("top header fits cleanly at " <> show (round winW :: Int) <> "px width") (null hdrOverflow)
+
+  scCtx <- newContext
+  let scInp = withInput 1400 900
+  warmup2 scCtx scInp (appView appRes) >>= \_ -> pure ()
+  _ <- evalUi scCtx (keyInp (KeyF 1) scInp) (appView appRes)
+  _ <- evalUi scCtx scInp (appView appRes)
+  scOverlay <- collectOverlayTextSpans scCtx scInp
+  check "F1 opens Keyboard shortcuts modal with keycaps"
+    (hasText "Keyboard shortcuts" scOverlay && hasText "Ctrl+K" scOverlay && hasText "F5" scOverlay && hasText "Shift+F11" scOverlay)
+  _ <- evalUi scCtx (keyInp KeyEscape scInp) (appView appRes)
+  _ <- evalUi scCtx scInp (appView appRes)
+  scClosed <- collectOverlayTextSpans scCtx scInp
+  check "Esc closes Keyboard shortcuts modal" (not (hasText "Keyboard shortcuts" scClosed))
+
+  -- Warm ink check: no cold blue tint on ground or pane surfaces in either theme.
+  let warmOk mode =
+        let i = ink (strongheadTheme (Just mode))
+            warm c = colorR c >= colorB c
+         in warm (inkGround i) && warm (inkPane i) && warm (inkRule i)
+  check "both Dark and Light palettes preserve Stronghead's warm neutral tone"
+    (warmOk AppearanceDark && warmOk AppearanceLight)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

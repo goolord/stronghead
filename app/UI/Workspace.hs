@@ -304,8 +304,8 @@ panelPreset = \case
   PTimeline -> Split 1000 AxisV 0.74 (Split 1001 AxisH 0.5 (Pane paneTlCaps) (Pane paneTlThreads)) (Split 1002 AxisH 0.64 (Pane paneTlOverview) (Pane paneTlMarkers))
   PHeap -> Split 1000 AxisH 0.46 (Split 1001 AxisV 0.75 (Pane paneHeapChart) (Pane paneHeapBands)) (Split 1002 AxisV 0.64 (Pane paneHeapAnalysis) (Pane paneInspector))
   PCore ->
-    Split 1000 AxisV 0.22 (Split 1001 AxisH 0.58 (Pane paneCoreBindings) (Pane paneInspector)) $
-      Split 1002 AxisH 0.26 (Pane paneCoreNotes) (Pane paneCoreSource)
+    Split 1000 AxisV 0.24 (Split 1001 AxisH 0.58 (Pane paneCoreBindings) (Pane paneInspector)) $
+      Split 1002 AxisH 0.30 (Pane paneCoreNotes) (Pane paneCoreSource)
   PDebugger -> Split 1000 AxisH 0.7 (Split 1001 AxisV 0.68 (Pane paneDbgSource) (Split 1002 AxisH 0.62 (Pane paneDbgLocals) (Pane paneDbgBreaks))) (Pane paneDbgConsole)
   PLive -> Split 1000 AxisH 0.58 (Pane paneLiveCharts) (Pane paneLiveThreads)
 

@@ -26,6 +26,7 @@ module UI.Common
   , axisTicks
     -- * Frame
   , toolStrip
+  , toolStripWrap
   , toolLabel
   , toolButton
   , toolIconButton
@@ -39,6 +40,9 @@ module UI.Common
   , actionIconButton
   , iconButtonWith
   , iconButtonWith'
+  , copyFeedbackButton
+  , kbdBadge
+  , statusDot
     -- * Icons
   , iconPlay
   , iconStop
@@ -72,7 +76,12 @@ module UI.Common
   , iconBookmark
   , iconCopy
   , iconMaximize
+  , iconMinimize
   , iconTarget
+  , iconKeyboard
+  , iconCode
+  , iconBug
+  , iconActivity
   , firstPath
   , Workbench (..)
   , HeldTab (..)
@@ -93,10 +102,14 @@ module UI.Common
   , paneMetaWith
   , paneMenu
   , paneMenuWithVar
+  , ReadoutItem (..)
+  , readoutItem
+  , readoutToned
   , readout
   , readoutDelta
   , readoutDeltaWith
   , emptyState
+  , emptyStateWith
   , paneScroll
   , paneScrollArea
   , bareScroll
@@ -453,7 +466,15 @@ toolStrip :: NanoUI a -> NanoUI a
 toolStrip body = do
   th <- uiTheme
   styled (panelStyle (background (inkPane (ink th)) . borderBottom 1 (inkRule (ink th)) . cornerRadius 0)) $
-    panelWith (asRow . fillW . padXY 8 8 . gap 8 . minH 48) (themed th body)
+    panelWith (asRow . fillW . padXY 10 7 . gap 8 . minH 46) (themed th body)
+
+-- | A toolbar whose items wrap cleanly onto a second line on narrow viewports
+-- rather than clipping off the right edge.
+toolStripWrap :: NanoUI a -> NanoUI a
+toolStripWrap body = do
+  th <- uiTheme
+  styled (panelStyle (background (inkPane (ink th)) . borderBottom 1 (inkRule (ink th)) . cornerRadius 0)) $
+    panelWith (asRow . fillW . padXY 10 7 . gap 8 . wrap . lineGap 6 . minH 46) (themed th body)
 
 -- | A caption for the control after it.
 toolLabel :: Text -> NanoUI ()
@@ -532,6 +553,46 @@ actionIconButton f ic label tip run = do
   for_ (either Just (const tip) run) (tooltip resp)
   when (respClicked resp) (sequence_ run)
 
+-- | A copy button that flashes a green checkmark ("Copied") for 1.5 s after
+-- copying @content@ to the clipboard.
+copyFeedbackButton :: (Layout -> Layout) -> Text -> Text -> NanoUI ()
+copyFeedbackButton f label content = do
+  copiedAt <- useVar (-10.0 :: Double)
+  now <- uiTime
+  t0 <- readVar copiedAt
+  let recentlyCopied = t0 >= 0 && now >= t0 && (now - t0) < 1.5
+  when recentlyCopied $ wakeAfter (max 0.05 (1.5 - (now - t0)))
+  let ic = if recentlyCopied then iconCheck else iconCopy
+      txt = if recentlyCopied then "Copied" else label
+  resp <-
+    if recentlyCopied
+      then do
+        th <- uiTheme
+        let sc = themeSuccess th
+        styled (buttonStyle (foreground sc . borderColor (alpha 0.5 sc) . background (alpha 0.12 sc))) $
+          iconButtonWith' f ic txt
+      else iconButtonWith' f ic txt
+  when (respClicked resp) $ do
+    void (setClipboard content)
+    writeVar copiedAt now
+
+-- | A monospace keyboard shortcut keycap badge (e.g., @Ctrl+K@).
+kbdBadge :: Text -> NanoUI ()
+kbdBadge txt = do
+  th <- uiTheme
+  let i = ink th
+  styled (panelStyle (background (inkSunken i) . borderColor (inkRule i) . borderWidth 1 . cornerRadius 4)) $
+    panelWith (alignMid . padXY 6 2 . tight) $
+      labelWith (fontMono . fontMuted . fontSizeScale 0.78) txt
+
+-- | A crisp 7px status dot in a semantic tone.
+statusDot :: Tone -> NanoUI ()
+statusDot t = do
+  th <- uiTheme
+  let c = toneColor th t
+  void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMid) $ \(Rect x y w h) ->
+    drawCircle (V2 (x + w / 2) (y + h / 2)) 3.5 c
+
 -- ---------------------------------------------------------------------------
 -- Icons
 
@@ -572,7 +633,7 @@ iconLayers = strokeIcon "<polygon points='12 2 2 7 12 12 22 7 12 2'/><polyline p
 iconLayout = strokeIcon "<rect x='3' y='3' width='18' height='18' rx='2'/><line x1='3' y1='9' x2='21' y2='9'/><line x1='9' y1='21' x2='9' y2='9'/>"
 iconCheck = strokeIcon "<polyline points='20 6 9 17 4 12'/>"
 
-iconLink, iconUnlink, iconRefresh, iconCamera, iconBookmark, iconCopy, iconMaximize, iconTarget :: Svg
+iconLink, iconUnlink, iconRefresh, iconCamera, iconBookmark, iconCopy, iconMaximize, iconMinimize, iconTarget, iconKeyboard, iconCode, iconBug, iconActivity :: Svg
 iconLink = strokeIcon "<path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'/><path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'/>"
 iconUnlink = strokeIcon "<path d='m18.84 12.25 1.72-1.71a5 5 0 0 0-7.07-7.07l-1.72 1.71'/><path d='m5.17 11.75-1.71 1.71a5 5 0 0 0 7.07 7.07l1.71-1.71'/><line x1='2' y1='2' x2='22' y2='22'/>"
 iconRefresh = strokeIcon "<polyline points='23 4 23 10 17 10'/><polyline points='1 20 1 14 7 14'/><path d='M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15'/>"
@@ -580,7 +641,12 @@ iconCamera = strokeIcon "<path d='M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0
 iconBookmark = strokeIcon "<path d='M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z'/>"
 iconCopy = strokeIcon "<rect x='9' y='9' width='13' height='13' rx='2'/><path d='M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1'/>"
 iconMaximize = strokeIcon "<polyline points='15 3 21 3 21 9'/><polyline points='9 21 3 21 3 15'/><line x1='21' y1='3' x2='14' y2='10'/><line x1='3' y1='21' x2='10' y2='14'/>"
+iconMinimize = strokeIcon "<polyline points='4 14 10 14 10 20'/><polyline points='20 10 14 10 14 4'/><line x1='14' y1='10' x2='21' y2='3'/><line x1='3' y1='21' x2='10' y2='14'/>"
 iconTarget = strokeIcon "<circle cx='12' cy='12' r='10'/><line x1='22' y1='12' x2='18' y2='12'/><line x1='6' y1='12' x2='2' y2='12'/><line x1='12' y1='6' x2='12' y2='2'/><line x1='12' y1='22' x2='12' y2='18'/>"
+iconKeyboard = strokeIcon "<rect x='2' y='4' width='20' height='16' rx='2'/><line x1='6' y1='8' x2='6.01' y2='8'/><line x1='10' y1='8' x2='10.01' y2='8'/><line x1='14' y1='8' x2='14.01' y2='8'/><line x1='18' y1='8' x2='18.01' y2='8'/><line x1='8' y1='12' x2='8.01' y2='12'/><line x1='12' y1='12' x2='12.01' y2='12'/><line x1='16' y1='12' x2='16.01' y2='12'/><line x1='7' y1='16' x2='17' y2='16'/>"
+iconCode = strokeIcon "<polyline points='16 18 22 12 16 6'/><polyline points='8 6 2 12 8 18'/>"
+iconBug = strokeIcon "<rect x='8' y='6' width='8' height='14' rx='4'/><path d='m19 7-3 2'/><path d='m5 7 3 2'/><path d='m19 19-3-2'/><path d='m5 19 3-2'/><path d='M20 13h-4'/><path d='M4 13h4'/><path d='m10 4 1 2'/><path d='m14 4-1 2'/>"
+iconActivity = strokeIcon "<polyline points='22 12 18 12 15 21 9 3 6 12 2 12'/>"
 
 -- | Act on the first path a file dialog picked, if it picked any: for
 -- @useFileDialog@.
@@ -740,10 +806,15 @@ paneWith bodyLayout ctx title trailing body = do
       borderWidthActive = if flashing && flashFactor > 0.05 then 2 else 1
 
   menuOpen <- useVar False
-  let headerRow = asRow . fillW . fixedH 34 . padXY 12 0 . gap 8
+  let headerRow = asRow . fillW . fixedH 36 . padXY 12 0 . gap 8
       contents = do
-        labelWith (alignMid . fontMedium . fontSizeScale 0.92) title
-        themed th trailing
+        rowWith (alignMid . fillW . tight . gap 8) $ do
+          labelWith (alignMid . fontSemiBold . fontSizeScale 0.92) title
+          themed th trailing
+        scope $ for_ (pcGrid ctx) $ \g -> when (pgcMaximized g) $ do
+          resp <- themed th $ styled quiet $ iconButtonWith' (alignMid . padXY 6 2 . tight) iconMinimize "Restore"
+          tooltip resp "Restore split layout (or double-click header)"
+          when (respClicked resp) (pgcRestore g)
         for_ (pcMenu ctx) (themed th . paneMenuWithVar menuOpen)
   styled (panelStyle (background (inkPane i) . borderColor borderColorActive . borderWidth borderWidthActive . cornerRadius 6)) $
     panelWith (tight . gap 0 . fillW . fillH) $ do
@@ -757,7 +828,7 @@ paneWith bodyLayout ctx title trailing body = do
           Nothing -> panelWith headerRow contents
       for_ (pcGrid ctx) $ \g -> do
         let Rect x y w _ = pgcRect g
-            inHeader = rectContains (Rect x y w 34) (inputMousePos inp)
+            inHeader = rectContains (Rect x y w 36) (inputMousePos inp)
         when (inHeader && pressedIn MouseLeft inp && inputMouseClicks inp >= 2) $
           if pgcMaximized g then pgcRestore g else pgcMaximize g
         when (inHeader && pressedIn MouseRight inp) $
@@ -809,31 +880,50 @@ paneMeta = paneMetaWith id
 paneMetaWith :: (Layout -> Layout) -> Text -> NanoUI ()
 paneMetaWith f = labelWith (alignMid . fontMuted . fontSizeScale 0.85 . f)
 
+-- | A single metric item in a 'readoutToned' strip.
+data ReadoutItem = ReadoutItem
+  { roLabel :: !Text
+  , roValue :: !Text
+  , roDelta :: !(Maybe Text)
+  , roTone :: !(Maybe Tone)
+  , roSubLayout :: !(Layout -> Layout)
+  }
+
+readoutItem :: Text -> Text -> ReadoutItem
+readoutItem lbl val = ReadoutItem lbl val Nothing Nothing id
+
 -- | The vital numbers of a run as one instrument line: each value over its
 -- name, separated by hairlines. Wraps onto more lines when narrow.
+readoutToned :: [ReadoutItem] -> NanoUI ()
+readoutToned items =
+  rowWith (padTop 14 . padXY 20 0 . tight . gap 0 . fillW . wrap . lineGap 8) $
+    forM_ (zip [0 :: Int ..] items) $ \(idx, ReadoutItem {..}) -> withKey idx $
+      rowWith (tight . gap 0) $ do
+        scope $ when (idx > 0) (vrule 34)
+        columnWith (padLeft (if idx > 0 then 14 else 0) . padRight 14 . tight . gap 0) $ do
+          let numTone = maybe id fontTone roTone
+              (number, unit) = splitUnit roValue
+          rowWith (tight . gap 3) $ do
+            cell (fontMono . fontSizeScale 1.3 . numTone) number
+            scope $ unless (T.null unit) (cell (fontMuted . fontSizeScale 0.9) unit)
+          labelWith (roSubLayout . fontMuted . fontSizeScale 0.8) roLabel
+          scope $ for_ roDelta $ labelWith (fontMuted . fontMono . fontSizeScale 0.75)
+
+-- | The vital numbers of a run as one instrument line: each value over its
+-- name. Wraps onto more lines when narrow.
 readout :: [(Text, Text)] -> NanoUI ()
-readout items = readoutDelta [(name, value, Nothing) | (name, value) <- items]
+readout items = readoutToned [readoutItem name value | (name, value) <- items]
 
 -- | 'readout' with, under a value, its change against the baseline run
 -- when there is one.
 readoutDelta :: [(Text, Text, Maybe Text)] -> NanoUI ()
-readoutDelta items = readoutDeltaWith [(name, value, delta, id) | (name, value, delta) <- items]
+readoutDelta items = readoutToned [ReadoutItem name value delta Nothing id | (name, value, delta) <- items]
 
 -- | 'readoutDelta' with layout modifiers on the subtitles (e.g. 'fixedW' so
 -- dynamic counts in a subtitle do not shift subsequent columns).
 readoutDeltaWith :: [(Text, Text, Maybe Text, Layout -> Layout)] -> NanoUI ()
 readoutDeltaWith items =
-  rowWith (padTop 14 . padXY 20 0 . tight . gap 0 . fillW . wrap . lineGap 8) $
-    forM_ (zip [0 :: Int ..] items) $ \(i, (name, value, delta, modSub)) -> withKey i $
-      rowWith (tight . gap 0) $ do
-        scope $ when (i > 0) (vrule 34)
-        columnWith (padLeft (if i > 0 then 14 else 0) . padRight 14 . tight . gap 0) $ do
-          let (number, unit) = splitUnit value
-          rowWith (tight . gap 3) $ do
-            cell (fontMono . fontSizeScale 1.3) number
-            scope $ unless (T.null unit) (cell (fontMuted . fontSizeScale 0.9) unit)
-          labelWith (modSub . fontMuted . fontSizeScale 0.8) name
-          scope $ for_ delta $ labelWith (fontMuted . fontMono . fontSizeScale 0.75)
+  readoutToned [ReadoutItem name value delta Nothing modSub | (name, value, delta, modSub) <- items]
 
 -- | A reading's number and its unit ("5.084 s", "16.5%"), so the unit can
 -- be set smaller and muted beside the figures.
@@ -850,24 +940,31 @@ splitUnit t
 -- | What a pane says before it has anything to show: a title, what to do,
 -- and the commands to do it with.
 emptyState :: Text -> [Text] -> [Text] -> NanoUI ()
-emptyState title body commands =
-  columnWith (fillW . fillH . padAll 24) $ do
-    flex
-    columnWith (tight . gap 10 . fixedW 640 . alignCenter) $ do
-      labelWith (fontMedium . fontSizeScale 1.1) title
-      forM_ body (labelWith (fontMuted . fillW))
-      scope $ when (not (null commands)) (codeBlock commands)
-    flex
-    flex
+emptyState title body commands = emptyStateWith title body commands (pure ())
 
--- | Lines of shell or Haskell, in a sunken monospace block.
+-- | 'emptyState' with primary action buttons below the copyable commands.
+emptyStateWith :: Text -> [Text] -> [Text] -> NanoUI () -> NanoUI ()
+emptyStateWith title body commands actions =
+  columnWith (fillW . fillH . padAll 36 . gap 10) $ do
+    columnWith (maxW 640 . fillW . tight . gap 10) $ do
+      labelWith (fontSemiBold . fontSizeScale 1.15 . fillW) title
+      forM_ body (labelWith (fontMuted . fontSizeScale 0.94 . fillW))
+      scope $ unless (null commands) (codeBlock commands)
+      rowWith (tight . gap 8 . padTop 4 . wrap . lineGap 6 . fillW) actions
+
+-- | Lines of shell or Haskell, in a sunken monospace block with a one-click
+-- Copy button.
 codeBlock :: [Text] -> NanoUI ()
 codeBlock ls = do
   th <- uiTheme
   let i = ink th
+      copyPayload = T.intercalate "\n" [l | l <- ls, not (T.null (T.strip l))]
   styled (panelStyle (background (inkSunken i) . borderColor (inkRule i) . cornerRadius 6)) $
-    panelWith (fillW . padXY 12 10 . gap 2) $
-      forM_ ls (labelWith (fontMono . fontSizeScale 0.9))
+    panelWith (asRow . fillW . padXY 12 10 . gap 8) $ themed th $ do
+      columnWith (fillW . tight . gap 2) $
+        forM_ ls (labelWith (fontMono . fontSizeScale 0.88 . fillW))
+      scope $ unless (T.null copyPayload) $
+        styled quiet $ copyFeedbackButton (alignTop . padXY 6 2 . tight) "Copy" copyPayload
 
 -- | Monospace metrics for canvases that lay out text themselves.
 data MonoMetrics = MonoMetrics
