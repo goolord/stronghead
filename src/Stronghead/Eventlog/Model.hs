@@ -946,7 +946,7 @@ biographyBreakdown hp
           lag = findBio "lag"
           drag = findBio "drag"
           void' = findBio "void"
-          use = findBio "use"
+          use = findBio "use" + findBio "inherent_use"
           dominant = fst $ foldl' (\best cur -> if snd cur > snd best then cur else best) ("use", use) [("lag", lag), ("drag", drag), ("void", void')]
        in if lag + drag + void' + use <= 0
             then Nothing

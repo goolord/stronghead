@@ -100,6 +100,52 @@ data StrongheadTool
       , baseline_path :: !(Maybe Text)
       , dump_path :: !(Maybe Text)
       }
+  | StrongheadTriageRun
+      { eventlog_path :: !(Maybe Text)
+      , hp_path :: !(Maybe Text)
+      , target :: !(Maybe Text)
+      , dump_path :: !(Maybe Text)
+      , prof_path :: !(Maybe Text)
+      , output_format :: !(Maybe Text)
+      }
+  | StrongheadQuery
+      { query :: !Text
+      , eventlog_path :: !(Maybe Text)
+      , hp_path :: !(Maybe Text)
+      , target :: !(Maybe Text)
+      , dump_path :: !(Maybe Text)
+      , prof_path :: !(Maybe Text)
+      , include_live_probes :: !(Maybe Bool)
+      , output_format :: !(Maybe Text)
+      }
+  | StrongheadStrictnessAudit
+      { target :: !(Maybe Text)
+      , dump_path :: !(Maybe Text)
+      , hp_path :: !(Maybe Text)
+      , include_live_probes :: !(Maybe Bool)
+      , top_n :: !(Maybe Int)
+      }
+  | StrongheadExperiment
+      { baseline_cmd :: !(Maybe Text)
+      , candidate_cmd :: !(Maybe Text)
+      , trials :: !(Maybe Int)
+      , warmup :: !(Maybe Int)
+      , baseline_csv :: !(Maybe Text)
+      , candidate_csv :: !(Maybe Text)
+      , cwd :: !(Maybe Text)
+      }
+  | StrongheadDebugSession
+      { action :: !Text
+      , session_id :: !(Maybe Text)
+      , arg :: !(Maybe Text)
+      , cwd :: !(Maybe Text)
+      , repl_cmd :: !(Maybe Text)
+      , timeout_ms :: !(Maybe Int)
+      }
+  | StrongheadGuiCopilot
+      { action :: !Text
+      , value :: !(Maybe Text)
+      }
   deriving stock (Show, Eq)
 
 -- | Descriptions for tools and arguments used by 'deriveToolHandlerWithDescription'.
@@ -215,6 +261,49 @@ toolDescriptions =
       for automated CI regression gating.
       """
     )
+  , ( "StrongheadTriageRun"
+    , """
+      Synthesizes confidence-ranked root-cause findings across all supplied GHC artifacts
+      (.eventlog, .hp, heap snapshot, Core/STG dumps, and .prof) in a single call, joining
+      heap leak bands to static STG closure captures, GC sync stragglers, runnable stalls,
+      and compiler optimization smells (Markdown or structured JSON).
+      """
+    )
+  , ( "StrongheadQuery"
+    , """
+      Executes a Stronghead Lens Pipe & topological pointer-path regex query across loaded
+      artifacts (domains: closures, bands, bindings, threads, spans, gcs; pointer regexes
+      such as 'closures | path (MutVar ~> Thunk{3,}) | sort dom | top 25') in Markdown or JSON.
+      """
+    )
+  , ( "StrongheadStrictnessAudit"
+    , """
+      Audits heap snapshots, live ghc-heap probes, heap profiles, and Core/STG/Cmm/Asm dumps
+      for missing strictness annotations ('!', BangPatterns, UNPACK), spine-strict/value-lazy
+      containers (Map/HashMap/Seq), STG \\u closure free-variable captures, and simplifier misses.
+      """
+    )
+  , ( "StrongheadExperiment"
+    , """
+      Runs a statistically rigorous interleaved multi-trial A/B experiment (with warmup runs
+      and Welch's two-sample t-test across duration, allocations, and peak live bytes) or
+      compares Criterion / tasty-bench CSV benchmark outputs.
+      """
+    )
+  , ( "StrongheadDebugSession"
+    , """
+      Controls a persistent, stateful multi-turn GHCi debugging session with process-group
+      timeout protection and ':set +s' step allocation metering: actions 'start', 'break',
+      'continue', 'step', 'steplocal', 'eval', 'force', 'bindings', 'interrupt', 'stop', 'list'.
+      """
+    )
+  , ( "StrongheadGuiCopilot"
+    , """
+      Drives a running Stronghead GUI window as a co-pilot: focus an entity reference across
+      all panes ('focus'), open and run a Lens Pipe query ('query'), open an artifact ('open'),
+      or surface the Triage feed ('triage').
+      """
+    )
   , ("path", "Path to the profiling artifact (.hp or .eventlog)")
   , ("dump_path", "Path to GHC dump directory or dump file (.dump-simpl, .dump-stg-final)")
   , ("top_n", "Maximum number of top suspects to return (default: 5)")
@@ -258,4 +347,17 @@ toolDescriptions =
   , ("spec", "Path to a .stronghead-spec file or inline key=value budget rules")
   , ("eventlog_path", "Optional .eventlog path to check against the runtime budget")
   , ("hp_path", "Optional .hp heap profile path to check against the runtime budget")
+  , ("output_format", "Output format: 'markdown' (default) or 'json'")
+  , ("query", "Lens Pipe query string (e.g. 'closures | path (MutVar ~> Thunk{3,}) | sort dom | top 20')")
+  , ("include_live_probes", "Whether to auto-connect to a running Stronghead.Agent and include live ghc-heap probes")
+  , ("baseline_cmd", "Baseline command line (executable and optional args) for A/B multi-trial experiment")
+  , ("candidate_cmd", "Candidate command line (executable and optional args) for A/B multi-trial experiment")
+  , ("trials", "Number of interleaved measured trials per variant (default: 5)")
+  , ("warmup", "Number of unmeasured warmup runs per variant before recording (default: 1)")
+  , ("baseline_csv", "Optional baseline Criterion or tasty-bench CSV file path")
+  , ("candidate_csv", "Optional candidate Criterion or tasty-bench CSV file path")
+  , ("action", "Operation to perform (for debug_session: start|break|continue|step|steplocal|eval|force|bindings|interrupt|stop|list; for gui_copilot: focus|query|open|triage)")
+  , ("session_id", "Named GHCi debug session identifier (default: 'default')")
+  , ("arg", "Action argument: expression, breakpoint location ('Module.hs:42' or 'Module.fn'), or thunk variable ('_t1')")
+  , ("value", "Co-pilot payload: entity reference target, Lens Pipe query string, or file path")
   ]

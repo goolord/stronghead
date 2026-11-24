@@ -25,19 +25,30 @@ module Stronghead.MCP.Tools
   , liveStacksReport
   , rtsSweepReport
   , assertBudgetReport
-    -- * Helpers
+    -- * MCP v3 stateful & synthesis engines
+  , triageRunReport
+  , queryReport
+  , strictnessAuditReport
+  , experimentReport
+  , debugSessionTool
+  , guiCopilotTool
+    -- * Helpers & Cache
   , loadProfile
+  , cachedLoadEventlog
+  , cachedLoadHp
   ) where
 
-import Control.Concurrent (newEmptyMVar, putMVar, takeMVar, threadDelay)
+import Control.Applicative ((<|>))
+import Control.Concurrent (MVar, modifyMVar, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar, threadDelay)
 import Control.Concurrent.Async (withAsync)
 import Control.Exception (SomeException, try)
 import Control.Monad (forM, forM_, unless, when)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (sort, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
 import Data.Ord (Down (..))
+import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -45,14 +56,16 @@ import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word32)
 import Numeric (showFFloat)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, makeAbsolute)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getFileSize, getModificationTime, makeAbsolute)
 import System.FilePath (takeBaseName, takeDirectory, takeFileName, (</>))
 import System.IO (IOMode (WriteMode), hSetEncoding, utf8, withFile)
+import System.IO.Unsafe (unsafePerformIO)
 
 import UI.Graph
   ( renderHpDiffSvg
   , renderHpSvg
   )
+import UI.Shell (sendCopilotCommand)
 
 import Stronghead.Debug
   ( ClosureNode (..)
@@ -68,16 +81,21 @@ import Stronghead.Debug
   )
 import Stronghead.Debug qualified as Dbg
 import Stronghead.Debug.Anatomy
-  ( DominatorTree (..)
+  ( ContainerHealth (..)
+  , DominatorTree (..)
   , DuplicateGroup (..)
   , HeapSkeleton (..)
   , SeverResult (..)
   , SeverTarget (..)
   , SpineFinding (..)
+  , StrictnessAdvice (..)
+  , auditContainers
   , auditDuplicates
+  , auditStrictnessOpportunities
   , buildHeapSkeleton
   , computeDominators
   , simulateSever
+  , snapshotFromProbes
   )
 import Stronghead.Diff
   ( BandChange (..)
@@ -97,9 +115,11 @@ import Stronghead.Dump
   ( Binding (..)
   , CodeFile (..)
   , CodeKind (..)
+  , FullModuleArtifacts (..)
   , ModuleArtifacts (..)
   , Notes (..)
   , discoverArtifacts
+  , discoverFullArtifacts
   , kindForPath
   , loadCodeFile
   , nameKey
@@ -130,13 +150,19 @@ import Stronghead.Eventlog.Model
   , threadName
   )
 import Stronghead.Lab
-  ( SweepConfig (..)
+  ( BenchCase (..)
+  , ComparisonStats (..)
+  , StatVerdict (..)
+  , SweepConfig (..)
+  , TrialStats (..)
   , defaultSweepGrid
   , evaluateBudget
   , formatBudgetMarkdown
+  , parseBenchCsv
   , parseBudgetSpec
   , renderParetoMarkdown
   , runRtsSweep
+  , runStatisticalExperiment
   )
 import Stronghead.Format
   ( fmtBytes
@@ -209,7 +235,25 @@ import Stronghead.Next
   ( Datum (..)
   , datumRecipe
   )
-import Stronghead.Source (renderSrcLoc)
+import Stronghead.Query
+  ( QueryContext (..)
+  , buildQueryBindings
+  , emptyQueryContext
+  , evalQuery
+  , formatQueryJson
+  , formatQueryMarkdown
+  , parseQuery
+  )
+import Stronghead.Ref (RunKey (..))
+import Stronghead.Run (runKey)
+import Stronghead.Source (renderSrcLoc, renderSrcSpan)
+import Stronghead.Triage
+  ( TriageInput (..)
+  , emptyTriageInput
+  , formatTriageJson
+  , formatTriageMarkdown
+  , triageRun
+  )
 
 -- ---------------------------------------------------------------------------
 -- 1. Leak Diagnosis
@@ -221,10 +265,78 @@ diagnoseLeak path topN threshold = do
     Left err -> pure (Left (T.pack err))
     Right hp -> pure (Right (formatLeakDiagnosis hp topN threshold path))
 
+type FileStamp = (FilePath, String, Integer)
+
+eventlogCacheRef :: IORef (M.Map FilePath (FileStamp, Timeline))
+eventlogCacheRef = unsafePerformIO (newIORef M.empty)
+{-# NOINLINE eventlogCacheRef #-}
+
+hpCacheRef :: IORef (M.Map FilePath (FileStamp, HeapProfile))
+hpCacheRef = unsafePerformIO (newIORef M.empty)
+{-# NOINLINE hpCacheRef #-}
+
+profCacheRef :: IORef (M.Map FilePath (FileStamp, ProfFile))
+profCacheRef = unsafePerformIO (newIORef M.empty)
+{-# NOINLINE profCacheRef #-}
+
+fileStampOf :: FilePath -> IO (Maybe FileStamp)
+fileStampOf p = do
+  r <- try @SomeException do
+    ap <- makeAbsolute p
+    mt <- getModificationTime ap
+    sz <- getFileSize ap
+    pure (ap, show mt, sz)
+  pure (either (const Nothing) Just r)
+
+cachedLoadEventlog :: FilePath -> IO (Either String Timeline)
+cachedLoadEventlog p = do
+  mSt <- fileStampOf p
+  case mSt of
+    Nothing -> loadEventlog p
+    Just st@(ap, _, _) -> do
+      cache <- readIORef eventlogCacheRef
+      case M.lookup ap cache of
+        Just (st0, tl) | st0 == st -> pure (Right tl)
+        _ -> do
+          res <- loadEventlog ap
+          case res of
+            Right tl -> atomicModifyIORef' eventlogCacheRef (\m -> (M.insert ap (st, tl) m, ())) >> pure (Right tl)
+            Left err -> pure (Left err)
+
+cachedLoadHp :: FilePath -> IO (Either String HeapProfile)
+cachedLoadHp p = do
+  mSt <- fileStampOf p
+  case mSt of
+    Nothing -> loadHp p
+    Just st@(ap, _, _) -> do
+      cache <- readIORef hpCacheRef
+      case M.lookup ap cache of
+        Just (st0, hp) | st0 == st -> pure (Right hp)
+        _ -> do
+          res <- loadHp ap
+          case res of
+            Right hp -> atomicModifyIORef' hpCacheRef (\m -> (M.insert ap (st, hp) m, ())) >> pure (Right hp)
+            Left err -> pure (Left err)
+
+cachedLoadProf :: FilePath -> IO (Either String ProfFile)
+cachedLoadProf p = do
+  mSt <- fileStampOf p
+  case mSt of
+    Nothing -> loadProf p
+    Just st@(ap, _, _) -> do
+      cache <- readIORef profCacheRef
+      case M.lookup ap cache of
+        Just (st0, pf) | st0 == st -> pure (Right pf)
+        _ -> do
+          res <- loadProf ap
+          case res of
+            Right pf -> atomicModifyIORef' profCacheRef (\m -> (M.insert ap (st, pf) m, ())) >> pure (Right pf)
+            Left err -> pure (Left err)
+
 loadProfile :: FilePath -> IO (Either String HeapProfile)
 loadProfile path
   | ".eventlog" `T.isSuffixOf` T.pack path = do
-      r <- loadEventlog path
+      r <- cachedLoadEventlog path
       case r of
         Left err -> pure (Left ("Failed to load eventlog: " <> err))
         Right tl -> case tlHeapProfile tl of
@@ -243,7 +355,7 @@ loadProfile path
                          """
                   )
               )
-  | otherwise = loadHp path
+  | otherwise = cachedLoadHp path
 
 formatLeakDiagnosis :: HeapProfile -> Int -> Double -> FilePath -> Text
 formatLeakDiagnosis hp topN threshold path = renderMD do
@@ -424,6 +536,8 @@ formatSingleMatch (cf, b) = renderMD do
   let kindStr = case cfKind cf of
         KindCore -> "GHC Core (Optimized)"
         KindStg -> "GHC STG (Pre-codegen)"
+        KindCmm -> "GHC Cmm (Low-level RTS IR)"
+        KindAsm -> "Native Assembly / LLVM"
         KindSource -> "Haskell Source"
       allLines = cfLines cf
       bLines = V.slice (bdFirst b) (max 1 (bdLast b - bdFirst b + 1)) allLines
@@ -1562,7 +1676,7 @@ assertBudgetReport specInput mEvPath mHpPath mBasePath mDumpPath = do
   let spec = parseBudgetSpec specTxt
   mTl <- case mEvPath of
     Nothing -> pure Nothing
-    Just p -> either (const Nothing) Just <$> loadEventlog p
+    Just p -> either (const Nothing) Just <$> cachedLoadEventlog p
   mHp <- case mHpPath of
     Nothing -> pure Nothing
     Just p -> either (const Nothing) Just <$> loadProfile p
@@ -1571,3 +1685,541 @@ assertBudgetReport specInput mEvPath mHpPath mBasePath mDumpPath = do
     Just p -> either (const Nothing) Just <$> loadProfile p
   res <- evaluateBudget spec mTl mHp mBaseHp mDumpPath
   pure (Right (formatBudgetMarkdown res))
+
+-- ---------------------------------------------------------------------------
+-- 16. MCP v3 Shared Snapshot / Dump / Probe Loaders
+
+fetchLiveProbesSnapshot :: Int -> IO (Maybe HeapSnapshot)
+fetchLiveProbesSnapshot timeoutMs = do
+  beacons <- discoverAgents
+  let (host, port) = case beacons of
+        b : _ -> (T.unpack (abHost b), abPort b)
+        [] -> ("127.0.0.1", 4777)
+  probesRef <- newIORef ([] :: [LiveProbeNode])
+  doneVar <- newEmptyMVar
+  let putOnce v = try @SomeException (putMVar doneVar v) >> pure ()
+      onEvent = \case
+        LiveConnected box -> sendCommand box 1 (CmdProbes Nothing)
+        LiveProbe pn -> modifyIORef' probesRef (pn :)
+        LiveReply 1 _ -> putOnce ()
+        LiveClosed _ -> putOnce ()
+        _ -> pure ()
+  _ <- withAsync (connectLive host port onEvent) \_ ->
+    withAsync (threadDelay (timeoutMs * 1000) >> putOnce ()) \_ ->
+      takeMVar doneVar
+  probes <- reverse <$> readIORef probesRef
+  pure (if null probes then Nothing else Just (snapshotFromProbes "live-probes" probes))
+
+resolveOptionalSnapshot :: Maybe FilePath -> Bool -> IO (Maybe HeapSnapshot)
+resolveOptionalSnapshot mTarget includeLiveProbes = do
+  mFromTarget <- case mTarget of
+    Nothing -> pure Nothing
+    Just rawTarget
+      | not ghcDebugEnabled -> pure Nothing
+      | otherwise -> do
+          isFile <- doesFileExist rawTarget
+          let dbgTarget
+                | isFile = DebugSnapshotFile rawTarget
+                | Just (h, p) <- parseHostPort (T.pack rawTarget) = DebugTCP h p
+                | otherwise = DebugUnix rawTarget
+          either (const Nothing) Just <$> takeSnapshot defaultSnapshotOptions dbgTarget
+  case mFromTarget of
+    Just snap -> pure (Just snap)
+    Nothing
+      | includeLiveProbes -> fetchLiveProbesSnapshot 1500
+      | otherwise -> pure Nothing
+
+loadDumpPairs :: Maybe FilePath -> IO [(Text, Maybe CodeFile, Maybe CodeFile)]
+loadDumpPairs Nothing = pure []
+loadDumpPairs (Just root) = do
+  isFile <- doesFileExist root
+  isDir <- doesDirectoryExist root
+  if isFile
+    then do
+      let k = fromMaybe KindCore (kindForPath root)
+      eCf <- loadCodeFile k root
+      pure case eCf of
+        Right cf ->
+          [ ( cfModule cf
+            , if k == KindCore then Just cf else Nothing
+            , if k == KindStg then Just cf else Nothing
+            )
+          ]
+        Left _ -> []
+    else if isDir
+      then do
+        arts0 <- discoverArtifacts root
+        arts <-
+          if null arts0
+            then do
+              let dist = root </> "dist-newstyle"
+              ex <- doesDirectoryExist dist
+              if ex then discoverArtifacts dist else pure []
+            else pure arts0
+        forM (take 40 arts) \a -> do
+          mc <- traverse (fmap (either (const Nothing) Just) . loadCodeFile KindCore) (maCore a)
+          ms <- traverse (fmap (either (const Nothing) Just) . loadCodeFile KindStg) (maStg a)
+          pure (maModule a, mc >>= id, ms >>= id)
+      else pure []
+
+-- ---------------------------------------------------------------------------
+-- 17. One-Call Run-Level Triage Synthesis (stronghead_triage_run)
+
+triageRunReport
+  :: Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe Text
+  -> IO (Either Text Text)
+triageRunReport mEvPath mHpPath mTarget mDumpPath mProfPath mFmt = do
+  mTl <- traverse (fmap (either (const Nothing) Just) . cachedLoadEventlog) mEvPath
+  mHp0 <- traverse (fmap (either (const Nothing) Just) . loadProfile) mHpPath
+  let tl = mTl >>= id
+      hp = (mHp0 >>= id) <|> (tl >>= tlHeapProfile)
+  mSnap <- resolveOptionalSnapshot mTarget False
+  dumpPairs <- loadDumpPairs mDumpPath
+  mProf <- traverse (fmap (either (const Nothing) Just) . cachedLoadProf) mProfPath
+  let costs = maybe [] (costTotals . pfRoots) (mProf >>= id)
+      weightMap =
+        M.fromListWith
+          max
+          [(nameKey (ctName c), max (ctInhTime c) (ctInhAlloc c)) | c <- costs]
+      smells =
+        concat
+          [ Forensics.detectCoreSmells mc ms weightMap
+          | (_, mc, ms) <- dumpPairs
+          ]
+      stgFiles = [s | (_, _, Just s) <- dumpPairs]
+      rk =
+        fromMaybe (RunKey "?:?") $
+          (runKey . tlRun <$> tl) <|> (runKey . hpRun <$> hp)
+      findings =
+        triageRun
+          emptyTriageInput
+            { triRunKey = rk
+            , triTimeline = tl
+            , triHeap = hp
+            , triSnapshots = maybe [] pure mSnap
+            , triCoreSmells = smells
+            , triStgFiles = stgFiles
+            }
+      labelTxt =
+        fromMaybe "Run" $
+          (T.pack . takeFileName <$> mEvPath)
+            <|> (T.pack . takeFileName <$> mHpPath)
+            <|> (T.pack . takeFileName <$> mDumpPath)
+      wantsJson = fmap (T.toLower . T.strip) mFmt == Just "json"
+  pure . Right $
+    if wantsJson
+      then formatTriageJson findings
+      else formatTriageMarkdown labelTxt findings
+
+-- ---------------------------------------------------------------------------
+-- 18. Cross-Artifact Lens Pipe & Pointer-Path Query Engine (stronghead_query)
+
+queryReport
+  :: Text
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Bool
+  -> Maybe Text
+  -> IO (Either Text Text)
+queryReport rawQuery mEvPath mHpPath mTarget mDumpPath mProfPath includeLive mFmt =
+  case parseQuery rawQuery of
+    Left err -> pure (Left ("Invalid Lens Pipe query:\n" <> err))
+    Right q -> do
+      mTl <- traverse (fmap (either (const Nothing) Just) . cachedLoadEventlog) mEvPath
+      mHp0 <- traverse (fmap (either (const Nothing) Just) . loadProfile) mHpPath
+      let tl = mTl >>= id
+          hp = (mHp0 >>= id) <|> (tl >>= tlHeapProfile)
+      mSnap <- resolveOptionalSnapshot mTarget includeLive
+      dumpPairs <- loadDumpPairs mDumpPath
+      mProf <- traverse (fmap (either (const Nothing) Just) . cachedLoadProf) mProfPath
+      let costs = maybe [] (costTotals . pfRoots) (mProf >>= id)
+          qBinds = buildQueryBindings dumpPairs costs
+          rk =
+            fromMaybe (RunKey "?:?") $
+              (runKey . tlRun <$> tl) <|> (runKey . hpRun <$> hp)
+          qctx =
+            emptyQueryContext
+              { qcRunKey = rk
+              , qcTimeline = tl
+              , qcHeap = hp
+              , qcSnapshot = mSnap
+              , qcSnapshotIndex = 0
+              , qcDominators = computeDominators <$> mSnap
+              , qcSurvivors = S.empty
+              , qcBindings = qBinds
+              }
+          res = evalQuery qctx q
+          wantsJson = fmap (T.toLower . T.strip) mFmt == Just "json"
+      pure . Right $
+        if wantsJson
+          then formatQueryJson res
+          else formatQueryMarkdown res
+
+-- ---------------------------------------------------------------------------
+-- 19. Automated Strictness, Container & IR Audit (stronghead_strictness_audit)
+
+strictnessAuditReport
+  :: Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Bool
+  -> Int
+  -> IO (Either Text Text)
+strictnessAuditReport mTarget mDumpPath mHpPath includeLive topN = do
+  mSnap <- resolveOptionalSnapshot mTarget includeLive
+  mHp0 <- traverse (fmap (either (const Nothing) Just) . loadProfile) mHpPath
+  let mHp = mHp0 >>= id
+  dumpPairs <- loadDumpPairs mDumpPath
+  fullLow <- case mDumpPath of
+    Nothing -> pure []
+    Just root -> do
+      isDir <- doesDirectoryExist root
+      if isDir then discoverFullArtifacts root else pure []
+  lowReports <- forM (take 10 fullLow) \f -> do
+    mcmm <- traverse (fmap (either (const Nothing) Just) . loadCodeFile KindCmm) (fmaCmm f)
+    masm <- traverse (fmap (either (const Nothing) Just) . loadCodeFile KindAsm) (fmaAsm f)
+    let rep = Forensics.analyzeLowLevelIr (mcmm >>= id) (masm >>= id)
+    pure (fmaModule f, rep)
+  let stgFiles = [s | (_, _, Just s) <- dumpPairs]
+      allSmells = concat [Forensics.detectCoreSmells mc ms M.empty | (_, mc, ms) <- dumpPairs]
+      misses = Forensics.explainOptimizationMisses allSmells []
+      bandCaps = case mHp of
+        Nothing -> []
+        Just hp ->
+          [ (bandName b, caps)
+          | b <- V.toList (hpBands hp)
+          , let caps = Forensics.bandStaticCaptures stgFiles b
+          , not (null caps)
+          ]
+  pure . Right $ renderMD do
+    h1 "Stronghead Strictness, Container & Low-Level IR Audit"
+    case mSnap of
+      Nothing ->
+        para "No heap snapshot or live ghc-heap probes supplied; skipping runtime constructor-slot counterfactuals (pass `target` or `include_live_probes = true` to include)."
+      Just snap -> do
+        let dt = computeDominators snap
+            strictOps = take topN (auditStrictnessOpportunities snap dt)
+            containers = take topN (auditContainers snap dt)
+        h2 ("Constructor Slot & Mutable Cell Strictness Opportunities (" <> tshow (length strictOps) <> ")")
+        if null strictOps
+          then para "No lazy constructor slots retaining unevaluated thunks detected."
+          else
+            tableAligned
+              [(AlignLeft, "Parent"), (AlignCenter, "Slot"), (AlignLeft, "Thunk"), (AlignRight, "Instances"), (AlignRight, "Freed Bytes"), (AlignLeft, "Recommended Fix")]
+              [ [ code (saParent sa)
+                , maybe "-" (("#" <>) . tshow) (saSlot sa)
+                , code (saChildThunk sa)
+                , fmtInt (saThunkInstances sa)
+                , bold (fmtBytes (fromIntegral (saFreedBytes sa)))
+                , saPragmaHint sa
+                ]
+              | sa <- strictOps
+              ]
+        h2 ("Container Spine vs. Value-Laziness Health (" <> tshow (length containers) <> ")")
+        if null containers
+          then para "No standard Haskell container spines detected in snapshot."
+          else
+            tableAligned
+              [(AlignLeft, "Container"), (AlignRight, "Spine Nodes"), (AlignRight, "Lazy Thunk Values"), (AlignRight, "Thunk Bytes"), (AlignLeft, "Diagnosis")]
+              [ [ code (chContainerKind ch)
+                , fmtInt (chSpineNodes ch)
+                , fmtInt (chThunkValues ch)
+                , fmtBytes (fromIntegral (chThunkValueBytes ch))
+                , chDiagnosis ch
+                ]
+              | ch <- containers
+              ]
+    unless (null bandCaps) do
+      h2 "Heap Profile Bands Joined to Static STG Closure Captures"
+      forM_ (take topN bandCaps) \(bName, caps) -> do
+        h3 ("Band " <> code bName)
+        forM_ (take 4 caps) \c ->
+          bullet (code (Forensics.scBinder c) <> " in " <> code (Forensics.scEnclosing c) <> " captures `[" <> T.intercalate ", " (Forensics.scCaptured c) <> "]`")
+    unless (null misses) do
+      h2 ("Simplifier & Worker/Wrapper Explanations (" <> tshow (length misses) <> ")")
+      forM_ (take topN misses) \ex ->
+        bullet (bold (exBinding ex) <> " (" <> Forensics.smellKindTitle (Forensics.seSmell ex) <> "): " <> Forensics.seReason ex)
+    let nonEmptyLow = [(m, r) | (m, r) <- lowReports, Forensics.carHeapChecks r + Forensics.carSlowCalls r + Forensics.carSpills r > 0]
+    unless (null nonEmptyLow) do
+      h2 "Cmm & Native Assembly Forensics"
+      tableAligned
+        [(AlignLeft, "Module"), (AlignRight, "Heap Checks"), (AlignRight, "Stack Checks"), (AlignRight, "Spills"), (AlignRight, "Slow Calls"), (AlignRight, "SIMD Ops")]
+        [ [ code m
+          , fmtInt (Forensics.carHeapChecks r)
+          , fmtInt (Forensics.carStackChecks r)
+          , fmtInt (Forensics.carSpills r)
+          , fmtInt (Forensics.carSlowCalls r)
+          , fmtInt (Forensics.carSimdOps r)
+          ]
+        | (m, r) <- nonEmptyLow
+        ]
+  where
+    exBinding = Forensics.seBinding
+
+-- ---------------------------------------------------------------------------
+-- 20. Multi-Trial Statistical A/B Experiment & CSV Comparison (stronghead_experiment)
+
+experimentReport
+  :: Maybe Text
+  -> Maybe Text
+  -> Int
+  -> Int
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> Maybe FilePath
+  -> IO (Either Text Text)
+experimentReport mBaseCmd mCandCmd trials warmups mBaseCsv mCandCsv mCwd =
+  case (mBaseCmd, mCandCmd, mBaseCsv, mCandCsv) of
+    (Just bCmd, Just cCmd, _, _) -> do
+      let parseCmd raw =
+            let ws = words (T.unpack (T.strip raw))
+                (pre, rtsRest) = break (== "+RTS") ws
+                rtsFlags = takeWhile (/= "-RTS") (drop 1 rtsRest)
+             in case pre of
+                  exe : args -> Just (exe, args, rtsFlags)
+                  [] -> Nothing
+      case (parseCmd bCmd, parseCmd cCmd) of
+        (Just bSpec, Just cSpec) -> do
+          res <- runStatisticalExperiment warmups trials bSpec cSpec mCwd
+          pure $ flip fmap res \(durCmp, allocCmp, liveCmp) -> renderMD do
+            h1 "Stronghead Statistical A/B Experiment (Welch's t-Test)"
+            fieldCode "Baseline" bCmd
+            fieldCode "Candidate" cCmd
+            field "Protocol" (tshow warmups <> " warmup(s) + " <> tshow (max 1 trials) <> " interleaved trial(s) per variant")
+            tableAligned
+              [(AlignLeft, "Metric"), (AlignRight, "Baseline (Mean ± 95% CI)"), (AlignRight, "Candidate (Mean ± 95% CI)"), (AlignRight, "Delta"), (AlignRight, "Welch t"), (AlignCenter, "Verdict")]
+              [ fmtCmpRow "Duration" fmtSec durCmp
+              , fmtCmpRow "Total Allocated" (fmtBytes . round) allocCmp
+              , fmtCmpRow "Peak Live Residency" (fmtBytes . round) liveCmp
+              ]
+        _ -> pure (Left "Both `baseline_cmd` and `candidate_cmd` must start with a valid executable path.")
+    (_, _, Just bCsvPath, Just cCsvPath) -> do
+      bTxt <- TIO.readFile bCsvPath
+      cTxt <- TIO.readFile cCsvPath
+      let bCases = M.fromList [(bcName bc, bc) | bc <- parseBenchCsv bTxt]
+          cCases = parseBenchCsv cTxt
+      pure . Right $ renderMD do
+        h1 "Stronghead Criterion / tasty-bench CSV Comparison"
+        fieldCode "Baseline CSV" (T.pack bCsvPath)
+        fieldCode "Candidate CSV" (T.pack cCsvPath)
+        tableAligned
+          [(AlignLeft, "Benchmark"), (AlignRight, "Baseline Mean"), (AlignRight, "Candidate Mean"), (AlignRight, "Delta"), (AlignRight, "Cand Allocated")]
+          [ let mb = M.lookup (bcName c) bCases
+                dStr = maybe "new" (\b -> fmtChange (bcMeanSec b) (bcMeanSec c)) mb
+             in [ code (bcName c)
+                , maybe "-" (fmtNs . (* 1e9) . bcMeanSec) mb
+                , fmtNs (bcMeanSec c * 1e9)
+                , bold dStr
+                , maybe "-" fmtBytes (bcAllocBytes c)
+                ]
+          | c <- take 50 cCases
+          ]
+    _ ->
+      pure (Left "Provide either (`baseline_cmd` and `candidate_cmd`) for a live multi-trial Welch's t-test run, or (`baseline_csv` and `candidate_csv`) to compare Criterion/tasty-bench CSV files.")
+  where
+    fmtCmpRow label fmtFn ComparisonStats {..} =
+      [ bold label
+      , fmtFn (tsMean csBaseline) <> " ± " <> fmtFn (tsCi95HalfWidth csBaseline)
+      , fmtFn (tsMean csCandidate) <> " ± " <> fmtFn (tsCi95HalfWidth csCandidate)
+      , (if csDeltaPct >= 0 then "+" else "") <> fmtPct csDeltaPct
+      , fmtFixed 2 csWelchT
+      , case csVerdict of
+          StatImproved -> bold "IMPROVED"
+          StatRegressed -> bold "REGRESSED"
+          StatNoise -> "NOISE (within variance)"
+      ]
+
+-- ---------------------------------------------------------------------------
+-- 21. Stateful Multi-Turn GHCi Debug Session (stronghead_debug_session)
+
+data GhciSessionEntry = GhciSessionEntry
+  { gseGhci :: !Ghci.Ghci
+  , gsePrevValues :: !(M.Map Text Ghci.Value)
+  , gseThunkAges :: !(M.Map Text Int)
+  }
+
+ghciSessionsRef :: MVar (M.Map Text GhciSessionEntry)
+ghciSessionsRef = unsafePerformIO (newMVar M.empty)
+{-# NOINLINE ghciSessionsRef #-}
+
+debugSessionTool
+  :: Text
+  -> Text
+  -> Maybe Text
+  -> Maybe FilePath
+  -> Maybe String
+  -> Int
+  -> IO (Either Text Text)
+debugSessionTool rawAction sid mArg mCwd mRepl timeoutMs = do
+  let act = T.toLower (T.strip rawAction)
+  case act of
+    "start" -> do
+      let replCmd = fromMaybe "cabal repl" mRepl
+          workDir = fromMaybe "." mCwd
+      started <- Ghci.startGhci workDir replCmd
+      case started of
+        Left err -> pure (Left ("Failed to start GHCi session '" <> sid <> "': " <> err))
+        Right (g, banner) -> do
+          _ <- Ghci.ghciCommandTimeout g timeoutMs ":set +s"
+          modifyMVar ghciSessionsRef \m -> do
+            for_ (M.lookup sid m) (Ghci.stopGhci . gseGhci)
+            pure (M.insert sid (GhciSessionEntry g M.empty M.empty) m, ())
+          pure . Right $ renderMD do
+            h1 ("GHCi Debug Session Started: " <> code sid)
+            fieldCode "Command" (T.pack replCmd)
+            fieldCode "Working Directory" (T.pack workDir)
+            unless (T.null (T.strip banner)) $ codeBlock_ (T.take 2000 (T.strip banner))
+    "stop" -> do
+      mOld <- modifyMVar ghciSessionsRef \m -> pure (M.delete sid m, M.lookup sid m)
+      case mOld of
+        Nothing -> pure (Right ("Session '" <> sid <> "' was not running."))
+        Just entry -> do
+          Ghci.stopGhci (gseGhci entry)
+          pure (Right ("Stopped GHCi session '" <> sid <> "'."))
+    "list" -> do
+      m <- readMVar ghciSessionsRef
+      rows <- forM (M.toList m) \(k, entry) -> do
+        alive <- Ghci.ghciAlive (gseGhci entry)
+        pure [code k, if alive then "running" else "exited", tshow (M.size (gsePrevValues entry)) <> " tracked bindings"]
+      pure . Right $ renderMD do
+        h1 "Active GHCi Debug Sessions"
+        if null rows
+          then para "No active sessions. Call `stronghead_debug_session` with `action = 'start'`."
+          else tableAligned [(AlignLeft, "Session ID"), (AlignCenter, "Status"), (AlignRight, "State")] rows
+    _ -> do
+      m <- readMVar ghciSessionsRef
+      case M.lookup sid m of
+        Nothing ->
+          pure (Left ("No active GHCi session '" <> sid <> "'. Call `stronghead_debug_session` with `action = 'start'` first."))
+        Just entry -> runInSession sid entry act mArg timeoutMs
+  where
+    for_ Nothing _ = pure ()
+    for_ (Just x) f = f x
+
+runInSession :: Text -> GhciSessionEntry -> Text -> Maybe Text -> Int -> IO (Either Text Text)
+runInSession sid entry act mArg timeoutMs = do
+  let g = gseGhci entry
+      argTxt = T.strip (fromMaybe "" mArg)
+  case act of
+    "interrupt" -> do
+      Ghci.interruptGhci g
+      pure (Right ("Sent process-group interrupt to GHCi session '" <> sid <> "'."))
+    "break" -> do
+      when (T.null argTxt) $ pure ()
+      eOut <- Ghci.ghciCommandTimeout g timeoutMs (":break " <> argTxt)
+      pure $ flip fmap eOut \out ->
+        let (clean, _) = Ghci.parseGhciStats out
+            bps = Ghci.parseBreakpointSet clean
+         in renderMD do
+              h2 ("Breakpoint (" <> code sid <> ")")
+              forM_ bps \(bpNo, mSp) ->
+                field ("Breakpoint #" <> tshow bpNo) (maybe "activated" renderSrcSpan mSp)
+              codeBlock_ (T.strip clean)
+    "bindings" -> inspectSessionBindings sid entry "" Nothing timeoutMs
+    "step" -> do
+      let cmd = if T.null argTxt then ":step" else ":step " <> argTxt
+      stepAndInspect sid entry cmd timeoutMs
+    "steplocal" -> stepAndInspect sid entry ":steplocal" timeoutMs
+    "continue" -> stepAndInspect sid entry ":continue" timeoutMs
+    "force"
+      | T.null argTxt -> pure (Left "`action = 'force'` requires `arg` naming a binding or `_tN` thunk.")
+      | otherwise -> do
+          beforeRaw <- either id fst . fmap Ghci.parseGhciStats <$> Ghci.ghciCommandTimeout g timeoutMs (":print " <> argTxt)
+          eForce <- Ghci.ghciCommandTimeout g timeoutMs (":force " <> argTxt)
+          case eForce of
+            Left err -> pure (Left err)
+            Right forceRaw -> do
+              let (forceClean, mStats) = Ghci.parseGhciStats forceRaw
+              pure . Right $ renderMD do
+                h2 ("Forced Thunk / Binding: " <> code argTxt)
+                whenJust mStats \st ->
+                  field "Evaluation Cost (:set +s)" (fmtSec (Ghci.ssSeconds st) <> " · " <> fmtBytes (Ghci.ssAllocBytes st) <> " allocated")
+                field "Before (:print)" (code (T.take 300 (T.strip beforeRaw)))
+                h3 "After (:force)"
+                codeBlock_ (T.take 2000 (T.strip forceClean))
+    "eval" -> do
+      eOut <- Ghci.ghciCommandTimeout g timeoutMs argTxt
+      pure $ flip fmap eOut \rawOut ->
+        let (clean, mStats) = Ghci.parseGhciStats rawOut
+         in renderMD do
+              h2 ("GHCi Eval (" <> code sid <> ")")
+              whenJust mStats \st ->
+                field "Step Timing & Allocation" (fmtSec (Ghci.ssSeconds st) <> " · " <> fmtBytes (Ghci.ssAllocBytes st))
+              codeBlock_ (T.take 3000 (T.strip clean))
+    _ ->
+      pure (Left ("Unknown debug_session action '" <> act <> "'. Expected: start, break, continue, step, steplocal, force, bindings, eval, interrupt, stop, list."))
+
+stepAndInspect :: Text -> GhciSessionEntry -> Text -> Int -> IO (Either Text Text)
+stepAndInspect sid entry cmd timeoutMs = do
+  eOut <- Ghci.ghciCommandTimeout (gseGhci entry) timeoutMs cmd
+  case eOut of
+    Left err -> pure (Left err)
+    Right rawOut -> do
+      let (clean, mStats) = Ghci.parseGhciStats rawOut
+      inspectSessionBindings sid entry clean mStats timeoutMs
+
+inspectSessionBindings :: Text -> GhciSessionEntry -> Text -> Maybe Ghci.StepStats -> Int -> IO (Either Text Text)
+inspectSessionBindings sid entry stepOut mStats timeoutMs = do
+  eBinds <- Ghci.ghciCommandTimeout (gseGhci entry) timeoutMs ":show bindings"
+  let bindRaw = either (const "") (fst . Ghci.parseGhciStats) eBinds
+      parsedBinds = Ghci.parseBindings bindRaw
+      curVals =
+        M.fromList
+          [ (Ghci.gbName b, Ghci.parseValue (fromMaybe "_" (Ghci.gbValue b)))
+          | b <- parsedBinds
+          ]
+      (newAges, xrays) = Ghci.diffValueStep (gsePrevValues entry) curVals (gseThunkAges entry)
+      mStop = Ghci.parseStop stepOut
+  modifyMVar ghciSessionsRef \m ->
+    pure (M.insert sid (entry {gsePrevValues = curVals, gseThunkAges = newAges}) m, ())
+  pure . Right $ renderMD do
+    h2 ("Debugger State (" <> code sid <> ")")
+    whenJust mStop \st ->
+      field "Stopped In" (code (Ghci.stName st) <> maybe "" (\sp -> " @ " <> code (renderSrcSpan sp)) (Ghci.stSpan st))
+    whenJust mStats \st ->
+      field "Step Allocation & Time" (fmtSec (Ghci.ssSeconds st) <> " · " <> fmtBytes (Ghci.ssAllocBytes st))
+    unless (T.null (T.strip stepOut)) $ codeBlock_ (T.take 1200 (T.strip stepOut))
+    unless (null parsedBinds) do
+      h3 "Bindings & Laziness X-Ray"
+      tableAligned
+        [(AlignLeft, "Binding"), (AlignLeft, "Type"), (AlignCenter, "X-Ray"), (AlignRight, "Thunks"), (AlignLeft, "Value")]
+        [ let xr = M.lookup (Ghci.gbName b) xrays
+              xTag = case fmap Ghci.vxTransition xr of
+                Just Ghci.ThunkCollapsed -> bold "COLLAPSED"
+                Just Ghci.ThunkSpawned -> "SPAWNED"
+                Just (Ghci.ThunkAging k) -> bold ("AGING ×" <> tshow k)
+                _ -> "WHNF/NF"
+              tCnt = maybe 0 Ghci.vxThunkCount xr
+           in [ code (Ghci.gbName b)
+              , code (T.take 40 (Ghci.gbType b))
+              , xTag
+              , tshow tCnt
+              , code (T.take 80 (fromMaybe "_" (Ghci.gbValue b)))
+              ]
+        | b <- take 40 parsedBinds
+        ]
+
+-- ---------------------------------------------------------------------------
+-- 22. GUI Co-Pilot Sync Bridge (stronghead_gui_copilot)
+
+guiCopilotTool :: Text -> Maybe Text -> IO (Either Text Text)
+guiCopilotTool rawAction mVal = do
+  let act = T.toLower (T.strip rawAction)
+      val = T.strip (fromMaybe "" mVal)
+  if act `notElem` ["focus", "query", "open", "triage"]
+    then pure (Left ("Unknown gui_copilot action '" <> act <> "'. Expected: focus, query, open, triage."))
+    else do
+      let line = if T.null val then act else act <> " " <> val
+      res <- sendCopilotCommand line
+      pure case res of
+        Left err -> Left err
+        Right cmdFile ->
+          Right ("Dispatched GUI co-pilot command `" <> line <> "` via `" <> T.pack cmdFile <> "`.")

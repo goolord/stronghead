@@ -19,6 +19,13 @@ module Stronghead.Eventlog.CriticalPath
   , gcPauseHeatmap
   , runnableHeatmap
   , spanLatencyHeatmap
+    -- * STM retry & thread contention topology
+  , StmContentionReport (..)
+  , analyzeStmContention
+  , ContentionEdgeKind (..)
+  , ThreadContentionEdge (..)
+  , ContentionGraph (..)
+  , buildContentionGraph
   ) where
 
 import Data.List (sortOn)
@@ -309,3 +316,150 @@ spanLatencyHeatmap tl tBins vBins =
     tBins
     vBins
     [(usStart s, fromIntegral (usEnd s - usStart s)) | s <- V.toList (tlUserSpans tl), usEnd s > usStart s]
+
+-- ---------------------------------------------------------------------------
+-- STM Retry Amplification & Thread Contention Topology
+
+data StmContentionReport = StmContentionReport
+  { stmBlockCount :: !Int
+  , stmTotalWaitNs :: !Word64
+  , stmWastedCpuNs :: !Word64
+    -- ^ Optimistic CPU burned in short run slices between consecutive @BlockedOnSTM@ stops.
+  , stmBurstCount :: !Int
+    -- ^ Thundering-herd wakeup bursts (>= 2 STM threads woken within 200 us).
+  , stmMaxCohortFanout :: !Int
+    -- ^ Largest simultaneous STM wakeup cohort size.
+  , stmHotThreads :: ![(Word32, Int, Word64)]
+    -- ^ @(tid, stmBlocks, stmWaitNs)@.
+  }
+  deriving stock (Eq, Show)
+
+-- | Analyze @BlockedOnSTM@ retry behavior, wakeup fanout bursts ("thundering
+-- herd"), and optimistic wasted CPU between consecutive STM blocks.
+analyzeStmContention :: Timeline -> StmContentionReport
+analyzeStmContention tl =
+  StmContentionReport
+    { stmBlockCount = sum [cnt | (_, cnt, _) <- perThread]
+    , stmTotalWaitNs = sum [w | (_, _, w) <- perThread]
+    , stmWastedCpuNs = sum wastedSlices
+    , stmBurstCount = length bursts
+    , stmMaxCohortFanout = maximum (0 : bursts)
+    , stmHotThreads = take 12 (sortOn (\(_, _, w) -> Down w) perThread)
+    }
+  where
+    threads = M.elems (tlThreads tl)
+    perThread =
+      [ (tiId ti, length stmSpans, sum [srEnd s - srStart s | s <- stmSpans])
+      | ti <- threads
+      , let tr = tiTrack ti
+            stmSpans =
+              [ trackSpan tr i
+              | i <- [0 .. trackLength tr - 1]
+              , trKind tr VU.! i == kindBlocked
+              , trStop tr VU.! i == 13
+              ]
+      , not (null stmSpans)
+      ]
+    -- Optimistic retry CPU: a run span immediately preceded by BlockedOnSTM AND
+    -- ending again in BlockedOnSTM (< 5ms) likely aborted/retried!
+    wastedSlices =
+      [ trEnd tr VU.! i - trStart tr VU.! i
+      | ti <- threads
+      , let tr = tiTrack ti
+            n = trackLength tr
+      , i <- [1 .. n - 1]
+      , trKind tr VU.! i == kindRun
+      , trStop tr VU.! i == 13
+      , trStop tr VU.! (i - 1) == 13
+      , trEnd tr VU.! i > trStart tr VU.! i
+      , trEnd tr VU.! i - trStart tr VU.! i <= 5000000
+      ]
+    -- Collect wakeup timestamps ending BlockedOnSTM spans across all threads
+    stmWakeTimes =
+      sortOn
+        id
+        [ wt
+        | ti <- threads
+        , let tr = tiTrack ti
+        , i <- [0 .. trackLength tr - 1]
+        , let sp = trackSpan tr i
+        , srKind sp == kindBlocked && srStop sp == 13
+        , Just (wt, _) <- [wokenBy ti sp]
+        ]
+    clusterBursts [] = []
+    clusterBursts (t0 : rest) =
+      let (same, later) = span (\t -> t - t0 <= 200000) rest -- 200 us burst window
+          sz = 1 + length same
+       in (if sz >= 2 then [sz] else []) ++ clusterBursts later
+    bursts = clusterBursts stmWakeTimes
+
+data ContentionEdgeKind
+  = EdgeMVarWakeup
+  | EdgeStmWakeup
+  | EdgeBlackHole
+  | EdgeOtherWakeup
+  deriving stock (Eq, Ord, Show)
+
+data ThreadContentionEdge = ThreadContentionEdge
+  { tceFrom :: !Word32
+    -- ^ Thread that held the lock / blackhole / posted the wakeup.
+  , tceTo :: !Word32
+    -- ^ Thread that was blocked waiting.
+  , tceKind :: !ContentionEdgeKind
+  , tceCount :: !Int
+  , tceWaitNs :: !Word64
+  }
+  deriving stock (Eq, Show)
+
+data ContentionGraph = ContentionGraph
+  { cgEdges :: ![ThreadContentionEdge]
+  , cgBottlenecks :: ![(Word32, Int, Word64)]
+    -- ^ Hub blocker threads ranked by total downstream wait time @(tid, wokenCount, totalWaitNs)@.
+  }
+  deriving stock (Eq, Show)
+
+-- | Reconstruct the directed thread-to-thread contention & wakeup topology
+-- across MVars, STM TVars, and shared BlackHole thunks.
+buildContentionGraph :: Timeline -> ContentionGraph
+buildContentionGraph tl =
+  ContentionGraph
+    { cgEdges = sortedEdges
+    , cgBottlenecks = take 15 (sortOn (\(_, _, w) -> Down w) [(tid, cnt, w) | (tid, (cnt, w)) <- M.toList hubs])
+    }
+  where
+    rawEdges =
+      [ ( (srcTid, tiId ti, edgeKind)
+        , (1 :: Int, srEnd sp - min (srEnd sp) (srStart sp))
+        )
+      | ti <- M.elems (tlThreads tl)
+      , let tr = tiTrack ti
+      , i <- [0 .. trackLength tr - 1]
+      , let sp = trackSpan tr i
+      , srKind sp == kindBlocked
+      , let mSource
+              | srStop sp == 9 && srAux sp /= 0 && srAux sp /= tiId ti =
+                  Just (srAux sp, EdgeBlackHole)
+              | Just (_, waker) <- wokenBy ti sp
+              , waker /= 0 && waker /= tiId ti =
+                  let ek = case srStop sp of
+                        7 -> EdgeMVarWakeup
+                        8 -> EdgeMVarWakeup
+                        9 -> EdgeBlackHole
+                        13 -> EdgeStmWakeup
+                        _ -> EdgeOtherWakeup
+                   in Just (waker, ek)
+              | otherwise = Nothing
+      , Just (srcTid, edgeKind) <- [mSource]
+      ]
+    grouped = M.fromListWith (\(c1, w1) (c2, w2) -> (c1 + c2, w1 + w2)) rawEdges
+    sortedEdges =
+      take 100 $
+        sortOn
+          (Down . tceWaitNs)
+          [ ThreadContentionEdge s d k cnt w
+          | ((s, d, k), (cnt, w)) <- M.toList grouped
+          ]
+    hubs =
+      M.fromListWith
+        (\(c1, w1) (c2, w2) -> (c1 + c2, w1 + w2))
+        [(tceFrom e, (tceCount e, tceWaitNs e)) | e <- sortedEdges]

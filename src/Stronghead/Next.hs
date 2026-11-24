@@ -332,8 +332,8 @@ hotSteps have m l facts = costStep ++ bindingStep
 bindingSteps :: Have -> Ref -> Text -> Text -> [Fact] -> [Step]
 bindingSteps have ref _ _ facts = case badges of
   Nothing
-    | haveDumps have -> heapSteps
-    | otherwise -> Step "Dump Core and STG" "the dumps show worker/wrapper, boxing and the closures STG allocates" (StepLoad DDumps) False : heapSteps
+    | haveDumps have -> smellSteps ++ heapSteps
+    | otherwise -> Step "Dump Core and STG" "the dumps show worker/wrapper, boxing and the closures STG allocates" (StepLoad DDumps) False : smellSteps ++ heapSteps
   Just (ww, boxes, lets) ->
     [ Step "Read its STG lets" (letsReason ww boxes lets) (StepGo ref) (lets > 0 && (heapHeld > 0 || maybe False ((> 0) . snd) ticky))
     | lets > 0 || boxes > 0
@@ -343,8 +343,13 @@ bindingSteps have ref _ _ facts = case badges of
          , not (haveTicky have)
          ]
       ++ heapSteps
+      ++ smellSteps
       ++ [Step "Break on entry" "stop GHCi when it is called and look at its arguments" (StepAct ref "break on entry") False]
   where
+    smellSteps =
+      [ Step ("Fix " <> kind) desc (StepGo ref) True
+      | FactCoreSmell kind desc <- facts
+      ]
     badges = listToMaybe [(w, b, l) | FactBadges w b l <- facts]
     ticky = listToMaybe [(e, a) | FactTicky e a <- facts]
     sites = [(b, v) | FactSiteHeap b v <- facts]

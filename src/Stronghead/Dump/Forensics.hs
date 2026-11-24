@@ -15,6 +15,7 @@ module Stronghead.Dump.Forensics
   , StgClosureCapture (..)
   , stgClosureCaptures
   , staticRetainersOf
+  , bandStaticCaptures
     -- * Runtime-weighted optimization smells
   , SmellKind (..)
   , smellKindTitle
@@ -30,6 +31,11 @@ module Stronghead.Dump.Forensics
   , OptLogEntry (..)
   , parseOptLog
   , discoverOptLogs
+  , SimplifierExplanation (..)
+  , explainOptimizationMisses
+    -- * Low-level Cmm & native assembly forensics
+  , CmmAsmReport (..)
+  , analyzeLowLevelIr
   ) where
 
 import Control.Exception (IOException, try)
@@ -50,6 +56,8 @@ import System.FilePath ((</>))
 
 import Stronghead.Dump
 import Stronghead.Format (tshow)
+import Stronghead.HeapProfile (Band (..), InfoProv (..))
+import Stronghead.Join (TableName (..), parseTableName)
 import Stronghead.TextFile (readTextFile)
 
 -- ---------------------------------------------------------------------------
@@ -151,8 +159,13 @@ parseStgLambda line = do
             then
               let withoutClose = T.dropEnd 1 trimmed
                   (pre, inside) = T.breakOnEnd "[" withoutClose
-               in if T.null pre then Nothing else Just (parseVars inside)
-            else Nothing
+               in if T.null pre && not ("[" `T.isPrefixOf` trimmed) then Nothing else Just (parseVars inside)
+            else if "}" `T.isSuffixOf` trimmed
+              then
+                let withoutClose = T.dropEnd 1 trimmed
+                    (pre, inside) = T.breakOnEnd "{" withoutClose
+                 in if T.null pre && not ("{" `T.isPrefixOf` trimmed) then Nothing else Just (parseVars inside)
+              else Nothing
     firstBracketList t =
       let trimmed = T.stripStart t
        in if "[" `T.isPrefixOf` trimmed
@@ -181,6 +194,29 @@ staticRetainersOf cf varQuery =
       StgSingleEntry -> 1
       StgReentrant -> 2
       StgUnknown -> 3
+
+-- | Resolve an info-table profiled 'Band' (@+RTS -hi@) to its static STG
+-- closure definition(s) across loaded STG dumps, revealing the exact free
+-- variables (@[fv1, fv2]@) captured in memory without requiring @ghc-debug@.
+bandStaticCaptures :: [CodeFile] -> Band -> [StgClosureCapture]
+bandStaticCaptures stgFiles band = case bandProv band of
+  Nothing -> []
+  Just ip ->
+    let modMatch cf = T.null (ipModule ip) || T.null (cfModule cf) || cfModule cf == ipModule ip
+        cands = concatMap stgClosureCaptures (filter (\cf -> cfKind cf == KindStg && modMatch cf) stgFiles)
+        exactBinder = case parseTableName (ipTableName ip) of
+          Just (TableOfBinder b) ->
+            [c | c <- cands, scBinder c == b || stripQualifier (scBinder c) == stripQualifier b]
+          _ -> []
+        byEnclosing =
+          [ c
+          | not (T.null (ipLabel ip))
+          , let k = nameKey (ipLabel ip)
+          , c <- cands
+          , scEnclosing c == k
+          , not (null (scCaptured c))
+          ]
+     in if not (null exactBinder) then exactBinder else byEnclosing
 
 -- ---------------------------------------------------------------------------
 -- Runtime-weighted optimization smell detector ("Perf Core-Lint")
@@ -490,3 +526,139 @@ discoverOptLogs root = do
           let paths = [dir </> e | e <- sort entries, case e of '.' : _ -> False; _ -> e /= "node_modules"]
           (dirs, files) <- partitionM doesDirectoryExist paths
           (files ++) <$> concatMapM (walk (d - 1)) dirs
+
+-- | Why-not explanation pairing a detected 'CoreSmell' with relevant
+-- GHC simplifier log entries (@-ddump-inlinings@, @-ddump-rule-firings@).
+data SimplifierExplanation = SimplifierExplanation
+  { seBinding :: !Text
+  , seSmell :: !SmellKind
+  , seReason :: !Text
+  , seLogEvidence :: ![Text]
+  }
+  deriving stock (Eq, Show)
+
+-- | Cross-correlate 'CoreSmell's against parsed GHC optimizer log entries to
+-- explain why inlining, specialization, or fusion failed.
+explainOptimizationMisses :: [CoreSmell] -> [OptLogEntry] -> [SimplifierExplanation]
+explainOptimizationMisses smells optLogs =
+  [ let bKey = nameKey (csBinding sm)
+        relevant =
+          [ ol
+          | ol <- optLogs
+          , let ok = nameKey (olBinding ol)
+          , ok == bKey || bKey `T.isInfixOf` olDetail ol || stripQualifier (csBinding sm) `T.isInfixOf` olDetail ol
+          ]
+        missedInlines = [olDetail ol | ol <- relevant, olKind ol == OptNotInlined]
+        firedRules = [olDetail ol | ol <- relevant, olKind ol == OptRuleFired]
+        specs = [olDetail ol | ol <- relevant, olKind ol == OptSpecialised]
+        reason = case csKind sm of
+          SmellBrokenFusion
+            | m0 : _ <- missedInlines ->
+                "Producer/consumer failed to inline (" <> T.take 90 m0 <> "), preventing build/foldr rule rewrite."
+            | null firedRules ->
+                "No fusion RULES fired for this binding; check phase control ([1] / [~1]) or multi-consumer list sharing."
+            | otherwise ->
+                "Partial fusion fired (" <> tshow (length firedRules) <> " rules), but residual stream/list combinators survived."
+          SmellDictPassing
+            | m0 : _ <- missedInlines ->
+                "GHC declined to inline polymorphic call (" <> T.take 90 m0 <> "), keeping dictionary argument."
+            | null specs ->
+                "No SPEC rule generated; mark cross-module polymorphic functions INLINABLE or add SPECIALIZE."
+            | otherwise ->
+                "Specialized for some types (" <> tshow (length specs) <> "), but generic dictionary entry remains hot."
+          SmellBoxedLoop ->
+            "Recursive loop breaker lacks strictness demand on accumulator argument; worker/wrapper ($w) could not unbox."
+          SmellUpdateableLoopThunk ->
+            "Let-bound expression inside recursive loop is not demanded strictly on all paths, forcing STG \\u update frame."
+          SmellPapCalls ->
+            "Higher-order function argument has unknown arity at call site, falling back to generic stg_ap_* apply."
+     in SimplifierExplanation
+          { seBinding = csModule sm <> "." <> csBinding sm
+          , seSmell = csKind sm
+          , seReason = reason
+          , seLogEvidence = take 4 (missedInlines ++ firedRules ++ specs)
+          }
+  | sm <- smells
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Low-level Cmm & Native Assembly / LLVM Forensics
+
+data CmmAsmReport = CmmAsmReport
+  { carHeapChecks :: !Int
+    -- ^ @Hp = Hp + N@ / @Hp > HpLim@ allocation check sites.
+  , carStackChecks :: !Int
+    -- ^ @Sp < SpLim@ stack-limit check sites.
+  , carSpills :: !Int
+    -- ^ Stack frame register spills (@I64[Sp + ...] =@ or @(%rsp)@ stores).
+  , carSlowCalls :: !Int
+    -- ^ Generic @stg_ap_*@ unknown-arity slow calls.
+  , carSimdOps :: !Int
+    -- ^ SIMD vector register / instruction occurrences (@xmm@/@ymm@/@zmm@/@vadd@/@vmul@).
+  , carFindings :: ![(Text, Int, Text)]
+    -- ^ @(kindTag, 0-based line, summary)@.
+  }
+  deriving stock (Eq, Show)
+
+-- | Inspect optional Cmm (@-ddump-cmm@) and Assembly (@-ddump-asm@) files for
+-- heap-limit checks, stack spills, generic PAP calls, and SIMD vectorization.
+analyzeLowLevelIr :: Maybe CodeFile -> Maybe CodeFile -> CmmAsmReport
+analyzeLowLevelIr mCmm mAsm =
+  CmmAsmReport
+    { carHeapChecks = length heapSites
+    , carStackChecks = length stackSites
+    , carSpills = length spillSites + asmSpills
+    , carSlowCalls = length slowSites + asmSlow
+    , carSimdOps = cmmSimd + asmSimd
+    , carFindings = take 40 (heapSites ++ stackSites ++ spillSites ++ slowSites)
+    }
+  where
+    cmmLines = maybe [] (zip [0 :: Int ..] . V.toList . cfLines) mCmm
+    asmLines = maybe [] (zip [0 :: Int ..] . V.toList . cfLines) mAsm
+
+    heapSites =
+      [ ("cmm-heap-check", i, "Cmm heap allocation / HpLim check: " <> T.strip l)
+      | (i, l) <- cmmLines
+      , "Hp = Hp +" `T.isInfixOf` l || "Hp > HpLim" `T.isInfixOf` l || "HpAlloc" `T.isInfixOf` l
+      ]
+    stackSites =
+      [ ("cmm-stack-check", i, "Cmm stack-limit check: " <> T.strip l)
+      | (i, l) <- cmmLines
+      , "Sp < SpLim" `T.isInfixOf` l || "< SpLim" `T.isInfixOf` l
+      ]
+    spillSites =
+      [ ("cmm-spill", i, "GHC stack slot store/reload: " <> T.strip l)
+      | (i, l) <- cmmLines
+      , ("I64[Sp" `T.isInfixOf` l || "P64[Sp" `T.isInfixOf` l || "F64[Sp" `T.isInfixOf` l || "D64[Sp" `T.isInfixOf` l)
+          && " = " `T.isInfixOf` l
+      ]
+    slowSites =
+      [ ("cmm-slow-ap", i, "Generic unknown-arity apply call: " <> T.strip l)
+      | (i, l) <- cmmLines
+      , "stg_ap_" `T.isInfixOf` l
+      ]
+    cmmSimd =
+      length
+        [ ()
+        | (_, l) <- cmmLines
+        , any (`T.isInfixOf` l) ["W128", "W256", "W512", "MO_VF_", "MO_VU_"]
+        ]
+    asmSpills =
+      length
+        [ ()
+        | (_, l) <- asmLines
+        , "%rsp)" `T.isInfixOf` l || "[sp," `T.isInfixOf` T.toLower l
+        ]
+    asmSlow =
+      length
+        [ ()
+        | (_, l) <- asmLines
+        , "stg_ap_" `T.isInfixOf` l
+        ]
+    asmSimd =
+      length
+        [ ()
+        | (_, l) <- asmLines
+        , let ll = T.toLower l
+        , any (`T.isInfixOf` ll) ["%xmm", "%ymm", "%zmm", "vaddp", "vmulp", "vmovdq", "vfmadd"]
+        ]

@@ -6,6 +6,7 @@ module UI.Inspector
   , inspectorSync
   , inspect
   , inspectorPane
+  , inspectorPaneWithTriage
   , inspectorBody
   , nextStepsSection
   ) where
@@ -14,14 +15,17 @@ import Control.Monad (forM_, unless, when)
 import Data.Containers.ListUtils (nubOrd)
 import Data.Foldable (for_)
 import Data.Maybe (isJust)
+import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
 import Stronghead.Format (tshow)
 import Stronghead.Next (Step (..), StepDo (..), datumRecipe, datumTitle)
 import Stronghead.Ref (Ref (..), refTarget)
 import Stronghead.Source (renderSrcSpan)
+import Stronghead.Triage (Finding)
 import UI.Common
 import UI.Link
+import UI.WorkbenchLab (triageCardsView)
 
 data Inspector = Inspector
   { inShown :: !(Var (Maybe Ref))
@@ -79,7 +83,10 @@ stepInspector env ins from to = do
       setFocus env (Just r)
 
 inspectorPane :: Env -> Inspector -> PaneCtx -> NanoUI ()
-inspectorPane env ins ctx = do
+inspectorPane env ins ctx = inspectorPaneWithTriage env ins [] (const (pure ())) ctx
+
+inspectorPaneWithTriage :: Env -> Inspector -> [Finding] -> (Text -> NanoUI ()) -> PaneCtx -> NanoUI ()
+inspectorPaneWithTriage env ins findings onRunQuery ctx = do
   shown <- readVar (inShown ins)
   back <- readVar (inBack ins)
   forward <- readVar (inForward ins)
@@ -92,13 +99,20 @@ inspectorPane env ins ctx = do
         let compact = winW < 1060
         step "←" back (stepInspector env ins inBack inForward)
         step "→" forward (stepInspector env ins inForward inBack)
+        scope $ when (isJust shown && not (null findings)) $
+          whenM (buttonWith (alignMid . padXY 7 2 . tight) "Findings") (writeVar (inShown ins) Nothing)
         flex
         (_, fArea) <- mouseArea alignMid $ checkboxWith alignMid (if compact then "" else "Follow") (inFollow ins)
         when compact (tooltip fArea "Follow focused entity")
   paneWith tight ctx "Inspector" header $
     paneScroll (grow . tight) $
       columnWith (padAll 12 . gap 6 . fillW) $ case shown of
-        Nothing -> hint "Click a thread, a band, a binding or a line of source anywhere: everything Stronghead knows about it shows here."
+        Nothing -> do
+          hint "Click a thread, a band, a binding or a line of source anywhere: everything Stronghead knows about it shows here."
+          unless (null findings) $ do
+            separator
+            sectionTitle ("Start here: Top findings (" <> tshow (length findings) <> ")")
+            triageCardsView env (take 8 findings) onRunQuery
         Just r -> inspectorBody env r
 
 -- | Everything known about an entity: its name and reference, where it is

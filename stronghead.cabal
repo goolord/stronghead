@@ -80,6 +80,9 @@ library
         Stronghead.Debug
         Stronghead.Debug.Graph
         Stronghead.Debug.Anatomy
+        Stronghead.Query
+        Stronghead.Triage
+        Stronghead.Runner
     build-depends:
         async >=2.2 && <2.3,
         base >=4.20 && <4.23,
@@ -161,6 +164,7 @@ library ui
         UI.Shell
         UI.Sources
         UI.Watchers
+        UI.WorkbenchLab
         UI.Workspace
     build-depends:
         base >=4.20 && <4.23,

@@ -25,7 +25,7 @@ module UI.Code
   , scrollToLineAt
   ) where
 
-import Control.Monad (forM_, guard, when)
+import Control.Monad (forM_, guard, void, when)
 import Data.Bits (shiftL, xor)
 import Data.Foldable (for_)
 import Data.IntMap.Strict (IntMap)
@@ -39,6 +39,7 @@ import Data.Set qualified as S
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
+import NanoUI.Shortcut qualified as K
 
 import Stronghead.Dump (TokKind (..), Token (..), nameKey, stripTokensUnique)
 import Stronghead.Format (tshow)
@@ -445,6 +446,30 @@ codeView cv mm cfg = do
   when (wy /= 0 && not shiftHeld) $ writeVar (cvScroll cv) (max 0 (min maxScroll (scroll + wy * 3)))
   when (wy /= 0 && shiftHeld) $ writeVar (cvHScroll cv) (max 0 (hscroll + wy * 6))
   when (wx /= 0) $ writeVar (cvHScroll cv) (max 0 (hscroll + wx * 6))
+  when inside $ do
+    kDown <- keyPressed KeyDown
+    kUp <- keyPressed KeyUp
+    kPgDn <- keyPressed KeyPageDown
+    kPgUp <- keyPressed KeyPageUp
+    kHome <- keyPressed KeyHome
+    kEnd <- keyPressed KeyEnd
+    let pageStep = fromIntegral (max 1 (visibleLines - 2))
+        keyDelta
+          | kDown = Just 3
+          | kUp = Just (-3)
+          | kPgDn = Just pageStep
+          | kPgUp = Just (-pageStep)
+          | kHome = Just (-scroll)
+          | kEnd = Just (maxScroll - scroll)
+          | otherwise = Nothing
+    for_ keyDelta $ \d -> writeVar (cvScroll cv) (max 0 (min maxScroll (scroll + d)))
+    copied <- shortcut (K.cmdOrCtrl <> K.key 'c')
+    when (copied && n > 0) $ do
+      let lineStr l = T.concat (map tkText (toksOf l))
+          clipTxt = case hoverLine of
+            Just hl -> lineStr hl
+            Nothing -> T.intercalate "\n" [lineStr l | l <- [first .. min (n - 1) (first + visibleLines - 1)]]
+      void (setClipboard clipTxt)
   let r = respRect resp
       inGutter = v2X mouse <= rectX r + gutterW
       clickedLine = if respClicked resp then Just (lineAt r (v2Y mouse)) else Nothing

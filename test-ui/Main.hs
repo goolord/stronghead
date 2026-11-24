@@ -35,6 +35,9 @@ import Stronghead.Source (SrcSpan (..), mkSourceIndex)
 import Stronghead.Watch
 import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
 import Stronghead.HeapProfile (fromSamples)
+import Stronghead.Query (QueryContext (..), emptyQueryContext)
+import Stronghead.Runner (CabalTarget (..), TargetKind (..))
+import Stronghead.Triage (Finding (..), FindingCategory (..), Severity (..))
 import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
@@ -55,6 +58,7 @@ import UI.Shell (Options (..), appView, defaultOptions, newApp)
 import UI.Sources
 import UI.Timeline (markersHeader, newTimelineState)
 import UI.Watchers
+import UI.WorkbenchLab
 import UI.Workspace
 
 -- | The world's lenses, for scenes that draw something other than 'view'.
@@ -1349,6 +1353,66 @@ main = do
   let diffOverflow = [t | (Rect x y bw _, t, _, _, _) <- diffSpans, y < 40, x + bw > 480.5]
   check "Heap diff header buttons fit cleanly inside 480px split pane"
     (hasText "Mark again" diffSpans && hasText "Clear" diffSpans && null diffOverflow)
+  check "Heap diff pane renders visual total residency comparison chart"
+    (hasText "Total live residency over elapsed run time" diffSpans)
+
+  putStrLn "Unified workbench: Inspector triage feed, Lens query pills, and Runner & lab pane"
+  wlSt <- newWorkbenchLabState
+  triCtx <- newContext
+  queriedRef <- newIORef ("" :: Text)
+  let sampleFinding =
+        Finding
+          { fnId = "leak-1"
+          , fnSeverity = SevCritical
+          , fnCategory = CatMemory
+          , fnConfidence = 0.94
+          , fnTitle = "Unforced accumulator thunk in Main.step"
+          , fnSummary = "THUNK_2_0 grew 18x monotonically across censuses."
+          , fnEvidence = [("peak", "18.4 MiB"), ("score", "0.94")]
+          , fnRemediation = "Force accumulator strictly with $! or BangPatterns."
+          , fnPrimaryRef = Just binding
+          , fnSuggestedQuery = Just "bands | thunk | top 10"
+          , fnSteps = []
+          }
+  triIns <- newInspector
+  let triInp = withInput 900 600
+      triScene =
+        void $ columnWith (fixedWH 900 600) $
+          inspectorPaneWithTriage (worldEnv w PHeap) triIns [sampleFinding] (\q -> liftIO (writeIORef queriedRef q)) floatingPane
+  warmup2 triCtx triInp triScene >>= \_ -> pure ()
+  triSpans <- collectTextSpans triCtx
+  check "Unfocused Inspector renders ranked Triage findings feed"
+    (hasText "Start here: Top findings (1)" triSpans && hasText "Unforced accumulator thunk in Main.step" triSpans)
+  explorePos <- findSpan "Explore query" triSpans
+  let (epPress, epRel) = clickPair triInp explorePos
+  mapM_ (\i -> evalUi triCtx i triScene) [epPress, epRel, triInp]
+  check "Clicking 'Explore query' on a Triage finding invokes the query runner" . (== "bands | thunk | top 10") =<< readIORef queriedRef
+
+  qCtxUi <- newContext
+  writeVarIO (wlQueryText wlSt) "bands | thunk | top 10"
+  let qHp = fromSamples "prog" "closure type" 0 (const Nothing) [(1.0, [("THUNK_2_0", 2048)]), (2.0, [("THUNK_2_0", 16384)])]
+      qData = emptyQueryContext {qcHeap = Just qHp}
+      qInp = withInput 900 600
+      qScene = void $ columnWith (fixedWH 900 600) $ queryPane (worldEnv w PHeap) wlSt qData floatingPane
+  warmup2 qCtxUi qInp qScene >>= \_ -> pure ()
+  qSpans <- collectTextSpans qCtxUi
+  check "Lens query pane renders preset chips, removable stage pills, and matched rows"
+    (hasText "Lens query" qSpans && hasText "thunk ×" qSpans && hasText "THUNK_2_0" qSpans)
+  pillPos <- findSpan "thunk ×" qSpans
+  let (ppPress, ppRel) = clickPair qInp pillPos
+  mapM_ (\i -> evalUi qCtxUi i qScene) [ppPress, ppRel, qInp]
+  qAfter <- readVarIO (wlQueryText wlSt)
+  check "Clicking a stage pill removes that filter stage from query text" (not ("thunk" `T.isInfixOf` qAfter) && "bands" `T.isPrefixOf` qAfter)
+
+  labCtx <- newContext
+  let sampleTargets = [CabalTarget "stronghead" "stronghead-sample" ExeTarget "stronghead.cabal"]
+      labScene =
+        void $ columnWith (fixedWH 950 750) $
+          labPane (worldEnv w PTimeline) wlSt sampleTargets Nothing (Just qHp) Nothing (\_ _ -> pure ()) floatingPane
+  warmup2 labCtx (withInput 950 750) labScene >>= \_ -> pure ()
+  labSpans <- collectTextSpans labCtx
+  check "Runner & lab pane renders target recipes, Pareto sweep controls, and live budget badge"
+    (hasText "Target runner & capture recipes" labSpans && hasText "Space-Leak Provenance (-hi)" labSpans && hasText "RTS flag Pareto tuning lab" labSpans)
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

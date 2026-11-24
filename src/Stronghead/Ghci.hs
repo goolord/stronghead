@@ -11,11 +11,15 @@ module Stronghead.Ghci
   ( Ghci
   , startGhci
   , ghciCommand
+  , ghciCommandTimeout
+  , interruptGhci
   , stopGhci
   , ghciAlive
     -- * Output parsing
   , StopInfo (..)
   , parseStop
+  , StepStats (..)
+  , parseGhciStats
   , parseBreakpointSet
   , parseHistory
   , historyLine
@@ -39,7 +43,7 @@ module Stronghead.Ghci
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (MVar, forkIO, newMVar, threadDelay, withMVar)
-import Control.Concurrent.Async (async)
+import Control.Concurrent.Async (async, race)
 import Control.Concurrent.STM (TQueue, TVar, atomically, newTQueueIO, newTVarIO, readTQueue, readTVarIO, writeTQueue, writeTVar)
 import Control.Exception (SomeException)
 import Control.Exception qualified as E
@@ -52,6 +56,7 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Void (Void)
+import Data.Word (Word64)
 import System.IO
 import System.Process
 
@@ -62,7 +67,7 @@ import Data.Text.Read qualified as TR
 import Text.Megaparsec (Parsec, anySingle, between, choice, chunk, eof, many, optional, parse, satisfy, sepBy, sepBy1, takeWhile1P, try)
 import Text.Megaparsec.Char (char, hspace)
 
-import Stronghead.Format (tshow)
+import Stronghead.Format (readDecimal, readDouble, tshow)
 import Stronghead.Source (SrcSpan, parseSrcSpan)
 
 data Ghci = Ghci
@@ -89,6 +94,7 @@ startGhci cwd' cmd =
           , std_in = CreatePipe
           , std_out = UseHandle writeEnd
           , std_err = UseHandle writeEnd
+          , create_group = True
           }
     forM_ [hin, readEnd] \h -> do
       hSetEncoding h utf8
@@ -142,6 +148,33 @@ ghciCommand g cmd = withMVar (ghLock g) \_ -> do
       r <- E.try @SomeException (sendLine g cmd)
       either (pure . tshow) (const (collect g)) r
 
+-- | Run a GHCi command bounded by @timeoutMs@ milliseconds. If evaluation
+-- exceeds the budget (e.g. forcing an infinite list @[1..]@), interrupts the
+-- GHCi process group and drains until the next prompt so the session stays
+-- responsive.
+ghciCommandTimeout :: Ghci -> Int -> Text -> IO (Either Text Text)
+ghciCommandTimeout g timeoutMs cmd = withMVar (ghLock g) \_ -> do
+  alive <- readTVarIO (ghAlive g)
+  if not alive
+    then pure (Left "<ghci is not running>")
+    else do
+      r <- E.try @SomeException (sendLine g cmd)
+      case r of
+        Left ex -> pure (Left (tshow ex))
+        Right () -> do
+          res <- race (threadDelay (max 100 timeoutMs * 1000)) (collect g)
+          case res of
+            Right out -> pure (Right out)
+            Left () -> do
+              interruptGhci g
+              _ <- race (threadDelay 1500000) (collect g)
+              pure (Left ("Command timed out after " <> tshow timeoutMs <> " ms (interrupted GHCi evaluation)."))
+
+-- | Send an OS process-group interrupt (@SIGINT@ / @CTRL_BREAK_EVENT@) to abort
+-- a runaway GHCi evaluation without tearing down the REPL session.
+interruptGhci :: Ghci -> IO ()
+interruptGhci g = void (E.try @SomeException (interruptProcessGroupOf (ghProc g)))
+
 ghciAlive :: Ghci -> IO Bool
 ghciAlive = readTVarIO . ghAlive
 
@@ -165,6 +198,35 @@ data StopInfo = StopInfo
   , stSpan :: !(Maybe SrcSpan)
   }
   deriving stock (Eq, Show)
+
+-- | Elapsed CPU/wall time and heap allocation reported by GHCi under @:set +s@:
+-- @(0.04 secs, 18,432,120 bytes)@.
+data StepStats = StepStats
+  { ssSeconds :: !Double
+  , ssAllocBytes :: !Word64
+  }
+  deriving stock (Eq, Show)
+
+-- | Strip and parse a trailing @:set +s@ timing/allocation line from GHCi
+-- command output, returning @(cleanedOutput, Maybe StepStats)@.
+parseGhciStats :: Text -> (Text, Maybe StepStats)
+parseGhciStats raw =
+  case reverse (T.lines raw) of
+    [] -> (raw, Nothing)
+    lastL : revRest ->
+      case parseStatLine (T.strip lastL) of
+        Just st -> (T.intercalate "\n" (reverse revRest), Just st)
+        Nothing -> (raw, Nothing)
+  where
+    parseStatLine l
+      | "(" `T.isPrefixOf` l && "bytes)" `T.isSuffixOf` l = do
+          let inner = T.drop 1 (T.dropEnd 1 l)
+              (secPart, rest) = T.breakOn "," inner
+          secs <- readDouble (T.strip (fst (T.breakOn "sec" secPart)))
+          let bytesDigits = T.filter isDigit (T.drop 1 rest)
+          bytes <- readDecimal bytesDigits
+          pure (StepStats secs bytes)
+      | otherwise = Nothing
 
 -- | The last "Stopped in NAME, LOC" in some output.
 parseStop :: Text -> Maybe StopInfo

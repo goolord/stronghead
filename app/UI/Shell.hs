@@ -8,6 +8,8 @@ module UI.Shell
   , appView
   , saveAppSettings
   , saveLastSession
+  , copilotCommandPath
+  , sendCopilotCommand
   ) where
 
 import Control.Applicative ((<|>))
@@ -26,9 +28,10 @@ import Data.List.Extra (chunksOf)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Sequence qualified as Seq
+import Data.Set qualified as S
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
 import Data.Word (Word64)
-import System.Directory (doesDirectoryExist, doesFileExist, makeAbsolute)
+import System.Directory (doesDirectoryExist, doesFileExist, getTemporaryDirectory, makeAbsolute)
 import System.FilePath (dropExtension, takeDirectory, takeExtension, takeFileName, (</>))
 
 import Data.Text qualified as T
@@ -40,20 +43,25 @@ import NanoUI.Shortcut qualified as K
 
 import Stronghead.Attach (AttachKind (..), AttachStep (..))
 import Stronghead.Debug (DebugTarget (..), ghcDebugEnabled)
+import Stronghead.Debug.Anatomy (computeDominators, snapshotFromProbes)
+import Stronghead.Debug.Graph (HeapSnapshot (..))
 import Stronghead.Diff (Baseline (..), BaselinePaths (..), noBaselinePaths)
-import Stronghead.Dump (ModuleArtifacts (..), kindForPath)
+import Stronghead.Dump (CodeFile (..), ModuleArtifacts (..), kindForPath)
+import Stronghead.Dump.Forensics (detectCoreSmells)
 import Stronghead.Eventlog (LoadProgress (..))
 import Stronghead.Eventlog.Model (Timeline (..), summarize)
 import Stronghead.Flamegraph (fromProfFile)
 import Stronghead.Format (fmtBytes, fmtNs, tshow)
 import Stronghead.HeapProfile (HeapProfile (..))
-import Stronghead.Live (AgentInfo (..), Frame (..))
+import Stronghead.Live (AgentInfo (..), Frame (..), LiveProbeNode)
 import Stronghead.Next (Have (..))
 import Stronghead.Prof (ProfFile (..))
-import Stronghead.Ref (Ref (..), RunKey, parseRefTarget)
+import Stronghead.Query (QueryContext (..), buildQueryBindings, emptyQueryContext)
+import Stronghead.Ref (Ref (..), RunKey (..), parseRefTarget)
 import Stronghead.Run (RunInfo (..), emptyRunInfo, mergeRunInfo, runFromArgs, runFromHello, runFromProfHeader, runFromSocket, runKey)
 import Stronghead.Session (Session (..), decodeSession, encodeSession, sessionExtension)
 import Stronghead.TextFile (readTextFile, saveTextFile)
+import Stronghead.Triage (Finding, TriageInput (..), emptyTriageInput, triageRun)
 import UI.Baseline
 import UI.Clock (confirmMoments)
 import UI.Code (colouringName)
@@ -71,6 +79,7 @@ import UI.Settings
 import UI.Sources
 import UI.Timeline
 import UI.Watchers
+import UI.WorkbenchLab
 import UI.Workspace
 
 -- | How to drive the panel, for the status bar (full & compact variants).
@@ -167,7 +176,13 @@ data App = App
   , appReopenLast :: !(Var Bool)
   , appWatchers :: !Watchers
   , appBaseline :: !BaselineState
+  , appLab :: !WorkbenchLabState
+  , appDerivedRef :: !(IORef (Maybe (ShellDerivedKey, QueryContext, [Finding])))
+  , appCopilotTask :: !(Task Int (Maybe T.Text))
+  , appCopilotSeen :: !(IORef T.Text)
   }
+
+type ShellDerivedKey = (Maybe Int, Maybe Int, Int, Maybe T.Text, Maybe Int, Maybe FilePath, Maybe FilePath, Int, Int)
 
 -- | What the command line asked for.
 data Options = Options
@@ -266,6 +281,11 @@ newApp settings Options {..} = do
   appReopenLast <- newVar (cfgReopenSession settings)
   appWatchers <- newWatchers
   appBaseline <- newBaselineState
+  appLab <- newWorkbenchLabState
+  appDerivedRef <- newIORef Nothing
+  appCopilotTask <- newTask
+  initCopilot <- fromMaybe "" <$> readCopilotRaw
+  appCopilotSeen <- newIORef initCopilot
   for_ optBaseline $ \basePath -> do
     let p = if ".hp" `isSuffixOf` basePath
               then noBaselinePaths { blHeapProfile = Just basePath }
@@ -486,6 +506,63 @@ appView app = do
   watchTick (appWatchers app) watchHooks live logTl following
 
   active <- readVar (appTab app)
+  projRootTxt <- T.unpack . T.strip <$> readVar (csProjectRoot (appCore app))
+  cabalTargets <- labSyncTargets (appLab app) (if not (null projRootTxt) then Just projRootTxt else dumpRoot)
+  (snIdx, snapHist) <- snapHistory (appHeap app)
+  markedMap <- readVar (hsDbgMarked (appHeap app))
+  let liveProbeList = maybe [] (concat . M.elems . ldProbes) live
+      latestSnap = listToMaybe (reverse snapHist)
+      effectiveSnap = latestSnap <|> (if null liveProbeList then Nothing else Just (snapshotFromProbes "live-probes" liveProbeList))
+      effectiveSnaps = if not (null snapHist) then snapHist else maybe [] pure effectiveSnap
+      mCoreCf = clCore core >>= eitherToMaybe
+      mStgCf = clStg core >>= eitherToMaybe
+      activeRunKey =
+        fromMaybe (RunKey "?:?") $
+          (runKey . tlRun <$> logTl) <|> (runKey . hpRun <$> heapShown)
+      derivKey :: ShellDerivedKey
+      derivKey =
+        ( tlEventCount <$> logTl
+        , VU.length . hpTimes <$> heapShown
+        , snIdx
+        , snapLabel <$> effectiveSnap
+        , M.size . snapNodes <$> effectiveSnap
+        , cfPath <$> mCoreCf
+        , cfPath <$> mStgCf
+        , maybe 0 length costsNow
+        , length liveProbeList
+        )
+  (qctx, findings) <- liftIO $ do
+    cached <- readIORef (appDerivedRef app)
+    case cached of
+      Just (k, q, fs) | k == derivKey -> pure (q, fs)
+      _ -> do
+        let modName = maybe "" cfModule (mCoreCf <|> mStgCf)
+            qBinds = buildQueryBindings [(modName, mCoreCf, mStgCf)] (fromMaybe [] costsNow)
+            mDom = computeDominators <$> effectiveSnap
+            q =
+              emptyQueryContext
+                { qcRunKey = activeRunKey
+                , qcTimeline = logTl
+                , qcHeap = heapShown
+                , qcSnapshot = effectiveSnap
+                , qcSnapshotIndex = snIdx
+                , qcDominators = mDom
+                , qcSurvivors = S.fromList (M.keys markedMap)
+                , qcBindings = qBinds
+                }
+            smells = detectCoreSmells mCoreCf mStgCf M.empty
+            fs =
+              triageRun
+                emptyTriageInput
+                  { triRunKey = activeRunKey
+                  , triTimeline = logTl
+                  , triHeap = heapShown
+                  , triSnapshots = effectiveSnaps
+                  , triCoreSmells = smells
+                  , triStgFiles = maybe [] pure mStgCf
+                  }
+        writeIORef (appDerivedRef app) (Just (derivKey, q, fs))
+        pure (q, fs)
   heapL <- heapLens (appHeap app) heap logProfile
   -- Each lens may ask the ones built before it where an entity is in the
   -- source: Core opens it in an editor, the Debugger breaks on it.
@@ -515,8 +592,19 @@ appView app = do
         (_, True) -> "watching the followed eventlog"
         _ -> "no live stream: connect in Live, or follow an eventlog"
       diffNow = DiffNow heapShown costsNow markNow
+      runQueryInBench qTxt = do
+        writeVar (wlQueryText (appLab app)) qTxt
+        wb <- activeBench app active
+        modifyVar (wbTree wb) (Just . addPane paneQuery)
+      onTargetLaunched evOut bdir = do
+        openEventlog (appTimeline app) evOut True
+        openDumpDir (appCore app) bdir
+        writeVar (appTab app) PTimeline
       shellPanes pid ctx
-        | pid == paneInspector = Just (inspectorPane env (appInspector app) ctx)
+        | pid == paneInspector = Just (inspectorPaneWithTriage env (appInspector app) findings runQueryInBench ctx)
+        | pid == paneTriage = Just (triagePane env (appLab app) findings runQueryInBench ctx)
+        | pid == paneQuery = Just (queryPane env (appLab app) qctx ctx)
+        | pid == paneLab = Just (labPane env (appLab app) cabalTargets logTl heapShown dumpRoot onTargetLaunched ctx)
         | pid == panePinboard = Just (pinboardPane env (askExport app) ctx)
         | pid == paneWatchers = Just (watchersPane env (appWatchers app) watching ctx)
         | otherwise = diffPanes env (appBaseline app) baseline diffNow pid ctx
@@ -540,6 +628,13 @@ appView app = do
   for_ goto $ \r -> when (any (`lensShows` r) (envLenses env)) $ do
     writeVar (appGoto app) Nothing
     goTo env r
+  nowUi <- uiTime
+  mCopilot <- useTask (appCopilotTask app) (floor (nowUi * 2) :: Int) readCopilotRaw
+  for_ (joinMaybe mCopilot) $ \rawCmd -> do
+    seen <- liftIO (readIORef (appCopilotSeen app))
+    when (rawCmd /= seen && not (T.null rawCmd)) $ do
+      liftIO (writeIORef (appCopilotSeen app) rawCmd)
+      applyCopilotCommand app env runQueryInBench rawCmd
 
   th <- uiTheme
   winW <- windowWidth
@@ -593,7 +688,7 @@ appView app = do
   settingsModal app
   shortcutsModal app
   markPrompt bus (appLive app) live
-  paletteView env (appPalette app) (commands app env active markNow)
+  paletteView env (appPalette app) (commands app env active markNow liveProbeList)
   poppedWindows app shellPanes providers
   persistSettings app
   publishHover (appBus app)
@@ -634,6 +729,14 @@ navShortcuts app env = do
       digit n = K.cmdOrCtrl <> K.key (intToDigit n)
   whenM (pressed [K.cmdOrCtrl <> K.key 'k']) (openPalette (appPalette app))
   whenM (pressed [K.cmdOrCtrl <> K.key ',']) (writeVar (appSettingsOpen app) True)
+  whenM (pressed [K.cmdOrCtrl <> K.key 'j']) $ do
+    act <- readVar (appTab app)
+    wb <- activeBench app act
+    modifyVar (wbTree wb) (Just . addPane paneQuery)
+  whenM (pressed [K.cmdOrCtrl <> K.key 'r']) $ do
+    act <- readVar (appTab app)
+    wb <- activeBench app act
+    modifyVar (wbTree wb) (Just . addPane paneLab)
   whenM (pressed [K.key (KeyF 1), K.shift <> K.key '/']) (modifyVar (appShortcutsOpen app) not)
   inp <- askInput
   back <- pressed [K.alt <> K.key KeyLeft]
@@ -645,10 +748,24 @@ navShortcuts app env = do
   whenM (pressed [K.key KeyEscape]) (setFocus env Nothing)
 
 -- | The palette's own commands, ahead of what the panels have loaded.
-commands :: App -> Env -> Panel -> Either T.Text (NanoUI ()) -> [Hit]
-commands app env active markNow =
+commands :: App -> Env -> Panel -> Either T.Text (NanoUI ()) -> [LiveProbeNode] -> [Hit]
+commands app env active markNow liveProbeList =
   [Hit "panel" (panelTitle p) ("Ctrl+" <> tshow n) (HitRun (writeVar (appTab app) p)) | (n, p) <- zip [1 :: Int ..] [minBound .. maxBound]]
     ++ [ Hit "command" "Open file…" "" (HitRun (askOpen app))
+       , Hit "command" "Open Lens query" "Ctrl+J" (HitRun (activeBench app active >>= \wb -> modifyVar (wbTree wb) (Just . addPane paneQuery)))
+       , Hit "command" "Open Triage & findings" "" (HitRun (activeBench app active >>= \wb -> modifyVar (wbTree wb) (Just . addPane paneTriage)))
+       , Hit "command" "Open Runner & lab" "Ctrl+R" (HitRun (activeBench app active >>= \wb -> modifyVar (wbTree wb) (Just . addPane paneLab)))
+       , Hit
+           "command"
+           "Promote live probes to Heap graph"
+           (if null liveProbeList then "connect a stronghead:probe target first" else tshow (length liveProbeList) <> " probed closures ready")
+           ( HitRun $
+               if null liveProbeList
+                 then writeVar (appMessage app) "No live ghc-heap probes received yet: connect to a target using Stronghead.Probe."
+                 else do
+                   pushHeapSnapshot (appHeap app) (snapshotFromProbes "live-probes" liveProbeList)
+                   writeVar (appTab app) PHeap
+           )
        , Hit "command" "Settings" "Ctrl+," (HitRun (writeVar (appSettingsOpen app) True))
        , Hit "command" "Keyboard shortcuts" "F1" (HitRun (writeVar (appShortcutsOpen app) True))
        , Hit "command" "Toggle theme (Light / Dark)" "" (HitRun (toggleTheme app))
@@ -1344,6 +1461,8 @@ shortcutsModal app =
         columnWith (fillW . tight . gap 10 . alignTop) $ do
           group "Global & navigation"
             [ (["Ctrl+K"], "Open command palette")
+            , (["Ctrl+J"], "Open cross-artifact Lens query pane")
+            , (["Ctrl+R"], "Open Target Runner & Pareto lab pane")
             , (["Ctrl+1–5"], "Switch panel (Timeline … Live)")
             , (["Alt+←", "Alt+→"], "Navigate history back / forward")
             , (["Esc"], "Clear focus / close modal")
@@ -1492,3 +1611,45 @@ settingNote t = columnWith (padLeft 142 . fillW . tight) (labelWith (fillW . fon
 -- | A dropdown over a bounded enum, with a layout.
 enumSelectWith :: (Bounded a, Enum a) => (Layout -> Layout) -> (a -> T.Text) -> Var a -> NanoUI ()
 enumSelectWith f name v = selectWith f (map name [minBound .. maxBound]) (zoomVar fromEnum (\i _ -> toEnum i) v)
+
+-- ---------------------------------------------------------------------------
+-- MCP <-> GUI Co-Pilot Bridge
+
+joinMaybe :: Maybe (Maybe a) -> Maybe a
+joinMaybe (Just x) = x
+joinMaybe Nothing = Nothing
+
+copilotCommandPath :: IO FilePath
+copilotCommandPath = (</> "stronghead-copilot.cmd") <$> getTemporaryDirectory
+
+sendCopilotCommand :: T.Text -> IO (Either T.Text FilePath)
+sendCopilotCommand cmd = do
+  p <- copilotCommandPath
+  stamp <- T.pack . formatTime defaultTimeLocale "%Y%m%d%H%M%S%q" <$> getZonedTime
+  res <- saveTextFile "co-pilot command" p (stamp <> "\n" <> cmd <> "\n")
+  pure (res >> Right p)
+
+readCopilotRaw :: IO (Maybe T.Text)
+readCopilotRaw = do
+  r <- try @IOException $ do
+    p <- copilotCommandPath
+    ex <- doesFileExist p
+    if ex then Just . T.strip <$> readTextFile p else pure Nothing
+  pure (either (const Nothing) id r)
+
+applyCopilotCommand :: App -> Env -> (T.Text -> NanoUI ()) -> T.Text -> NanoUI ()
+applyCopilotCommand app env runQuery raw =
+  case T.lines raw of
+    _stamp : cmdLine : _ ->
+      let (verb, rest0) = T.break (== ' ') (T.strip cmdLine)
+          arg = T.strip rest0
+       in case verb of
+            "focus" -> for_ (parseRefTarget arg) $ \r -> setFocus env (Just r) >> goTo env r
+            "query" -> unless (T.null arg) (runQuery arg)
+            "open" -> unless (T.null arg) (openAny app (T.unpack arg))
+            "triage" -> do
+              act <- readVar (appTab app)
+              wb <- activeBench app act
+              modifyVar (wbTree wb) (Just . addPane paneTriage)
+            _ -> pure ()
+    _ -> pure ()

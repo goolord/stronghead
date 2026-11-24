@@ -21,6 +21,7 @@ module UI.Timeline
   , markersHeader
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.IORef
@@ -1079,11 +1080,39 @@ threadsSection env st pal mm tl v sel marks = do
             case sel of
               Just (SelSpan (OnThread tid) k) | tid == tiId ti -> outlineSpan pal v rowRect (tiTrack ti) k
               _ -> pure ()
-          -- Markers through the rows, the shared cursor and range, and a
-          -- scroll indicator.
-          withClip (Rect px y pw h) $ forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
-            let mx = timeToX v px pw (fromIntegral (mkTime mk))
-            drawStroke (V2 mx y) (V2 mx (y + h)) 1 (alpha 0.35 (pMarker pal))
+          -- Markers through the rows, causal critical-path arrows, the shared
+          -- cursor and range, and a scroll indicator.
+          let mFocusTid =
+                focus <|> case sel of
+                  Just (SelSpan (OnThread tid) _) -> Just tid
+                  _ -> Nothing
+              rowMidY =
+                M.fromList
+                  [ (tiId ti, y + 4 + fromIntegral idx * threadRowH - scrollY + threadRowH / 2)
+                  | (idx, ti) <- zip [0 :: Int ..] threads
+                  ]
+          withClip (Rect px y pw h) $ do
+            forM_ (markersIn tl v) $ \mk -> when (mkIsMarker mk) $ do
+              let mx = timeToX v px pw (fromIntegral (mkTime mk))
+              drawStroke (V2 mx y) (V2 mx (y + h)) 1 (alpha 0.35 (pMarker pal))
+            for_ mFocusTid $ \ftid -> do
+              let cpr = analyzeCriticalPath tl ftid (floorW (tvStart v)) (ceiling (tvEnd v))
+              forM_ (take 64 (cpCausalEdges cpr)) $ \ce ->
+                case (M.lookup (ceFromThread ce) rowMidY, M.lookup (ceToThread ce) rowMidY) of
+                  (Just y1, Just y2)
+                    | abs (y2 - y1) >= 2
+                    , min y1 y2 <= y + h + 20
+                    , max y1 y2 >= y - 20 -> do
+                        let cx = timeToX v px pw (fromIntegral (ceTime ce))
+                            edgeCol =
+                              if "blackhole" `T.isInfixOf` T.toLower (ceReason ce) || "black hole" `T.isInfixOf` T.toLower (ceReason ce)
+                                then pBlocked pal
+                                else pWakeup pal
+                            dir = if y2 > y1 then 1 else -1
+                        when (cx >= px && cx <= px + pw) $ do
+                          drawStroke (V2 cx y1) (V2 cx y2) 1.5 (alpha 0.85 edgeCol)
+                          drawPath (P.polygon [V2 (cx - 3.5) (y2 - dir * 5), V2 (cx + 3.5) (y2 - dir * 5), V2 cx y2]) edgeCol
+                  _ -> pure ()
           drawMarks pal (linearAxis rk v px pw) (Rect px y pw h) marks {tmMarkers = []}
           when (contentH > h) $ do
             let barH = max 20 (h * h / contentH)
@@ -1430,6 +1459,28 @@ overview env st tl v = do
       fact "dud" (fmtInt (ssDud sp))
       fact "overflowed" (fmtInt (ssOverflowed sp))
       fact "GC'd" (fmtInt (ssGCd sp))
+  let stmRep = analyzeStmContention tl
+  scope $ when (stmBlockCount stmRep > 0) $ do
+    separator
+    sectionTitle "STM contention & retry bursts"
+    rowWith (tight . gap 12 . wrap . fillW) $ do
+      fact "STM blocks" (fmtInt (stmBlockCount stmRep))
+      fact "retry CPU" (fmtNs (fromIntegral (stmWastedCpuNs stmRep)))
+      fact "herd bursts" (fmtInt (stmBurstCount stmRep))
+    forM_ (take 4 (stmHotThreads stmRep)) $ \(tid, cnt, waitNs) -> withKey ("stm" <> tshow tid) $
+      rowWith (tight . gap 8 . fillW) $ do
+        linkText env (RThread rk tid) (fontSizeScale 0.88) (threadLabel tl tid)
+        flex
+        labelWith (fontMono . fontMuted . fontSizeScale 0.84) (fmtInt cnt <> " blocks · " <> fmtNs (fromIntegral waitNs))
+  let cg = buildContentionGraph tl
+  scope $ unless (null (cgBottlenecks cg)) $ do
+    separator
+    sectionTitle "Synchronization contention hubs"
+    forM_ (take 5 (cgBottlenecks cg)) $ \(tid, wokenCnt, waitNs) -> withKey ("hub" <> tshow tid) $
+      rowWith (tight . gap 8 . fillW) $ do
+        linkText env (RThread rk tid) (fontSizeScale 0.88) (threadLabel tl tid)
+        flex
+        labelWith (fontMono . fontMuted . fontSizeScale 0.82) (fmtInt wokenCnt <> " wakeups · holds " <> fmtNs (fromIntegral waitNs))
   let conc = tlConcGC tl
       nm = tlNonmoving tl
   scope $ when (not (V.null conc) || nmRemSetFlushes nm > 0) $ do

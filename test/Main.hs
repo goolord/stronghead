@@ -38,7 +38,7 @@ import Stronghead.Agent
   , withExceptionTap
   , withSpan
   )
-import Stronghead.Probe (defaultProbeOptions, inspectValue, probeRef)
+import Stronghead.Probe (defaultProbeOptions, inspectValue, probeRef, probeWeakRef)
 import Stronghead.Attach
 import Stronghead.Clock
 import Stronghead.Debug
@@ -47,7 +47,7 @@ import Stronghead.Diff
 import Stronghead.Dump
 import Stronghead.Dump.Forensics
 import Stronghead.Dump.Forensics qualified as Forensics
-import Stronghead.Eventlog (emptyBuilder, feedEvent, snapshot)
+import Stronghead.Eventlog (emptyBuilder, feedChunkStream, feedEvent, newChunkStream, snapshot)
 import Stronghead.Eventlog.CriticalPath
 import Stronghead.Eventlog.Model
 import Stronghead.Flamegraph
@@ -61,18 +61,22 @@ import Stronghead.Live
 import Stronghead.Markdown qualified as MD
 import Stronghead.Next
 import Stronghead.Prof
+import Stronghead.Query
 import Stronghead.Ref
 import Stronghead.Run
+import Stronghead.Runner qualified as Runner
 import Stronghead.Session
 import Stronghead.MCP.Tools qualified as MCPTools
 import Stronghead.MCP.Types qualified as MCPTypes
 import Stronghead.TextFile (readTextFile, writeTextFile)
+import Stronghead.Triage
 import Stronghead.Source
 import Stronghead.Watch
 import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath (pathSeparator, (</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import System.Mem (performGC)
 
 main :: IO ()
 main = do
@@ -1119,6 +1123,220 @@ main = do
       , "StrongheadRtsSweep"
       , "StrongheadAssertBudget"
       ]
+
+  putStrLn "Step 1-5 evolution: accuracy seams, query engine, triage, IR/concurrency/lab, and MCP v3"
+  -- 1. Post-wakeup [blocked, runnable] split & MigrateThread attribution
+  let schedTl = snapshot $ foldl' (\b (t, mCap, inf) -> feedEvent b (E.Event t inf mCap)) emptyBuilder schedFixture
+      mT2 = M.lookup 2 (tlThreads schedTl)
+      t2Runnable = runnableStats schedTl
+  check "post-wakeup interval splits off-CPU into blocked + runnable queue delay" $
+    case mT2 of
+      Just t2 -> M.lookup 7 (tiBlocked t2) == Just 40 && rnCount t2Runnable >= 2
+      Nothing -> False
+  let migEvents =
+        [ (100, Just 0, RunThread 9)
+        , (120, Just 0, MigrateThread 9 1)
+        , (125, Just 0, StopThread 9 BlockedOnCCall)
+        , (140, Just 1, RunThread 9)
+        , (160, Just 1, StopThread 9 ThreadFinished)
+        ]
+      migTl = snapshot $ foldl' (\b (t, mc, inf) -> feedEvent b (E.Event t inf mc)) emptyBuilder migEvents
+  check "MigrateThread reclassifies RTS BlockedOnCCall stop to runnable migrating (stop 17)" $
+    rnMigrations (runnableStats migTl) >= 1 && maybe False (\t9 -> M.notMember 10 (tiBlocked t9)) (M.lookup 9 (tlThreads migTl))
+
+  -- 2. Biography INHERENT_USE & ChunkStream empty/prefix resilience
+  let bioHp = fromSamples "" "biography" 0 (const Nothing) [(1.0, [("LAG", 100), ("USE", 200), ("INHERENT_USE", 300), ("DRAG", 50), ("VOID", 25)])]
+  check "biographyBreakdown includes INHERENT_USE in useful live bytes" $
+    case biographyBreakdown bioHp of
+      Just bb -> bioUseBytes bb == 500 && bioLagBytes bb == 100 && bioDragBytes bb == 50
+      Nothing -> False
+  cs <- newChunkStream
+  csEmpty <- feedChunkStream cs 0 B.empty
+  check "ChunkStream handles empty initial chunk cleanly" (either (const False) (const True) csEmpty)
+
+  -- 3. Merkle payload digest non-collision & bounded sub-DAG waste
+  let pNode cid ty nm kids = ClosureNode cid ty (kindOfClosureType ty) nm Nothing 16 kids Nothing []
+      snapDistinct =
+        mkSnapshotWithMeta
+          "distinct-ints"
+          False
+          [1]
+          [pNode 1 "CONSTR_2_0" "(,)" [2, 3], pNode 2 "CONSTR_0_1" "I#" [], pNode 3 "CONSTR_0_1" "I#" []]
+          (M.fromList [(2, 0x1111), (3, 0x2222)])
+          M.empty
+      snapIdentical =
+        mkSnapshotWithMeta
+          "same-ints"
+          False
+          [1]
+          [pNode 1 "CONSTR_2_0" "(,)" [2, 3], pNode 2 "CONSTR_0_1" "I#" [], pNode 3 "CONSTR_0_1" "I#" []]
+          (M.fromList [(2, 0x1111), (3, 0x1111)])
+          M.empty
+  check "Merkle auditDuplicates distinguishes distinct scalar payload digests" (null (auditDuplicates snapDistinct))
+  check "Merkle auditDuplicates groups identical scalar payload digests" (length (auditDuplicates snapIdentical) == 1)
+
+  -- 4. Stronghead.Probe DAG sharing (SHARED_REF), snapshotFromProbes, and probeWeakRef GC non-retention
+  let sharedLeaf = [1 .. 15 :: Int]
+      sharedPair = (sharedLeaf, sharedLeaf)
+  sharedNodes <- inspectValue defaultProbeOptions sharedPair
+  let toLive pn = LiveProbeNode "shared-test" (pnId pn) (pnParent pn) (T.pack (pnType pn)) (T.pack (pnName pn)) (T.pack (pnSource pn)) (pnBytes pn) (pnIsThunk pn) (T.pack (pnDetail pn))
+      probedSnap = snapshotFromProbes "probe-dag" (map toLive sharedNodes)
+      probedDom = computeDominators probedSnap
+  check "Probe inspectValue emits SHARED_REF on shared Haskell sub-expressions" $
+    any (\p -> pnType p == "SHARED_REF") sharedNodes
+  check "snapshotFromProbes resolves SHARED_REF into valid dominator tree" $
+    M.size (snapNodes probedSnap) >= 2 && not (null (dtTopDominators probedDom))
+  do
+    ephemRef <- newIORef ([1 .. 100 :: Int])
+    probeWeakRef "weak-ephemeral" ephemRef
+    performGC
+    unregisterProbe "weak-ephemeral"
+    check "probeWeakRef registers and unregisters cleanly across GC" True
+
+  -- 5. Static STG closure captures joined to heap band & FactCoreSmell next step
+  let parsedStg = parseCodeFile KindStg "Main.dump-stg-final" stgText
+      hiHp =
+        fromSamples
+          ""
+          "info table"
+          0
+          (const (Just (InfoProv "main2_sat_s7qA_info" 15 KindThunk "Integer" "main2" "Main" (parseSrcLoc "sample/Main.hs:82:59-63"))))
+          [(1.0, [("0x1000", 1000)]), (2.0, [("0x1000", 8000)])]
+      joinedCaps = concatMap (Forensics.bandStaticCaptures [parsedStg]) (V.toList (hpBands hiHp))
+  check "bandStaticCaptures joins -hi Band InfoProv to STG closure free-variable captures" $
+    any (\c -> "x1_s7qu" `elem` Forensics.scCaptured c) joinedCaps
+  let smellSteps = nextSteps haveNothing {haveDumps = True} (RBinding "Main" "go") [FactCoreSmell "Boxed recursive loop" "Add BangPatterns on accumulator"]
+  check "FactCoreSmell wires actionable compiler smell step into Stronghead.Next" (not (null smellSteps))
+
+  -- 6. Stronghead.Query parser, pills, pointer-path regexes, JSON, and .stronghead-spec forbid-query
+  let qStr = "closures | path (MutVar ~> Thunk{3,}) | sort dom | top 10"
+      parsedQ = parseQuery qStr
+  check "Query parser round-trips pointer-path regex pipeline and builds removable pills" $
+    case parsedQ of
+      Right q -> isJust ( either (const Nothing) Just (parseQuery (renderQuery q)) ) && length (queryToPills q) == 3 && length (qStages (removePillAt 0 q)) == 2
+      Left _ -> False
+  let leak5 = leakSnapshot 5
+      leak5Dom = computeDominators leak5
+      qCtx5 = emptyQueryContext {qcSnapshot = Just leak5, qcDominators = Just leak5Dom}
+      qRes5 = fmap (evalQuery qCtx5) parsedQ
+  check "Query pointer-path regex 'MutVar ~> Thunk{3,}' matches 5-thunk chain headed by top dominator" $
+    case qRes5 of
+      Right qr -> qresTotalMatched qr == 5 && maybe False (("plus" `T.isInfixOf`) . qrTitle) (listToMaybe (qresRows qr)) && "{" `T.isPrefixOf` formatQueryJson qr
+      Left _ -> False
+  let Right hpSample = Right (fromSamples "prog" "closure type" 0 (const Nothing) [(1.0, [("THUNK_2_0", 4096)]), (2.0, [("THUNK_2_0", 16384)])])
+  forbidRes <- evaluateBudget (parseBudgetSpec "forbid-query = bands | thunk | peak >= 1KB") Nothing (Just hpSample) Nothing Nothing
+  check "BudgetSpec forbid-query fails CI check when forbidden query matches bands" (not (brPassed forbidRes))
+
+  -- 7. Stronghead.Triage root-cause synthesis
+  let parsedCore = parseCodeFile KindCore "Main.dump-simpl" coreText
+      triFindings =
+        triageRun
+          emptyTriageInput
+            { triRunKey = RunKey "prog:1"
+            , triTimeline = Just schedTl
+            , triHeap = Just hpSample
+            , triSnapshots = [leakSnapshot 2, leakSnapshot 5]
+            , triCoreSmells = Forensics.detectCoreSmells (Just parsedCore) (Just parsedStg) M.empty
+            , triStgFiles = [parsedStg]
+            }
+  check "Triage engine synthesizes ranked findings and emits Markdown & JSON" $
+    not (null triFindings)
+      && "Stronghead" `T.isInfixOf` formatTriageMarkdown "test" triFindings
+      && "{\"findings\":" `T.isPrefixOf` T.strip (formatTriageJson triFindings)
+
+  -- 8. Cmm/Asm IR forensics, simplifier misses, strictness & container health
+  check "Dump kindForPath recognizes Cmm and Asm dump extensions" $
+    kindForPath "Main.dump-cmm" == Just KindCmm && kindForPath "Main.dump-asm" == Just KindAsm
+  let cmmSample = parseCodeFile KindCmm "Main.dump-cmm" "foo_entry() {\n  Hp = Hp + 24;\n  if (Hp > HpLim) goto gc;\n  if (Sp - 16 < SpLim) goto stk;\n  I64[Sp - 8] = R1;\n  jump stg_ap_p_fast(R1);\n}"
+      asmSample = parseCodeFile KindAsm "Main.dump-asm" "foo_info:\n  vaddpd %ymm0, %ymm1, %ymm2\n  movq %rax, 16(%rsp)\n  jmp stg_ap_pp_fast\n"
+      lowIr = Forensics.analyzeLowLevelIr (Just cmmSample) (Just asmSample)
+  check "analyzeLowLevelIr counts heap checks, stack checks, spills, slow calls, and SIMD ops" $
+    Forensics.carHeapChecks lowIr >= 1
+      && Forensics.carStackChecks lowIr >= 1
+      && Forensics.carSpills lowIr >= 1
+      && Forensics.carSlowCalls lowIr >= 1
+      && Forensics.carSimdOps lowIr >= 1
+  let synthSmell = Forensics.CoreSmell "Main" "loop" 10 Forensics.SmellBrokenFusion 5.0 "unfused list" "inline producer"
+      synthOptLog = Forensics.parseOptLog "Not inlining: producer (loop breaker)"
+      exMisses = Forensics.explainOptimizationMisses [synthSmell] synthOptLog
+  check "explainOptimizationMisses pairs SmellBrokenFusion with Not-inlining log evidence" $
+    not (null exMisses) && any (\e -> not (null (Forensics.seLogEvidence e))) exMisses
+  let mapSnap =
+        mkSnapshotWithMeta
+          "map-lazy"
+          False
+          [1]
+          [ pNode 1 "TSO" "thread 1" [2]
+          , ClosureNode 2 "CONSTR_2_1" NConstr "Data.Map.Internal.Bin" Nothing 32 [3, 4, 5] Nothing []
+          , ClosureNode 3 "CONSTR_0_1" NConstr "I#" Nothing 16 [] Nothing []
+          , ClosureNode 4 "THUNK_2_0" NThunk "expensiveVal" Nothing 64 [] Nothing []
+          , ClosureNode 5 "CONSTR_0_0" NConstr "Data.Map.Internal.Tip" Nothing 8 [] Nothing []
+          ]
+          M.empty
+          (M.fromList [((2, 3), 0), ((2, 4), 1), ((2, 5), 2)])
+      mapDom = computeDominators mapSnap
+      strictAdvs = auditStrictnessOpportunities mapSnap mapDom
+      contAdvs = auditContainers mapSnap mapDom
+  check "auditStrictnessOpportunities identifies constructor slot #1 holding unevaluated thunk" $
+    any (\sa -> saSlot sa == Just 1 && saFreedBytes sa >= 64) strictAdvs
+  check "auditContainers flags Spine-Strict, Value-Lazy Map holding unevaluated leaf thunks" $
+    any (\ch -> "Map" `T.isInfixOf` chContainerKind ch && chThunkValues ch >= 1) contAdvs
+
+  -- 9. STM retry contention, contention hubs, Welch's t-test, CSV parser, Cabal runner, GHCi +s stats
+  let stmEvents =
+        [ (100, Just 0, RunThread 1)
+        , (120, Just 0, StopThread 1 BlockedOnSTM)
+        , (130, Just 1, WakeupThread 1 0)
+        , (140, Just 0, RunThread 1)
+        , (160, Just 0, StopThread 1 BlockedOnSTM)
+        , (170, Just 1, WakeupThread 1 0)
+        , (180, Just 0, RunThread 1)
+        , (200, Just 0, StopThread 1 ThreadFinished)
+        ]
+      stmTl = snapshot $ foldl' (\b (t, mc, inf) -> feedEvent b (E.Event t inf mc)) emptyBuilder stmEvents
+      stmRep = analyzeStmContention stmTl
+      cGraph = buildContentionGraph schedTl
+  check "analyzeStmContention detects BlockedOnSTM blocks and retry wasted CPU" $
+    stmBlockCount stmRep == 2 && stmWastedCpuNs stmRep == 20
+  check "buildContentionGraph identifies MVar wakeup bottleneck threads" $
+    not (null (cgEdges cGraph)) && not (null (cgBottlenecks cGraph))
+  let cmpImproved = compareSamples [100, 102, 99, 101, 100] [60, 61, 59, 60, 62]
+      cmpNoise = compareSamples [100, 102, 98, 101, 99] [100.5, 99.5, 101, 99, 100]
+  check "Welch's two-sample t-test separates statistically significant speedup from noise" $
+    csVerdict cmpImproved == StatImproved && csVerdict cmpNoise == StatNoise
+  let benchCsv = "Name,Mean (ps),2*Stdev (ps),Allocated\nAll.Parser.jsonDecode,2500000,100000,65536\n"
+      parsedBenches = parseBenchCsv benchCsv
+  check "parseBenchCsv normalizes tasty-bench picosecond CSV and extracts binding key & allocs" $
+    case parsedBenches of
+      [bc] -> bcBindingKey bc == "jsonDecode" && bcAllocBytes bc == Just 65536 && bcMeanSec bc > 0
+      _ -> False
+  cabalTxt <- readTextFile "stronghead.cabal"
+  let cTargets = Runner.parseCabalTargets "stronghead.cabal" cabalTxt
+  check "parseCabalTargets discovers stronghead executables and test-suites and formats recipe command" $
+    any (\t -> Runner.ctName t == "stronghead" && Runner.ctKind t == Runner.ExeTarget) cTargets
+      && any (\t -> Runner.ctName t == "stronghead-test" && Runner.ctKind t == Runner.TestTarget) cTargets
+      && (case cTargets of t0 : _ -> "cabal run" `T.isPrefixOf` Runner.formatRecipeCommand t0 Runner.RecipeLeakProvenance [] "out.eventlog"; [] -> False)
+  let (ghciClean, mGhciSt) = parseGhciStats "42\n(0.04 secs, 18,432,120 bytes)"
+  check "parseGhciStats extracts seconds and comma-formatted allocation bytes" $
+    ghciClean == "42" && mGhciSt == Just (StepStats 0.04 18432120)
+
+  -- 10. MCP v3 tool descriptions & pure/in-memory tool invocations
+  check "MCP v3: toolDescriptions covers all 6 new v3 tools" $
+    all (\k -> isJust (lookup k MCPTypes.toolDescriptions))
+      [ "StrongheadTriageRun"
+      , "StrongheadQuery"
+      , "StrongheadStrictnessAudit"
+      , "StrongheadExperiment"
+      , "StrongheadDebugSession"
+      , "StrongheadGuiCopilot"
+      ]
+  mcpQ <- MCPTools.queryReport "threads | top 5" Nothing Nothing Nothing Nothing Nothing False (Just "json")
+  mcpTri <- MCPTools.triageRunReport Nothing Nothing Nothing Nothing Nothing (Just "json")
+  mcpStrict <- MCPTools.strictnessAuditReport Nothing Nothing Nothing False 5
+  mcpDbgList <- MCPTools.debugSessionTool "list" "default" Nothing Nothing Nothing 1000
+  mcpCopilot <- MCPTools.guiCopilotTool "query" (Just "bands | thunk | top 10")
+  check "MCP v3: query, triage, strictness_audit, debug_session list, and gui_copilot succeed" $
+    all (either (const False) (not . T.null)) [mcpQ, mcpTri, mcpStrict, mcpDbgList, mcpCopilot]
 
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure

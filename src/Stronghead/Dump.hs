@@ -22,6 +22,8 @@ module Stronghead.Dump
   , lineTokensClean
   , ModuleArtifacts (..)
   , discoverArtifacts
+  , FullModuleArtifacts (..)
+  , discoverFullArtifacts
   , dumpModuleName
   , sourceModuleName
   , dumpSourcePath
@@ -58,7 +60,7 @@ import Data.Vector qualified as V
 import Stronghead.Source (SrcSpan (..), parseSrcLoc, srcLocSpan)
 import Stronghead.TextFile (readTextFile)
 
-data CodeKind = KindSource | KindCore | KindStg
+data CodeKind = KindSource | KindCore | KindStg | KindCmm | KindAsm
   deriving stock (Eq, Ord, Show, Enum, Bounded)
 
 data TokKind
@@ -135,6 +137,8 @@ kindForPath :: FilePath -> Maybe CodeKind
 kindForPath p
   | "dump-simpl" `isSuffixOf` p = Just KindCore
   | "dump-stg-final" `isSuffixOf` p || "dump-stg" `isSuffixOf` p = Just KindStg
+  | any (`isSuffixOf` p) ["dump-cmm", "dump-cmm-from-stg", "dump-cmm-raw", "dump-opt-cmm"] = Just KindCmm
+  | any (`isSuffixOf` p) ["dump-asm", "dump-llvm"] = Just KindAsm
   | takeExtension p `elem` [".hs", ".lhs", ".hs-boot"] = Just KindSource
   | otherwise = Nothing
 
@@ -193,7 +197,7 @@ stripTokensUnique = go 0
       let txt = if tkKind t == TkIdent || tkKind t == TkCon then stripUnique (tkText t) else tkText t
        in t {tkText = txt, tkCol = col} : go (col + T.length txt) rest
 
-sourceKeywords, coreKeywords, stgKeywords :: S.Set Text
+sourceKeywords, coreKeywords, stgKeywords, cmmKeywords, asmKeywords :: S.Set Text
 sourceKeywords =
   S.fromList
     [ "module", "import", "qualified", "as", "hiding", "where", "data", "newtype", "type", "class"
@@ -202,12 +206,16 @@ sourceKeywords =
     ]
 coreKeywords = S.fromList ["case", "of", "let", "letrec", "in", "join", "joinrec", "jump", "forall", "Rec", "end", "\\"]
 stgKeywords = S.fromList ["case", "of", "let", "letrec", "in", "join", "joinrec", "jump", "forall", "Rec", "end", "\\r", "\\u", "\\s"]
+cmmKeywords = S.fromList ["if", "else", "goto", "call", "return", "jump", "switch", "case", "default", "foreign", "section", "bits64", "bits32", "gcptr", "Hp", "HpLim", "Sp", "SpLim", "BaseReg"]
+asmKeywords = S.fromList ["mov", "movq", "lea", "leaq", "add", "addq", "sub", "subq", "cmp", "cmpq", "jmp", "je", "jne", "jg", "jge", "jl", "jle", "ja", "jb", "call", "ret", "push", "pop", "xor", "and", "or", "shl", "shr"]
 
 keywords :: CodeKind -> S.Set Text
 keywords = \case
   KindSource -> sourceKeywords
   KindCore -> coreKeywords
   KindStg -> stgKeywords
+  KindCmm -> cmmKeywords
+  KindAsm -> asmKeywords
 
 symChar :: Char -> Bool
 symChar = \case
@@ -260,6 +268,8 @@ tokenizeLine kind inComment0 line = go inComment0 0 line []
                           n = T.length body + min 3 (T.length rest)
                        in emit TkPragma n
                   | "{-" `T.isPrefixOf` t -> go True col t acc
+                  | "//" `T.isPrefixOf` t && (kind == KindCmm || kind == KindAsm) -> go inC (col + T.length t) "" (Token TkComment t col : acc)
+                  | ";" `T.isPrefixOf` t && kind == KindAsm -> go inC (col + T.length t) "" (Token TkComment t col : acc)
                   | "--" `T.isPrefixOf` t, isLineComment t -> go inC (col + T.length t) "" (Token TkComment t col : acc)
                   | isSpace c -> emit TkSpace (T.length (T.takeWhile isSpace t))
                   | c == '"' -> emit TkString (stringLen t)
@@ -427,11 +437,15 @@ dumpBindings kind ls toks = catMaybes (snd (mapAccumL step False (blocks 0)))
           hasEq l = " = " `T.isInfixOf` l || " =" `T.isSuffixOf` l
           allToks = concat [toks V.! k | k <- body]
           sizeLine = listToMaybe [T.strip r | k <- body, Just r <- [T.stripPrefix "-- RHS size:" (ls V.! k)]]
-          letLines = [k | k <- body, any (\t -> tkKind t == TkKeyword && tkText t `elem` ["let", "letrec"]) (toks V.! k)]
+          letLines = case kind of
+            KindCmm -> [k | k <- body, let ln = ls V.! k, "Hp = Hp +" `T.isInfixOf` ln || "HpAlloc" `T.isInfixOf` ln]
+            KindStg -> [k | k <- body, any (\t -> tkKind t == TkKeyword && tkText t `elem` ["let", "letrec"]) (toks V.! k)]
+            KindCore -> [k | k <- body, any (\t -> tkKind t == TkKeyword && tkText t `elem` ["let", "letrec"]) (toks V.! k)]
+            _ -> []
           boxLines =
             [ k
             | k <- body
-            , any (\t -> tkKind t == TkCon && lastSegment (tkText t) `elem` ["I#", "D#", "F#", "W#", "C#", "W8#", "W64#", "I64#"]) (toks V.! k)
+            , any (\t -> tkKind t == TkCon && lastSegment (tkText t) `elem` ["I#", "D#", "F#", "W#", "C#", "W8#", "W16#", "W32#", "W64#", "I8#", "I16#", "I32#", "I64#", "Addr#"]) (toks V.! k)
             ]
        in Binding
             { bdName = name
@@ -448,7 +462,7 @@ dumpBindings kind ls toks = catMaybes (snd (mapAccumL step False (blocks 0)))
                   , nRecursive = recNow
                   , nUnboxedOps = length [() | t <- allToks, tkKind t `elem` [TkIdent, TkCon, TkOperator, TkNumber], "#" `T.isSuffixOf` tkText t]
                   , nBoxing = boxLines
-                  , nAllocs = if kind == KindStg || kind == KindCore then letLines else []
+                  , nAllocs = if kind `elem` [KindStg, KindCore, KindCmm] then letLines else []
                   , nJoins = length [() | t <- allToks, tkKind t == TkKeyword, tkText t `elem` ["join", "joinrec"]]
                   }
             }
@@ -546,13 +560,65 @@ discoverArtifacts root = do
           (dirs, files) <- partitionM doesDirectoryExist paths
           (files ++) <$> concatMapM (walk (d - 1)) dirs
 
+-- | Full pipeline artifacts found for one module, including Cmm and native
+-- assembly / LLVM dumps.
+data FullModuleArtifacts = FullModuleArtifacts
+  { fmaModule :: !Text
+  , fmaSource :: !(Maybe FilePath)
+  , fmaCore :: !(Maybe FilePath)
+  , fmaStg :: !(Maybe FilePath)
+  , fmaCmm :: !(Maybe FilePath)
+  , fmaAsm :: !(Maybe FilePath)
+  }
+  deriving stock (Eq, Show)
+
+-- | Discover Source, Core, STG, Cmm, and Assembly/LLVM dumps per module.
+discoverFullArtifacts :: FilePath -> IO [FullModuleArtifacts]
+discoverFullArtifacts root = do
+  files <- walkFull (10 :: Int) root
+  let dumps k = [(dumpModuleName f, f) | f <- files, kindForPath f == Just k]
+      cores = M.fromList (dumps KindCore)
+      stgs = M.fromList (dumps KindStg)
+      cmms = M.fromList (dumps KindCmm)
+      asms = M.fromList (dumps KindAsm)
+  sources <- mapMaybeM (\f -> fmap (,f) <$> sourceModuleName f) [f | f <- files, kindForPath f == Just KindSource]
+  let srcMap = M.fromList sources
+      byFile = M.fromList [(T.pack (takeBaseName f), f) | (_, f) <- sources]
+      findSrc m =
+        M.lookup m srcMap
+          <|> M.lookup m byFile
+          <|> listToMaybe [f | (sm, f) <- M.toList srcMap, ("." <> m) `T.isSuffixOf` sm]
+      mods = M.keys (M.unions [() <$ cores, () <$ stgs, () <$ cmms, () <$ asms])
+  pure [FullModuleArtifacts m (findSrc m) (M.lookup m cores) (M.lookup m stgs) (M.lookup m cmms) (M.lookup m asms) | m <- mods]
+  where
+    walkFull 0 _ = pure []
+    walkFull d dir = do
+      r <- try @IOException (listDirectory dir)
+      case r of
+        Left _ -> pure []
+        Right entries -> do
+          let paths = [dir </> e | e <- sort entries, case e of '.' : _ -> False; _ -> e /= "node_modules"]
+          (dirs, files) <- partitionM doesDirectoryExist paths
+          (files ++) <$> concatMapM (walkFull (d - 1)) dirs
+
 -- | The module a dump is of, from its file name: @Foo.Bar.dump-simpl@ is
 -- @Foo.Bar@. A build in another way puts the way in the name
 -- (@Main.thr.dump-stg-final@, @Main.p_dyn.dump-simpl@), which is dropped.
 dumpModuleName :: FilePath -> Text
 dumpModuleName f =
   let b = takeFileName f
-      stem = fromMaybe b (listToMaybe (mapMaybe (`stripSuffix` b) [".dump-simpl", ".dump-stg-final", ".dump-stg"]))
+      dumpSufs =
+        [ ".dump-simpl"
+        , ".dump-stg-final"
+        , ".dump-stg"
+        , ".dump-cmm-from-stg"
+        , ".dump-cmm-raw"
+        , ".dump-opt-cmm"
+        , ".dump-cmm"
+        , ".dump-asm"
+        , ".dump-llvm"
+        ]
+      stem = fromMaybe b (listToMaybe (mapMaybe (`stripSuffix` b) dumpSufs))
    in case unsnoc (T.splitOn "." (T.pack stem)) of
         Just (initParts@(_ : _), lastPart) | isWay lastPart -> T.intercalate "." initParts
         _ -> T.pack stem

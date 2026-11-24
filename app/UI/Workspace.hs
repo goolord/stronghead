@@ -20,6 +20,7 @@ module UI.Workspace
   , paneCoreSource
   , paneCoreCore
   , paneCoreStg
+  , paneCoreCmm
   , paneDbgSource
   , paneDbgLocals
   , paneDbgConsole
@@ -32,6 +33,9 @@ module UI.Workspace
   , paneDiffHeap
   , paneDiffCosts
   , paneDiffBindings
+  , paneTriage
+  , paneQuery
+  , paneLab
   , timelineTimePanes
     -- * Trees
   , treeKinds
@@ -112,12 +116,13 @@ paneHeapAnalysis = 203
 paneHeapGraph = 204
 paneHeapCosts = 205
 
-paneCoreBindings, paneCoreNotes, paneCoreSource, paneCoreCore, paneCoreStg :: Word64
+paneCoreBindings, paneCoreNotes, paneCoreSource, paneCoreCore, paneCoreStg, paneCoreCmm :: Word64
 paneCoreBindings = 301
 paneCoreNotes = 302
 paneCoreSource = 303
 paneCoreCore = 304
 paneCoreStg = 305
+paneCoreCmm = 306
 
 paneDbgSource, paneDbgLocals, paneDbgConsole, paneDbgBreaks :: Word64
 paneDbgSource = 401
@@ -129,13 +134,16 @@ paneLiveCharts, paneLiveThreads :: Word64
 paneLiveCharts = 501
 paneLiveThreads = 502
 
-paneInspector, panePinboard, paneWatchers, paneDiffHeap, paneDiffCosts, paneDiffBindings :: Word64
+paneInspector, panePinboard, paneWatchers, paneDiffHeap, paneDiffCosts, paneDiffBindings, paneTriage, paneQuery, paneLab :: Word64
 paneInspector = 901
 panePinboard = 902
 paneWatchers = 903
 paneDiffHeap = 904
 paneDiffCosts = 905
 paneDiffBindings = 906
+paneTriage = 907
+paneQuery = 908
+paneLab = 909
 
 paneKinds :: [PaneKind]
 paneKinds =
@@ -153,6 +161,7 @@ paneKinds =
   , PaneKind paneCoreSource "core.source" "Source" (Just PCore) False
   , PaneKind paneCoreCore "core.core" "Core" (Just PCore) False
   , PaneKind paneCoreStg "core.stg" "STG" (Just PCore) False
+  , PaneKind paneCoreCmm "core.cmm" "Cmm & Asm" (Just PCore) False
   , PaneKind paneDbgSource "debugger.source" "Debugger source" (Just PDebugger) False
   , PaneKind paneDbgLocals "debugger.locals" "Local bindings" (Just PDebugger) False
   , PaneKind paneDbgConsole "debugger.console" "GHCi console" (Just PDebugger) False
@@ -165,6 +174,9 @@ paneKinds =
   , PaneKind paneDiffHeap "diff.heap" "Heap diff" Nothing False
   , PaneKind paneDiffCosts "diff.costs" "Cost-centre diff" Nothing False
   , PaneKind paneDiffBindings "diff.bindings" "Binding diff" Nothing False
+  , PaneKind paneTriage "triage" "Triage & findings" Nothing False
+  , PaneKind paneQuery "query" "Lens query" Nothing False
+  , PaneKind paneLab "lab" "Runner & lab" Nothing False
   ]
 
 paneKind :: Word64 -> Maybe PaneKind
@@ -329,6 +341,10 @@ userPresets =
   , Preset "Before and after" $
       Split 1000 AxisH 0.42 (Split 1001 AxisV 0.6 (Pane paneHeapChart) (Pane paneHeapBands)) $
         Split 1002 AxisV 0.5 (Pane paneDiffHeap) (Split 1003 AxisH 0.5 (Pane paneDiffCosts) (Pane paneDiffBindings))
+  , Preset "Triage & query" $
+      Split 1000 AxisV 0.52 (Pane paneTriage) (Split 1001 AxisH 0.55 (Pane paneQuery) (Pane paneInspector))
+  , Preset "Runner & lab" $
+      Split 1000 AxisV 0.58 (Pane paneLab) (Split 1001 AxisH 0.52 (Pane paneTriage) (Pane paneInspector))
   ]
 
 -- ---------------------------------------------------------------------------

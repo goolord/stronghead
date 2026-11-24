@@ -229,15 +229,23 @@ ccsFrames name =
    in filter (not . T.null) (T.splitOn "/" stripped)
 
 -- | The path through a @.prof@ tree a cost-centre stack names, root first:
--- an exact match on names, frame by frame. A heap profile truncates long
--- stacks, so a stack that runs out early still matches its prefix.
+-- matches either unqualified names (from @.hp@ @-hc@, innermost first) or
+-- @Module.label@ names (from eventlog @HeapProfSampleCostCentre@, which may
+-- be root-first or innermost-first). A heap profile truncates long stacks,
+-- so a stack that runs out early still matches its prefix.
 profPath :: [Text] -> [CostCentre] -> Maybe [CostCentre]
-profPath framesInnermostFirst roots = case reverse framesInnermostFirst of
-  [] -> Nothing
-  fs -> go fs roots
+profPath [] _ = Nothing
+profPath frames roots =
+  case go (reverse frames) roots of
+    Just p -> Just p
+    Nothing -> go frames roots
   where
+    matches f c =
+      ccName c == f
+        || (ccModule c <> "." <> ccName c) == f
+        || (ccName c == "MAIN" && f == "MAIN.MAIN")
     go [] _ = Just []
-    go (f : rest) level = listToMaybe [c : path | c <- level, ccName c == f, Just path <- [go rest (ccChildren c)]]
+    go (f : rest) level = listToMaybe [c : path | c <- level, matches f c, Just path <- [go rest (ccChildren c)]]
 
 -- ---------------------------------------------------------------------------
 -- Info tables and STG

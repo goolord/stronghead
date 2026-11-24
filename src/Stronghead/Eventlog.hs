@@ -21,6 +21,10 @@ module Stronghead.Eventlog
   , streamEventlog
   , loadEventlog
   , forceTimeline
+    -- * Incremental TCP / byte-chunk relay decoder
+  , ChunkStream
+  , newChunkStream
+  , feedChunkStream
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -87,10 +91,12 @@ data ThreadB = ThreadB
   , tbRuns :: ![RunRec]
   , tbWakeups :: ![(Word64, Word32)]
     -- ^ Newest first.
+  , tbMigrations :: ![Word64]
+    -- ^ Timestamps of @MigrateThread@ events for this thread.
   }
 
 emptyThread :: ThreadB
-emptyThread = ThreadB Nothing Nothing Nothing [] []
+emptyThread = ThreadB Nothing Nothing Nothing [] [] []
 
 data GCStat = GCStat !Word64 !Int !Word64 !Int
 
@@ -218,7 +224,9 @@ capEvent b c t = \case
   SparkGC -> if bHasSparkCounters b then b else b {bSparks = (bSparks b) {ssGCd = ssGCd (bSparks b) + 1}}
   CreateThread tid -> onThread tid (\tb -> tb {tbCreated = Just t}) b
   ThreadLabel tid lbl -> onThread tid (\tb -> tb {tbLabel = Just lbl}) b
-  MigrateThread tid _ -> addPoint pointMigrate tid
+  MigrateThread tid _ ->
+    let b' = onThread tid (\tb -> tb {tbMigrations = t : tbMigrations tb}) b
+     in addPointTo b' pointMigrate tid
   SparkSteal victim -> addPoint pointSteal (fromIntegral victim)
   -- Every wakeup names its waker for the woken thread; one that crosses
   -- capabilities is also a point on the posting capability's track.
@@ -445,19 +453,43 @@ threadInfo end tid tb =
     , tiFinished = tbFinished tb
     , tiRuns = length runs
     , tiRunTime = sum [rrEnd r - rrStart r | r <- runs]
-    , tiBlocked = M.fromListWith (+) [(srStop g, srEnd g - srStart g) | g <- gaps]
+    , tiBlocked = M.fromListWith (+) [(srStop g, srEnd g - srStart g) | g <- gaps, srKind g == kindBlocked]
     , tiTrack = mkTrack (sortOn srStart (gaps ++ [SpanRec (rrStart r) (rrEnd r) kindRun (fromIntegral tid) (rrStop r) (rrAux r) | r <- runs]))
     , tiCaps = IM.keys (IM.fromList [(rrCap r, ()) | r <- runs])
-    , tiWakeups = VU.fromList (sortOn fst (tbWakeups tb))
+    , tiWakeups = wakeups
     }
   where
+    tid32 = fromIntegral tid
+    wakeups = VU.fromList (sortOn fst (tbWakeups tb))
+    migs = VU.fromList (sortOn id (tbMigrations tb))
     runs = sortOn rrStart (tbRuns tb)
     gaps = concat (zipWith gap runs (map Just (drop 1 runs) ++ [Nothing]))
+    hasMigrationIn s e =
+      let i = lowerBoundBy id migs s
+       in maybe False (<= e) (migs VU.!? i)
+    firstWakeupStrictlyBetween s e =
+      let i = lowerBoundBy fst wakeups (s + 1)
+       in case wakeups VU.!? i of
+            Just (tw, _) | tw < e -> Just tw
+            _ -> Nothing
     gap r next =
       let s = rrEnd r
           e = maybe (if rrStop r == 5 then s else end) rrStart next
-          k = if stopIsBlocked (rrStop r) then kindBlocked else kindRunnable
-       in [SpanRec s e k (fromIntegral tid) (rrStop r) (rrAux r) | e > s]
+          migrated = rrStop r == 15 && hasMigrationIn s (min e (s + 50000))
+          effStop = if migrated then 17 else rrStop r
+          blocked = not migrated && stopIsBlocked effStop
+       in if e <= s
+            then []
+            else
+              if not blocked
+                then [SpanRec s e kindRunnable tid32 effStop (rrAux r)]
+                else case firstWakeupStrictlyBetween s e of
+                  Just tw ->
+                    [ SpanRec s tw kindBlocked tid32 effStop (rrAux r)
+                    , SpanRec tw e kindRunnable tid32 effStop (rrAux r)
+                    ]
+                  Nothing ->
+                    [SpanRec s e kindBlocked tid32 effStop (rrAux r)]
 
 -- | Merge overlapping per-capability GC spans into one event per
 -- collection, and give each the generation from the GC statistics event
@@ -696,3 +728,45 @@ loadEventlog path = do
       (_, Just tl) | lpDone p -> writeIORef result (Right tl)
       _ -> pure ()
   readIORef result
+
+-- ---------------------------------------------------------------------------
+-- Incremental byte-chunk relay decoder (Agent v3 @L <offset> <base64>@)
+
+-- | Mutable incremental decoder state for streaming raw eventlog chunks over
+-- TCP ('Stronghead.Live.LiveEventlogChunk') without requiring a shared local
+-- filesystem.
+newtype ChunkStream = ChunkStream (IORef (Decoder Event, Builder, Word64))
+
+-- | Create a fresh incremental eventlog chunk stream starting at byte offset 0.
+newChunkStream :: IO ChunkStream
+newChunkStream = ChunkStream <$> newIORef (decodeEventLog, emptyBuilder, 0)
+
+-- | Feed an ordered raw eventlog chunk @(offset, bytes)@ into the incremental
+-- decoder and return an evaluated 'Timeline' snapshot when new events decoded.
+feedChunkStream :: ChunkStream -> Word64 -> B.ByteString -> IO (Either Text Timeline)
+feedChunkStream (ChunkStream ref) offset rawChunk = do
+  (dec0, b0, curOff) <- readIORef ref
+  -- Trim already-consumed prefix if chunks overlap, or reset if offset == 0.
+  let (decStart, bStart, effectiveChunk)
+        | offset == 0 && curOff > 0 = (decodeEventLog, emptyBuilder, rawChunk)
+        | offset < curOff =
+            let skip = fromIntegral (curOff - offset)
+             in (dec0, b0, B.drop skip rawChunk)
+        | otherwise = (dec0, b0, rawChunk)
+  if B.null effectiveChunk
+    then Right <$> forceTimeline (snapshot bStart)
+    else do
+      let drain (Produce ev d') !b = drain d' (feedEvent b ev)
+          drain d !b = (d, b)
+          (dec1, b1) = drain decStart bStart
+      case dec1 of
+        Error _ err -> pure (Left (T.pack err))
+        Done _ -> Right <$> forceTimeline (snapshot b1)
+        Produce {} -> Right <$> forceTimeline (snapshot b1)
+        Consume k -> do
+          let (dec2, b2) = drain (k effectiveChunk) b1
+              newOff = max curOff (offset + fromIntegral (B.length rawChunk))
+          writeIORef ref (dec2, b2, newOff)
+          case dec2 of
+            Error _ err -> pure (Left (T.pack err))
+            _ -> Right <$> forceTimeline (snapshot b2)

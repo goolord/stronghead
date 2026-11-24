@@ -82,6 +82,24 @@ handleTool _ctx tool = do
       StrongheadAssertBudget specInput mEv mHp mBase mDump -> do
         Tools.assertBudgetReport specInput (fmap T.unpack mEv) (fmap T.unpack mHp) (fmap T.unpack mBase) (fmap T.unpack mDump)
 
+      StrongheadTriageRun mEv mHp mTarget mDump mProf mFmt -> do
+        Tools.triageRunReport (fmap T.unpack mEv) (fmap T.unpack mHp) (fmap T.unpack mTarget) (fmap T.unpack mDump) (fmap T.unpack mProf) mFmt
+
+      StrongheadQuery q mEv mHp mTarget mDump mProf mLive mFmt -> do
+        Tools.queryReport q (fmap T.unpack mEv) (fmap T.unpack mHp) (fmap T.unpack mTarget) (fmap T.unpack mDump) (fmap T.unpack mProf) (fromMaybe False mLive) mFmt
+
+      StrongheadStrictnessAudit mTarget mDump mHp mLive mTopN -> do
+        Tools.strictnessAuditReport (fmap T.unpack mTarget) (fmap T.unpack mDump) (fmap T.unpack mHp) (fromMaybe False mLive) (fromMaybe 12 mTopN)
+
+      StrongheadExperiment mBaseCmd mCandCmd mTrials mWarmup mBaseCsv mCandCsv mCwd -> do
+        Tools.experimentReport mBaseCmd mCandCmd (fromMaybe 5 mTrials) (fromMaybe 1 mWarmup) (fmap T.unpack mBaseCsv) (fmap T.unpack mCandCsv) (fmap T.unpack mCwd)
+
+      StrongheadDebugSession act mSid mArg mCwd mRepl mTimeout -> do
+        Tools.debugSessionTool act (fromMaybe "default" mSid) mArg (fmap T.unpack mCwd) (fmap T.unpack mRepl) (fromMaybe 5000 mTimeout)
+
+      StrongheadGuiCopilot act mVal -> do
+        Tools.guiCopilotTool act mVal
+
 -- | Run the MCP server over standard input and output (stdio).
 runServer :: IO ()
 runServer = do
@@ -151,6 +169,12 @@ printTools = do
         , ("stronghead_live_stacks", "Capture live cross-platform CloneStack backtraces and ghc-heap value probes from a running agent")
         , ("stronghead_rts_sweep", "Sweep RTS flags against a binary and compute the empirical Pareto frontier")
         , ("stronghead_assert_budget", "Evaluate a declarative .stronghead-spec performance budget against profiling artifacts")
+        , ("stronghead_triage_run", "Synthesize confidence-ranked root-cause findings across eventlogs, heap profiles, snapshots, and dumps")
+        , ("stronghead_query", "Execute cross-artifact Lens Pipe & topological pointer-path regex queries in Markdown or JSON")
+        , ("stronghead_strictness_audit", "Audit constructor slots, containers, STG closure captures, and simplifier misses for strictness fixes")
+        , ("stronghead_experiment", "Run multi-trial interleaved A/B Welch's t-test experiments or compare Criterion/tasty-bench CSVs")
+        , ("stronghead_debug_session", "Persistent stateful multi-turn GHCi debugger with timeout protection and step allocation metering")
+        , ("stronghead_gui_copilot", "Drive a running Stronghead GUI window (focus entity, run Lens query, open artifact, show triage)")
         ]
   forM_ tools $ \(name, desc) -> do
     putStrLn ("* " <> name <> ":")

@@ -25,6 +25,7 @@ module Stronghead.Debug.Graph
   , RootKind (..)
   , HeapSnapshot (..)
   , mkSnapshot
+  , mkSnapshotWithMeta
   , isCAF
     -- * Retainer paths
   , retainerPath
@@ -253,12 +254,29 @@ data HeapSnapshot = HeapSnapshot
   , snapBiggest :: [ClosureId]
     -- ^ The closures holding the most bytes, roots and threads excluded.
   , snapRootsByHeld :: [ClosureId]
+  , snapPayloads :: Map ClosureId Word64
+    -- ^ Optional 64-bit FNV-1a payload digests for primitive / ARR_WORDS
+    -- closures so Merkle deduplication never confuses distinct payloads.
+  , snapEdgeSlots :: Map (ClosureId, ClosureId) Int
+    -- ^ Optional 0-based outgoing pointer slot index @(parent, child) -> slot@.
   }
 
 -- | Index the closures and run the per-snapshot analyses. Children missing
 -- from the map (past the traversal limit) are ignored.
 mkSnapshot :: Text -> Bool -> [ClosureId] -> [ClosureNode] -> HeapSnapshot
-mkSnapshot snapLabel snapTruncated roots nodes =
+mkSnapshot lbl trunc roots nodes = mkSnapshotWithMeta lbl trunc roots nodes M.empty M.empty
+
+-- | Like 'mkSnapshot', attaching optional non-pointer payload hashes and
+-- constructor pointer-slot indices.
+mkSnapshotWithMeta
+  :: Text
+  -> Bool
+  -> [ClosureId]
+  -> [ClosureNode]
+  -> Map ClosureId Word64
+  -> Map (ClosureId, ClosureId) Int
+  -> HeapSnapshot
+mkSnapshotWithMeta snapLabel snapTruncated roots nodes snapPayloads snapEdgeSlots =
   let snapNodes = M.fromList [(cnId n, n) | n <- nodes]
       snapRoots = nubOrd (filter (`M.member` snapNodes) roots)
       (snapParent, order) = bfs snapNodes snapRoots

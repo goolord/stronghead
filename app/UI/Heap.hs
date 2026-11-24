@@ -12,6 +12,7 @@
 module UI.Heap
   ( HeapState (..)
   , HeapSource (..)
+  , DbgTab (..)
   , newHeapState
   , heapLoad
   , heapSync
@@ -27,6 +28,8 @@ module UI.Heap
   , useDebugSocket
   , requestSnapshot
   , snapshotRunning
+  , pushHeapSnapshot
+  , snapHistory
     -- * For the shell's next steps and baseline
   , heapOnShow
   , snapshotCount
@@ -434,6 +437,32 @@ heapOnShow st loaded fromLog = (\source -> shownProfile source loaded fromLog) <
 -- | The ghc-debug snapshots kept.
 snapshotCount :: HeapState -> NanoUI Int
 snapshotCount st = (\(History _ ss) -> length ss) <$> readVar (hsDbgHistory st)
+
+-- | Read the snapshot history (oldest first) alongside the latest stored id.
+snapHistory :: HeapState -> NanoUI (Int, [HeapSnapshot])
+snapHistory st = do
+  History _ ss <- readVar (hsDbgHistory st)
+  sn <- readVar (hsDbgStored st)
+  pure (sn, ss)
+
+-- | Push an in-memory 'HeapSnapshot' (e.g. from cross-platform 'snapshotFromProbes')
+-- directly into the Heap panel's snapshot history and switch to its Anatomy view.
+pushHeapSnapshot :: HeapState -> HeapSnapshot -> NanoUI ()
+pushHeapSnapshot st snap = do
+  sn0 <- readVar (hsDbgStored st)
+  let sn = sn0 + 1
+  writeVar (hsDbgStored st) sn
+  History _ old <- readVar (hsDbgHistory st)
+  let history = drop (length old + 1 - keepSnapshots) old ++ [snap]
+      survivors = survivingThunks history
+  writeVar (hsDbgHistory st) (History sn history)
+  writeVar (hsDbgSurvivors st) survivors
+  writeVar (hsDbgMarked st) (survivorIds snap survivors)
+  writeVar (hsDbgSources st) (closuresBySource snap (survivorIds snap survivors))
+  writeVar (hsDbgOpen st) S.empty
+  writeVar (hsDbgSel st) Nothing
+  writeVar (hsSource st) FromGhcDebug
+  writeVar (hsDbgTab st) DbgAnatomy
 
 -- | The profile on show: the @.hp@ file's, or else the eventlog's.
 shownProfile :: HeapSource -> HeapLoaded -> Maybe HeapProfile -> Maybe HeapProfile
@@ -1228,73 +1257,19 @@ dbgTabName = \case
   DbgAnatomy -> "Anatomy & What-If"
 
 ghcDebugView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
-ghcDebugView env bench st loaded logTl
-  | not ghcDebugEnabled =
+ghcDebugView env bench st loaded logTl = do
+  History _ history0 <- readVar (hsDbgHistory st)
+  if not ghcDebugEnabled && null history0
+    then
       emptyState
         "Built without ghc-debug"
         [ "The live graph pauses a running program through ghc-debug, walks every closure reachable from its GC roots, and shows exact retainer paths. Rebuild Stronghead with the flag to turn it on."
-        , "The program being debugged links ghc-debug-stub and wraps main in withGhcDebug (Unix socket) or withGhcDebugTCP. The stub does not build on Windows; from Windows, connect over TCP to a program running on Linux, macOS or WSL, or open a snapshot file."
+        , "Cross-platform alternative: link stronghead:probe on Windows, macOS, or Linux, connect in Live, and run 'Promote live probes to Heap graph' (Ctrl+K) to inspect exact dominators, quotient spines, and what-if severing right here."
         ]
         ["cabal build -f ghc-debug"]
-  | otherwise = do
-      useFileDialog (hsDbgFileDialog st) (firstPath (writeVar (hsDbgFile st) . Just))
-      conn <- readVar (hsDbgConn st)
-      file <- readVar (hsDbgFile st)
-      sockets <- readVar (hsDbgSockets st)
-      History _ history <- readVar (hsDbgHistory st)
-      limit <- readVar (hsDbgLimit st)
-      target <- debugTarget st
-      let running = snapshotRunning loaded
-      toolStrip $ do
-        toolLabel "Target"
-        rowWith (alignMid . tight) $
-          boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} connName (hsDbgConn st)
-        scope $ case conn of
-          ConnSocket -> do
-            textInputConfigured defaultTextInputConfig {ticPlaceholder = "socket path, printed by withGhcDebug", ticLayout = (alignMid . minW 260 . fillW) defaultLayout} (hsDbgSocket st)
-            whenM (toolIconButton iconSearch "Find sockets") (writeVar (hsDbgSockets st) =<< liftIO listSockets)
-          ConnTcp ->
-            textInputConfigured defaultTextInputConfig {ticPlaceholder = "host:port, as given to withGhcDebugTCP", ticLayout = (alignMid . minW 200 . fillW) defaultLayout} (hsDbgHostPort st)
-          ConnFile -> do
-            whenM (toolIconButton iconFolderOpen "Open snapshot…") $
-              writeVar (hsDbgFileDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions
-            pathLabel file
-            flex
-      scope $ when (conn == ConnSocket && not (null sockets)) $
-        toolStrip $ do
-          toolLabel "Sockets found"
-          forM_ sockets $ \p -> withKey (T.pack p) $
-            whenM (toolButton (T.pack (takeFileName p))) (writeVar (hsDbgSocket st) (T.pack p))
-      toolStrip $ do
-        disabledWhen (running || isNothing target) $ whenM (styled primary (toolIconButton iconCamera "Take snapshot")) (void (requestSnapshot st))
-        toolGroup $ do
-          toolLabel "Closure limit"
-          sliderWith (alignMid . fixedW 120) 10 1000 (hsDbgLimit st)
-          numCell 52 id (fmtInt (round limit :: Int) <> "k")
-        toolGroup $ checkboxWith alignMid "Follow SRTs (CAFs)" (hsDbgSrt st)
-        disabledWhen (null history || running) $ whenM (toolIconButton iconTrash "Clear snapshots") $ do
-          writeVar (hsDbgHistory st) (History (-1) [])
-          writeVar (hsDbgSurvivors st) []
-          writeVar (hsDbgMarked st) M.empty
-          writeVar (hsDbgSel st) Nothing
-          writeVar (hsDbgOpen st) S.empty
-          writeVar (hsDbgSever st) Nothing
-        flex
-        scope $ case hlSnap loaded of
-          Just (TaskRunning _) -> labelWith (alignMid . fontTone Warning) "Target paused: walking its heap…"
-          Just (TaskDone (Left e)) -> labelWith (alignMid . fontTone Danger) (T.pack e)
-          Just (TaskFailed e _) -> labelWith (alignMid . fontTone Danger) (T.pack (displayException e))
-          _ -> pure ()
-      mixed <- bnMixed bench (hsDbgPanes st)
-      case reverse history of
-        [] | not mixed ->
-          emptyState
-            "Take a snapshot"
-            [ "A snapshot pauses the program, walks every closure reachable from its GC roots, and resumes it."
-            , "Take another after the program has run for a while: thunks still unevaluated in both are what a lazy accumulator leaves behind."
-            ]
-            []
-        [] -> scope (bnDraw bench (hsDbgPanes st) (heapPanes env st loaded logTl))
+    else if not ghcDebugEnabled
+      then case reverse history0 of
+        [] -> pure ()
         latest : _ -> scope $ do
           columnWith (padBottom 8 . tight . fillW) $
             readout
@@ -1302,9 +1277,78 @@ ghcDebugView env bench st loaded logTl
               , ("thunks", fmtInt (M.size (snapThunkKeys latest)))
               , ("bytes", fmtBytes (fromIntegral (snapBytes latest)))
               , ("roots", fmtInt (length (snapRoots latest)))
-              , ("snapshots kept", tshow (length history))
+              , ("snapshots kept", tshow (length history0))
               ]
           bnDraw bench (hsDbgPanes st) (heapPanes env st loaded logTl)
+      else do
+        useFileDialog (hsDbgFileDialog st) (firstPath (writeVar (hsDbgFile st) . Just))
+        conn <- readVar (hsDbgConn st)
+        file <- readVar (hsDbgFile st)
+        sockets <- readVar (hsDbgSockets st)
+        let history = history0
+        limit <- readVar (hsDbgLimit st)
+        target <- debugTarget st
+        let running = snapshotRunning loaded
+        toolStrip $ do
+          toolLabel "Target"
+          rowWith (alignMid . tight) $
+            boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} connName (hsDbgConn st)
+          scope $ case conn of
+            ConnSocket -> do
+              textInputConfigured defaultTextInputConfig {ticPlaceholder = "socket path, printed by withGhcDebug", ticLayout = (alignMid . minW 260 . fillW) defaultLayout} (hsDbgSocket st)
+              whenM (toolIconButton iconSearch "Find sockets") (writeVar (hsDbgSockets st) =<< liftIO listSockets)
+            ConnTcp ->
+              textInputConfigured defaultTextInputConfig {ticPlaceholder = "host:port, as given to withGhcDebugTCP", ticLayout = (alignMid . minW 200 . fillW) defaultLayout} (hsDbgHostPort st)
+            ConnFile -> do
+              whenM (toolIconButton iconFolderOpen "Open snapshot…") $
+                writeVar (hsDbgFileDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions
+              pathLabel file
+              flex
+        scope $ when (conn == ConnSocket && not (null sockets)) $
+          toolStrip $ do
+            toolLabel "Sockets found"
+            forM_ sockets $ \p -> withKey (T.pack p) $
+              whenM (toolButton (T.pack (takeFileName p))) (writeVar (hsDbgSocket st) (T.pack p))
+        toolStrip $ do
+          disabledWhen (running || isNothing target) $ whenM (styled primary (toolIconButton iconCamera "Take snapshot")) (void (requestSnapshot st))
+          toolGroup $ do
+            toolLabel "Closure limit"
+            sliderWith (alignMid . fixedW 120) 10 1000 (hsDbgLimit st)
+            numCell 52 id (fmtInt (round limit :: Int) <> "k")
+          toolGroup $ checkboxWith alignMid "Follow SRTs (CAFs)" (hsDbgSrt st)
+          disabledWhen (null history || running) $ whenM (toolIconButton iconTrash "Clear snapshots") $ do
+            writeVar (hsDbgHistory st) (History (-1) [])
+            writeVar (hsDbgSurvivors st) []
+            writeVar (hsDbgMarked st) M.empty
+            writeVar (hsDbgSel st) Nothing
+            writeVar (hsDbgOpen st) S.empty
+            writeVar (hsDbgSever st) Nothing
+          flex
+          scope $ case hlSnap loaded of
+            Just (TaskRunning _) -> labelWith (alignMid . fontTone Warning) "Target paused: walking its heap…"
+            Just (TaskDone (Left e)) -> labelWith (alignMid . fontTone Danger) (T.pack e)
+            Just (TaskFailed e _) -> labelWith (alignMid . fontTone Danger) (T.pack (displayException e))
+            _ -> pure ()
+        mixed <- bnMixed bench (hsDbgPanes st)
+        case reverse history of
+          [] | not mixed ->
+            emptyState
+              "Take a snapshot"
+              [ "A snapshot pauses the program, walks every closure reachable from its GC roots, and resumes it."
+              , "Take another after the program has run for a while: thunks still unevaluated in both are what a lazy accumulator leaves behind."
+              ]
+              []
+          [] -> scope (bnDraw bench (hsDbgPanes st) (heapPanes env st loaded logTl))
+          latest : _ -> scope $ do
+            columnWith (padBottom 8 . tight . fillW) $
+              readout
+                [ ("closures", fmtInt (M.size (snapNodes latest)))
+                , ("thunks", fmtInt (M.size (snapThunkKeys latest)))
+                , ("bytes", fmtBytes (fromIntegral (snapBytes latest)))
+                , ("roots", fmtInt (length (snapRoots latest)))
+                , ("snapshots kept", tshow (length history))
+                ]
+            bnDraw bench (hsDbgPanes st) (heapPanes env st loaded logTl)
 
 -- | The live graph's pane: the latest snapshot's survivors, graph and
 -- biggest retainers, or how to take a snapshot.
@@ -1665,6 +1709,32 @@ dbgAnatomy env st snap = do
           numCell 84 (fontTone Warning) (fmtBytes (fromIntegral (dgWasteBytes dg)) <> " waste")
           scope $ for_ (listToMaybe (dgSample dg)) $ \cid ->
             whenM (buttonWith (padXY 6 0 . tight) "Reveal") (reveal st snap cid)
+    let strictOps = auditStrictnessOpportunities snap dt
+    separator
+    sectionTitle ("Strictness & UNPACK advisor (" <> tshow (length strictOps) <> ")")
+    if null strictOps
+      then hint "No lazy constructor slots retaining unevaluated thunks detected."
+      else forM_ (zip [0 :: Int ..] (take 10 strictOps)) $ \(si, sa) -> withKey ("sa" <> tshow si <> saParent sa) $
+        panelWith (padXY 8 5 . gap 3 . fillW) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            for_ (saSlot sa) $ \sl -> badge Warning ("slot #" <> tshow sl)
+            cell (fillW . fontMono . fontSizeScale 0.9) (saParent sa <> " → " <> saChildThunk sa <> " (×" <> fmtInt (saThunkInstances sa) <> ")")
+            numCell 84 (fontTone Success) (fmtBytes (fromIntegral (saFreedBytes sa)))
+            whenM (buttonWith (padXY 6 0 . tight) "What-if sever") $
+              writeVar (hsDbgSever st) (Just (simulateSever snap (SeverInfoEdge (saParent sa) (saChildThunk sa))))
+            copyFeedbackButton (padXY 6 0 . tight) "Copy fix" (saPragmaHint sa)
+          hint (saPragmaHint sa)
+    let contHealth = auditContainers snap dt
+    scope $ unless (null contHealth) $ do
+      separator
+      sectionTitle ("Container value-laziness health (" <> tshow (length contHealth) <> ")")
+      forM_ (take 8 contHealth) $ \ch -> withKey ("ch" <> chContainerKind ch) $
+        panelWith (padXY 8 5 . gap 3 . fillW) $ do
+          rowWith (tight . gap 8 . alignMid . fillW) $ do
+            badge (if chThunkValues ch > 0 then Danger else Success) (if chThunkValues ch > 0 then "value-lazy" else "strict")
+            cell (fillW . fontMono . fontSizeScale 0.9) (chContainerKind ch)
+            labelWith (fontMono . fontMuted . fontSizeScale 0.84) (fmtInt (chSpineNodes ch) <> " spine · " <> fmtInt (chThunkValues ch) <> " thunks (" <> fmtBytes (fromIntegral (chThunkValueBytes ch)) <> ")")
+          hint (chDiagnosis ch)
 
 -- ---------------------------------------------------------------------------
 -- Lens

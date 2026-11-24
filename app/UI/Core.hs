@@ -98,6 +98,12 @@ data CoreState = CoreState
   , csTabGestures :: !(IORef (M.Map Word64 (DragHandle Word64)))
   , csTabHashes :: !(IORef (M.Map Word64 Int))
   , csTabJumpRev :: !(IORef (M.Map Word64 Int))
+  , csFullDiscover :: !(Task FilePath [FullModuleArtifacts])
+  , csFullArts :: !(Var [FullModuleArtifacts])
+  , csLowPath :: !(Var (Maybe FilePath))
+  , csLowTask :: !(Task FilePath (Either String CodeFile))
+  , csLowLoaded :: !(IORef (Maybe CodeFile))
+  , csLowView :: !CodeViewState
   }
 
 type CoreDerivedKey = (Bool, Maybe FilePath, Maybe FilePath, Maybe FilePath, Int, [FilePath], [Annotation])
@@ -162,16 +168,16 @@ newCoreState = do
   csTabGestures <- newIORef M.empty
   csTabHashes <- newIORef M.empty
   csTabJumpRev <- newIORef M.empty
+  csFullDiscover <- newTask
+  csFullArts <- newVar []
+  csLowPath <- newVar Nothing
+  csLowTask <- newTask
+  csLowLoaded <- newIORef Nothing
+  csLowView <- newCodeViewState
   pure CoreState {..}
 
 codeTabIds :: [Word64]
 codeTabIds = [paneCoreSource, paneCoreCore, paneCoreStg]
-
-paneForKind :: CodeKind -> Word64
-paneForKind = \case
-  KindSource -> paneCoreSource
-  KindCore -> paneCoreCore
-  KindStg -> paneCoreStg
 
 -- | Bring a code tab to the front in whichever pane holds it.
 activateCodeTab :: CoreState -> Word64 -> NanoUI ()
@@ -316,13 +322,25 @@ commitCodeTabDrop bench st draggedTab fromPid mStripDrop mGridDrop = do
 
 -- | Put a file in the pane its kind belongs to.
 openCodeFile :: CoreState -> FilePath -> NanoUI ()
-openCodeFile st p = for_ (kindForPath p) $ \k -> do
-  modifyVar (csPaths st) $ \(s, c, g) -> case k of
-    KindSource -> (Just p, c, g)
-    KindCore -> (s, Just p, g)
-    KindStg -> (s, c, Just p)
-  writeVar (csSelected st) Nothing
-  activateCodeTab st (paneForKind k)
+openCodeFile st p = for_ (kindForPath p) $ \case
+  KindCmm -> do
+    writeVar (csLowPath st) (Just p)
+    modifyVar (wbTree (csPanes st)) (Just . addPane paneCoreCmm)
+  KindAsm -> do
+    writeVar (csLowPath st) (Just p)
+    modifyVar (wbTree (csPanes st)) (Just . addPane paneCoreCmm)
+  KindSource -> do
+    modifyVar (csPaths st) (\(s, c, g) -> let _ = s in (Just p, c, g))
+    writeVar (csSelected st) Nothing
+    activateCodeTab st paneCoreSource
+  KindCore -> do
+    modifyVar (csPaths st) (\(s, _, g) -> (s, Just p, g))
+    writeVar (csSelected st) Nothing
+    activateCodeTab st paneCoreCore
+  KindStg -> do
+    modifyVar (csPaths st) (\(s, c, _) -> (s, c, Just p))
+    writeVar (csSelected st) Nothing
+    activateCodeTab st paneCoreStg
 
 -- | Open a source file on its own, away from the dump folder's modules.
 openSourceAlone :: CoreState -> FilePath -> NanoUI ()
@@ -357,6 +375,16 @@ coreLoad :: CoreState -> [FilePath] -> NanoUI CoreLoaded
 coreLoad st extra = do
   root <- readVar (csRoot st)
   arts <- traverse (\r -> useTask (csDiscover st) r (discoverArtifacts r)) root
+  fullArts <- traverse (\r -> useTask (csFullDiscover st) r (discoverFullArtifacts r)) root
+  writeVar (csFullArts st) (fromMaybe [] (join fullArts))
+  lowP <- readVar (csLowPath st)
+  mLowCf <- case lowP of
+    Nothing -> pure Nothing
+    Just lp -> do
+      let lk = fromMaybe KindCmm (kindForPath lp)
+      res <- useTask (csLowTask st) lp (loadCodeFile lk lp)
+      pure (res >>= eitherToMaybe)
+  liftIO (writeIORef (csLowLoaded st) mLowCf)
   projectRoot <- T.unpack . T.strip <$> readVar (csProjectRoot st)
   let starts = nubOrd (filter (not . null) (projectRoot : maybe [] pure root ++ extra))
   ix <- useTask (csIndex st) starts (buildSourceIndex =<< traverse makeAbsolute =<< sourceRoots starts)
@@ -502,7 +530,7 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
           =<< askOpenFileDialog
             defaultFileDialogOptions
               { dialogAllowMany = True
-              , dialogFilters = [FileFilter "Dumps and source" "dump-simpl;dump-stg-final;dump-stg;hs", FileFilter "All files" "*"]
+              , dialogFilters = [FileFilter "Dumps and source" "dump-simpl;dump-stg-final;dump-stg;dump-cmm-raw;dump-cmm;dump-asm;hs", FileFilter "All files" "*"]
               }
       openButtons = do
         whenM (styled primary (toolIconButton iconFolderOpen "Open dump folder…")) askDir
@@ -521,6 +549,9 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
         when (current /= Just a) $ do
           writeVar (csLoadedModule st) (Just a)
           writeVar (csPaths st) (maSource a, maCore a, maStg a)
+          fulls <- readVar (csFullArts st)
+          let mLow = listToMaybe [p | f <- fulls, fmaModule f == maModule a, Just p <- [fmaCmm f <|> fmaAsm f]]
+          writeVar (csLowPath st) mLow
           writeVar (csSelected st) Nothing
     flex
     msg <- readVar (csMessage st)
@@ -531,6 +562,10 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
       toolLabel "Colour"
       rowWith (alignMid . tight) $
         boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring st)
+      colNow <- readVar (csColouring st)
+      scope $ when (colNow == BoxingColours) $ do
+        labelWith (alignMid . fontTone Warning . fontSizeScale 0.8) "■ box"
+        labelWith (alignMid . fontTone Success . fontSizeScale 0.8) "■ unboxed #"
     toolGroup $ checkboxWith alignMid "Hide uniques" (csHideUniques st)
     checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable st)
   root <- readVar (csRoot st)
@@ -595,6 +630,8 @@ corePanes env st loaded sitePanes = do
   hideT <- readVar (csHideTypeable st)
   hideL <- readVar (csHideLifted st)
   colouring <- readVar (csColouring st)
+  lowCf <- liftIO (readIORef (csLowLoaded st))
+  fullArtsNow <- readVar (csFullArts st)
   filt <- T.toLower <$> readVar (csFilter st)
   selected <- readVar (csSelected st)
   hot <- readVar (csHot st)
@@ -765,6 +802,7 @@ corePanes env st loaded sitePanes = do
                         KindSource -> enSrc e
                         KindCore -> enCore e
                         KindStg -> enStg e
+                        _ -> enStg e
                     ]
                   _ -> []
               )
@@ -923,6 +961,7 @@ corePanes env st loaded sitePanes = do
                               KindSource -> enSrc e
                               KindCore -> enCore e
                               KindStg -> enStg e
+                              _ -> enStg e
                           ]
                         _ -> []
                     )
@@ -957,14 +996,14 @@ corePanes env st loaded sitePanes = do
                         , ccPinned = case activeKind of
                             KindSource -> pinnedSrc
                             KindStg -> (`IS.member` pinnedStg)
-                            KindCore -> const False
+                            _ -> const False
                         }
                   )
                   (codeRef activeKind activeMcf)
               -- Hovering a name lights it up in every pane; clicking one jumps to
               -- its binding, if it has one.
               let (hs, hc, hg) = csHovers st
-              writeVar (case activeKind of KindSource -> hs; KindCore -> hc; KindStg -> hg) (ceHoverKey ev)
+              writeVar (case activeKind of KindSource -> hs; KindCore -> hc; _ -> hg) (ceHoverKey ev)
               for_ (ceClickedKey ev) $ \k -> when (M.member k byKey) (select k)
             (lastClickTime, lastClickPos) <- liftIO (readIORef lastMouseClickRef)
             let recentClick = lastClickTime >= 0 && (now - lastClickTime) >= 0 && (now - lastClickTime) < 0.40
@@ -1072,7 +1111,8 @@ corePanes env st loaded sitePanes = do
                             scrollToLine targetCv (Forensics.csLine sm)
                         labelWith (fontSizeScale 0.86 . fillW) (Forensics.csSummary sm)
                         hint (Forensics.csRemediation sm)
-                Just e -> notesBar st e core stg (rt e) (not (null lanes))
+                Just e -> notesBar st e core stg lowCf (rt e) (not (null lanes))
+      | pid == paneCoreCmm -> Just (cmmAsmPane env st mm colouring hideU hot modName fullArtsNow lowCf ctx)
       | pid `elem` codeTabIds -> Just (tabbedCodePane ctx pid)
       | otherwise -> Nothing
   where
@@ -1099,8 +1139,8 @@ entryBadges e haveCore = do
   scope $ when (allocs > 0) $ badge Danger ("let " <> tshow allocs)
   scope $ when (haveCore && null (enCore e) && not (null (enSrc e))) $ badge Muted "gone"
 
-notesBar :: CoreState -> Entry -> Maybe CodeFile -> Maybe CodeFile -> Runtime -> Bool -> NanoUI ()
-notesBar st e core stg r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
+notesBar :: CoreState -> Entry -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Runtime -> Bool -> NanoUI ()
+notesBar st e core stg lowCf r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
   let (_, vCore, vStg) = csViews st
   rowWith (tight . gap 12 . wrap . fillW . alignMid) $ do
     labelWith (fontMedium . fontMono) (enKey e)
@@ -1113,6 +1153,13 @@ notesBar st e core stg r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ 
       for_ (nSize n) $ \s -> labelWith (fontMuted . fontSizeScale 0.85) (T.take 60 s)
       when (nRecursive n) $ badge Muted "recursive"
       when (nJoins n > 0) $ badge Success (tshow (nJoins n) <> " join points")
+    flex
+    for_ lowCf $ \lcf ->
+      whenM (buttonWith (padXY 7 1 . tight) "Show Cmm / Asm") $ do
+        modifyVar (wbTree (csPanes st)) (Just . addPane paneCoreCmm)
+        for_ (listToMaybe [cfBindings lcf V.! i | i <- M.findWithDefault [] (enKey e) (cfByKey lcf)]) $ \lb ->
+          scrollToLine (csLowView st) (bdFirst lb)
+    whenM (buttonWith (padXY 7 1 . tight) "← Module smells") (writeVar (csSelected st) Nothing)
   scope $ when haveRuntime $ rowWith (tight . gap 16 . wrap . fillW) $ do
     fact "time" (fmtFixed 1 (rtTime r) <> "%")
     fact "allocation" (fmtFixed 1 (rtAlloc r) <> "%")
@@ -1178,6 +1225,65 @@ notesBar st e core stg r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ 
             scrollToLine (if isStgSmell then vStg else vCore) (Forensics.csLine sm)
             liftIO $ modifyIORef' (csTabJumpRev st) (M.insertWith (+) (if isStgSmell then paneCoreStg else paneCoreCore) 1)
         hint (Forensics.csRemediation sm)
+  let misses = Forensics.explainOptimizationMisses bindingSmells []
+  scope $ unless (null misses) $ do
+    separator
+    sectionTitle ("Why didn't GHC optimize further? (" <> tshow (length misses) <> ")")
+    forM_ (zip [0 :: Int ..] misses) $ \(mi, ex) -> withKey ("ex" <> tshow mi) $
+      columnWith (tight . gap 2 . fillW) $ do
+        rowWith (tight . gap 8 . alignMid . fillW) $ do
+          badge Accent (Forensics.smellKindTitle (Forensics.seSmell ex))
+          labelWith (fontSizeScale 0.86 . fillW) (Forensics.seReason ex)
+        forM_ (Forensics.seLogEvidence ex) $ \evLine ->
+          labelWith (fontMono . fontMuted . fontSizeScale 0.8 . fillW) evLine
+
+cmmAsmPane :: Env -> CoreState -> MonoMetrics -> Colouring -> Bool -> Maybe Text -> Text -> [FullModuleArtifacts] -> Maybe CodeFile -> PaneCtx -> NanoUI ()
+cmmAsmPane env st mm colouring hideU hot modName fullArts mLowCf ctx = do
+  let curFull = listToMaybe [f | f <- fullArts, fmaModule f == modName]
+      hdr = do
+        for_ mLowCf $ \cf -> paneMeta (T.pack (takeFileName (cfPath cf)))
+        flex
+        for_ curFull $ \f -> do
+          for_ (fmaCmm f) $ \cp ->
+            whenM (buttonWith (alignMid . padXY 7 1 . tight) "Cmm") (writeVar (csLowPath st) (Just cp))
+          for_ (fmaAsm f) $ \ap ->
+            whenM (buttonWith (alignMid . padXY 7 1 . tight) "Asm") (writeVar (csLowPath st) (Just ap))
+  case mLowCf of
+    Nothing ->
+      paneEmpty
+        ctx
+        "Cmm & Asm"
+        "No .dump-cmm or .dump-asm file loaded for this module. Compile with Cmm/Asm dumps enabled or open a file via Open files…:"
+        ["cabal build --ghc-options=\"-ddump-cmm -ddump-asm -ddump-to-file\""]
+    Just cf ->
+      paneWith tight ctx "Cmm & Asm" hdr $ do
+        let rep =
+              Forensics.analyzeLowLevelIr
+                (if cfKind cf == KindCmm then Just cf else Nothing)
+                (if cfKind cf == KindAsm then Just cf else Nothing)
+        rowWith (padXY 10 4 . tight . gap 12 . wrap . fillW) $ do
+          fact "heap checks" (tshow (Forensics.carHeapChecks rep))
+          fact "stack checks" (tshow (Forensics.carStackChecks rep))
+          fact "spills" (tshow (Forensics.carSpills rep))
+          fact "slow calls" (tshow (Forensics.carSlowCalls rep))
+          when (Forensics.carSimdOps rep > 0) $ fact "SIMD" (tshow (Forensics.carSimdOps rep))
+        let tokFn = if hideU then lineTokensClean else lineTokens
+        ev <-
+          annotatedCode
+            env
+            (csLowView st)
+            mm
+            defaultCodeConfig
+              { ccLineCount = V.length (cfLines cf)
+              , ccTokens = tokFn cf
+              , ccHideUniques = False
+              , ccHot = hot
+              , ccEmpty = "Empty Cmm / Asm file"
+              , ccColouring = colouring
+              }
+            (const Nothing)
+        let (_, _, hg) = csHovers st
+        for_ (ceHoverKey ev) (writeVar hg . Just)
 
 -- | The module the loaded files are of.
 moduleOf :: Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Text

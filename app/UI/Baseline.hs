@@ -8,6 +8,7 @@ module UI.Baseline
   , clearBaseline
   , DiffNow (..)
   , diffPanes
+  , heapDiffChart
   , baselineStatus
   ) where
 
@@ -28,7 +29,7 @@ import Stronghead.Diff
 import Stronghead.Eventlog (loadEventlog)
 import Stronghead.Eventlog.Model (Timeline (..), summarize)
 import Stronghead.Format (fmtBytesD, fmtFixed, tshow)
-import Stronghead.HeapProfile (HeapProfile (..), loadHp)
+import Stronghead.HeapProfile (HeapProfile (..), hpOffsets, loadHp)
 import Stronghead.Join (CostTotal (..), costTotals)
 import Stronghead.Prof (ProfFile (..), loadProf)
 import Stronghead.Ref
@@ -201,6 +202,7 @@ heapDiff env st mbase mcur = case (mbase, mcur) of
       fact "larger" (tshow (length [() | c <- changes, bcStatus c == BandGrew]))
       flex
       checkboxWith alignMid "Show unchanged" (bvAllBands st)
+    heapDiffChart base cur
     rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
       colHeader fillW "band"
       colHeader (fixedW 90) "matched"
@@ -236,6 +238,31 @@ heapDiff env st mbase mcur = case (mbase, mcur) of
       BandGrew -> fontTone Warning
       BandNew -> fontTone Warning
       BandSame -> fontMuted
+
+-- | Visual Before vs. After total heap residency comparison chart.
+heapDiffChart :: HeapProfile -> HeapProfile -> NanoUI ()
+heapDiffChart base cur = do
+  th <- uiTheme
+  mm <- monoMetrics 0.82
+  let pal = palette th
+      ptsOf hp = zip (VU.toList (hpOffsets hp)) (VU.toList (hpTotals hp))
+      basePts = ptsOf base
+      curPts = ptsOf cur
+      maxT = max 1e-6 (maximum (0 : map fst basePts ++ map fst curPts))
+      series =
+        [ ChartSeries "baseline" (pMuted pal) basePts False
+        , ChartSeries "current" (pAccent pal) curPts True
+        ]
+  unless (null basePts && null curPts) $
+    columnWith (fillW . tight . gap 3 . padXY 4 4) $ do
+      rowWith (fillW . tight . gap 12 . alignMid) $ do
+        labelWith (fontMuted . fontSizeScale 0.82) "Total live residency over elapsed run time"
+        flex
+        labelWith (fontMuted . fontSizeScale 0.8) "— baseline"
+        labelWith (fontTone Accent . fontSizeScale 0.8) "■ current"
+      void $
+        canvasConfigured defaultCanvasConfig {canvasLayout = (fillW . fixedH 116) defaultLayout} $ \r ->
+          drawLineChart pal (mmFont mm) r (0, maxT) (\v -> "peak " <> fmtBytesD v) series
 
 
 -- | Cost centres of the two @.prof@ files.

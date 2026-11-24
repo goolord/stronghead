@@ -33,6 +33,13 @@ module Stronghead.Debug.Anatomy
     -- * Cross-snapshot structural diff
   , SkeletonDelta (..)
   , diffSnapshots
+    -- * Cross-platform ghc-heap probe bridge
+  , snapshotFromProbes
+    -- * Constructor field strictness advisor & container spine X-ray
+  , StrictnessAdvice (..)
+  , auditStrictnessOpportunities
+  , ContainerHealth (..)
+  , auditContainers
   ) where
 
 import Control.Applicative ((<|>))
@@ -44,7 +51,7 @@ import Data.IntMap.Strict qualified as IM
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as M
-import Data.Maybe (mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
 import Data.Sequence (Seq (..))
 import Data.Sequence qualified as Seq
@@ -56,6 +63,8 @@ import Data.Vector.Unboxed qualified as VU
 import Data.Word (Word64)
 
 import Stronghead.Debug.Graph
+import Stronghead.Format (fmtPct, readDecimal, readHex, tshow)
+import Stronghead.Live (LiveProbeNode (..))
 
 -- ---------------------------------------------------------------------------
 -- Exact dominator tree (Cooper-Harvey-Kennedy)
@@ -435,13 +444,26 @@ data DuplicateGroup = DuplicateGroup
 
 -- | Compute bounded bottom-up FNV-1a Merkle hashes over immutable closures
 -- (@CONSTR@, @ARR_WORDS@, @THUNK@) to surface duplicated data structures that
--- could be interned or shared.
+-- could be interned or shared. Incorporates 'snapPayloads' digests when
+-- available so distinct @ByteString@/@Int@ values never collide, and measures
+-- full bounded sub-DAG byte waste rather than root-only shallow size.
 auditDuplicates :: HeapSnapshot -> [DuplicateGroup]
 auditDuplicates snap =
   let nodes = snapNodes snap
+      payloads = snapPayloads snap
       eligible n = cnKind n `elem` [NConstr, NArray, NThunk] && cnSize n > 0
       -- Memoize bounded-depth structural hashes bottom-up.
-      hashes = foldl' (\m n -> fst (hashNode nodes (6 :: Int) S.empty m (cnId n))) M.empty (M.elems nodes)
+      hashes = foldl' (\m n -> fst (hashNode nodes payloads (6 :: Int) S.empty m (cnId n))) M.empty (M.elems nodes)
+      subDagSize cid =
+        let go _ [] acc = acc
+            go seen (x : xs) !acc
+              | S.member x seen || S.size seen >= 256 = go seen xs acc
+              | otherwise = case M.lookup x nodes of
+                  Nothing -> go seen xs acc
+                  Just nd ->
+                    let seen' = S.insert x seen
+                     in go seen' (cnChildren nd ++ xs) (acc + cnSize nd)
+         in go S.empty [cid] 0
       grouped =
         M.fromListWith
           (\(n1, c1, s1) (_, c2, s2) -> (n1, c1 + c2, take 4 (s1 ++ s2)))
@@ -452,28 +474,30 @@ auditDuplicates snap =
           ]
    in take 30 $
         sortOn (Down . dgWasteBytes)
-          [ DuplicateGroup
-              { dgHash = h
-              , dgType = cnType n
-              , dgName = cnName n
-              , dgSource = cnSource n
-              , dgCount = cnt
-              , dgUnitBytes = cnSize n
-              , dgWasteBytes = (cnt - 1) * cnSize n
-              , dgSample = samples
-              }
+          [ let unitB = max (cnSize n) (subDagSize (cnId n))
+             in DuplicateGroup
+                  { dgHash = h
+                  , dgType = cnType n
+                  , dgName = cnName n
+                  , dgSource = cnSource n
+                  , dgCount = cnt
+                  , dgUnitBytes = unitB
+                  , dgWasteBytes = (cnt - 1) * unitB
+                  , dgSample = samples
+                  }
           | (h, (n, cnt, samples)) <- M.toList grouped
           , cnt >= 2
           ]
 
 hashNode
   :: Map ClosureId ClosureNode
+  -> Map ClosureId Word64
   -> Int
   -> Set ClosureId
   -> Map ClosureId Word64
   -> ClosureId
   -> (Map ClosureId Word64, Word64)
-hashNode nodes depth visiting memo cid
+hashNode nodes payloads depth visiting memo cid
   | Just h <- M.lookup cid memo = (memo, h)
   | depth <= 0 || S.member cid visiting = (memo, 0x9e3779b97f4a7c15)
   | otherwise = case M.lookup cid nodes of
@@ -483,16 +507,19 @@ hashNode nodes depth visiting memo cid
             (memo', childHashes) =
               foldl'
                 ( \(m, hs) k ->
-                    let (m', kh) = hashNode nodes (depth - 1) visiting' m k
+                    let (m', kh) = hashNode nodes payloads (depth - 1) visiting' m k
                      in (m', kh : hs)
                 )
                 (memo, [])
                 (take 8 (cnChildren n))
-            baseH =
+            baseH0 =
               fnvText (cnType n)
                 `fnvMix` fnvText (cnName n)
                 `fnvMix` maybe 0 fnvText (cnSource n)
                 `fnvMix` fromIntegral (cnSize n)
+            baseH = case M.lookup cid payloads of
+              Just ph -> baseH0 `fnvMix` ph
+              Nothing -> baseH0
             finalH = foldl' fnvMix baseH (reverse childHashes)
          in (M.insert cid finalH memo', finalH)
 
@@ -585,4 +612,241 @@ diffSnapshots base cur =
         , let mb = M.lookup k bm
               mc = M.lookup k cm
         , maybe 0 skCount mb /= maybe 0 skCount mc || maybe 0 skOwnBytes mb /= maybe 0 skOwnBytes mc
+        ]
+
+-- ---------------------------------------------------------------------------
+-- Cross-platform ghc-heap Probe -> HeapSnapshot Bridge
+
+-- | Convert in-process @ghc-heap@ 'LiveProbeNode's (from "Stronghead.Probe" /
+-- "Stronghead.Agent" v3) into a full 'HeapSnapshot', resolving @SHARED_REF@
+-- links into multi-parent DAG edges, populating payload FNV-1a digests for
+-- accurate Merkle deduplication, and recording pointer slot indices.
+--
+-- Works on Windows, macOS, and Linux without @ghc-debug-stub@.
+snapshotFromProbes :: Text -> [LiveProbeNode] -> HeapSnapshot
+snapshotFromProbes label probes =
+  mkSnapshotWithMeta label False rootIds allNodes payloadMap slotMap
+  where
+    probeNames = nubOrd (map lpnProbe probes)
+    byProbe = M.fromListWith (++) [(lpnProbe p, [p]) | p <- reverse probes]
+    -- Assign disjoint ClosureId namespaces: probe k gets anchor (k+1)*1_000_000
+    -- and node lpnId gets (k+1)*1_000_000 + lpnId + 1.
+    cidOf :: Int -> Int -> ClosureId
+    cidOf pIdx localId = fromIntegral ((pIdx + 1) * 1000000 + localId + 1)
+    anchorIdOf :: Int -> ClosureId
+    anchorIdOf pIdx = fromIntegral ((pIdx + 1) * 1000000)
+
+    parseMeta :: Text -> Text -> Maybe Text
+    parseMeta key det =
+      listToMaybe
+        [ T.drop (T.length key + 1) tok
+        | tok <- T.words det
+        , (key <> "=") `T.isPrefixOf` tok
+        ]
+
+    buildOneProbe :: Int -> Text -> (ClosureId, [ClosureNode], [(ClosureId, Word64)], [((ClosureId, ClosureId), Int)])
+    buildOneProbe pIdx pName =
+      let pNodes = M.findWithDefault [] pName byProbe
+          realNodes = [p | p <- pNodes, lpnType p /= "SHARED_REF"]
+          -- Children of parent localId in declaration order, resolving SHARED_REF -> target localId
+          resolveChild p
+            | lpnType p == "SHARED_REF"
+            , Just tTxt <- parseMeta "shared" (lpnDetail p)
+            , Just tgt <- readDecimal tTxt =
+                Just (cidOf pIdx tgt)
+            | otherwise = Just (cidOf pIdx (lpnId p))
+          childrenByParent :: Map Int [ClosureId]
+          childrenByParent =
+            M.fromListWith
+              (++)
+              [ (lpnParent p, [childCid])
+              | p <- pNodes
+              , Just childCid <- [resolveChild p]
+              ]
+          anchorCid = anchorIdOf pIdx
+          rootKids = M.findWithDefault [] (-1) childrenByParent
+          anchorNode =
+            ClosureNode
+              { cnId = anchorCid
+              , cnType = "MUT_VAR_CLEAN"
+              , cnKind = NMutable
+              , cnName = pName
+              , cnSource = Nothing
+              , cnSize = 16
+              , cnChildren = rootKids
+              , cnInfo = Nothing
+              , cnFrames = []
+              }
+          converted =
+            [ let cid = cidOf pIdx (lpnId p)
+                  kids = M.findWithDefault [] (lpnId p) childrenByParent
+                  ty = if lpnIsThunk p && not ("THUNK" `T.isPrefixOf` lpnType p || lpnType p `elem` ["AP", "AP_STACK", "BLACKHOLE"])
+                         then "THUNK"
+                         else lpnType p
+               in ClosureNode
+                    { cnId = cid
+                    , cnType = lpnType p
+                    , cnKind = if lpnIsThunk p then NThunk else kindOfClosureType ty
+                    , cnName = if T.null (lpnName p) then lpnType p else lpnName p
+                    , cnSource = if T.null (lpnSource p) then Nothing else Just (lpnSource p)
+                    , cnSize = max 0 (lpnBytes p)
+                    , cnChildren = kids
+                    , cnInfo = Nothing
+                    , cnFrames = []
+                    }
+            | p <- realNodes
+            ]
+          pHashes =
+            [ (cidOf pIdx (lpnId p), h)
+            | p <- realNodes
+            , Just hTxt <- [parseMeta "hash" (lpnDetail p)]
+            , Just h <- [readHex hTxt]
+            ]
+          eSlots =
+            concat
+              [ zipWith (\slot childCid -> ((ndId, childCid), slot)) [0 ..] (cnChildren nd)
+              | nd <- anchorNode : converted
+              , let ndId = cnId nd
+              ]
+       in (anchorCid, anchorNode : converted, pHashes, eSlots)
+
+    built = zipWith buildOneProbe [0 ..] probeNames
+    rootIds = [r | (r, _, _, _) <- built]
+    allNodes = concat [ns | (_, ns, _, _) <- built]
+    payloadMap = M.fromList (concat [hs | (_, _, hs, _) <- built])
+    slotMap = M.fromList (concat [es | (_, _, _, es) <- built])
+
+-- ---------------------------------------------------------------------------
+-- Constructor Field Strictness Advisor & Container Spine X-Ray
+
+data StrictnessAdvice = StrictnessAdvice
+  { saParent :: !Text
+  , saParentType :: !Text
+  , saSlot :: !(Maybe Int)
+  , saChildThunk :: !Text
+  , saThunkInstances :: !Int
+  , saFreedBytes :: !Int
+  , saFreedClosures :: !Int
+  , saFreedFraction :: !Double
+  , saPragmaHint :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | Discover constructor fields and mutable cells holding unevaluated thunks
+-- and run counterfactual edge-class severing ('simulateSever') to rank exact
+-- @BangPatterns@ / @!@ / @{-# UNPACK #-}@ strictness opportunities.
+auditStrictnessOpportunities :: HeapSnapshot -> DominatorTree -> [StrictnessAdvice]
+auditStrictnessOpportunities snap dt =
+  let nodes = snapNodes snap
+      slots = snapEdgeSlots snap
+      -- Aggregate (parentName, parentType, mSlot, childName) -> (thunkCount, sumDomBytes)
+      edgeGroups =
+        M.fromListWith
+          (\(c1, b1) (c2, b2) -> (c1 + c2, b1 + b2))
+          [ ( (cnName p, cnType p, M.lookup (cnId p, cid) slots, cnName kn)
+            , (1 :: Int, domRetained dt cid)
+            )
+          | p <- M.elems nodes
+          , cnKind p `elem` [NConstr, NMutable]
+          , (idx, cid) <- zip [0 :: Int ..] (cnChildren p)
+          , Just kn <- [M.lookup cid nodes]
+          , cnKind kn == NThunk
+          , let _ = idx
+          ]
+      topCandidates =
+        take 12 $
+          sortOn (Down . snd . snd) (M.toList edgeGroups)
+   in sortOn (Down . saFreedBytes)
+        [ let sev = simulateSever snap (SeverInfoEdge pName cName)
+              slotHint = maybe "" (\s -> " (pointer slot #" <> tshow s <> ")") mSlot
+              hint
+                | "MUT_VAR" `T.isPrefixOf` pType || pType `elem` ["MVAR", "TVAR"] =
+                    "Use strict update (modifyIORef' / modifyTVar' / $!) when writing to '" <> pName <> "'."
+                | otherwise =
+                    "Mark field" <> slotHint <> " of constructor '" <> pName <> "' strict with '!' (and {-# UNPACK #-} if single-constructor)."
+           in StrictnessAdvice
+                { saParent = pName
+                , saParentType = pType
+                , saSlot = mSlot
+                , saChildThunk = cName
+                , saThunkInstances = instCnt
+                , saFreedBytes = max sumDom (srFreedBytes sev)
+                , saFreedClosures = max instCnt (srFreedClosures sev)
+                , saFreedFraction = srFreedFraction sev
+                , saPragmaHint = hint
+                }
+        | ((pName, pType, mSlot, cName), (instCnt, sumDom)) <- topCandidates
+        , sumDom > 0
+        ]
+
+data ContainerHealth = ContainerHealth
+  { chContainerKind :: !Text
+    -- ^ @Map/Set@, @HashMap@, @Sequence@, or @List@.
+  , chSpineNodes :: !Int
+  , chSpineBytes :: !Int
+  , chValueSlots :: !Int
+  , chThunkValues :: !Int
+  , chValueLazyRatio :: !Double
+  , chThunkValueBytes :: !Int
+  , chDiagnosis :: !Text
+  }
+  deriving stock (Eq, Show)
+
+-- | Inspect standard Haskell container skeletons (@Data.Map@/@IntMap@/@Set@,
+-- @Data.HashMap@, @Data.Sequence@, and @[]@) to detect "Spine-Strict, Value-Lazy"
+-- space leaks where tree spines are evaluated WHNF while leaf payload values
+-- remain unevaluated thunks.
+auditContainers :: HeapSnapshot -> DominatorTree -> [ContainerHealth]
+auditContainers snap dt =
+  let nodes = snapNodes snap
+      classifyContainer n =
+        let base = snd (T.breakOnEnd "." (cnName n))
+            nm = if T.null base then cnName n else base
+         in if
+              | nm `elem` ["Bin", "Tip", "Nil"] && cnKind n == NConstr -> Just "Map / IntMap / Set"
+              | nm `elem` ["BitmapIndexed", "Full", "Leaf", "Collision"] && cnKind n == NConstr -> Just "HashMap / HashSet"
+              | nm `elem` ["Deep", "Digit", "Node2", "Node3", "Elem"] && cnKind n == NConstr -> Just "Data.Sequence"
+              | nm `elem` [":", "(:)"] && cnKind n == NConstr -> Just "Linked List ([])"
+              | otherwise -> Nothing
+      isSpineCon kName child =
+        case classifyContainer child of
+          Just ck -> ck == kName
+          Nothing -> False
+      statsByKind =
+        M.fromListWith
+          (\(sn1, sb1, vs1, tv1, tb1) (sn2, sb2, vs2, tv2, tb2) -> (sn1 + sn2, sb1 + sb2, vs1 + vs2, tv1 + tv2, tb1 + tb2))
+          [ ( ck
+            , ( 1 :: Int
+              , cnSize n
+              , length valueKids
+              , length thunkKids
+              , sum [domRetained dt (cnId tk) | tk <- thunkKids]
+              )
+            )
+          | n <- M.elems nodes
+          , Just ck <- [classifyContainer n]
+          , let childNodes = mapMaybe (`M.lookup` nodes) (cnChildren n)
+                valueKids = [c | c <- childNodes, not (isSpineCon ck c)]
+                thunkKids = [c | c <- valueKids, cnKind c == NThunk]
+          ]
+   in sortOn (Down . chThunkValueBytes)
+        [ let ratio = if vSlots > 0 then fromIntegral tVals / fromIntegral vSlots else 0
+              diag
+                | tVals == 0 = "Healthy: container spine and all leaf values are in WHNF."
+                | ratio >= 0.25 =
+                    "Spine-strict, value-lazy leak: " <> fmtPct ratio <> " of container value slots hold unevaluated thunks (import .Strict or force values with $! before insertion)."
+                | otherwise =
+                    "Partially lazy values: " <> tshow tVals <> " unevaluated thunk slot(s) inside container leaves."
+           in ContainerHealth
+                { chContainerKind = ck
+                , chSpineNodes = sNodes
+                , chSpineBytes = sBytes
+                , chValueSlots = vSlots
+                , chThunkValues = tVals
+                , chValueLazyRatio = ratio
+                , chThunkValueBytes = tBytes
+                , chDiagnosis = diag
+                }
+        | (ck, (sNodes, sBytes, vSlots, tVals, tBytes)) <- M.toList statsByKind
+        , sNodes >= 2
         ]
