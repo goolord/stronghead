@@ -93,6 +93,8 @@ module UI.Common
   , paneFlashRef
   , lastMouseClickRef
   , hashText
+  , notePaneKey
+  , notePaneState
   , recordTabFlash
   , isPaneFlashing
   , paneFlashing
@@ -110,10 +112,9 @@ module UI.Common
   , readoutDeltaWith
   , emptyState
   , emptyStateWith
+  , bareScrollArea
   , paneScroll
   , paneScrollArea
-  , bareScroll
-  , bareScrollArea
   , paneVirtualRows
   , canvasKeyed
   , codeBlock
@@ -131,7 +132,6 @@ module UI.Common
   , pathLabel
   , monoMetrics
   , MonoMetrics (..)
-  , drawTextClipped
   , drawLineChart
   , chartTimeX
   , chartXTime
@@ -155,18 +155,14 @@ import Data.Text qualified as T
 import Data.Text.Encoding qualified as TE
 import Data.Vector qualified as V
 import Stronghead.Format (tshow)
-import Data.Bits (shiftL, shiftR, (.|.))
 import Data.Map.Strict qualified as M
 import Data.Word (Word64)
-import GHC.Float (castFloatToWord32)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef
 
 import NanoUI
 import NanoUI.Adornment qualified as A
-import NanoUI.Internal.Context (Context (..), CustomDrawingEntry (..), lookupCustomDrawingAt)
-import NanoUI.Internal.Layout.Arena (arenaCount, getNodeValue, getStyleIdx, getText, lookupNodeByWidgetId, setStyleIdx)
-import NanoUI.Internal.Monad (askContext, askFrameInput)
+import NanoUI.Monad (askFrameInput)
 import NanoUI.Path qualified as P
 
 -- ---------------------------------------------------------------------------
@@ -406,11 +402,15 @@ asRow l = l {layoutDirection = Row}
 -- one, so every label sits on the row's shared baseline whatever its face
 -- or size.
 cell :: (Layout -> Layout) -> Text -> NanoUI ()
-cell f = labelWith (alignBaseline . f)
+cell f txt = do
+  notePaneState txt
+  labelWith (alignBaseline . f) txt
 
--- | A number in a fixed-width, right-aligned monospace column.
+-- | A number in a fixed-width, right-aligned monospace column with tabular figures.
 numCell :: Float -> (Layout -> Layout) -> Text -> NanoUI ()
-numCell w f = labelWith (alignBaseline . fixedW w . alignEnd . fontMono . f)
+numCell w f txt = do
+  notePaneState txt
+  labelWith (alignBaseline . fixedW w . alignEnd . fontMono . fontTabular . f) txt
 
 -- | A table column header, sized like the column it heads.
 colHeader :: (Layout -> Layout) -> Text -> NanoUI ()
@@ -435,13 +435,18 @@ tableRows = columnWith (tight . gap 0 . fillW)
 
 -- | A heading inside a pane's body.
 sectionTitle :: Text -> NanoUI ()
-sectionTitle = labelWith (fontMedium . fontSizeScale 0.92 . padTop 10 . padBottom 2)
+sectionTitle txt = do
+  notePaneState txt
+  labelWith (fontMedium . fontSizeScale 0.92 . padTop 10 . padBottom 2) txt
 
 hint :: Text -> NanoUI ()
-hint = labelWith (fontMuted . fontSizeScale 0.9 . fillW)
+hint txt = do
+  notePaneState txt
+  labelWith (fontMuted . fontSizeScale 0.9 . fillW) txt
 
 badge :: Tone -> Text -> NanoUI ()
 badge t txt = do
+  notePaneState txt
   th <- uiTheme
   let c = toneColor th t
   styled (panelStyle (background (alpha 0.16 c) . borderWidth 0 . cornerRadius 4)) $
@@ -449,8 +454,11 @@ badge t txt = do
 
 pathLabel :: Maybe FilePath -> NanoUI ()
 pathLabel = \case
-  Nothing -> labelWith (alignMid . fontMuted) "No file open"
-  Just p -> labelWith (alignMid . fontMono . fontSizeScale 0.92) (T.pack (takeFileName p))
+  Nothing -> notePaneState "No file open" >> labelWith (alignMid . fontMuted) "No file open"
+  Just p -> do
+    let name = T.pack (takeFileName p)
+    notePaneState name
+    labelWith (alignMid . fontMono . fontSizeScale 0.92) name
 
 fillRow :: NanoUI a -> NanoUI a
 fillRow = rowWith (tight . gap 8 . alignMid . fillW)
@@ -737,29 +745,24 @@ paneFlashing title = do
 hashText :: Text -> Word64
 hashText = T.foldl' (\h c -> (h * 1099511628211) `xor` fromIntegral (ord c)) 14695981039346656037
 
--- | Compute a signature/hash of the nodes rendered in a pane.
-computePaneHash :: Context -> Text -> Int -> Int -> IO Int
-computePaneHash ctx title start end = do
-  let na = ctxNodeArena ctx
-  let initHash = fromIntegral (hashText title) :: Int
-  let count = max 0 (end - start)
-  let initAcc = (initHash `shiftL` 7) `xor` count
-  let go !acc !i
-        | i >= end = pure acc
-        | otherwise = do
-            txt <- getText na i
-            val <- getNodeValue na i
-            stIdx <- getStyleIdx na i
-            mCustom <- lookupCustomDrawingAt ctx i
-            let hTxt = if T.null txt then 0 else fromIntegral (hashText txt) :: Int
-            let hVal = fromIntegral (castFloatToWord32 val) :: Int
-            let hSt = stIdx
-            let hCustom = maybe 0 cdrContent mCustom
-            let step = (hTxt * 1099511628211) `xor` (hVal * 1469598103934665603) `xor` (hSt * 2166136261) `xor` (hCustom * 16777619)
-            let acc' = ((acc `shiftL` 5) .|. (acc `shiftR` 59)) `xor` step
-            go acc' (i + 1)
-  finalHash <- go initAcc start
-  pure (if finalHash == 0 then 1 else finalHash)
+-- | Stack of active pane state digests while rendering nested/outer panes.
+activePaneDigestRef :: IORef [Word64]
+activePaneDigestRef = unsafePerformIO (newIORef [])
+{-# NOINLINE activePaneDigestRef #-}
+
+mixDigest :: Word64 -> Word64 -> Word64
+mixDigest h w = (h * 1099511628211) `xor` w
+
+-- | Mix a 64-bit state token into the enclosing pane's flash digest.
+notePaneKey :: Word64 -> NanoUI ()
+notePaneKey w = liftIO $ modifyIORef' activePaneDigestRef $ \case
+  h : hs -> let !h' = mixDigest h w in h' : hs
+  [] -> []
+
+-- | Mix a text state token into the enclosing pane's flash digest.
+notePaneState :: Text -> NanoUI ()
+notePaneState = notePaneKey . hashText
+
 -- | A pane: a header with its title and @trailing@ (meta text, actions),
 -- and a padded body. Drag the header to move the pane, double-click it to
 -- maximize; the header's last button opens the pane's menu.
@@ -818,9 +821,7 @@ paneWith bodyLayout ctx title trailing body = do
         for_ (pcMenu ctx) (themed th . paneMenuWithVar menuOpen)
   styled (panelStyle (background (inkPane i) . borderColor borderColorActive . borderWidth borderWidthActive . cornerRadius 6)) $
     panelWith (tight . gap 0 . fillW . fillH) $ do
-      c <- askContext
-      let na = ctxNodeArena c
-      startCount <- liftIO (arenaCount na)
+      liftIO $ modifyIORef' activePaneDigestRef (hashText title :)
       styled (panelStyle (background colorTransparent . borderBottom 1 (inkRule i) . cornerRadius 0)) $
         case pcGrid ctx of
           -- The header drags the pane; a press on a control in it does not.
@@ -834,8 +835,11 @@ paneWith bodyLayout ctx title trailing body = do
         when (inHeader && pressedIn MouseRight inp) $
           for_ (pcMenu ctx) (const (writeVar menuOpen True))
       res <- themed th $ columnWith (fillW . fillH . bodyLayout) body
-      endCount <- liftIO (arenaCount na)
-      curHash <- liftIO (computePaneHash c title startCount endCount)
+      curDigest <- liftIO $ atomicModifyIORef' activePaneDigestRef $ \case
+        h : hs -> (hs, h)
+        [] -> ([], hashText title)
+      let !curHash0 = fromIntegral curDigest :: Int
+          !curHash = if curHash0 == 0 then 1 else curHash0
       prevHash <- readVar prevHashVar
       (lastClickTime, lastClickPos) <- liftIO (readIORef lastMouseClickRef)
       let recentClick = lastClickTime >= 0 && (now - lastClickTime) >= 0 && (now - lastClickTime) < 0.40
@@ -878,7 +882,9 @@ paneMeta = paneMetaWith id
 
 -- | 'paneMeta' with an additional layout modifier, e.g. 'fixedW'.
 paneMetaWith :: (Layout -> Layout) -> Text -> NanoUI ()
-paneMetaWith f = labelWith (alignMid . fontMuted . fontSizeScale 0.85 . f)
+paneMetaWith f txt = do
+  notePaneState txt
+  labelWith (alignMid . fontMuted . fontSizeScale 0.85 . f) txt
 
 -- | A single metric item in a 'readoutToned' strip.
 data ReadoutItem = ReadoutItem
@@ -904,10 +910,10 @@ readoutToned items =
           let numTone = maybe id fontTone roTone
               (number, unit) = splitUnit roValue
           rowWith (tight . gap 3) $ do
-            cell (fontMono . fontSizeScale 1.3 . numTone) number
+            cell (fontMono . fontTabular . fontSizeScale 1.3 . numTone) number
             scope $ unless (T.null unit) (cell (fontMuted . fontSizeScale 0.9) unit)
           labelWith (roSubLayout . fontMuted . fontSizeScale 0.8) roLabel
-          scope $ for_ roDelta $ labelWith (fontMuted . fontMono . fontSizeScale 0.75)
+          scope $ for_ roDelta $ labelWith (fontMuted . fontMono . fontTabular . fontSizeScale 0.75)
 
 -- | The vital numbers of a run as one instrument line: each value over its
 -- name. Wraps onto more lines when narrow.
@@ -977,6 +983,7 @@ data MonoMetrics = MonoMetrics
   { mmFont :: !TextFont
   , mmCharW :: !Float
   , mmLineH :: !Float
+  , mmMetrics :: !FontMetrics
   }
 
 monoMetrics :: Float -> NanoUI MonoMetrics
@@ -985,7 +992,7 @@ monoMetrics scale = do
   let size = base * scale
   fm <- resolveFontUi size WeightNormal FontStyleNormal FontMono
   w <- lineWidthUi fm "MMMMMMMMMM"
-  pure (MonoMetrics defaultTextFont {textFontSize = size, textFontVariant = FontMono} (w / 10) (fmLineHeight fm))
+  pure (MonoMetrics defaultTextFont {textFontSize = size, textFontVariant = FontMono} (w / 10) (fmLineHeight fm) fm)
 
 -- | Text cut to a pixel width by character count (exact for monospace,
 -- approximate otherwise).
@@ -995,11 +1002,6 @@ fitText charW width t
   | fromIntegral (T.length t) * charW <= width = t
   | width < charW * 2 = ""
   | otherwise = T.take (max 0 (floor (width / charW) - 1)) t <> "…"
-
-drawTextClipped :: TextFont -> Float -> V2 -> Float -> Text -> Color -> CanvasM ()
-drawTextClipped font charW (V2 x y) width txt c =
-  let t = fitText charW width txt
-   in if T.null t then pure () else drawTextWith font (V2 x y) AlignStart AlignMiddle t c
 
 data ChartSeries = ChartSeries
   { csName :: !Text
@@ -1066,41 +1068,24 @@ vrule h = do
 
 -- | 'canvas' with a content key, so unchanged frames skip rebuilding its ops.
 canvasKeyed :: Int -> (Layout -> Layout) -> (Rect -> CanvasM ()) -> NanoUI Response
-canvasKeyed k f = canvasConfigured defaultCanvasConfig {canvasLayout = f defaultLayout, canvasContent = k}
+canvasKeyed k f draw = do
+  when (k /= 0) (notePaneKey (fromIntegral k))
+  canvasConfigured defaultCanvasConfig {canvasLayout = f defaultLayout, canvasContent = k} draw
 
--- | A scroll area inside a pane, drawn on the pane's surface. nano-ui gives
--- a scroller a sunken well (or, filling both ways, the window colour);
--- inside a pane that reads as a box within the box, so the well is made
--- transparent and the scroller takes a percentage width to stay off the
--- window-colour path. @f@ sizes the area, e.g. @grow . minH 160@.
--- | A scroll area without an embedded well, border or background: children
--- are clipped to the viewport, and scrollbars paint over them.
+-- | Chromeless vertical scroll area inside a pane, sharing height cleanly with siblings.
 bareScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
-bareScrollArea f child = do
-  (wid, res) <- scrollArea f child
-  ctx <- askContext
-  liftIO $ do
-    mIdx <- lookupNodeByWidgetId (ctxNodeArena ctx) wid
-    for_ mIdx $ \idx -> do
-      si <- getStyleIdx (ctxNodeArena ctx) idx
-      setStyleIdx (ctxNodeArena ctx) idx (si .|. 32)
-  pure (wid, res)
+bareScrollArea f =
+  scrollAreaConfigured (ScrollConfig ScrollNone ScrollAuto True) (f . minW 0 . minH 0)
 
--- | 'bareScrollArea' discarding the container id.
-bareScroll :: (Layout -> Layout) -> NanoUI a -> NanoUI a
-bareScroll f child = snd <$> bareScrollArea f child
-
+-- | A chromeless scroll area inside a pane, using native @bareScrollArea@
+-- so it blends onto the pane surface and shares height cleanly with siblings.
 paneScroll :: (Layout -> Layout) -> NanoUI a -> NanoUI a
 paneScroll f body = snd <$> paneScrollArea f body
 
 paneScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
 paneScrollArea f body = do
   th <- uiTheme
-  -- The scroller is pinned over a column that takes the space it is given:
-  -- in flow, a scroller reports its content's height, and that would push
-  -- the pane's neighbours aside.
-  columnWith (f . tight . fillW . fillH) $
-    bareScrollArea (pinAt 0 0 . percent 100 . fillH . tight) (themed th body)
+  bareScrollArea (f . tight . fillW . fillH) (themed th body)
 
 -- | A vertically scrolled list of uniform-height rows inside a pane that
 -- virtualizes when there are many items, building only the rows near the
@@ -1117,25 +1102,23 @@ paneVirtualRows scrollLayout colLayout items drawItem
       fm <- resolveFontUi base WeightNormal FontStyleNormal FontRegular
       let !rowH = max 18 (fmLineHeight fm + 4)
           !vec = V.fromListN n items
-      columnWith (scrollLayout . tight . fillW . fillH) $
-        styled (inputStyle (background colorTransparent . borderWidth 0)) $ do
-          sid <- currentId
-          metrics <- getScrollMetricsUi sid
-          let (!firstRow, !lastRow) = case metrics of
-                Nothing -> (0, min (n - 1) 59)
-                Just m ->
-                  let top = v2Y (scrollOffset m)
-                      vh = max 200 (rectH (scrollViewport m))
-                   in ( max 0 (floor (top / rowH) - 10)
-                      , min (n - 1) (ceiling ((top + vh) / rowH) + 10)
-                      )
-          void . bareScrollArea (pinAt 0 0 . percent 100 . fillH . tight) . themed th $
-            columnWith (colLayout . tight . fillW . gap 0) $ do
-              when (firstRow > 0) $
-                spacer Fit (Fixed (fromIntegral firstRow * rowH))
-              forM_ [firstRow .. lastRow] $ \i ->
-                drawItem (vec V.! i)
-              when (lastRow < n - 1) $
-                spacer Fit (Fixed (fromIntegral (n - 1 - lastRow) * rowH))
+      sid <- currentId
+      metrics <- getScrollMetricsUi sid
+      let (!firstRow, !lastRow) = case metrics of
+            Nothing -> (0, min (n - 1) 59)
+            Just m ->
+              let top = v2Y (scrollOffset m)
+                  vh = max 200 (rectH (scrollViewport m))
+               in ( max 0 (floor (top / rowH) - 10)
+                  , min (n - 1) (ceiling ((top + vh) / rowH) + 10)
+                  )
+      void . bareScrollArea (scrollLayout . tight . fillW . fillH) . themed th $
+        columnWith (colLayout . tight . fillW . gap 0) $ do
+          when (firstRow > 0) $
+            spacer Fit (Fixed (fromIntegral firstRow * rowH))
+          forM_ [firstRow .. lastRow] $ \i ->
+            drawItem (vec V.! i)
+          when (lastRow < n - 1) $
+            spacer Fit (Fixed (fromIntegral (n - 1 - lastRow) * rowH))
   where
     n = length items

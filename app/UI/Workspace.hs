@@ -200,6 +200,7 @@ timelineTimePanes = [paneTlCaps, paneTlThreads]
 treeKinds :: GridNode -> [Word64]
 treeKinds = \case
   Pane i -> [i]
+  PaneTabs _ ps _ -> ps
   Split _ _ _ a b -> treeKinds a ++ treeKinds b
 
 hasPane :: Word64 -> Maybe GridNode -> Bool
@@ -208,6 +209,7 @@ hasPane k = maybe False (elem k . treeKinds)
 splitIds :: GridNode -> [Word64]
 splitIds = \case
   Pane _ -> []
+  PaneTabs i _ _ -> [i]
   Split i _ _ a b -> i : splitIds a ++ splitIds b
 
 -- | Add a pane beside the whole arrangement, on the right, taking a third
@@ -224,6 +226,10 @@ addPane k = \case
 removePane :: Word64 -> GridNode -> Maybe GridNode
 removePane k = \case
   Pane i -> if i == k then Nothing else Just (Pane i)
+  PaneTabs i ps act -> case filter (/= k) ps of
+    [] -> Nothing
+    [only] -> Just (Pane only)
+    ps'@(p0 : _) -> Just (PaneTabs i ps' (if act == k then p0 else act))
   Split i ax r a b -> case (removePane k a, removePane k b) of
     (Just a', Just b') -> Just (Split i ax r a' b')
     (Nothing, b') -> b'
@@ -233,6 +239,7 @@ removePane k = \case
 renamePane :: Word64 -> Word64 -> GridNode -> GridNode
 renamePane old new = \case
   Pane i -> Pane (if i == old then new else i)
+  PaneTabs i ps act -> PaneTabs i [if p == old then new else p | p <- ps] (if act == old then new else act)
   Split i ax r a b -> Split i ax r (renamePane old new a) (renamePane old new b)
 
 -- | Split a tree at a drop location to insert a pane with a fresh split id.
@@ -255,14 +262,29 @@ splitAtDrop loc newPid tree0 =
               go (Pane i)
                 | i == targetPid = mkSplit ax onFirst (Pane newPid) (Pane i)
                 | otherwise = Pane i
+              go t@(PaneTabs _ ps _)
+                | targetPid `elem` ps = mkSplit ax onFirst (Pane newPid) t
+                | otherwise = t
+              go (Split i sAx r a b) = Split i sAx r (go a) (go b)
+           in go tree
+        IntoTabs targetPid ->
+          let go (Pane i)
+                | i == targetPid = PaneTabs sid [i, newPid] newPid
+                | otherwise = Pane i
+              go t@(PaneTabs tid ps _)
+                | targetPid `elem` ps = PaneTabs tid (filter (/= newPid) ps ++ [newPid]) newPid
+                | otherwise = t
               go (Split i sAx r a b) = Split i sAx r (go a) (go b)
            in go tree
 
 encodeTree :: GridNode -> Text
 encodeTree = \case
-  Pane i -> maybe ("pane." <> tshow i) pkKey (paneKind i)
+  Pane i -> keyOf i
+  PaneTabs _ ps act -> "(t " <> keyOf act <> " " <> T.unwords (map keyOf ps) <> ")"
   Split _ ax r a b ->
     "(" <> (if ax == AxisV then "v" else "h") <> " " <> T.pack (showFFloat (Just 3) r "") <> " " <> encodeTree a <> " " <> encodeTree b <> ")"
+  where
+    keyOf i = maybe ("pane." <> tshow i) pkKey (paneKind i)
 
 -- | Read a tree back, giving its splits fresh ids. Unknown pane names, a
 -- pane named twice and ratios outside @(0, 1)@ are refused, and the result
@@ -277,26 +299,41 @@ decodeTree src = do
     lexeme :: StateT Word64 (Parsec Void Text) a -> StateT Word64 (Parsec Void Text) a
     lexeme p = p <* hspace
     wordChar c = not (isSpace c) && c /= '(' && c /= ')'
+    pPaneId :: StateT Word64 (Parsec Void Text) Word64
+    pPaneId = do
+      w <- lexeme (takeWhile1P Nothing wordChar)
+      case paneKindNamed w of
+        Just k -> pure (pkId k)
+        Nothing -> fail ("unknown pane " <> T.unpack w)
+    pMany1 :: StateT Word64 (Parsec Void Text) a -> StateT Word64 (Parsec Void Text) [a]
+    pMany1 p = do
+      x <- p
+      choice [((x :) <$> pMany1 p), pure [x]]
     pNode :: StateT Word64 (Parsec Void Text) GridNode
     pNode =
       choice
         [ between (lexeme (char '(')) (lexeme (char ')')) do
-            splitId <- get <* modify (+ 1)
-            ax <- lexeme (takeWhile1P Nothing wordChar)
-            axis <- case ax of
-              "v" -> pure AxisV
-              "h" -> pure AxisH
-              _ -> fail ("unknown split " <> T.unpack ax)
-            rTxt <- lexeme (takeWhile1P Nothing wordChar)
-            ratio <- case readDouble rTxt of
-              Just x | x > 0 && x < 1 -> pure (realToFrac x)
-              _ -> fail ("bad ratio " <> T.unpack rTxt)
-            Split splitId axis ratio <$> pNode <*> pNode
-        , do
-            w <- lexeme (takeWhile1P Nothing wordChar)
-            case paneKindNamed w of
-              Just k -> pure (Pane (pkId k))
-              Nothing -> fail ("unknown pane " <> T.unpack w)
+            nodeId <- get <* modify (+ 1)
+            tag <- lexeme (takeWhile1P Nothing wordChar)
+            case tag of
+              "t" -> do
+                act <- pPaneId
+                ps <- pMany1 pPaneId
+                pure (PaneTabs nodeId ps act)
+              "v" -> do
+                rTxt <- lexeme (takeWhile1P Nothing wordChar)
+                ratio <- case readDouble rTxt of
+                  Just x | x > 0 && x < 1 -> pure (realToFrac x)
+                  _ -> fail ("bad ratio " <> T.unpack rTxt)
+                Split nodeId AxisV ratio <$> pNode <*> pNode
+              "h" -> do
+                rTxt <- lexeme (takeWhile1P Nothing wordChar)
+                ratio <- case readDouble rTxt of
+                  Just x | x > 0 && x < 1 -> pure (realToFrac x)
+                  _ -> fail ("bad ratio " <> T.unpack rTxt)
+                Split nodeId AxisH ratio <$> pNode <*> pNode
+              _ -> fail ("unknown split " <> T.unpack tag)
+        , Pane <$> pPaneId
         ]
 
 -- ---------------------------------------------------------------------------
@@ -406,6 +443,7 @@ workspace places popped bench draw = do
           , pgLeeway = 3
           , pgFocusable = False
           , pgTree = ControlledTree tree
+          , pgTabTitle = paneTitle
           , pgDividerColor = Just (inkGround (ink th))
           , pgViewPane = \pid g -> do
               let ctx = PaneCtx (Just g) (Just (menu pid)) (Just pid) (Just bench)

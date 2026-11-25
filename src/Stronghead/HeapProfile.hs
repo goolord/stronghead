@@ -28,6 +28,8 @@ module Stronghead.HeapProfile
   ) where
 
 import Control.Applicative ((<|>))
+import Control.Exception (IOException, displayException, try)
+import Data.Bifunctor (first)
 import Data.Containers.ListUtils (nubOrd)
 import Data.IntMap.Strict qualified as IM
 import Data.List (sortOn, unsnoc)
@@ -217,7 +219,9 @@ closureTypeKind t
 -- .hp files
 
 loadHp :: FilePath -> IO (Either String HeapProfile)
-loadHp path = parseHp <$> readTextFile path
+loadHp path = do
+  eTxt <- first displayException <$> try @IOException (readTextFile path)
+  pure (eTxt >>= parseHp)
 
 data HpAcc = HpAcc
   { accJob :: !Text

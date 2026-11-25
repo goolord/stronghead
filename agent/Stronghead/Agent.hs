@@ -26,6 +26,7 @@ module Stronghead.Agent
   , withAgent
   , startAgent
   , startAgentListening
+  , stopAgent
   , agentBeaconsDir
     -- * Zero-overhead spans & allocation tripwires
   , withSpan
@@ -373,16 +374,31 @@ removeBeacon = mapM_ (\p -> void (try @SomeException (removeFile p)))
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 
+{-# NOINLINE agentSocketsRef #-}
+agentSocketsRef :: IORef (Map ThreadId Socket)
+agentSocketsRef = unsafePerformIO (newIORef M.empty)
+
+-- | Close the listening sockets of threads returned by 'startAgent' or
+-- 'startAgentListening' (waking any blocking Windows @accept@ call) and
+-- terminate the threads asynchronously.
+stopAgent :: [ThreadId] -> IO ()
+stopAgent ts = do
+  socks <- atomicModifyIORef' agentSocketsRef \m ->
+    let picked = [s | t <- ts, Just s <- [M.lookup t m]]
+        m' = foldl' (flip M.delete) m ts
+     in (m', picked)
+  mapM_ (void . try @SomeException . close) socks
+  mapM_ (forkIO . killThread) ts
+
 -- | Run an action with the agent server running in the background.
 --
 -- On Windows, a blocking @accept@ is an uninterruptible foreign call, so
--- synchronous 'killThread' would block; cleanup kills the threads
--- asynchronously instead.
+-- 'stopAgent' closes the listening socket first before killing the threads.
 withAgent :: AgentConfig -> IO a -> IO a
 withAgent cfg act =
   bracket
     (startAgentInternal cfg)
-    (\(_, mBeacon, ts) -> removeBeacon mBeacon >> mapM_ (forkIO . killThread) ts)
+    (\(_, mBeacon, ts) -> removeBeacon mBeacon >> stopAgent ts)
     (\_ -> act)
 
 -- | Start the server (and the eventlog flusher); returns their threads.
@@ -425,8 +441,12 @@ serve cfg portVar = do
   case listToMaybe addrs of
     Nothing -> void (tryPutMVar portVar (agentPort cfg))
     Just addr -> do
+      tid <- myThreadId
       let accepting = fromMaybe (isLoopback (addrAddress addr)) (agentAcceptCommands cfg)
-      bracket (openSocket addr) close \sock -> do
+      bracket
+        (do sock <- openSocket addr; atomicModifyIORef' agentSocketsRef (\m -> (M.insert tid sock m, ())); pure sock)
+        (\sock -> atomicModifyIORef' agentSocketsRef (\m -> (M.delete tid m, ())) >> void (try @SomeException (close sock)))
+        \sock -> do
         setSocketOption sock ReuseAddr 1
         bind sock (addrAddress addr)
         actualPort <- fromIntegral <$> socketPort sock

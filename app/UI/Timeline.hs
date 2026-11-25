@@ -674,8 +674,10 @@ drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
       px = rPlotX rows
       pw = rPlotW rows
       font = mmFont mm
-      label' y txt = drawTextClipped font (mmCharW mm) (V2 (x + 14) y) (gutterW - 26) txt (pText pal)
-      sub y txt = drawTextClipped font (mmCharW mm) (V2 (x + 14) y) (gutterW - 26) txt (pMuted pal)
+      fm = mmMetrics mm
+      lineH = mmLineH mm
+      label' y txt = drawTextClippedWith fm font EllipsisEnd (Rect (x + 14) (y - lineH / 2) (gutterW - 26) lineH) AlignStart AlignMiddle txt (pText pal)
+      sub y txt = drawTextClippedWith fm font EllipsisEnd (Rect (x + 14) (y - lineH / 2) (gutterW - 26) lineH) AlignStart AlignMiddle txt (pMuted pal)
       capsBottom = maximum (rectY (rRuler rows) + rulerH : [cy + ch | Rect _ cy _ ch <- rCaps rows ++ rCode rows])
   drawGutter pal r
   drawRuler pal mm tl v (rRuler rows)
@@ -846,7 +848,7 @@ drawCodeTrack pal mm tl v r@(Rect x y w h) runs focusCC = do
             bw = max 1 (xb - xa)
         drawRect (Rect xa (y + 1) bw (h - 2)) (colour (crCostCentre cr))
         when (bw > 40) $ for_ (info (crCostCentre cr)) $ \c ->
-          drawTextClipped (mmFont mm) (mmCharW mm) (V2 (xa + 3) (y + h / 2)) (bw - 6) (cciLabel c) (pText pal)
+          drawTextClippedWith (mmMetrics mm) (mmFont mm) EllipsisMiddle (Rect (xa + 3) y (bw - 6) h) AlignStart AlignMiddle (cciLabel c) (pText pal)
       else do
         -- Too many to draw: keep the most sampled run per pixel.
         let buckets =
@@ -1096,7 +1098,7 @@ threadsSection env st pal mm tl v sel marks = do
             when (even i) $ drawRect (Rect x ry w threadRowH) (alpha 0.022 (pText pal))
             when focused $ drawRect (Rect x ry w threadRowH) (alpha 0.18 (pSelection pal))
             when (not focused && isHover (RThread rk (tiId ti))) $ drawRect (Rect x ry w threadRowH) (alpha 0.06 (pText pal))
-            drawTextClipped (mmFont mm) (mmCharW mm) (V2 (x + 14) (ry + threadRowH / 2)) (gutterW - 26) (threadName ti) (if focused then pAccent pal else pText pal)
+            drawTextClippedWith (mmMetrics mm) (mmFont mm) EllipsisMiddle (Rect (x + 14) ry (gutterW - 26) threadRowH) AlignStart AlignMiddle (threadName ti) (if focused then pAccent pal else pText pal)
             drawTrack pal v rowRect (tiTrack ti) [(kindRun, pRun pal), (kindBlocked, pBlocked pal), (kindRunnable, pRunnable pal)] False
             case sel of
               Just (SelSpan (OnThread tid) k) | tid == tiId ti -> outlineSpan pal v rowRect (tiTrack ti) k

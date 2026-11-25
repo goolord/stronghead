@@ -32,6 +32,7 @@ import Stronghead.Agent
   , getEra
   , startAgent
   , startAgentListening
+  , stopAgent
   , unregisterProbe
   , withAllocGuard
   , withEra
@@ -72,7 +73,7 @@ import Stronghead.TextFile (readTextFile, writeTextFile)
 import Stronghead.Triage
 import Stronghead.Source
 import Stronghead.Watch
-import System.Directory (createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getTemporaryDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath (pathSeparator, (</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
@@ -831,22 +832,28 @@ main = do
     fmap (map ruOn . sesWatchers) (decodeSession "version = 1\nwatch.1 = band-growing n=4 on=true\n") == Right [False, False, False, True]
 
   putStrLn "mcp tools"
-  leakRes <- MCPTools.diagnoseLeak "stronghead-sample.hp" 5 0.1
+  hasRootHp <- doesFileExist "stronghead-sample.hp"
+  hasRootEv <- doesFileExist "stronghead-sample.eventlog"
+  let sampleHpPath = if hasRootHp then "stronghead-sample.hp" else "scratch/stronghead-sample.hp"
+      sampleEvPath = if hasRootEv then "stronghead-sample.eventlog" else "scratch/stronghead-sample.eventlog"
+  missingHpRes <- MCPTools.diagnoseLeak "nonexistent-stronghead-sample.hp" 5 0.1
+  check "mcp: missing .hp file returns Left cleanly" (isLeft missingHpRes)
+  leakRes <- MCPTools.diagnoseLeak sampleHpPath 5 0.1
   check "mcp: leak diagnosis detects THUNK_2_0" $ case leakRes of
     Right txt -> "THUNK_2_0" `T.isInfixOf` txt && "Leak Suspects Analysis" `T.isInfixOf` txt
     Left _ -> False
 
-  evRes <- MCPTools.eventlogSummary "stronghead-sample.eventlog" 5
+  evRes <- MCPTools.eventlogSummary sampleEvPath 5
   check "mcp: eventlog summary reports contention and GC pause" $ case evRes of
     Right txt -> "MVar Lock Contention Detected" `T.isInfixOf` txt && "GC Execution Time" `T.isInfixOf` txt
     Left _ -> False
 
-  diffRes <- MCPTools.diffRuns "stronghead-sample.hp" "stronghead-sample.hp" Nothing Nothing
+  diffRes <- MCPTools.diffRuns sampleHpPath sampleHpPath Nothing Nothing
   check "mcp: diff runs identifies unchanged bands" $ case diffRes of
     Right txt -> "UNCHANGED" `T.isInfixOf` txt && "Overall Metric Deltas" `T.isInfixOf` txt
     Left _ -> False
 
-  diffEvRes <- MCPTools.diffRuns "stronghead-sample.eventlog" "stronghead-sample.eventlog" Nothing Nothing
+  diffEvRes <- MCPTools.diffRuns sampleEvPath sampleEvPath Nothing Nothing
   check "mcp: diff runs supports eventlog runtime deltas" $ case diffEvRes of
     Right txt -> "Eventlog Runtime Deltas" `T.isInfixOf` txt && "GC Pause p99" `T.isInfixOf` txt
     Left _ -> False
@@ -1644,7 +1651,8 @@ agentChecks check = do
   check "v1 client: only lines it knows or skips" (all (`elem` ["H", "I", "S", "T", "C", "E"]) kinds && "T" `elem` kinds && "E" `elem` kinds)
   check "v1 client: thread lines unchanged" (and [length (words l) >= 3 | l <- raw, take 2 l == "T "])
   -- A v2 client reading a v1 agent, which never reads what it is sent.
-  v1 <- forkIO (fakeV1Agent 47773)
+  v1Socks <- newIORef ([] :: [N.Socket])
+  v1 <- forkIO (fakeV1Agent v1Socks 47773)
   threadDelay 100000
   (events3, client3) <- listen 47773
   box3 <- waitFor events3 (\case LiveConnected b -> Just b; _ -> Nothing)
@@ -1655,8 +1663,10 @@ agentChecks check = do
   check "v1 agent: frames still arrive" (isJust frames && not (null [() | LiveHello "prog" 7 1 <- seen]))
   check "v1 agent: no info line, so no replies" (null [() | LiveInfo _ <- seen] && null [() | LiveReply _ _ <- seen])
   stop client3
-  -- A synchronous kill would wait on a blocking accept (Windows).
-  mapM_ (forkIO . killThread) (v1 : agent ++ closed)
+  -- Close listening sockets first so blocking Winsock calls return cleanly.
+  readIORef v1Socks >>= mapM_ (void . try @SomeException . N.close)
+  void (forkIO (killThread v1))
+  stopAgent (agent ++ closed)
   where
     listen port = do
       events <- newIORef []
@@ -1695,16 +1705,20 @@ rawLines port =
 
 -- | An agent from before protocol v2: hello and frames, and it never reads
 -- the socket.
-fakeV1Agent :: Int -> IO ()
-fakeV1Agent port = do
+fakeV1Agent :: IORef [N.Socket] -> Int -> IO ()
+fakeV1Agent socksRef port = do
   addrs <- N.getAddrInfo (Just N.defaultHints {N.addrFlags = [N.AI_PASSIVE], N.addrSocketType = N.Stream}) (Just "127.0.0.1") (Just (show port))
   for_ (listToMaybe addrs) $ \addr ->
-    bracket (N.openSocket addr) N.close $ \sock -> do
-      N.setSocketOption sock N.ReuseAddr 1
-      N.bind sock (N.addrAddress addr)
-      N.listen sock 1
-      (conn, _) <- N.accept sock
-      NB.sendAll conn "H prog 7 1\n"
-      forever $ do
-        NB.sendAll conn "S rts_stats=0\nT 1 running main\nE\n"
-        threadDelay 50000
+    bracket
+      (do s <- N.openSocket addr; atomicModifyIORef' socksRef (\ss -> (s : ss, ())); pure s)
+      (void . try @SomeException . N.close)
+      $ \sock -> do
+        N.setSocketOption sock N.ReuseAddr 1
+        N.bind sock (N.addrAddress addr)
+        N.listen sock 1
+        (conn, _) <- N.accept sock
+        atomicModifyIORef' socksRef (\ss -> (conn : ss, ()))
+        NB.sendAll conn "H prog 7 1\n"
+        forever $ do
+          NB.sendAll conn "S rts_stats=0\nT 1 running main\nE\n"
+          threadDelay 50000

@@ -37,10 +37,8 @@ flamegraphView ft zoomVar = do
   th <- uiTheme
   mm <- monoMetrics 0.82
   zoomed <- readVar zoomVar
-  inp <- askInput
   let pal = palette th
       viewTree = maybe ft (\target -> fromMaybe ft (zoomInto target ft)) zoomed
-      mouse = inputMousePos inp
   columnWith (tight . fillW . fillH . gap 6) $ do
     rowWith (tight . gap 8 . alignMid . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) (ftTitle viewTree)
@@ -55,29 +53,18 @@ flamegraphView ft zoomVar = do
     if null (ftRoots viewTree) || ftTotal viewTree <= 0
       then hint "No stack samples available for this view."
       else do
-        sid <- currentId
-        prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
-        let hoverRect = if rectContains prev mouse then fst <$> findHit mouse (layoutFlame prev viewTree) else Nothing
-        resp <-
-          canvasConfigured
-            defaultCanvasConfig
-              { canvasLayout = (fillW . grow . minH 180) defaultLayout
-              , canvasTrackPointer = True
-              , canvasCursor = Just (\_ _ _ -> UiCursorPointer)
-              }
-            $ \r -> do
+        (_, mClicked) <-
+          canvasRegions
+            (fillW . grow . minH 180)
+            (\r -> flameRegions r viewTree)
+            $ \r mHover -> do
               drawFlameTree pal mm r viewTree
-              case hoverRect of
-                Just (Rect hx hy hw hh) ->
+              case mHover of
+                Just (_, Rect hx hy hw hh) ->
                   drawStrokeRoundedRect (Rect (hx + 0.5) (hy + 0.5) (max 1 (hw - 2)) (max 1 (hh - 2))) 2 1.5 (pText pal)
                 Nothing -> pure ()
-        let boxes = layoutFlame (respRect resp) viewTree
-            hit = if respHovered resp then findHit mouse boxes else Nothing
-        case hit of
-          Just (_, n) -> do
-            let pct = if ftTotal viewTree > 0 then fnTotal n / ftTotal viewTree else 0
-            tooltip resp (fnName n <> "\ntotal: " <> fmtFixed 1 (fnTotal n) <> " (" <> fmtPct pct <> "), self: " <> fmtFixed 1 (fnSelf n) <> "\nClick to zoom")
-            when (respClicked resp) (writeVar zoomVar (Just (fnName n)))
+        case mClicked of
+          Just n -> writeVar zoomVar (Just (fnName n))
           Nothing -> pure ()
 
 -- | Draw a differential flamegraph comparing baseline vs current: red frames
@@ -86,9 +73,7 @@ diffFlamegraphView :: DiffFlameTree -> NanoUI ()
 diffFlamegraphView dft = do
   th <- uiTheme
   mm <- monoMetrics 0.82
-  inp <- askInput
   let pal = palette th
-      mouse = inputMousePos inp
   columnWith (tight . fillW . fillH . gap 6) $ do
     rowWith (tight . gap 8 . alignMid . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) (dftTitle dft)
@@ -98,27 +83,99 @@ diffFlamegraphView dft = do
     if null (dftRoots dft)
       then hint "No differential flamegraph frames available."
       else do
-        sid <- currentId
-        prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
-        let hoverRect = if rectContains prev mouse then fst <$> findHit mouse (layoutDiffFlame prev dft) else Nothing
-        resp <-
-          canvasConfigured
-            defaultCanvasConfig
-              { canvasLayout = (fillW . grow . minH 180) defaultLayout
-              , canvasTrackPointer = True
-              }
-            $ \r -> do
+        _ <-
+          canvasRegions
+            (fillW . grow . minH 180)
+            (\r -> diffFlameRegions r dft)
+            $ \r mHover -> do
               drawDiffFlameTree pal mm r dft
-              case hoverRect of
-                Just (Rect hx hy hw hh) ->
+              case mHover of
+                Just (_, Rect hx hy hw hh) ->
                   drawStrokeRoundedRect (Rect (hx + 0.5) (hy + 0.5) (max 1 (hw - 2)) (max 1 (hh - 2))) 2 1.5 (pText pal)
                 Nothing -> pure ()
-        let boxes = layoutDiffFlame (respRect resp) dft
-            hit = if respHovered resp then findHit mouse boxes else Nothing
-        case hit of
-          Just (_, n) ->
-            tooltip resp (dfnName n <> "\nbase: " <> fmtFixed 1 (dfnBaseTotal n) <> " → cur: " <> fmtFixed 1 (dfnCurTotal n) <> " (delta " <> (if dfnDelta n >= 0 then "+" else "") <> fmtFixed 1 (dfnDelta n) <> ")")
-          Nothing -> pure ()
+        pure ()
+
+flameRegions :: Rect -> FlameTree -> [(FlameNode, Rect, Maybe Text, UiCursorKind)]
+flameRegions r ft =
+  [ (node, box, Just tip, UiCursorPointer)
+  | (box, node) <- layoutFlame r ft
+  , let pct = if ftTotal ft > 0 then fnTotal node / ftTotal ft else 0
+        tip =
+          fnName node
+            <> "\ntotal: "
+            <> fmtFixed 1 (fnTotal node)
+            <> " ("
+            <> fmtPct pct
+            <> "), self: "
+            <> fmtFixed 1 (fnSelf node)
+            <> "\nClick to zoom"
+  ]
+
+diffFlameRegions :: Rect -> DiffFlameTree -> [(DiffFlameNode, Rect, Maybe Text, UiCursorKind)]
+diffFlameRegions r dft =
+  [ (node, box, Just tip, UiCursorDefault)
+  | (box, node) <- layoutDiffFlame r dft
+  , let tip =
+          dfnName node
+            <> "\nbase: "
+            <> fmtFixed 1 (dfnBaseTotal node)
+            <> " → cur: "
+            <> fmtFixed 1 (dfnCurTotal node)
+            <> " (delta "
+            <> (if dfnDelta node >= 0 then "+" else "")
+            <> fmtFixed 1 (dfnDelta node)
+            <> ")"
+  ]
+
+-- | Interactive canvas over typed hit regions @[(a, Rect, Maybe Text, UiCursorKind)]@
+-- (last matching region wins), handling hover highlight, press-and-release click
+-- matching on the same region, pointer cursor, and tooltip.
+canvasRegions ::
+  (Layout -> Layout) ->
+  (Rect -> [(a, Rect, Maybe Text, UiCursorKind)]) ->
+  (Rect -> Maybe (a, Rect) -> CanvasM ()) ->
+  NanoUI (Response, Maybe a)
+canvasRegions layoutMod mkRegions draw = do
+  inp <- askInput
+  let mouse = inputMousePos inp
+  pressedIdxVar <- useVar (-1 :: Int)
+  sid <- currentId
+  prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
+  let hitIn rs pt =
+        foldl'
+          (\acc entry@(_, (_, box, _, _)) -> if rectContains box pt then Just entry else acc)
+          Nothing
+          rs
+      prevHit = if rectContains prev mouse then hitIn (zip [0 :: Int ..] (mkRegions prev)) mouse else Nothing
+      mHover = fmap (\(_, (k, box, _, _)) -> (k, box)) prevHit
+      cursorAt _ r pos =
+        case hitIn (zip [0 :: Int ..] (mkRegions r)) pos of
+          Just (_, (_, _, _, cur)) -> cur
+          Nothing -> UiCursorDefault
+  resp <-
+    canvasConfigured
+      defaultCanvasConfig
+        { canvasLayout = layoutMod defaultLayout
+        , canvasTrackPointer = True
+        , canvasCursor = Just cursorAt
+        }
+      (\r -> draw r mHover)
+  let curHit = if respHovered resp then hitIn (zip [0 :: Int ..] (mkRegions (respRect resp))) mouse else Nothing
+  when (respHovered resp && pressedIn MouseLeft inp) $
+    writeVar pressedIdxVar (maybe (-1) fst curHit)
+  pressedIdx <- readVar pressedIdxVar
+  clicked <-
+    if releasedIn MouseLeft inp
+      then do
+        writeVar pressedIdxVar (-1)
+        pure $ case curHit of
+          Just (idx, (k, _, _, _)) | idx == pressedIdx && idx >= 0 -> Just k
+          _ -> Nothing
+      else pure Nothing
+  case curHit of
+    Just (_, (_, _, Just tip, _)) -> tooltip resp tip
+    _ -> pure ()
+  pure (resp, clicked)
 
 -- | Render a 'FlameTree' onto a @nano-ui@ canvas (usable live or in SVG export).
 drawFlameTree :: Palette -> MonoMetrics -> Rect -> FlameTree -> CanvasM ()
@@ -127,10 +184,8 @@ drawFlameTree pal mm r ft = withClip r $ do
   forM_ (layoutFlame r ft) $ \(Rect bx by bw bh, node) -> do
     let col = flameColor (fnName node)
     drawRoundedRect (Rect bx by (max 1 (bw - 1)) (max 1 (bh - 1))) 2 col
-    when (bw >= 36) $ do
-      let maxChars = max 1 (floor ((bw - 8) / max 1 (mmCharW mm)))
-          lbl = clipText maxChars (fnName node)
-      drawTextWith (mmFont mm) (V2 (bx + 4) (by + bh / 2)) AlignStart AlignMiddle lbl (colorRGB 20 22 26)
+    when (bw >= 36) $
+      drawTextClippedWith (mmMetrics mm) (mmFont mm) EllipsisMiddle (Rect (bx + 4) by (bw - 8) bh) AlignStart AlignMiddle (fnName node) (colorRGB 20 22 26)
 
 drawDiffFlameTree :: Palette -> MonoMetrics -> Rect -> DiffFlameTree -> CanvasM ()
 drawDiffFlameTree pal mm r dft = withClip r $ do
@@ -143,10 +198,8 @@ drawDiffFlameTree pal mm r dft = withClip r $ do
           | ratio < -0.05 = blendColor (colorRGB 215 215 220) (colorRGB 72 156 235) (realToFrac (negate ratio))
           | otherwise = colorRGB 190 194 202
     drawRoundedRect (Rect bx by (max 1 (bw - 1)) (max 1 (bh - 1))) 2 col
-    when (bw >= 36) $ do
-      let maxChars = max 1 (floor ((bw - 8) / max 1 (mmCharW mm)))
-          lbl = clipText maxChars (dfnName node)
-      drawTextWith (mmFont mm) (V2 (bx + 4) (by + bh / 2)) AlignStart AlignMiddle lbl (colorRGB 20 22 26)
+    when (bw >= 36) $
+      drawTextClippedWith (mmMetrics mm) (mmFont mm) EllipsisMiddle (Rect (bx + 4) by (bw - 8) bh) AlignStart AlignMiddle (dfnName node) (colorRGB 20 22 26)
 
 layoutFlame :: Rect -> FlameTree -> [(Rect, FlameNode)]
 layoutFlame (Rect rx ry rw rh) ft =
@@ -193,14 +246,6 @@ zoomInto target ft = case findNode (ftRoots ft) of
           Just found -> Just found
           Nothing -> findNode ns
 
-findHit :: V2 -> [(Rect, a)] -> Maybe (Rect, a)
-findHit (V2 px py) = go
-  where
-    go [] = Nothing
-    go (pair@(Rect x y w h, _) : rest)
-      | px >= x && px <= x + w && py >= y && py <= y + h = Just pair
-      | otherwise = go rest
-
 flameColor :: Text -> Color
 flameColor name =
   let h = T.foldl' (\acc c -> (acc * 33 + ord c) `mod` 997) (17 :: Int) name
@@ -214,12 +259,6 @@ blendColor a b t0 =
   let t = max 0 (min 1 t0)
       lerp x y = round (fromIntegral x + (fromIntegral y - fromIntegral x) * t)
    in colorRGB (lerp (colorR a) (colorR b)) (lerp (colorG a) (colorG b)) (lerp (colorB a) (colorB b))
-
-clipText :: Int -> Text -> Text
-clipText n t
-  | T.length t <= n = t
-  | n <= 1 = "…"
-  | otherwise = T.take (n - 1) t <> "…"
 
 -- ---------------------------------------------------------------------------
 -- 2D HDR Latency Heatmap View

@@ -61,7 +61,6 @@ import Data.Set qualified as S
 import Data.Word (Word64)
 import System.Directory (getFileSize)
 import System.FilePath (takeFileName)
-import Numeric (showFFloat)
 
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -658,86 +657,86 @@ profilePanes env st loaded logTl hp site = do
       fitView = cwFit cw
   pure $ \pid ctx ->
     if
-      | pid == paneHeapChart -> Just $ do
-          winW <- windowWidth
-          let compact = winW < 1260
-              veryCompact = winW < 1120
-              actions = do
-                paneMeta $
-                  if
-                    | source /= FromHpFile -> "Program time"
-                    | cmExact clock -> if compact then "Paired time" else "Program time, paired with the eventlog's censuses"
-                    | otherwise -> if compact then "Approx. clock" else "Approximate: a .hp file keeps its own clock"
-                scope $ when (following && source == FromEventlog) $
-                  if tracking
-                    then paneMeta (if compact then "· live" else "· following the newest census")
-                    else whenM (buttonWith (alignMid . padXY 8 2 . tight) "Follow the latest") (writeVar (hsTracking st) True)
-                flex
-                scope $ for_ solo $ \s -> whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
-                scope $ unless (S.null hidden) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show all bands") (writeVar (hsHidden st) S.empty)
-                scope $ when (cwOwn cw && not (cwLocked cw)) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Fit") fitView
-                scope $
-                  if placed && cwLocked cw
-                    then paneMeta (if veryCompact then "Timeline axis" else "On the Timeline's axis")
-                    else disabledWhen (not (cwLockable cw)) $ do
-                      (_, lockArea) <- mouseArea alignMid $ checkboxWith alignMid (if veryCompact then "Lock" else "Lock to Timeline") (hsLock st)
-                      when veryCompact (tooltip lockArea "Lock heap time window to Timeline")
-                labelWith (alignMid . fontMuted . fontSizeScale 0.85) (if veryCompact then "Top " <> tshow topN else "Top " <> tshow topN <> " bands")
-                sliderWith (alignMid . fixedW (if compact then 68 else 104)) 3 30 (hsTopN st)
-          paneWith (padAll 8) ctx "Residency" actions $ do
-            inp <- askInput
-            let mouse = inputMousePos inp
-                mods = inputModifiers inp
-            sid <- currentId
-            prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
-            let plot0 = chartPlot prev
-                hoverLines = do
-                  guard (rectContains plot0 mouse)
-                  let i = nearestIndex (hpTimes hp) (xToTime v (rectX plot0) (rectW plot0) (v2X mouse) / 1e9)
-                      stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
-                      bytesAtMouse = (1 - (v2Y mouse - rectY plot0) / rectH plot0) * realToFrac ymax
-                      under = [l | (l, lo', hi') <- zip3 ls stackAt (drop 1 stackAt), realToFrac bytesAtMouse >= lo', realToFrac bytesAtMouse < hi']
-                  pure $
-                    ("t = " <> fmtSec (times VU.! i) <> approx <> ", total " <> fmtBytesD (hpTotals hp VU.! i))
-                      : [lyName l <> ": " <> fmtBytesD (lyValues l VU.! i) | l <- take 1 under]
-            resp <-
-              canvasConfigured
-                defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
-                (\r -> drawChart pal mm hp ls ymax v cursorIx (chartAxis rk clock v (chartPlot r)) marks {tmCursor = Nothing} r (fmap (v2X mouse,v2Y mouse,) hoverLines))
-            let plot@(Rect px py pw ph) = chartPlot (respRect resp)
-                onAxis = v2Y mouse >= py + ph && v2X mouse >= px && v2X mouse <= px + pw
-            canvasLinks env resp (chartRefAt hp ls ymax v (respRect resp))
-            -- Shift+drag selects a range; a drag that starts on the time
-            -- axis pans; any other drag moves the cursor; the wheel zooms.
-            brushing <- timeGestures env (chartAxis rk clock v plot) resp ScrubNone
-            panning <- readVar (hsPanning st)
-            let panNow
-                  | respHovered resp && pressedIn MouseLeft inp = onAxis && not (modShift mods) && not (modCtrl mods)
-                  | otherwise = panning && heldIn MouseLeft inp
-            when (panNow /= panning) (writeVar (hsPanning st) panNow)
-            (wx, wy) <- useWheelDeltaOn resp
-            when (wy /= 0) $ setView (zoomAround (wheelZoom wy) (xToTime v px pw (v2X mouse)) v)
-            when (wx /= 0) $ setView (wheelPan wx v)
-            drag <- useDrag2DOn resp
-            let dx = v2X (dragDelta drag)
-            when (panNow && dragActive drag && dx /= 0) $ setView (dragPan pw dx v)
-            when (respHovered resp && pressedIn MouseLeft inp && inputMouseClicks inp >= 2 && onAxis) fitView
-            when (dragActive drag && not panNow && not brushing && not (modCtrl mods) && not (modShift mods)) $ do
-              let i = nearestIndex (hpTimes hp) (xToTime v px pw (v2X (dragPosition drag)) / 1e9)
-              when (cursorT /= Just (times VU.! i)) $ writeVar (hsCursor st) (Just (times VU.! i))
+      | pid == paneHeapChart -> Just $
+          withContainerWidth (grow . minW 0 . minH 0) $ \paneW -> do
+            let compact = paneW < 920
+                veryCompact = paneW < 760
+                actions = do
+                  paneMeta $
+                    if
+                      | source /= FromHpFile -> "Program time"
+                      | cmExact clock -> if compact then "Paired time" else "Program time, paired with the eventlog's censuses"
+                      | otherwise -> if compact then "Approx. clock" else "Approximate: a .hp file keeps its own clock"
+                  scope $ when (following && source == FromEventlog) $
+                    if tracking
+                      then paneMeta (if compact then "· live" else "· following the newest census")
+                      else whenM (buttonWith (alignMid . padXY 8 2 . tight) "Follow the latest") (writeVar (hsTracking st) True)
+                  flex
+                  scope $ for_ solo $ \s -> whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Unsolo " <> T.take 24 s)) (writeVar (hsSolo st) Nothing)
+                  scope $ unless (S.null hidden) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Show all bands") (writeVar (hsHidden st) S.empty)
+                  scope $ when (cwOwn cw && not (cwLocked cw)) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Fit") fitView
+                  scope $
+                    if placed && cwLocked cw
+                      then paneMeta (if veryCompact then "Timeline axis" else "On the Timeline's axis")
+                      else disabledWhen (not (cwLockable cw)) $ do
+                        (_, lockArea) <- mouseArea alignMid $ checkboxWith alignMid (if veryCompact then "Lock" else "Lock to Timeline") (hsLock st)
+                        when veryCompact (tooltip lockArea "Lock heap time window to Timeline")
+                  labelWith (alignMid . fontMuted . fontSizeScale 0.85) (if veryCompact then "Top " <> tshow topN else "Top " <> tshow topN <> " bands")
+                  sliderWith (alignMid . fixedW (if compact then 68 else 104)) 3 30 (hsTopN st)
+            paneWith (padAll 8) ctx "Residency" actions $ do
+              inp <- askInput
+              let mouse = inputMousePos inp
+                  mods = inputModifiers inp
+              sid <- currentId
+              prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
+              let plot0 = chartPlot prev
+                  hoverLines = do
+                    guard (rectContains plot0 mouse)
+                    let i = nearestIndex (hpTimes hp) (xToTime v (rectX plot0) (rectW plot0) (v2X mouse) / 1e9)
+                        stackAt = scanl (+) 0 [lyValues l VU.! i | l <- ls]
+                        bytesAtMouse = (1 - (v2Y mouse - rectY plot0) / rectH plot0) * realToFrac ymax
+                        under = [l | (l, lo', hi') <- zip3 ls stackAt (drop 1 stackAt), realToFrac bytesAtMouse >= lo', realToFrac bytesAtMouse < hi']
+                    pure $
+                      ("t = " <> fmtSec (times VU.! i) <> approx <> ", total " <> fmtBytesD (hpTotals hp VU.! i))
+                        : [lyName l <> ": " <> fmtBytesD (lyValues l VU.! i) | l <- take 1 under]
+              resp <-
+                canvasConfigured
+                  defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
+                  (\r -> drawChart pal mm hp ls ymax v cursorIx (chartAxis rk clock v (chartPlot r)) marks {tmCursor = Nothing} r (fmap (v2X mouse,v2Y mouse,) hoverLines))
+              let plot@(Rect px py pw ph) = chartPlot (respRect resp)
+                  onAxis = v2Y mouse >= py + ph && v2X mouse >= px && v2X mouse <= px + pw
+              canvasLinks env resp (chartRefAt hp ls ymax v (respRect resp))
+              -- Shift+drag selects a range; a drag that starts on the time
+              -- axis pans; any other drag moves the cursor; the wheel zooms.
+              brushing <- timeGestures env (chartAxis rk clock v plot) resp ScrubNone
+              panning <- readVar (hsPanning st)
+              let panNow
+                    | respHovered resp && pressedIn MouseLeft inp = onAxis && not (modShift mods) && not (modCtrl mods)
+                    | otherwise = panning && heldIn MouseLeft inp
+              when (panNow /= panning) (writeVar (hsPanning st) panNow)
+              (wx, wy) <- useWheelDeltaOn resp
+              when (wy /= 0) $ setView (zoomAround (wheelZoom wy) (xToTime v px pw (v2X mouse)) v)
+              when (wx /= 0) $ setView (wheelPan wx v)
+              drag <- useDrag2DOn resp
+              let dx = v2X (dragDelta drag)
+              when (panNow && dragActive drag && dx /= 0) $ setView (dragPan pw dx v)
+              when (respHovered resp && pressedIn MouseLeft inp && inputMouseClicks inp >= 2 && onAxis) fitView
+              when (dragActive drag && not panNow && not brushing && not (modCtrl mods) && not (modShift mods)) $ do
+                let i = nearestIndex (hpTimes hp) (xToTime v px pw (v2X (dragPosition drag)) / 1e9)
+                when (cursorT /= Just (times VU.! i)) $ writeVar (hsCursor st) (Just (times VU.! i))
       | pid == paneHeapBands ->
           Just (paneWith (padAll 6 . gap 2) ctx "Bands" (paneMeta (tshow (V.length (hpBands hp)) <> ", by " <> hpBreakdown hp)) (legend env st hp hidden solo))
-      | pid == paneHeapAnalysis -> Just $ do
-          let actions = do
-                flex
-                rowWith (alignMid . tight) $
-                  boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabName (hsTab st)
-          winW <- windowWidth
-          pane ctx (analysisTitle (winW < 1180) tab) actions $ case tab of
-            AtCursor -> atCursor env st hp cursorIx
-            Leaks -> leakView env st hp
-            Retention -> retentionView env st hp cursorIx
-            CostCentres -> costCentreTree env st (taskOutcome (hlProf loaded))
+      | pid == paneHeapAnalysis -> Just $
+          withContainerWidth (grow . minW 0 . minH 0) $ \paneW -> do
+            let actions = do
+                  flex
+                  rowWith (alignMid . tight) $
+                    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabName (hsTab st)
+            pane ctx (analysisTitle (paneW < 680) tab) actions $ case tab of
+              AtCursor -> atCursor env st hp cursorIx
+              Leaks -> leakView env st hp
+              Retention -> retentionView env st hp cursorIx
+              CostCentres -> costCentreTree env st (taskOutcome (hlProf loaded))
       | otherwise -> Nothing
 
 -- | @[@ and @]@ move the cursor to the previous or next census; the chart
@@ -857,7 +856,7 @@ legend env st hp hidden solo = do
           tooltip sw (if isHidden then "Show this band; click a name to show it alone" else "Hide this band; click a name to show it alone")
           when (respClicked sw) $ writeVar (hsHidden st) (if isHidden then S.delete name hidden else S.insert name hidden)
           picked <- linkRow env (RBand name) (solo == Just name) (padXY 8 3 . gap 8) $ do
-            cell (fillW . fontSizeScale 0.9 . (if isHidden then fontMuted else id)) (T.take 60 (bandTitle b))
+            cell (fillW . ellipsisMiddle . fontSizeScale 0.9 . (if isHidden then fontMuted else id)) (bandTitle b)
             numCell 82 (fontMuted . fontSizeScale 0.85) (fmtBytesD (bandPeak b))
           when picked $ writeVar (hsSolo st) (if solo == Just name then Nothing else Just name)
 
@@ -869,9 +868,6 @@ shorten maxLen t
   | T.length t <= maxLen = t
   | otherwise = T.take (maxLen - 1) t <> "…"
 
-numSortKey :: RealFloat a => Int -> a -> Text
-numSortKey decimals val = T.justifyRight 20 '0' (T.pack (showFFloat (Just decimals) val ""))
-
 softTable :: NanoUI a -> NanoUI a
 softTable body = do
   th <- uiTheme
@@ -879,11 +875,22 @@ softTable body = do
       stripeBtn = if light then colorRGB 254 254 254 else colorRGB 38 38 38
   styled (buttonStyle (background stripeBtn)) body
 
+withCellBar :: Float -> Color -> NanoUI () -> NanoUI ()
+withCellBar frac0 tint content = do
+  let pct = max 0 (min 100 (frac0 * 100))
+  layersWith (fillW . fillH) $ do
+    scope $ when (pct > 0) $
+      box (percent pct . fillH . pointer PointerPass) tint
+    content
+
 atCursor :: Env -> HeapState -> HeapProfile -> Int -> NanoUI ()
 atCursor env st hp i = do
+  pal <- palette <$> uiTheme
   byDelta <- readVar (hsByDelta st)
   let total = hpTotals hp VU.! i
       rawRows = [(k, b) | (k, b) <- zip [0 :: Int ..] (V.toList (hpBands hp)), bandValues b VU.! i > 0 || bandDelta b i /= 0]
+      maxRes = maximum (1 : [bandValues b VU.! i | (_, b) <- rawRows])
+      barTint = alpha 0.16 (pAccent pal)
   sortVar <- useVar (if byDelta then SortCol 3 SortDesc else SortCol 2 SortDesc)
   prevByDelta <- useVar byDelta
   prev <- readVar prevByDelta
@@ -899,10 +906,10 @@ atCursor env st hp i = do
           [ headed "closure or band" $ \(k, b) ->
               let c = bandColor k (bandName b)
                   title = bandTitle b
-              in Cell (Just title) (shorten 20 title) $ Just $
+              in cellSort title . withText (shorten 20 title) $ cellWidget $
                    rowWith (padXY 8 0 . gap 8 . tight . fillW . fillH . alignMid) $ do
                      _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 10 10 . alignMid) (\r -> drawRoundedRect r 2 c)
-                     picked <- linkText' env (RBand (bandName b)) (fillW . alignMid . fontSizeScale 0.92) title
+                     picked <- linkText' env (RBand (bandName b)) (fillW . ellipsisMiddle . alignMid . fontSizeScale 0.92) title
                      when picked $ writeVar (hsSolo st) (Just (bandName b))
           , headed "kind" $ \(_, b) ->
               let kName = kindName (bandKind b)
@@ -911,32 +918,34 @@ atCursor env st hp i = do
                      labelWith (alignMid . kindTone (bandKind b) . fillW) kName
           , headed "residency" $ \(_, b) ->
               let val = bandValues b VU.! i
-              in Cell
-                   (Just (numSortKey 0 val))
-                   (tshow (round val :: Integer))
-                   (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                      labelWith (alignMid . fontMono . alignEnd . fillW) (fmtBytesD val))
+              in cellSortNum val
+                   . withText (tshow (round val :: Integer))
+                   $ cellWidget
+                   $ withCellBar (realToFrac (val / maxRes)) barTint
+                   $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                       labelWith (alignMid . fontMono . fontTabular . alignEnd . fillW) (fmtBytesD val)
           , headed "Δ previous" $ \(_, b) ->
               let d = bandDelta b i
                   stTone = if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted
                   txt = (if d > 0 then "+" else "") <> fmtBytesD d
-              in Cell
-                   (Just (numSortKey 0 (d + 1e15)))
-                   (tshow (round (abs d) :: Integer))
-                   (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                      labelWith (alignMid . fontMono . stTone . alignEnd . fillW) txt)
+              in cellSortNum d
+                   . withText (tshow (round (abs d) :: Integer))
+                   $ cellWidget $
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                       labelWith (alignMid . fontMono . fontTabular . stTone . alignEnd . fillW) txt
           , headed "share" $ \(_, b) ->
               let val = bandValues b VU.! i
                   sh = val / max 1 total
-              in Cell
-                   (Just (numSortKey 4 sh))
-                   (tshow (round (sh * 10000) :: Integer))
-                   (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                      labelWith (alignMid . fontMono . fontMuted . alignEnd . fillW) (fmtPct sh))
+              in cellSortNum sh
+                   . withText (tshow (round (sh * 10000) :: Integer))
+                   $ cellWidget $
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                       labelWith (alignMid . fontMono . fontTabular . fontMuted . alignEnd . fillW) (fmtPct sh)
           ]
         cfg = defaultTableConfig
           { tableColSizes = [ColStretch, ColFixed 78, ColFixed 114, ColFixed 118, ColFixed 80]
           , tableSqueeze = True
+          , tableBare = True
           }
     softTable $ tableConfigured cfg (grow . tight . fillW . fillH) "atCursor" cols rawRows sortVar
 kindName :: BandKind -> Text
@@ -989,33 +998,29 @@ leakView env st hp = do
             [ headed "leak suspect" $ \(c, bf) ->
                 let title = figuresTitle bf
                     name = maybe (bfName bf) bfName (bcCur c)
-                in Cell (Just title) (shorten 20 title) $ Just $
+                in cellSort title . withText (shorten 20 title) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $ do
-                       picked <- linkText' env (RBand name) (fillW . alignMid . fontSizeScale 0.92) title
+                       picked <- linkText' env (RBand name) (fillW . ellipsisMiddle . alignMid . fontSizeScale 0.92) title
                        when picked $ writeVar (hsSolo st) (Just name)
             , headed "peak before" $ \(_, bf) ->
                 let peak = bfPeak bf
                     txt = fmtBytesD peak
-                in Cell
-                     (Just (numSortKey 0 peak))
-                     (tshow (round peak :: Integer))
-                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                        labelWith (alignMid . fontMono . fontMuted . alignEnd . fillW) txt)
+                in cellSortNum peak . withText (tshow (round peak :: Integer)) $ cellWidget $
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                       labelWith (alignMid . fontMono . fontTabular . fontMuted . alignEnd . fillW) txt
             , headed "peak now" $ \(c, _) ->
                 let mPeak = bcCur c >>= (Just . bfPeak)
                     txt = maybe "—" fmtBytesD mPeak
                     sortKey = maybe (-1) bfPeak (bcCur c)
-                in Cell
-                     (Just (numSortKey 0 (max 0 sortKey)))
-                     (tshow (round (max 0 sortKey) :: Integer))
-                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                        labelWith (alignMid . fontMono . alignEnd . fillW) txt)
+                in cellSortNum sortKey . withText (tshow (round (max 0 sortKey) :: Integer)) $ cellWidget $
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                       labelWith (alignMid . fontMono . fontTabular . alignEnd . fillW) txt
             , headed "status" $ \(c, bf) ->
                 let (stTone, stText) = case bcStatus c of
                       BandGone -> (Success, "gone")
                       BandShrank -> (Success, "much smaller (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")")
                       _ -> (Warning, "still there (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")" <> maybe "" (const ", still a suspect") (bcCur c >>= bfScore))
-                in Cell (Just stText) (shorten 20 stText) $ Just $
+                in cellSort stText . withText (shorten 20 stText) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
                        labelWith (alignMid . fontTone stTone . fillW) stText
             ]
@@ -1068,32 +1073,33 @@ leakView env st hp = do
       hint "Thunks that are still on the heap at a census have survived a major GC without being forced. Thunk bands, and how many consecutive censuses they have only grown:"
       let nAnalysed = analysedSamples hp
       thunkSortVar <- useVar (SortCol 2 SortDesc)
+      let thunkMax = maximum (1 : [maybe 0 snd (VU.unsnoc (VU.take nAnalysed (bandValues b))) | b <- thunkBands])
+      pal <- palette <$> uiTheme
       let thunkCols = mconcat
             [ headed "thunk band" $ \b ->
                 let name = bandName b
-                in Cell (Just name) (shorten 20 name) $ Just $
+                in cellSort name . withText (shorten 20 name) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $ do
-                       picked <- linkText' env (RBand name) (fillW . alignMid . fontSizeScale 0.92) name
+                       picked <- linkText' env (RBand name) (fillW . ellipsisMiddle . alignMid . fontSizeScale 0.92) name
                        when picked $ writeVar (hsSolo st) (Just name)
             , headed "residency" $ \b ->
                 let vs = VU.take nAnalysed (bandValues b)
                     val = maybe 0 snd (VU.unsnoc vs)
-                in Cell
-                     (Just (numSortKey 0 val))
-                     (tshow (round val :: Integer))
-                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                        labelWith (alignMid . fontMono . alignEnd . fillW) (fmtBytesD val))
+                in cellSortNum val
+                     . withText (tshow (round val :: Integer))
+                     $ cellWidget
+                     $ withCellBar (realToFrac (val / thunkMax)) (alpha 0.16 (pGC pal))
+                     $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                         labelWith (alignMid . fontMono . fontTabular . alignEnd . fillW) (fmtBytesD val)
             , headed "growing streak" $ \b ->
                 let vs = VU.take nAnalysed (bandValues b)
                     streak
                       | VU.null vs = 0
                       | otherwise = fst (VU.foldl' (\(!tr, !prev) v -> if v >= prev then (tr + 1, v) else (0, v)) (0 :: Int, vs VU.! 0) (VU.drop 1 vs))
                     sText = tshow streak <> " censuses growing"
-                in Cell
-                     (Just (numSortKey 0 (fromIntegral streak :: Double)))
-                     (tshow streak)
-                     (Just $ rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
-                        labelWith (alignMid . (if streak >= 5 then fontTone Danger else fontMuted) . fillW) sText)
+                in cellSortInt streak . withText (tshow streak) $ cellWidget $
+                     rowWith (padXY 8 0 . tight . fillW . fillH . alignMid) $
+                       labelWith (alignMid . (if streak >= 5 then fontTone Danger else fontMuted) . fillW) sText
             ]
           tcfg = defaultTableConfig
             { tableColSizes = [ColStretch, ColFixed 112, ColFixed 188]
@@ -1520,22 +1526,22 @@ dbgGraph env st sn snap marked = do
       shown = take 300 (snapRootsByHeld snap)
       roots = shown ++ [cnId r | r <- take 1 selPath, cnId r `notElem` shown]
       rows = take 3000 (flattenGraph snap openSet roots)
-  rowWith (grow . tight . gap 10 . fillW . minH 220) $ do
-    columnWith (grow . fillH . tight . gap 4) $ do
+  responsiveRowColIn 680 (grow . tight . gap 10 . fillW . minH 220) $ do
+    columnWith (grow . minW 260 . fillH . tight . gap 4) $ do
       hint "GC roots (threads, stable pointers), biggest first. Expand to follow pointers. Held: bytes a closure keeps alive, each closure charged to its first retainer on a shortest path. Thunks are amber, surviving thunks red."
       paneVirtualRows (grow . tight) id rows $ \(path, depth, n, expandable, isOpen, cyclic) -> withKey path $ do
         picked <- linkRow env (RClosure sn (cnId n)) (sel == Just (cnId n)) id $ do
           spacer (Fixed (fromIntegral (min 40 depth) * 14)) Fit
           cell (fixedW 14 . fontMuted) (if cyclic then "↺" else if expandable then (if isOpen then "▾" else "▸") else " ")
-          cell (fillW . nodeTone marked n) (cnName n)
+          cell (fillW . ellipsisMiddle . nodeTone marked n) (cnName n)
           scope $ for_ (M.lookup (cnId n) marked) $ \k -> badge Danger ("×" <> tshow k)
           cell (fontMuted . fontSizeScale 0.85 . fixedW 120) (cnType n)
-          cell (fontMono . fixedW 70) (fmtBytes (fromIntegral (cnSize n)))
+          cell (fontMono . fontTabular . fixedW 70) (fmtBytes (fromIntegral (cnSize n)))
           heldBar snap (cnId n)
         when picked $ do
           writeVar (hsDbgSel st) (Just (cnId n))
           when expandable $ writeVar (hsDbgOpen st) (if isOpen then S.delete path openSet else S.insert path openSet)
-    panelWith (fixedW 440 . fillH . padAll 10 . gap 6) $ dbgDetail env st sn snap marked sel selPath
+    panelWith (minW 260 . maxW 440 . fillW . fillH . padAll 10 . gap 6) $ dbgDetail env st sn snap marked sel selPath
 
 dbgDetail :: Env -> HeapState -> Int -> HeapSnapshot -> M.Map ClosureId Int -> Maybe ClosureId -> [ClosureNode] -> NanoUI ()
 dbgDetail env st sn snap marked sel selPath = case sel >>= (`M.lookup` snapNodes snap) of

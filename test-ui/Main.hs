@@ -42,7 +42,7 @@ import System.Exit (exitFailure)
 import UI.Baseline
 import UI.Clock
 import UI.Code
-import UI.Common (Ink (..), PaneCtx (..), TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, ink, isPaneFlashing, monoMetrics, newWorkbench, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
+import UI.Common (Ink (..), PaneCtx (..), TimeView (..), Workbench (..), clearPaneFlashes, floatingPane, ink, isPaneFlashing, monoMetrics, newWorkbench, notePaneState, pane, paneFlashing, paneWith, quiet, readoutDeltaWith, strongheadTheme, wasPaneFlashed)
 import UI.Core (CoreLoaded (..), CoreState (..), corePanes, newCoreState)
 import UI.Flamegraph (diffFlamegraphView, eraCohortHeatmapView, flamegraphView, latencyHeatmapView)
 import UI.Graph (renderFlamegraphSvg, renderHpDiffSvg, renderHpSvg)
@@ -715,6 +715,7 @@ main = do
             when (respClicked resp) (modifyVar counterVar (+ 1))
           else do
             c <- readVar counterVar
+            notePaneState (tshow c)
             void (label ("Count: " <> tshow c))
             respSelf <- buttonWith' (padAll 4) "SelfIncrement"
             when (respClicked respSelf) (modifyVar counterVar (+ 1))
