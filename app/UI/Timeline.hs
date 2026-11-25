@@ -22,7 +22,7 @@ module UI.Timeline
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef
 import Data.IntMap.Strict qualified as IM
@@ -315,7 +315,7 @@ timelineView env bench st mprog = columnWith (tight . gap 0 . grow) $ do
           =<< askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "GHC eventlog" "eventlog", FileFilter "All files" "*"]}
   toolStrip $ do
     whenM (toolIconButton iconFolderOpen "Open eventlog…") askOpenLog
-    checkboxWith alignMid "Follow as it is written" (tsFollow st)
+    checkbox "Follow as it is written" (tsFollow st)
     flex
     scope $ for_ loaded $ \tl -> do
       mv <- readVar (tsView st)
@@ -422,7 +422,7 @@ timelinePanes env st mprog _ = case mprog >>= lpTimeline of
 capsLegend :: TimelineState -> Palette -> Timeline -> NanoUI ()
 capsLegend st pal tl = do
   scope $ unless (V.null (tlProfSamples tl)) $
-    checkboxWith alignMid ("Code (" <> fmtInt (V.length (tlProfSamples tl)) <> " samples)") (tsCode st)
+    checkbox ("Code (" <> fmtInt (V.length (tlProfSamples tl)) <> " samples)") (tsCode st)
   flex
   legendDot (pRun pal) "running"
   legendDot (pGC pal) "minor GC"
@@ -434,12 +434,12 @@ inspectorActions :: Env -> TimelineState -> Timeline -> Maybe Sel -> Marks -> Na
 inspectorActions env st tl sel marks = do
   flex
   scope $ for_ (tmRange marks) $ \(a, b) -> unless (sel == Just (SelRange a b)) $
-    whenM (buttonWith (alignMid . padXY 8 2 . tight) "Analyse range") (analyseRange env st tl a b)
+    whenM (buttonWith (padXY 8 2 . tight) "Analyse range") (analyseRange env st tl a b)
   focus <- readVar (tsFocusThread st)
   scope $ when (isJust focus) $
-    whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear highlight") (writeVar (tsFocusThread st) Nothing)
+    whenM (buttonWith (padXY 8 2 . tight) "Clear highlight") (writeVar (tsFocusThread st) Nothing)
   scope $ when (isJust sel) $
-    whenM (buttonWith (alignMid . padXY 8 2 . tight) "Back to overview") (writeVar (tsSel st) Nothing)
+    whenM (buttonWith (padXY 8 2 . tight) "Back to overview") (writeVar (tsSel st) Nothing)
 
 -- | Apply wheel zoom, drag pan (unless @pan@ is off: a range or the cursor
 -- is being dragged) and double-click fit for a canvas whose plot area spans
@@ -495,7 +495,8 @@ mainCanvas env st pal mm tl v sel marks = do
         , canvasTrackPointer = True
         , canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)
         }
-      (\r -> drawMain pal mm tl v sel marks code focusCC (if rectContains r mouse then hover else Nothing) r)
+      (\r -> drawMain pal mm tl v sel marks code focusCC (if rectContains r mouse then (\(hx, _, _) -> hx) <$> hover else Nothing) r)
+  cursorTooltip resp (if respHovered resp then (\(_, _, ls) -> ls) <$> hover else Nothing)
   let rows = layoutRows (respRect resp) nCaps code
       axis = linearAxis rk v (rPlotX rows) (rPlotW rows)
       Rect _ ry _ rh = rRuler rows
@@ -668,8 +669,8 @@ threadLabel tl tid = maybe ("thread " <> tshow tid) threadName (M.lookup tid (tl
 -- ---------------------------------------------------------------------------
 -- Drawing
 
-drawMain :: Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> Bool -> (Int -> Bool) -> Maybe (Float, Float, [Text]) -> Rect -> CanvasM ()
-drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
+drawMain :: Palette -> MonoMetrics -> Timeline -> TimeView -> Maybe Sel -> Marks -> Bool -> (Int -> Bool) -> Maybe Float -> Rect -> CanvasM ()
+drawMain pal mm tl v sel marks code focusCC hoverX r@(Rect x _ _ _) = do
   let rows = layoutRows r (V.length (tlCaps tl)) code
       px = rPlotX rows
       pw = rPlotW rows
@@ -731,9 +732,8 @@ drawMain pal mm tl v sel marks code focusCC hover r@(Rect x _ _ _) = do
         top = rectY (rRuler rows)
     when (cx >= px && cx <= px + pw) $
       drawPath (P.polygon [V2 (cx - 5) top, V2 (cx + 5) top, V2 cx (top + 7)]) (pAccent pal)
-  for_ hover $ \(hx, hy, ls) -> do
+  for_ hoverX $ \hx ->
     drawStroke (V2 hx (rectY r)) (V2 hx (rectY r + rectH r)) 1 (pCursor pal)
-    drawTooltip pal mm r hx hy ls
 
 drawRuler :: Palette -> MonoMetrics -> Timeline -> TimeView -> Rect -> CanvasM ()
 drawRuler pal mm tl v (Rect px py pw ph) = do
@@ -977,20 +977,14 @@ downsample w ps
       | (px, maxB) <- IM.toList (IM.fromListWith max [(floor x :: Int, b) | (x, b) <- ps])
       ]
 
-drawTooltip :: Palette -> MonoMetrics -> Rect -> Float -> Float -> [Text] -> CanvasM ()
-drawTooltip pal mm (Rect rx ry rw rh) hx hy ls = do
-  let lw = maximum (1 : map T.length ls)
-      tw = fromIntegral lw * mmCharW mm + 16
-      th' = fromIntegral (length ls) * (mmLineH mm + 2) + 10
-      tx = if hx + 14 + tw > rx + rw then hx - 14 - tw else hx + 14
-      ty = max ry (min (ry + rh - th') (hy + 14))
-  drawRoundedRect (Rect (tx + 2) (ty + 3) tw th') 6 (alpha 0.25 colorBlack)
-  drawRoundedRect (Rect tx ty tw th') 6 (alpha 0.96 (colorFrom pal))
-  drawStrokeRoundedRect (Rect tx ty tw th') 6 1 (pGrid pal)
-  forM_ (zip [0 :: Int ..] ls) $ \(i, l) ->
-    drawTextWith (mmFont mm) (V2 (tx + 8) (ty + 5 + (fromIntegral i + 0.5) * (mmLineH mm + 2))) AlignStart AlignMiddle l (if i == 0 then pMuted pal else pText pal)
-  where
-    colorFrom p = if colorLuminance (pText p) > 0.5 then colorRGB 30 32 36 else colorRGB 252 252 250
+-- | Cursor-following rich tooltip overlay for timeline canvases.
+cursorTooltip :: HasResponse r => r -> Maybe [Text] -> NanoUI ()
+cursorTooltip resp mLines =
+  scope $ for_ mLines $ \ls ->
+    void . tooltipWidgetConfigured defaultTooltipConfig {tooltipDelay = 0, tooltipGrace = 0, tooltipPlacement = PlacementAtCursor, tooltipGap = 12} resp $
+      columnWith (tight . gap 2 . padXY 6 4) $
+        forM_ (zip [0 :: Int ..] ls) $ \(i, l) ->
+          labelWith (fontMono . fontTabular . fontSizeScale 0.84 . (if i == 0 then fontMuted else id)) l
 
 -- ---------------------------------------------------------------------------
 -- Threads
@@ -1000,11 +994,10 @@ threadsHeader st pal tl = do
   winW <- windowWidth
   paneMeta (fmtInt (M.size (tlThreads tl)))
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW (if winW < 1200 then 160 else 200) . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (fixedW (if winW < 1200 then 160 else 200) . padXY 0 0) defaultLayout}
     (tsThreadFilter st)
   scope $ when (winW >= 1220) $
-    rowWith (alignMid . tight) $
-      boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} threadSortName (tsThreadSort st)
+    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} threadSortName (tsThreadSort st)
   flex
   legendDot (pRun pal) "running"
   legendDot (pBlocked pal) "blocked"
@@ -1136,9 +1129,9 @@ threadsSection env st pal mm tl v sel marks = do
             let barH = max 20 (h * h / contentH)
                 barY = y + (h - barH) * (scrollY / max 1 (contentH - h))
             drawRoundedRect (Rect (x + w - 4) barY 3 barH) 2 (pGrid pal)
-          for_ hoverText $ \(hx, hy, ls) -> do
+          for_ hoverText $ \(hx, _, _) ->
             drawStroke (V2 hx y) (V2 hx (y + h)) 1 (pCursor pal)
-            drawTooltip pal mm r hx hy ls
+    cursorTooltip resp (if respHovered resp then (\(_, _, ls) -> ls) <$> hoverText else Nothing)
     let r = respRect resp
     -- The wheel scrolls rows here; Ctrl+wheel zooms time.
     inp <- askInput
@@ -1174,9 +1167,9 @@ wakerLine tl ti s = case wokenBy ti s of
   Nothing -> []
 
 legendDot :: Color -> Text -> NanoUI ()
-legendDot c txt = rowWith (tight . gap 5 . alignMid) $ do
-  _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 9 9 . alignMid) (\r -> drawRoundedRect r 2 c)
-  labelWith (alignMid . fontMuted . fontSizeScale 0.85) txt
+legendDot c txt = rowWith (tight . gap 5 . itemsCenter) $ do
+  _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 9 9) (\r -> drawRoundedRect r 2 c)
+  labelWith (fontMuted . fontSizeScale 0.85) txt
 
 -- ---------------------------------------------------------------------------
 -- Inspector
@@ -1265,7 +1258,7 @@ codeRows env tl cp n = do
   let counted = max 1 (cpSamples cp - cpIdle cp)
   forM_ (take n (cpTop cp)) $ \(i, k) -> withKey ("cc" <> tshow i) $ for_ (costCentreRef tl i) $ \ref -> do
     _ <- linkRow env ref False id $ do
-      columnWith (tight . gap 0 . fillW . alignMid) $ do
+      columnWith (tight . gap 0 . fillW) $ do
         labelWith (fillW . fontMono . fontSizeScale 0.88) (costCentreName tl i)
         scope $ for_ (IM.lookup i (tlCostCentres tl) >>= srcLocSpan . cciSrc) $ \sp ->
           labelWith (fillW . fontMuted . fontSizeScale 0.8) (renderSrcSpan sp)
@@ -1294,13 +1287,13 @@ tickyNote entries alloc = fmtInt entries <> " entries · " <> fmtBytes alloc <> 
 -- bindings.
 tickyRows :: Env -> [((TickyCounter, TickyName, Text), Word64, Word64)] -> NanoUI ()
 tickyRows env rows = do
-  rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+  rowWith (padXY 8 0 . tight . gap 8 . itemsBaseline . fillW) $ do
     colHeader fillW "closure"
     colHeader (fixedW 64 . alignEnd) "entries"
     colHeader (fixedW 72 . alignEnd) "alloc"
   forM_ (zip [0 :: Int ..] rows) $ \(k, (x@(_, tn, key), e, al)) -> withKey ("t" <> tshow k) $ do
     _ <- linkRow env (tickyRef x) False id $ do
-      columnWith (tight . gap 0 . fillW . alignMid) $ do
+      columnWith (tight . gap 0 . fillW) $ do
         labelWith (fillW . fontMono . fontSizeScale 0.88) (tickyBinder tn)
         labelWith (fillW . fontMuted . fontSizeScale 0.8) ("in " <> tnModule tn <> "." <> key)
       numCell 64 id (fmtInt e)
@@ -1377,19 +1370,19 @@ overview env st tl v = do
   kv "Window" (fmtNs (viewWidth v))
   cursor <- readVar (busCursor bus)
   scope $ case cursor of
-    Just (r, t) | runKeysMatch r rk -> rowWith (fillW . tight . gap 8) $ do
-      labelWith (alignBaseline . fontMuted) "Cursor"
+    Just (r, t) | runKeysMatch r rk -> rowWith (fillW . tight . gap 8 . itemsBaseline) $ do
+      labelWith fontMuted "Cursor"
       flex
-      linkText env (RInstant rk t) alignBaseline (fmtNs (fromIntegral t - fromIntegral (tlStart tl)))
+      linkText env (RInstant rk t) id (fmtNs (fromIntegral t - fromIntegral (tlStart tl)))
     _ -> pure ()
   range <- readVar (busRange bus)
   scope $ case range of
     Just (r, a, b) | runKeysMatch r rk -> do
-      rowWith (fillW . tight . gap 8) $ do
-        labelWith (alignBaseline . fontMuted) "Range"
+      rowWith (fillW . tight . gap 8 . itemsBaseline) $ do
+        labelWith fontMuted "Range"
         flex
-        linkText env (RRange rk a b) alignBaseline (fmtNs (fromIntegral a - fromIntegral (tlStart tl)) <> " to " <> fmtNs (fromIntegral b - fromIntegral (tlStart tl)))
-      rowWith (tight . gap 6) $ do
+        linkText env (RRange rk a b) id (fmtNs (fromIntegral a - fromIntegral (tlStart tl)) <> " to " <> fmtNs (fromIntegral b - fromIntegral (tlStart tl)))
+      rowWith (tight . gap 6 . itemsCenter) $ do
         whenM (button "Analyse range") (analyseRange env st tl a b)
         whenM (button "Clear range") (writeVar (busRange bus) Nothing)
     _ -> pure ()
@@ -1400,7 +1393,7 @@ overview env st tl v = do
       pauseColW = if showKind then 92 else 86
       atColW = if showKind then 92 else 82
   tableRows $ do
-    rowWith (padXY 8 0 . tight . gap 6 . fillW) $ do
+    rowWith (padXY 8 0 . tight . gap 6 . itemsBaseline . fillW) $ do
       colHeader (fixedW pauseColW . alignEnd) "pause"
       if showKind then colHeader fillW "collection" else flex
       colHeader (fixedW atColW . alignEnd) "at"
@@ -1416,7 +1409,7 @@ overview env st tl v = do
   sectionTitle "Most blocked threads"
   tableRows $ forM_ (tlcWorstBlocked tlc) $ \(ti, bt, top) -> withKey (tiId ti) $ do
     picked <- linkRow env (RThread rk (tiId ti)) False (padXY 8 3) $ do
-      columnWith (tight . gap 0 . fillW . alignMid) $ do
+      columnWith (tight . gap 0 . fillW) $ do
         labelWith fillW (threadName ti)
         scope $ for_ top $ \(c, _) -> labelWith (fillW . fontMuted . fontSizeScale 0.82) (stopName c)
       numCell 94 id (fmtNs (fromIntegral bt))
@@ -1447,7 +1440,7 @@ overview env st tl v = do
     sectionTitle "STW rendezvous stragglers"
     hint "Delay between the first capability pausing for GC and the last capability stopping. High sync wait points to a straggler thread in a tight non-allocating loop or unsafe FFI call."
     forM_ lags $ \l -> withKey ("lag" <> tshow (slCollection l)) $
-      rowWith (tight . gap 8 . fillW . alignMid) $ do
+      rowWith (tight . gap 8 . fillW . itemsCenter) $ do
         numCell 72 (if slSyncWaitNs l > 5_000_000 then fontTone Danger else id) (fmtNs (fromIntegral (slSyncWaitNs l)))
         cell (fontMuted . fontSizeScale 0.85) ("cap " <> tshow (slFirstCap l) <> " → " <> tshow (slLastCap l))
         flex
@@ -1680,9 +1673,9 @@ markersHeader st tl = do
       compact = winW < 1220
   paneMetaWith (fixedW (if compact then 24 else 32)) (fmtInt nMarkers)
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (alignMid . minW 52 . fillW . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (minW 52 . fillW . padXY 0 0) defaultLayout}
     (tsMarkerFilter st)
-  (_, evArea) <- mouseArea alignMid $ checkboxWith alignMid (if compact then "All" else "Events") (tsMarkerEvents st)
+  (_, evArea) <- mouseArea tight $ checkbox (if compact then "All" else "Events") (tsMarkerEvents st)
   when compact (tooltip evArea "Include all runtime events (markers and RTS events)")
 
 -- | Every marker in the log, as links; clicking one moves the cursor to it.

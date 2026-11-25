@@ -441,7 +441,7 @@ linkRow env ref selected f body = do
         | otherwise = colorTransparent
   (_, area) <- mouseArea (fillW . tight) $
     styled (panelStyle (hoverBackground (if lit then themeSelection th else wash) . background bg . borderWidth 0 . cornerRadius 4)) $
-      panelWith (asRow . fillW . padXY 8 2 . gap 8 . f) body
+      panelWith (asRow . itemsCenter . fillW . padXY 8 2 . gap 8 . f) body
   linked env ref area
 
 -- | A name that is a link, like a hyperlink: underlined under the pointer,
@@ -460,10 +460,10 @@ linkText env ref f txt = void (linkText' env ref f txt)
 
 -- | 'kv' whose value is a link.
 kvLink :: Env -> Text -> Ref -> Text -> NanoUI ()
-kvLink env k ref v = rowWith (fillW . tight . gap 8) $ do
-  labelWith (alignBaseline . fontMuted) k
+kvLink env k ref v = rowWith (fillW . tight . gap 8 . itemsBaseline) $ do
+  labelWith fontMuted k
   flex
-  linkText env ref alignBaseline v
+  linkText env ref id v
 
 -- | Links for a canvas that draws many entities: @refAt@ names the one at
 -- a point. Right-click opens its actions and Ctrl+click goes to it. The

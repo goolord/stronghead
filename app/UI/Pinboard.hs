@@ -32,25 +32,26 @@ pinboardPane env export ctx = do
   let header = do
         paneMeta (tshow (length pins))
         flex
-        disabledWhen (null pins) $ do
-          copyFeedbackButton (alignMid . padXY 8 2 . tight) "Copy report" (pinsReport env [] pins)
-          whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconSave "Export…") export
+        disabledWhen (null pins) $ buttonGroup $ do
+          copyFeedbackButton (padXY 8 2 . tight) "Copy report" (pinsReport env [] pins)
+          whenM (iconButtonWith (padXY 8 2 . tight) iconSave "Export…") export
   paneWith tight ctx "Pinboard" header $
     if null pins
       then columnWith (padAll 12 . fillW) $ hint "Pin a thread, a band, a binding or a line from its right-click menu or the inspector. Pins keep a note each, and are saved with the session."
       else paneScroll (grow . tight) $ columnWith (padAll 8 . tight . gap 8 . fillW) $
         forM_ (zip [0 :: Int ..] pins) $ \(i, p) -> withKey (refTarget (pinRef p)) $
           columnWith (fillW . tight . gap 4) $ do
-            rowWith (fillW . tight . gap 6) $ do
-              linkText env (pinRef p) (alignMid . fontMedium) (T.take 70 (refTitle env (pinRef p)))
+            rowWith (fillW . itemsCenter . tight . gap 6) $ do
+              linkText env (pinRef p) fontMedium (T.take 70 (refTitle env (pinRef p)))
               flex
               let small label tip enabled act = do
-                    resp <- disabledWhen (not enabled) (buttonWith' (alignMid . padXY 6 0 . tight) label)
+                    resp <- disabledWhen (not enabled) (buttonWith' (padXY 6 0 . tight) label)
                     tooltip resp tip
                     when (respClicked resp) act
-              small "↑" "Move up" (i > 0) (modifyVar (busPins bus) (pinMove i (-1)))
-              small "↓" "Move down" (i < length pins - 1) (modifyVar (busPins bus) (pinMove i 1))
-              small "×" "Unpin" True (modifyVar (busPins bus) (filter ((/= pinRef p) . pinRef)))
+              buttonGroup $ do
+                small "↑" "Move up" (i > 0) (modifyVar (busPins bus) (pinMove i (-1)))
+                small "↓" "Move down" (i < length pins - 1) (modifyVar (busPins bus) (pinMove i 1))
+                small "×" "Unpin" True (modifyVar (busPins bus) (filter ((/= pinRef p) . pinRef)))
             textInputConfigured
               defaultTextInputConfig {ticPlaceholder = "Note", ticLayout = fillW defaultLayout}
               (zoomVar (noteOf (pinRef p)) (setNote (pinRef p)) (busPins bus))

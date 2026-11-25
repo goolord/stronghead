@@ -11,8 +11,9 @@ module UI.Flamegraph
   , drawLatencyHeatmap
   ) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, void, when)
 import Data.Char (ord)
+import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -40,7 +41,7 @@ flamegraphView ft zoomVar = do
   let pal = palette th
       viewTree = maybe ft (\target -> fromMaybe ft (zoomInto target ft)) zoomed
   columnWith (tight . fillW . fillH . gap 6) $ do
-    rowWith (tight . gap 8 . alignMid . fillW) $ do
+    rowWith (tight . gap 8 . itemsCenter . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) (ftTitle viewTree)
       labelWith (fontMuted . fontSizeScale 0.85)
         (fmtFixed 0 (ftTotal viewTree) <> " " <> ftUnit viewTree)
@@ -75,7 +76,7 @@ diffFlamegraphView dft = do
   mm <- monoMetrics 0.82
   let pal = palette th
   columnWith (tight . fillW . fillH . gap 6) $ do
-    rowWith (tight . gap 8 . alignMid . fillW) $ do
+    rowWith (tight . gap 8 . itemsCenter . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) (dftTitle dft)
       flex
       badge Danger "regressed"
@@ -95,44 +96,51 @@ diffFlamegraphView dft = do
                 Nothing -> pure ()
         pure ()
 
-flameRegions :: Rect -> FlameTree -> [(FlameNode, Rect, Maybe Text, UiCursorKind)]
+cursorTipConfig :: TooltipConfig
+cursorTipConfig =
+  defaultTooltipConfig
+    { tooltipDelay = 0.05
+    , tooltipGrace = 0
+    , tooltipPlacement = PlacementAtCursor
+    , tooltipGap = 10
+    }
+
+flameRegions :: Rect -> FlameTree -> [(FlameNode, Rect, Maybe (NanoUI ()), UiCursorKind)]
 flameRegions r ft =
-  [ (node, box, Just tip, UiCursorPointer)
-  | (box, node) <- layoutFlame r ft
+  [ (node, rectBox, Just tip, UiCursorPointer)
+  | (rectBox, node) <- layoutFlame r ft
   , let pct = if ftTotal ft > 0 then fnTotal node / ftTotal ft else 0
-        tip =
-          fnName node
-            <> "\ntotal: "
-            <> fmtFixed 1 (fnTotal node)
-            <> " ("
-            <> fmtPct pct
-            <> "), self: "
-            <> fmtFixed 1 (fnSelf node)
-            <> "\nClick to zoom"
+        tip = columnWith (tight . gap 3 . padXY 4 2) $ do
+          labelWith (fontMono . fontMedium . fontSizeScale 0.88) (fnName node)
+          rowWith (tight . gap 12 . itemsBaseline) $ do
+            factMono "total" (fmtFixed 1 (fnTotal node) <> " (" <> fmtPct pct <> ")")
+            factMono "self" (fmtFixed 1 (fnSelf node))
+          labelWith (fontMuted . fontSizeScale 0.78) "Click frame to zoom"
   ]
 
-diffFlameRegions :: Rect -> DiffFlameTree -> [(DiffFlameNode, Rect, Maybe Text, UiCursorKind)]
+diffFlameRegions :: Rect -> DiffFlameTree -> [(DiffFlameNode, Rect, Maybe (NanoUI ()), UiCursorKind)]
 diffFlameRegions r dft =
-  [ (node, box, Just tip, UiCursorDefault)
-  | (box, node) <- layoutDiffFlame r dft
-  , let tip =
-          dfnName node
-            <> "\nbase: "
-            <> fmtFixed 1 (dfnBaseTotal node)
-            <> " → cur: "
-            <> fmtFixed 1 (dfnCurTotal node)
-            <> " (delta "
-            <> (if dfnDelta node >= 0 then "+" else "")
-            <> fmtFixed 1 (dfnDelta node)
-            <> ")"
+  [ (node, rectBox, Just tip, UiCursorDefault)
+  | (rectBox, node) <- layoutDiffFlame r dft
+  , let deltaTxt = (if dfnDelta node >= 0 then "+" else "") <> fmtFixed 1 (dfnDelta node)
+        deltaTone
+          | dfnDelta node > 0 = fontTone Danger
+          | dfnDelta node < 0 = fontTone Success
+          | otherwise = fontMuted
+        tip = columnWith (tight . gap 3 . padXY 4 2) $ do
+          labelWith (fontMono . fontMedium . fontSizeScale 0.88) (dfnName node)
+          rowWith (tight . gap 10 . itemsBaseline) $ do
+            factMono "base" (fmtFixed 1 (dfnBaseTotal node))
+            factMono "cur" (fmtFixed 1 (dfnCurTotal node))
+            labelWith (fontMono . fontTabular . fontSizeScale 0.85 . deltaTone) ("Δ " <> deltaTxt)
   ]
 
--- | Interactive canvas over typed hit regions @[(a, Rect, Maybe Text, UiCursorKind)]@
+-- | Interactive canvas over typed hit regions @[(a, Rect, Maybe (NanoUI ()), UiCursorKind)]@
 -- (last matching region wins), handling hover highlight, press-and-release click
--- matching on the same region, pointer cursor, and tooltip.
+-- matching on the same region, pointer cursor, and rich pass-through tooltip.
 canvasRegions ::
   (Layout -> Layout) ->
-  (Rect -> [(a, Rect, Maybe Text, UiCursorKind)]) ->
+  (Rect -> [(a, Rect, Maybe (NanoUI ()), UiCursorKind)]) ->
   (Rect -> Maybe (a, Rect) -> CanvasM ()) ->
   NanoUI (Response, Maybe a)
 canvasRegions layoutMod mkRegions draw = do
@@ -143,11 +151,11 @@ canvasRegions layoutMod mkRegions draw = do
   prev <- fromMaybe (Rect 0 0 0 0) <$> lastRect sid
   let hitIn rs pt =
         foldl'
-          (\acc entry@(_, (_, box, _, _)) -> if rectContains box pt then Just entry else acc)
+          (\acc entry@(_, (_, rectBox, _, _)) -> if rectContains rectBox pt then Just entry else acc)
           Nothing
           rs
       prevHit = if rectContains prev mouse then hitIn (zip [0 :: Int ..] (mkRegions prev)) mouse else Nothing
-      mHover = fmap (\(_, (k, box, _, _)) -> (k, box)) prevHit
+      mHover = fmap (\(_, (k, rectBox, _, _)) -> (k, rectBox)) prevHit
       cursorAt _ r pos =
         case hitIn (zip [0 :: Int ..] (mkRegions r)) pos of
           Just (_, (_, _, _, cur)) -> cur
@@ -172,9 +180,8 @@ canvasRegions layoutMod mkRegions draw = do
           Just (idx, (k, _, _, _)) | idx == pressedIdx && idx >= 0 -> Just k
           _ -> Nothing
       else pure Nothing
-  case curHit of
-    Just (_, (_, _, Just tip, _)) -> tooltip resp tip
-    _ -> pure ()
+  scope $ for_ curHit $ \(_, (_, _, mTip, _)) ->
+    for_ mTip (void . tooltipWidgetConfigured cursorTipConfig resp)
   pure (resp, clicked)
 
 -- | Render a 'FlameTree' onto a @nano-ui@ canvas (usable live or in SVG export).
@@ -271,7 +278,7 @@ latencyHeatmapView hm = do
   let pal = palette th
       mouse = inputMousePos inp
   columnWith (tight . fillW . gap 4) $ do
-    rowWith (tight . gap 8 . alignMid . fillW) $ do
+    rowWith (tight . gap 8 . itemsCenter . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.9) (hmTitle hm)
       labelWith (fontMuted . fontSizeScale 0.82)
         (fmtInt (hmSampleCount hm) <> " samples · " <> fmtNs (hmMinNs hm) <> " .. " <> fmtNs (hmMaxNs hm))
@@ -294,13 +301,16 @@ latencyHeatmapView hm = do
             tb = max 1 (hmTimeBins hm)
             vb = max 1 (hmValueBins hm)
             V2 mx my = mouse
-        when (respHovered resp && mx >= plotX && mx <= plotX + plotW && my >= ry + 4 && my <= ry + 4 + plotH) $ do
+        scope $ when (respHovered resp && mx >= plotX && mx <= plotX + plotW && my >= ry + 4 && my <= ry + 4 + plotH) $ do
           let tIdx = max 0 (min (tb - 1) (floor ((mx - plotX) / (plotW / fromIntegral tb))))
               vIdx = max 0 (min (vb - 1) (vb - 1 - floor ((my - (ry + 4)) / (plotH / fromIntegral vb))))
               cnt = hmCounts hm VU.! (tIdx * vb + vIdx)
               loNs = hmMinNs hm + (hmMaxNs hm - hmMinNs hm) * (fromIntegral vIdx / fromIntegral vb)
               hiNs = hmMinNs hm + (hmMaxNs hm - hmMinNs hm) * (fromIntegral (vIdx + 1) / fromIntegral vb)
-          tooltip resp ("Bucket " <> fmtNs loNs <> " – " <> fmtNs hiNs <> "\n" <> fmtInt cnt <> (if cnt == 1 then " sample" else " samples"))
+          void . tooltipWidgetConfigured cursorTipConfig resp $
+            columnWith (tight . gap 2 . padXY 4 2) $ do
+              labelWith (fontMono . fontTabular . fontMedium . fontSizeScale 0.86) (fmtNs loNs <> " – " <> fmtNs hiNs)
+              labelWith (fontMono . fontTabular . fontMuted . fontSizeScale 0.82) (fmtInt cnt <> (if cnt == 1 then " sample" else " samples"))
 
 drawLatencyHeatmap :: Palette -> MonoMetrics -> Rect -> LatencyHeatmap -> CanvasM ()
 drawLatencyHeatmap pal mm r@(Rect rx ry rw rh) hm = withClip r $ do
@@ -352,7 +362,7 @@ eraCohortHeatmapView hp = do
       maxVal = maximum (1 : [bandPeak b | (_, b) <- eraBands])
       rows = take 48 eraBands
   columnWith (tight . fillW . fillH . gap 6) $ do
-    rowWith (tight . gap 8 . alignMid . fillW) $ do
+    rowWith (tight . gap 8 . itemsCenter . fillW) $ do
       labelWith (fontMedium . fontSizeScale 0.92) "Era cohort retention matrix (+RTS -he)"
       labelWith (fontMuted . fontSizeScale 0.84)
         (tshow (length eraBands) <> " eras × " <> tshow nTimes <> " censuses · peak " <> fmtBytesD maxVal)
@@ -391,12 +401,15 @@ eraCohortHeatmapView hp = do
             ph = max 1 (rh - 8)
             nRows = max 1 (length rows)
             V2 mx my = mouse
-        when (respHovered resp && mx >= px && mx <= px + pw && my >= ry + 4 && my <= ry + 4 + ph) $ do
+        scope $ when (respHovered resp && mx >= px && mx <= px + pw && my >= ry + 4 && my <= ry + 4 + ph) $ do
           let ti = max 0 (min (nTimes - 1) (floor ((mx - px) / (pw / fromIntegral (max 1 nTimes)))))
               ri = max 0 (min (nRows - 1) (floor ((my - (ry + 4)) / (ph / fromIntegral nRows))))
           case drop ri rows of
             (eraNum, band) : _ -> do
               let v = if ti < VU.length (bandValues band) then bandValues band VU.! ti else 0
                   tSec = if ti < VU.length (hpOffsets hp) then hpOffsets hp VU.! ti else 0
-              tooltip resp ("era " <> tshow eraNum <> " at " <> fmtSec tSec <> "\n" <> fmtBytesD v <> " live")
+              void . tooltipWidgetConfigured cursorTipConfig resp $
+                columnWith (tight . gap 2 . padXY 4 2) $ do
+                  labelWith (fontMono . fontMedium . fontSizeScale 0.86) ("era " <> tshow eraNum <> " · " <> fmtSec tSec)
+                  labelWith (fontMono . fontTabular . fontMuted . fontSizeScale 0.82) (fmtBytesD v <> " live")
             [] -> pure ()

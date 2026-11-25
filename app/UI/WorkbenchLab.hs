@@ -139,7 +139,7 @@ triagePane env _st findings onRunQuery ctx = do
         paneMeta (fmtInt (length findings) <> " finding" <> (if length findings == 1 then "" else "s"))
         flex
         unless (null findings) $
-          copyFeedbackButton (alignMid . padXY 8 2 . tight) "Copy brief" (formatTriageMarkdown "Current Run" findings)
+          copyFeedbackButton (padXY 8 2 . tight) "Copy brief" (formatTriageMarkdown "Current Run" findings)
   paneWith tight ctx "Triage & findings" hdr $
     paneScroll (grow . tight) $
       columnWith (padAll 12 . gap 8 . fillW) $
@@ -153,7 +153,7 @@ triageCardsView :: Env -> [Finding] -> (Text -> NanoUI ()) -> NanoUI ()
 triageCardsView env findings onRunQuery =
   forM_ (zip [0 :: Int ..] findings) $ \(idx, Finding {..}) -> withKey ("fnd" <> tshow idx <> fnId) $
     panelWith (padXY 10 8 . gap 5 . fillW) $ do
-      rowWith (fillW . tight . gap 6 . alignMid . wrap) $ do
+      rowWith (fillW . tight . gap 6 . itemsCenter . wrap) $ do
         badge (sevTone fnSeverity) (severityName fnSeverity)
         badge Muted (categoryName fnCategory)
         labelWith (fontMuted . fontSizeScale 0.82) (fmtPct fnConfidence <> " conf")
@@ -163,7 +163,7 @@ triageCardsView env findings onRunQuery =
         rowWith (fillW . tight . gap 12 . wrap) $
           forM_ (take 4 fnEvidence) $ \(k, v) -> withKey k $ fact k v
       hint ("Fix: " <> fnRemediation)
-      rowWith (fillW . tight . gap 6 . wrap) $ do
+      rowWith (fillW . tight . gap 6 . itemsCenter . wrap) $ do
         for_ fnPrimaryRef $ \r ->
           whenM (iconButtonWith (padXY 8 2 . tight) iconForward "Investigate") (goTo env r)
         for_ fnSuggestedQuery $ \q ->
@@ -191,19 +191,19 @@ queryPane env st qctx ctx = do
         for_ mRes $ \res ->
           paneMeta (fmtInt (qresTotalMatched res) <> " matched" <> (if qresTotalBytes res > 0 then " · " <> fmtBytes (qresTotalBytes res) else ""))
         flex
-        for_ mRes $ \res -> do
-          copyFeedbackButton (alignMid . padXY 8 2 . tight) "Copy MD" (formatQueryMarkdown res)
-          copyFeedbackButton (alignMid . padXY 8 2 . tight) "Copy CI rule" ("forbid-query = " <> qresQueryText res)
+        for_ mRes $ \res -> buttonGroup $ do
+          copyFeedbackButton (padXY 8 2 . tight) "Copy MD" (formatQueryMarkdown res)
+          copyFeedbackButton (padXY 8 2 . tight) "Copy CI rule" ("forbid-query = " <> qresQueryText res)
   paneWith tight ctx "Lens query" hdr $
     columnWith (fillW . grow . padAll 10 . gap 6) $ do
       -- Preset catalog strip
-      rowWith (fillW . tight . gap 5 . wrap . lineGap 4) $
+      rowWith (fillW . tight . gap 5 . itemsCenter . wrap . lineGap 4) $
         forM_ builtinQueries $ \(title, qStr, desc) -> withKey title $ do
           resp <- buttonWith' (padXY 7 2 . tight) title
           tooltip resp (desc <> "\n" <> qStr)
           when (respClicked resp) (writeVar (wlQueryText st) qStr)
       -- Query text bar
-      rowWith (fillW . tight . gap 6 . alignMid) $ do
+      rowWith (fillW . tight . gap 6 . itemsCenter) $ do
         labelWith (fontMono . fontMuted . fontSizeScale 0.88) "query>"
         textInputConfigured
           defaultTextInputConfig
@@ -216,7 +216,7 @@ queryPane env st qctx ctx = do
         Right q -> do
           let pills = queryToPills q
           unless (null pills) $
-            rowWith (fillW . tight . gap 5 . wrap . lineGap 4) $
+            rowWith (fillW . tight . gap 5 . itemsCenter . wrap . lineGap 4) $
               forM_ (zip [0 :: Int ..] pills) $ \(pi', pill) -> withKey ("pill" <> tshow pi') $
                 whenM (buttonWith (padXY 6 1 . tight . fontMono . fontSizeScale 0.82) (qpLabel pill <> " ×")) $
                   writeVar (wlQueryText st) (renderQuery (removePillAt pi' q))
@@ -240,7 +240,7 @@ queryPane env st qctx ctx = do
                           labelWith (fontMono . fontMedium . fontSizeScale 0.86 . alignEnd) qrPrimaryMetric
                         labelWith (padLeft 14 . fontMuted . fontSizeScale 0.8 . fillW) (qrSecondary <> maybe "" (\s -> " · " <> s) qrSource)
                       Nothing ->
-                        rowWith (padXY 8 2 . gap 8 . fillW) $ do
+                        rowWith (padXY 8 2 . gap 8 . itemsCenter . fillW) $ do
                           badge Muted qrKindBadge
                           labelWith (fontMono . fontSizeScale 0.88 . fillW) qrTitle
                           labelWith (fontMono . fontSizeScale 0.86) qrPrimaryMetric
@@ -275,14 +275,14 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
             selIdx0 <- readVar (wlSelectedTarget st)
             let selIdx = max 0 (min (length targets - 1) selIdx0)
             for_ (targets !? selIdx) $ \curTarget -> do
-              rowWith (fillW . tight . gap 6 . wrap . lineGap 4) $
+              rowWith (fillW . tight . gap 6 . itemsCenter . wrap . lineGap 4) $
                 forM_ (zip [0 :: Int ..] (take 10 targets)) $ \(ti, ct) -> withKey ("tgt" <> tshow ti) $ do
                   let chosen = ti == selIdx
                       lbl = ctName ct <> " (" <> targetKindName (ctKind ct) <> ")"
                   whenM (buttonWith (padXY 8 2 . tight . (if chosen then fontMedium else fontMuted)) lbl) $
                     writeVar (wlSelectedTarget st) ti
               recipe <- readVar (wlRecipe st)
-              rowWith (fillW . tight . gap 6 . wrap . lineGap 4) $
+              rowWith (fillW . tight . gap 6 . itemsCenter . wrap . lineGap 4) $
                 forM_ allRecipes $ \rc -> withKey (recipeTitle rc) $ do
                   let activeR = rc == recipe
                   resp <- buttonWith' (padXY 8 2 . tight . (if activeR then fontMedium else fontMuted)) (recipeTitle rc)
@@ -291,14 +291,14 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
               hint (recipeSummary recipe)
               for_ (recipeCaveat recipe) $ \cav ->
                 labelWith (fontTone Warning . fontSizeScale 0.84 . fillW) cav
-              rowWith (fillW . tight . gap 6 . alignMid) $ do
+              rowWith (fillW . tight . gap 6 . itemsCenter) $ do
                 labelWith (fontMuted . fontSizeScale 0.85) "Args:"
                 textInputConfigured defaultTextInputConfig {ticPlaceholder = "program arguments before +RTS", ticLayout = fillW defaultLayout} (wlTargetArgs st)
               root <- readVar (wlProjectRoot st)
               argsRaw <- readVar (wlTargetArgs st)
               let evOut = root </> (T.unpack (ctName curTarget) <> ".eventlog")
                   cmdPreview = formatRecipeCommand curTarget recipe (T.words argsRaw) evOut
-              rowWith (fillW . tight . gap 6 . alignMid . wrap) $ do
+              rowWith (fillW . tight . gap 6 . itemsCenter . wrap) $ do
                 whenM (iconButtonWith (padXY 10 3 . tight) iconPlay "Run & follow live") $ do
                   res <- liftIO (launchTargetRecipe (LaunchSpec root curTarget recipe (T.words argsRaw) evOut))
                   case res of
@@ -314,17 +314,17 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
         -- Section B: RTS Pareto Frontier Lab
         sectionTitle "RTS flag Pareto tuning lab"
         hint "Sweep nursery sizes, idle GC, and concurrent non-moving GC (+RTS -xn) across a compiled binary to plot the Throughput vs Tail-Latency Pareto frontier."
-        rowWith (fillW . tight . gap 6 . alignMid) $ do
+        rowWith (fillW . tight . gap 6 . itemsCenter) $ do
           textInputConfigured defaultTextInputConfig {ticPlaceholder = "path/to/executable", ticLayout = fillW defaultLayout} (wlSweepExe st)
           textInputConfigured defaultTextInputConfig {ticPlaceholder = "args", ticLayout = fixedW 120 defaultLayout} (wlSweepArgs st)
-        rowWith (fillW . tight . gap 6 . alignMid) $ do
+        rowWith (fillW . tight . gap 6 . itemsCenter) $ do
           textInputConfigured defaultTextInputConfig {ticPlaceholder = "-A16m, -A64m, -A64m -xn", ticLayout = (fillW . fontMono) defaultLayout} (wlSweepGrid st)
           exeTxt <- T.strip <$> readVar (wlSweepExe st)
           sArgs <- readVar (wlSweepArgs st)
           gridTxt <- readVar (wlSweepGrid st)
           root <- readVar (wlProjectRoot st)
           disabledWhen (T.null exeTxt) $
-            whenM (iconButtonWith (padXY 10 3 . tight) iconBolt "Sweep RTS") $ do
+            whenM (iconButtonWith tight iconBolt "Sweep RTS") $ do
               let parsedGrid = filter (not . null) [words (T.unpack (T.strip g)) | g <- T.splitOn "," gridTxt]
                   grid = if null parsedGrid then defaultSweepGrid else parsedGrid
               writeVar (wlSweepTrigger st) (Just (SweepConfig (T.unpack exeTxt) (words (T.unpack sArgs)) grid (Just root)))
@@ -345,14 +345,14 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
         textInputConfigured defaultTextInputConfig {ticPlaceholder = "max-leak-score = 0.5\nmax-gc-p99-ms = 15", ticLayout = (fillW . fontMono) defaultLayout} (wlBudgetSpec st)
         specTxt <- readVar (wlBudgetSpec st)
         bRes <- liftIO (evaluateBudget (parseBudgetSpec specTxt) mTl mHp (envBaseline env >>= baHeap) mDumps)
-        rowWith (fillW . tight . gap 8 . alignMid . wrap) $ do
+        rowWith (fillW . tight . gap 8 . itemsCenter . wrap) $ do
           badge (if brPassed bRes then Success else Danger) (if brPassed bRes then "BUDGET PASS" else "BUDGET FAIL")
           forM_ (brChecks bRes) $ \ck ->
             labelWith (fontMono . fontSizeScale 0.82 . (if ckPassed ck then fontMuted else fontTone Danger)) (ckName ck <> ": " <> ckActual ck)
           flex
           copyFeedbackButton (padXY 8 2 . tight) "Copy report" (formatBudgetMarkdown bRes)
 
-        rowWith (fillW . tight . gap 8 . alignMid) $ do
+        rowWith (fillW . tight . gap 8 . itemsCenter) $ do
           whenM (iconButtonWith (padXY 8 2 . tight) iconFolderOpen "Import Criterion / tasty-bench CSV…") $ do
             fid <- askOpenFileDialog defaultFileDialogOptions {dialogFilters = [FileFilter "CSV files" "csv", FileFilter "All files" "*"]}
             writeVar (wlBenchDialog st) (Just fid)
@@ -400,7 +400,7 @@ paretoScatterView ParetoSummary {..} = do
           drawCircle (V2 cx cy) (if spParetoOptimal p then 5 else 3.5) col
           drawTextWith (mmFont mm) (V2 (cx + 7) cy) AlignStart AlignMiddle lbl (if spParetoOptimal p then pText pal else pMuted pal)
     forM_ (sortOn spDurationSec pts) $ \p ->
-      rowWith (fillW . tight . gap 8 . padXY 4 1) $ do
+      rowWith (fillW . tight . gap 8 . itemsCenter . padXY 4 1) $ do
         badge (if spParetoOptimal p then Success else Muted) (if spParetoOptimal p then "FRONTIER" else "dominated")
         labelWith (fontMono . fontSizeScale 0.85 . fillW) ("+RTS " <> T.unwords (spFlags p))
         labelWith (fontMono . fontSizeScale 0.85) (fmtSec (spDurationSec p))

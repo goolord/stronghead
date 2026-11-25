@@ -308,9 +308,9 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
   busy <- readVar (dsBusy st)
   stop <- readVar (dsStop st)
   let send cmds = liftIO (runCommands st wake cmds)
-      input placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
+      input placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = f defaultLayout} v
       tipBtn ic lbl tip = do
-        r <- iconButtonWith' alignMid ic lbl
+        r <- iconButtonWith' id ic lbl
         tooltip r tip
         pure (respClicked r)
       stepping = running && not busy && isJust stop
@@ -324,16 +324,16 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
     toolLabel "Run"
     input "ghci  or  cabal repl" (fixedW 150) (dsCommand st)
     toolLabel "in"
-    rowWith (tight . gap 4 . alignMid . minW 180 . fillW) $ do
+    rowWith (tight . gap 4 . itemsCenter . minW 180 . fillW) $ do
       input "working directory" fillW (dsDir st)
-      dirBrowse <- iconButtonWith' (alignMid . padXY 6 4 . tight) iconFolderOpen ""
+      dirBrowse <- iconButton' iconFolderOpen "Browse working directory"
       tooltip dirBrowse "Browse working directory…"
       when (respClicked dirBrowse) $
         writeVar (dsDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
     toolLabel "and load"
-    rowWith (tight . gap 4 . alignMid) $ do
+    rowWith (tight . gap 4 . itemsCenter) $ do
       input "src/Main.hs" (fixedW 180) (dsFile st)
-      fileBrowse <- iconButtonWith' (alignMid . padXY 6 4 . tight) iconFile ""
+      fileBrowse <- iconButton' iconFile "Browse Haskell source file"
       tooltip fileBrowse "Browse Haskell source file…"
       when (respClicked fileBrowse) $
         writeVar (dsFileDialog st) . Just
@@ -346,22 +346,24 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
       if running
         then whenM (toolIconButton iconStop "Stop session") (liftIO (stopSession st wake))
         else disabledWhen busy $ whenM (styled primary (toolIconButton iconPlay "Start session")) (liftIO (startSession st wake))
-    scope $ when busy (rowWith (alignMid . tight) spinner)
+    scope $ when busy (rowWith (itemsCenter . tight) spinner)
     disabledWhen (not running || busy) $ toolGroup $ do
       input "expression, e.g. main" (fixedW 160) (dsExpr st)
       expr <- T.strip <$> readVar (dsExpr st)
-      whenM (tipBtn iconStepInto "Step into" "Evaluate expression stopping at the first step (:step)") (send [":step " <> expr])
-      whenM (tipBtn iconTrace "Trace" "Evaluate expression recording history for time-travel (:trace)") (send [":trace " <> expr])
-      whenM (tipBtn iconBolt "Run" "Evaluate expression until a breakpoint is hit") (send [expr])
+      buttonGroup $ do
+        whenM (tipBtn iconStepInto "Step into" "Evaluate expression stopping at the first step (:step)") (send [":step " <> expr])
+        whenM (tipBtn iconTrace "Trace" "Evaluate expression recording history for time-travel (:trace)") (send [":trace " <> expr])
+        whenM (tipBtn iconBolt "Run" "Evaluate expression until a breakpoint is hit") (send [expr])
     -- Continue and Abandon take their colour only when they can act.
     disabledWhen (not stepping) $ do
       toolGroup $ do
-        whenM (tipBtn iconStep "Step" "Step into next expression (F11)") (send [":step"])
-        whenM (tipBtn iconStepOver "Step over" "Step within current binding (:steplocal, F10)") (send [":steplocal"])
-        whenM (tipBtn iconStepOut "Step out" "Step out of current function (:stepout, Shift+F11)") (send [":stepout"])
-        whenM (tipBtn iconStepModule "Step module" "Step within current module (:stepmodule)") (send [":stepmodule"])
+        buttonGroup $ do
+          whenM (tipBtn iconStep "Step" "Step into next expression (F11)") (send [":step"])
+          whenM (tipBtn iconStepOver "Step over" "Step within current binding (:steplocal, F10)") (send [":steplocal"])
+          whenM (tipBtn iconStepOut "Step out" "Step out of current function (:stepout, Shift+F11)") (send [":stepout"])
+          whenM (tipBtn iconStepModule "Step module" "Step within current module (:stepmodule)") (send [":stepmodule"])
         whenM (styled (whenStepping success) (tipBtn iconContinue "Continue" "Resume execution until next breakpoint (F5)")) (send [":continue"])
-      toolGroup $ do
+      toolGroup $ buttonGroup $ do
         whenM (tipBtn iconBack "Back" "Step backwards through traced history (:back)") (send [":back"])
         whenM (tipBtn iconForward "Forward" "Step forwards through traced history (:forward)") (send [":forward"])
         whenM (tipBtn iconHistory "History" "Show traced call history (:history)") (send [":history"])
@@ -425,10 +427,10 @@ sourcePane env st ix ctx source stop send = do
         scope $ case stop of
           Just s -> do
             statusDot Warning
-            labelWith (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) "Stopped in"
-            linkText env (stopBinding (stName s)) (alignMid . fontSizeScale 0.85 . fontColor (pGC pal)) (stName s)
+            labelWith (fontSizeScale 0.85 . fontColor (pGC pal)) "Stopped in"
+            linkText env (stopBinding (stName s)) (fontSizeScale 0.85 . fontColor (pGC pal)) (stName s)
             for_ (stSpan s) $ \sp ->
-              linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (alignMid . fontMono . fontMuted . fontSizeScale 0.85) (shortFileName (ssFile sp) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
+              linkText env (RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}) (fontMono . fontMuted . fontSizeScale 0.85) (shortFileName (ssFile sp) <> ":" <> tshow (ssLine sp) <> ":" <> tshow (ssCol sp))
           Nothing -> when running $ do
             statusDot Success
             paneMeta "Running"
@@ -489,11 +491,11 @@ breaksPane env st ctx send = do
     scope $ when (M.null breaks) $ hint "No breakpoints. Click the gutter, or right-click any line, binding, cost centre or closure in another panel: Break here."
     paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
       forM_ (M.toList breaks) $ \((f, l), n) -> withKey (T.pack f <> ":" <> tshow l) $
-        rowWith (tight . fillW . gap 4) $ do
+        rowWith (tight . itemsCenter . fillW . gap 4) $ do
           _ <- linkRow env (RBreakpoint f l) False fillW $ do
             cell (fixedW 26 . fontMuted . fontSizeScale 0.85) ("#" <> tshow n)
             cell (fillW . fontMono . fontSizeScale 0.9) (T.pack (takeFileName f) <> ":" <> tshow l)
-          disabledWhen (not running) $ whenM (iconButtonWith (alignMid . padXY 6 0 . tight) iconTrash "Delete") (deleteBreak st send (Just f, l) n)
+          disabledWhen (not running) $ whenM (iconButtonWith (padXY 6 0 . tight) iconTrash "Delete") (deleteBreak st send (Just f, l) n)
 
 -- | The local bindings at the stop, each value an expandable tree, plus
 -- Laziness X-Ray step transition badges and a clickable :history scrubber.
@@ -510,10 +512,10 @@ bindingsPane env st stop send = do
   let force name deep = liftIO (forceValue st wake name deep)
   scope $ unless (null hist) $ do
     panelWith (padXY 8 5 . gap 4 . fillW) $ do
-      rowWith (tight . gap 6 . alignMid . fillW) $ do
+      rowWith (tight . gap 6 . itemsCenter . fillW) $ do
         labelWith (fontMedium . fontSizeScale 0.85) ("Time-travel scrubber (" <> tshow (length hist) <> " steps)")
         flex
-        disabledWhen busy $ do
+        disabledWhen busy $ buttonGroup $ do
           whenM (buttonWith (padXY 6 0 . tight) "← Back") (send [":back"])
           whenM (buttonWith (padXY 6 0 . tight) "Forward →") (send [":forward"])
       rowWith (tight . gap 4 . wrap . fillW) $
@@ -529,9 +531,9 @@ bindingsPane env st stop send = do
       let value = maybe (parseValue <$> gbValue b) Just (M.lookup (gbName b) values)
           name = gbName b
           mxr = M.lookup name xrays
-      rowWith (tight . gap 6 . fillW) $ do
-        cell (fontMono . fontMedium . alignMid) name
-        cell (fontMono . fontMuted . fillW . fontSizeScale 0.9 . alignMid) (":: " <> gbType b)
+      rowWith (tight . gap 6 . itemsCenter . fillW) $ do
+        cell (fontMono . fontMedium) name
+        cell (fontMono . fontMuted . fillW . fontSizeScale 0.9) (":: " <> gbType b)
         scope $ case mxr of
           Just xr -> case vxTransition xr of
             ThunkCollapsed -> badge Success "collapsed"
@@ -544,9 +546,9 @@ bindingsPane env st stop send = do
           Just (VThunk _ _) -> badge Warning "thunk"
           Just v | valueHasThunks v -> badge Warning "partly evaluated"
           Just _ -> badge Success "evaluated"
-        disabledWhen busy $ do
-          whenM (buttonWith (alignMid . padXY 6 0 . tight) "WHNF") (force name False)
-          whenM (buttonWith (alignMid . padXY 6 0 . tight) "Force all") (force name True)
+        disabledWhen busy $ buttonGroup $ do
+          whenM (buttonWith (padXY 6 0 . tight) "WHNF") (force name False)
+          whenM (buttonWith (padXY 6 0 . tight) "Force all") (force name True)
       scope $ for_ value $ \v -> valueTree st toggled busy force name v
   scope $ unless (null bindings) $
     hint "Laziness X-Ray: green = thunk collapsed this step, amber = newly allocated thunk, red = aging unforced thunk across steps. Evaluate takes a thunk to WHNF (seq), Force evaluates it all the way (:force)."
@@ -556,7 +558,7 @@ bindingsPane env st stop send = do
 valueTree :: DebugState -> S.Set Text -> Bool -> (Text -> Bool -> NanoUI ()) -> Text -> Value -> NanoUI ()
 valueTree st toggled busy force root v0 = columnWith (tight . fillW . gap 0) $
   forM_ (take 400 (flattenValue toggled root v0)) $ \(path, depth, label', v, open, expandable) -> withKey path $
-    rowWith (tight . fillW . gap 4) $ do
+    rowWith (tight . itemsCenter . fillW . gap 4) $ do
       clicked <- selectableRow False fillW $ do
         spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
         cell (fixedW 14 . fontMuted) (if expandable then (if open then "▾" else "▸") else " ")
@@ -567,9 +569,9 @@ valueTree st toggled busy force root v0 = columnWith (tight . fillW . gap 0) $
           _ -> pure ()
       when (clicked && expandable) $ modifyVar (dsToggled st) (\s -> if S.member path s then S.delete path s else S.insert path s)
       scope $ case v of
-        VThunk n _ | isThunkBinding n -> disabledWhen busy $ do
-          whenM (buttonWith (alignMid . padXY 6 0 . tight) "Evaluate") (force n False)
-          whenM (buttonWith (alignMid . padXY 6 0 . tight) "Force") (force n True)
+        VThunk n _ | isThunkBinding n -> disabledWhen busy $ buttonGroup $ do
+          whenM (buttonWith (padXY 6 0 . tight) "Evaluate") (force n False)
+          whenM (buttonWith (padXY 6 0 . tight) "Force") (force n True)
         _ -> pure ()
 
 -- | Rows of a value tree: path, depth, field label, value, whether it is
@@ -608,21 +610,20 @@ consolePane env st ctx send = do
   let i = ink th
       clear = do
         flex
-        whenM (iconButtonWith (alignMid . padXY 8 2 . tight) iconTrash "Clear") (writeVar (dsConsole st) [])
+        whenM (iconButtonWith (padXY 8 2 . tight) iconTrash "Clear") (writeVar (dsConsole st) [])
       at sp = RSource sp {ssFile = T.pack (resolve dir (ssFile sp))}
       mono = fontMono . fontSizeScale 0.85
   paneWith tight ctx "GHCi console" clear $ do
     ls <- readVar (dsConsole st)
-    sid <- currentId
-    (_, ()) <- paneScrollArea (grow . tight) $ columnWith (padXY 12 8 . tight . fillW . gap 0) $
+    (scrollWid, ()) <- paneScrollArea (grow . tight) $ columnWith (padXY 12 8 . tight . fillW . gap 0) $
       forM_ (zip [0 :: Int ..] (drop (length ls - 400) ls)) $ \(n, l) -> withKey n $
         -- History steps and stops are links to where they are.
         case (historyLine l, parseStop l) of
-          (Just (k, name, sp), _) -> rowWith (fillW . tight . gap 8) $ do
+          (Just (k, name, sp), _) -> rowWith (fillW . tight . gap 8 . itemsBaseline) $ do
             labelWith (mono . fontMuted) (tshow k)
             labelWith mono name
             linkText env (at sp) (mono . fontMuted) (renderSrcSpan sp)
-          (_, Just s) | Just sp <- stSpan s -> rowWith (fillW . tight . gap 8) $ do
+          (_, Just s) | Just sp <- stSpan s -> rowWith (fillW . tight . gap 8 . itemsBaseline) $ do
             labelWith mono "Stopped in"
             linkText env (stopBinding (stName s)) mono (stName s)
             linkText env (at sp) (mono . fontMuted) (renderSrcSpan sp)
@@ -632,12 +633,12 @@ consolePane env st ctx send = do
     n <- readVar seen
     when (n /= length ls) $ do
       writeVar seen (length ls)
-      scrollToUi sid (V2 0 (1 / 0)) ScrollInstant
+      scrollToEndUi scrollWid ScrollInstant
     running <- readVar (dsRunning st)
     styled (panelStyle (background (inkSunken i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
-      panelWith (asRow . fillW . padXY 12 6 . gap 8) $ themed th $ do
-        labelWith (alignMid . fontMono . fontTone Accent) "λ>"
-        resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "Any GHCi command, e.g. :show breaks, :history, :sprint xs", ticLayout = (alignMid . fillW) defaultLayout} (dsInput st)
+      panelWith (asRow . itemsCenter . fillW . padXY 12 6 . gap 8) $ themed th $ do
+        labelWith (fontMono . fontTone Accent) "λ>"
+        resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "Any GHCi command, e.g. :show breaks, :history, :sprint xs", ticLayout = fillW defaultLayout} (dsInput st)
         go <- disabledWhen (not running) (toolIconButton iconSend "Send")
         when (respSubmitted resp || go) $ do
           cmd <- readVar (dsInput st)

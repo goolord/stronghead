@@ -23,7 +23,7 @@ import Data.Foldable (asum, for_)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
-import Data.List (sort, sortOn)
+import Data.List (findIndex, sort, sortOn)
 import Data.Map.Strict qualified as M
 import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Ord (Down (..))
@@ -536,11 +536,12 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
         whenM (styled primary (toolIconButton iconFolderOpen "Open dump folder…")) askDir
         whenM (toolIconButton iconFile "Open files…") askFiles
   toolStripWrap $ do
-    whenM (toolIconButton iconFolderOpen "Open dump folder…") askDir
-    whenM (toolIconButton iconFile "Open files…") askFiles
+    buttonGroup $ do
+      whenM (toolIconButton iconFolderOpen "Open dump folder…") askDir
+      whenM (toolIconButton iconFile "Open files…") askFiles
     scope $ unless (null arts) $ toolGroup $ do
       toolLabel "Module"
-      selectWith (alignMid . minW 200) (map maModule arts) (csModule st)
+      selectWith (minW 200) (map maModule arts) (csModule st)
       i <- readVar (csModule st)
       current <- readVar (csLoadedModule st)
       -- Load whichever module the picker shows (the first one after a
@@ -556,18 +557,18 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
     flex
     msg <- readVar (csMessage st)
     scope $ unless (T.null msg) $ do
-      labelWith (alignMid . fontSizeScale 0.85 . fontTone Warning) (T.take 100 msg)
-      whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (csMessage st) "")
+      labelWith (fontSizeScale 0.85 . fontTone Warning) (T.take 100 msg)
+      whenM (buttonWith (padXY 6 0 . tight) "Dismiss") (writeVar (csMessage st) "")
     toolGroup $ do
       toolLabel "Colour"
-      rowWith (alignMid . tight) $
+      rowWith (itemsCenter . tight) $
         boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring st)
       colNow <- readVar (csColouring st)
       scope $ when (colNow == BoxingColours) $ do
-        labelWith (alignMid . fontTone Warning . fontSizeScale 0.8) "■ box"
-        labelWith (alignMid . fontTone Success . fontSizeScale 0.8) "■ unboxed #"
-    toolGroup $ checkboxWith alignMid "Hide uniques" (csHideUniques st)
-    checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable st)
+        labelWith (fontTone Warning . fontSizeScale 0.8) "■ box"
+        labelWith (fontTone Success . fontSizeScale 0.8) "■ unboxed #"
+    toolGroup $ checkbox "Hide uniques" (csHideUniques st)
+    checkbox "Hide Typeable bindings" (csHideTypeable st)
   root <- readVar (csRoot st)
   let src = clSource loaded >>= eitherToMaybe
       core = clCore loaded >>= eitherToMaybe
@@ -878,7 +879,7 @@ corePanes env st loaded sitePanes = do
             borderColorActive = if paneFlashFactor0 > 0 then lerpColor baseBorder accent paneFlashFactor0 else baseBorder
             borderWidthActive = if paneFlashFactor0 > 0.05 then 2 else 1
         menuOpen <- useVar False
-        let metaContent = rowWith (alignMid . tight . gap 8 . padRight 6) $ do
+        let metaContent = rowWith (itemsCenter . tight . gap 8 . padRight 6) $ do
               paneMeta (maybe (if activeKind == KindSource then "not found: set the project root in Settings" else "not loaded") (T.pack . takeFileName . cfPath) activeMcf)
               scope $ unless (T.null (laneLegend activeNotes)) $ paneMeta (laneLegend activeNotes)
               scope $ for_ (pcGrid ctx) $ \g -> when (pgcMaximized g) $ do
@@ -1058,7 +1059,7 @@ corePanes env st loaded sitePanes = do
               checkboxWith (fillW . fontSizeScale 0.86) "Hide compiler lifted" (csHideLifted st)
             scope $ unless (null lanes) $ do
               checkboxWith fillW "Hot and boxed only" (csHotBoxed st)
-              rowWith (padXY 8 0 . tight . gap 6 . fillW) $ do
+              rowWith (padXY 8 0 . tight . gap 6 . itemsBaseline . fillW) $ do
                 sortHeader st fillW "binding" InFileOrder
                 forM_ lanes $ \l -> withKey (laneName l) $ case l of
                   LaneTime -> sortHeader st (fixedW 38 . alignEnd) "time" ByTime
@@ -1066,14 +1067,27 @@ corePanes env st loaded sitePanes = do
                   LaneEntries -> sortHeader st (fixedW 44 . alignEnd) "entries" ByEntries
                   LaneTicky -> sortHeader st (fixedW 46 . alignEnd) "ticky" ByTicky
                   _ -> sortHeader st (fixedW 52 . alignEnd) "heap" ByHeap
-            paneScroll (grow . tight) $ columnWith (tight . fillW . gap 0) $
+            let shownVec = V.fromList shown
+                nShown = V.length shownVec
+                multiLine = length lanes >= 3 || LaneTicky `elem` lanes
+                curIdx = fromMaybe (-1) (selected >>= \k -> findIndex ((== k) . enKey) shown)
+            sid <- currentId
+            nav <- useListNav sid nShown curIdx (if multiLine then 38 else 24)
+            selectedNow <-
+              if lnChanged nav && lnIndex nav >= 0 && lnIndex nav < nShown
+                then do
+                  let pickedKey = enKey (shownVec V.! lnIndex nav)
+                  select pickedKey
+                  pure (Just pickedKey)
+                else pure selected
+            void $ paneFocusScrollArea (grow . tight) $ columnWith (tight . fillW . gap 0) $
               forM_ shown $ \e -> withKey (enKey e) $ do
                 let r = rt e
-                picked <- linkRow env (RBinding modName (enKey e)) (selected == Just (enKey e)) id $ do
+                picked <- linkRow env (RBinding modName (enKey e)) (selectedNow == Just (enKey e)) id $ do
                   -- With several columns, the badges go under the name so
                   -- the numbers keep their place.
-                  if length lanes >= 3 || LaneTicky `elem` lanes
-                    then columnWith (fillW . minW 72 . tight . gap 2 . alignMid) $ do
+                  if multiLine
+                    then columnWith (fillW . minW 72 . tight . gap 2) $ do
                       labelWith (fillW . fontMono . fontSizeScale 0.9) (T.take 24 (enKey e))
                       rowWith (tight . gap 4 . wrap . fillW) (entryBadges e (isJust core))
                     else do
@@ -1099,7 +1113,7 @@ corePanes env st loaded sitePanes = do
                     sectionTitle ("Module optimization smells (" <> tshow (length smells) <> ")")
                     forM_ (zip [0 :: Int ..] smells) $ \(si, sm) -> withKey ("sm" <> tshow si) $
                       panelWith (padXY 10 7 . gap 4 . fillW) $ do
-                        rowWith (tight . gap 8 . alignMid . fillW) $ do
+                        rowWith (tight . gap 8 . itemsCenter . fillW) $ do
                           badge Warning (Forensics.smellKindTitle (Forensics.csKind sm))
                           labelWith (fontMono . fontMedium . fillW) (Forensics.csBinding sm)
                           whenM (buttonWith (padXY 6 0 . tight) ("@" <> tshow (Forensics.csLine sm + 1))) $ do
@@ -1142,9 +1156,9 @@ entryBadges e haveCore = do
 notesBar :: CoreState -> Entry -> Maybe CodeFile -> Maybe CodeFile -> Maybe CodeFile -> Runtime -> Bool -> NanoUI ()
 notesBar st e core stg lowCf r haveRuntime = panelWith (padXY 10 6 . gap 4 . fillW) $ do
   let (_, vCore, vStg) = csViews st
-  rowWith (tight . gap 12 . wrap . fillW . alignMid) $ do
+  rowWith (tight . gap 12 . wrap . fillW . itemsCenter) $ do
     labelWith (fontMedium . fontMono) (enKey e)
-    scope $ forM_ (enCore e) $ \b -> withKey (bdName b) $ rowWith (tight . gap 8 . alignMid) $ do
+    scope $ forM_ (enCore e) $ \b -> withKey (bdName b) $ rowWith (tight . gap 8 . itemsCenter) $ do
       labelWith (fontMono . fontMuted) (stripQualifier (bdName b))
       let n = bdNotes b
       for_ (nArity n) $ \a -> fact "arity" (tshow a)
@@ -1200,7 +1214,7 @@ notesBar st e core stg lowCf r haveRuntime = panelWith (padXY 10 6 . gap 4 . fil
     sectionTitle ("STG closure captures (" <> tshow (length captures) <> ")")
     hint "Free variables statically retained inside closures allocated by this binding. Updateable thunks (\\u) keep all captured free variables alive until forced."
     forM_ (take 16 captures) $ \c -> withKey ("cap" <> tshow (Forensics.scLine c) <> Forensics.scBinder c) $
-      rowWith (tight . gap 8 . alignMid . fillW) $ do
+      rowWith (tight . gap 8 . itemsCenter . fillW) $ do
         badge
           (case Forensics.scFlag c of Forensics.StgUpdateable -> Danger; Forensics.StgSingleEntry -> Warning; _ -> Muted)
           (case Forensics.scFlag c of Forensics.StgUpdateable -> "\\u thunk"; Forensics.StgSingleEntry -> "\\s thunk"; Forensics.StgReentrant -> "\\r fun"; Forensics.StgUnknown -> "closure")
@@ -1217,7 +1231,7 @@ notesBar st e core stg lowCf r haveRuntime = panelWith (padXY 10 6 . gap 4 . fil
     sectionTitle ("Optimization smells (" <> tshow (length bindingSmells) <> ")")
     forM_ (zip [0 :: Int ..] bindingSmells) $ \(si, sm) -> withKey ("bsm" <> tshow si) $
       columnWith (tight . gap 2 . fillW) $ do
-        rowWith (tight . gap 8 . alignMid . fillW) $ do
+        rowWith (tight . gap 8 . itemsCenter . fillW) $ do
           badge Warning (Forensics.smellKindTitle (Forensics.csKind sm))
           labelWith (fontSizeScale 0.88 . fillW) (Forensics.csSummary sm)
           whenM (buttonWith (padXY 6 0 . tight) ("@" <> tshow (Forensics.csLine sm + 1))) $ do
@@ -1231,7 +1245,7 @@ notesBar st e core stg lowCf r haveRuntime = panelWith (padXY 10 6 . gap 4 . fil
     sectionTitle ("Why didn't GHC optimize further? (" <> tshow (length misses) <> ")")
     forM_ (zip [0 :: Int ..] misses) $ \(mi, ex) -> withKey ("ex" <> tshow mi) $
       columnWith (tight . gap 2 . fillW) $ do
-        rowWith (tight . gap 8 . alignMid . fillW) $ do
+        rowWith (tight . gap 8 . itemsCenter . fillW) $ do
           badge Accent (Forensics.smellKindTitle (Forensics.seSmell ex))
           labelWith (fontSizeScale 0.86 . fillW) (Forensics.seReason ex)
         forM_ (Forensics.seLogEvidence ex) $ \evLine ->
@@ -1243,11 +1257,11 @@ cmmAsmPane env st mm colouring hideU hot modName fullArts mLowCf ctx = do
       hdr = do
         for_ mLowCf $ \cf -> paneMeta (T.pack (takeFileName (cfPath cf)))
         flex
-        for_ curFull $ \f -> do
+        for_ curFull $ \f -> buttonGroup $ do
           for_ (fmaCmm f) $ \cp ->
-            whenM (buttonWith (alignMid . padXY 7 1 . tight) "Cmm") (writeVar (csLowPath st) (Just cp))
+            whenM (buttonWith (padXY 7 1 . tight) "Cmm") (writeVar (csLowPath st) (Just cp))
           for_ (fmaAsm f) $ \ap ->
-            whenM (buttonWith (alignMid . padXY 7 1 . tight) "Asm") (writeVar (csLowPath st) (Just ap))
+            whenM (buttonWith (padXY 7 1 . tight) "Asm") (writeVar (csLowPath st) (Just ap))
   case mLowCf of
     Nothing ->
       paneEmpty

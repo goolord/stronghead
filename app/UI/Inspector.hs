@@ -91,18 +91,19 @@ inspectorPaneWithTriage env ins findings onRunQuery ctx = do
   back <- readVar (inBack ins)
   forward <- readVar (inForward ins)
   let step label refs go = do
-        resp <- disabledWhen (null refs) (buttonWith' (alignMid . padXY 8 2 . tight) label)
+        resp <- disabledWhen (null refs) (buttonWith' (padXY 8 2 . tight) label)
         for_ (take 1 refs) $ \r -> tooltip resp (refTitle env r)
         when (respClicked resp) go
       header = do
         winW <- windowWidth
         let compact = winW < 1060
-        step "←" back (stepInspector env ins inBack inForward)
-        step "→" forward (stepInspector env ins inForward inBack)
+        buttonGroup $ do
+          step "←" back (stepInspector env ins inBack inForward)
+          step "→" forward (stepInspector env ins inForward inBack)
         scope $ when (isJust shown && not (null findings)) $
-          whenM (buttonWith (alignMid . padXY 7 2 . tight) "Findings") (writeVar (inShown ins) Nothing)
+          whenM (buttonWith (padXY 7 2 . tight) "Findings") (writeVar (inShown ins) Nothing)
         flex
-        (_, fArea) <- mouseArea alignMid $ checkboxWith alignMid (if compact then "" else "Follow") (inFollow ins)
+        (_, fArea) <- mouseArea id $ checkbox (if compact then "" else "Follow") (inFollow ins)
         when compact (tooltip fArea "Follow focused entity")
   paneWith tight ctx "Inspector" header $
     paneScroll (grow . tight) $
@@ -124,7 +125,7 @@ inspectorBody env r = do
       shownBy x = any (`lensShows` x) ls
   labelWith (fontMedium . fontSizeScale 1.05 . fillW) (refTitle env r)
   labelWith (fontMono . fontMuted . fontSizeScale 0.8 . fillW) (refTarget r)
-  rowWith (fillW . tight . gap 6 . wrap . lineGap 6) $ do
+  rowWith (fillW . itemsCenter . tight . gap 6 . wrap . lineGap 6) $ do
     pinned <- isPinned bus r
     whenM (iconButtonWith (padXY 8 2 . tight) iconBookmark (if pinned then "Unpin" else "Pin")) (togglePin bus r)
     focus <- readVar (busFocus bus)
@@ -153,10 +154,10 @@ inspectorBody env r = do
           for_ (peek >>= peekExact) $ labelWith (fontMuted . fontSizeScale 0.82 . fillW)
           for_ peek $ columnWith (fillW . tight . gap 2) . drawPeek False
           forM_ (zip [0 :: Int ..] related) $ \(i, (lbl, x)) -> withKey i $
-            rowWith (fillW . tight . gap 8) $ do
-              linkText env x alignBaseline (T.take 60 lbl)
-              labelWith (alignBaseline . fontMuted . fontSizeScale 0.85 . fillW) (T.take 60 (refTitle env x))
-          rowWith (fillW . tight . gap 6 . wrap . lineGap 6) $ do
+            rowWith (fillW . itemsBaseline . tight . gap 8) $ do
+              linkText env x id (T.take 60 lbl)
+              labelWith (fontMuted . fontSizeScale 0.85 . fillW) (T.take 60 (refTitle env x))
+          rowWith (fillW . itemsCenter . tight . gap 6 . wrap . lineGap 6) $ do
             scope $ when (lensShows l r) $
               whenM (buttonWith (padXY 8 2 . tight) ("Show in " <> panelTitle (lensPanel l))) (showIn env l r)
             forM_ (zip [0 :: Int ..] actions) $ \(i, a) -> withKey i $
@@ -171,18 +172,18 @@ nextStepsSection env steps = unless (null steps) $
     labelWith (fontMedium . fontSizeScale 0.92) "Next steps"
     forM_ (zip [1 :: Int ..] steps) $ \(i, s) -> withKey i $
       columnWith (fillW . tight . gap 2) $ do
-        rowWith (fillW . tight . gap 8) $ do
-          labelWith (alignMid . fontMuted . fontSizeScale 0.85 . fixedW 14) (tshow i)
+        rowWith (fillW . itemsCenter . tight . gap 8) $ do
+          labelWith (fontMuted . fontSizeScale 0.85 . fixedW 14) (tshow i)
           let run = stepRun env s
           scope $ case stepDo s of
             -- Missing data has nothing to click: what to add is below it.
-            StepLoad _ -> labelWith (alignMid . fontMedium . fontSizeScale 0.9) (stepTitle s)
-            _ -> actionButton (alignMid . padXY 8 2 . tight) (stepTitle s) Nothing run
+            StepLoad _ -> labelWith (fontMedium . fontSizeScale 0.9) (stepTitle s)
+            _ -> actionButton (padXY 8 2 . tight) (stepTitle s) Nothing run
           scope $ case stepDo s of
-            StepGo x -> linkText env x (alignMid . fontSizeScale 0.9) (T.take 60 (refTitle env x))
+            StepGo x -> linkText env x (fontSizeScale 0.9) (T.take 60 (refTitle env x))
             StepTry flag -> do
-              labelWith (alignMid . fontMono . fontSizeScale 0.85) flag
-              copyFeedbackButton (alignMid . padXY 6 0 . tight) "Copy" flag
+              labelWith (fontMono . fontSizeScale 0.85) flag
+              copyFeedbackButton (padXY 6 0 . tight) "Copy" flag
             _ -> pure ()
         labelWith (padLeft 22 . fillW . fontMuted . fontSizeScale 0.85) (stepReason s)
         scope $ case stepDo s of
@@ -190,8 +191,8 @@ nextStepsSection env steps = unless (null steps) $
             let (build, runWith) = datumRecipe d
             labelWith (padLeft 22 . fillW . fontSizeScale 0.85) (datumTitle d)
             forM_ (zip [0 :: Int ..] ([("build", b) | Just b <- [build]] ++ [("run", x) | Just x <- [runWith]])) $ \(j, (what, line)) -> withKey j $
-              rowWith (padLeft 22 . fillW . tight . gap 6) $ do
-                labelWith (alignMid . fixedW 34 . fontMuted . fontSizeScale 0.8) what
-                labelWith (alignMid . fillW . fontMono . fontSizeScale 0.8) line
-                copyFeedbackButton (alignMid . padXY 6 0 . tight) "Copy" line
+              rowWith (padLeft 22 . fillW . itemsCenter . tight . gap 6) $ do
+                labelWith (fixedW 34 . fontMuted . fontSizeScale 0.8) what
+                labelWith (fillW . fontMono . fontSizeScale 0.8) line
+                copyFeedbackButton (padXY 6 0 . tight) "Copy" line
           _ -> pure ()

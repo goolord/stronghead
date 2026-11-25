@@ -312,8 +312,8 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
   toolStripWrap $ do
     scope $ for_ mDotTone statusDot
     toolLabel "Agent"
-    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 140) defaultLayout} (lvHost st)
-    textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . fixedW 68) defaultLayout} (lvPort st)
+    textInputConfigured defaultTextInputConfig {ticLayout = (fixedW 140) defaultLayout} (lvHost st)
+    textInputConfigured defaultTextInputConfig {ticLayout = (fixedW 68) defaultLayout} (lvPort st)
     if want
       then whenM (toolIconButton iconUnlink "Disconnect") (writeVar (lvWant st) False)
       else whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
@@ -324,7 +324,7 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
     flex
     toolGroup $ do
       toolLabel "Eventlog"
-      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (alignMid . minW 180 . fixedW 220) defaultLayout} (lvEventlog st)
+      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (minW 180 . fixedW 220) defaultLayout} (lvEventlog st)
       path <- readVar (lvEventlog st)
       disabledWhen (T.null (T.strip path)) $
         whenM (toolIconButton iconTrace "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
@@ -353,14 +353,14 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
               rowWith (fillW . padTop 24 . padXY 24 0 . tight) $ do
                 flex
                 columnWith (tight . gap 6 . maxW 640 . fillW) $ do
-                  rowWith (tight . gap 8 . alignMid . fillW) $ do
+                  rowWith (tight . gap 8 . itemsCenter . fillW) $ do
                     sectionTitle ("Discovered local Haskell processes (" <> tshow (length bs) <> ")")
                     flex
                     whenM (toolIconButton iconRefresh "Rescan") (modifyVar (lvBeaconsTick st) (+ 1))
                   forM_ bs $ \b -> withKey (abPath b) $
                     styled cardStyle $
                       panelWith (padXY 12 8 . fillW) $ themed th $
-                        rowWith (tight . gap 12 . alignMid . fillW) $ do
+                        rowWith (tight . gap 12 . itemsCenter . fillW) $ do
                           statusDot Success
                           labelWith fontMedium (abProgram b)
                           labelWith (fontMono . fontMuted) ("pid " <> tshow (abPid b))
@@ -395,14 +395,14 @@ actionStrip st remote = do
   toolStripWrap $ do
     toolLabel "Program"
     forM_ (zip [0 :: Int ..] (groupsOf remote)) $ \(gi, grp) -> withKey gi $ do
-      scope $ when (gi > 0) (box (fixedWH 1 20 . alignMid) (inkRule (ink th)))
+      scope $ when (gi > 0) (box (fixedWH 1 20) (inkRule (ink th)))
       forM_ grp $ \a -> withKey (raLabel a) $
-        actionButton alignMid (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
+        actionButton id (raLabel a) (Just (maybe (raLabel a) (\k -> raLabel a <> " (" <> k <> ")") (raKey a))) (raRun a)
     flex
     msg <- readVar (lvMessage st)
     scope $ unless (T.null msg) $ do
-      labelWith (alignMid . fontSizeScale 0.88 . fontTone Warning) (T.take 120 msg)
-      whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
+      labelWith (fontSizeScale 0.88 . fontTone Warning) (T.take 120 msg)
+      whenM (buttonWith (padXY 6 0 . tight) "Dismiss") (writeVar (lvMessage st) "")
   where
     groupsOf as = filter (not . null) [[a | a <- as, raGroup a == g] | g <- [GroupAgent, GroupDebug]]
 
@@ -422,10 +422,10 @@ attachReport st d = do
               codeBlock ["cabal build <your-program>      (picks up the new stronghead:agent)"]
     | Just (_, steps) <- attached ->
         columnWith (padTop 8 . padBottom 2 . padXY 20 0 . tight . fillW) $
-          rowWith (fillW . tight . gap 18 . wrap . lineGap 4) $ do
+          rowWith (fillW . tight . gap 18 . itemsBaseline . wrap . lineGap 4) $ do
             labelWith (fontMuted . fontSizeScale 0.85) "Connect found"
             forM_ steps $ \s -> withKey (attachKindName (asKind s)) $ do
-              (_, area) <- mouseArea tight $ rowWith (tight . gap 6 . alignBaseline) $ do
+              (_, area) <- mouseArea tight $ rowWith (tight . gap 6 . itemsBaseline) $ do
                 labelWith (fontMedium . fontSizeScale 0.85) (attachKindName (asKind s))
                 case asPath s of
                   Just p -> labelWith (fontMono . fontSizeScale 0.82) (T.pack (takeFileName p))
@@ -563,10 +563,13 @@ livePanes env st mdata logTl site = case mdata of
                         drawStroke (V2 cx (y + 2)) (V2 cx (y + h - 4)) 1 (alpha 0.45 (pText pal))
                         drawCircle (V2 cx cy) 3.5 color
                         drawStrokeCircle (V2 cx cy) 3.5 1.2 (inkPane (ink th))
-            when (respHovered resp) $ do
+            scope $ when (respHovered resp) $ do
               let tHover = chartXTime (respRect resp) span' (v2X (inputMousePos inp))
               for_ (nearestPt tHover pts) $ \(ptT, ptV) ->
-                tooltip resp (title <> ": " <> fmtY ptV <> " at " <> fmtSec ptT)
+                void . tooltipWidgetConfigured defaultTooltipConfig {tooltipDelay = 0, tooltipGrace = 0, tooltipPlacement = PlacementAtCursor, tooltipGap = 10} resp $
+                  columnWith (tight . gap 2 . padXY 4 2) $ do
+                    labelWith (fontMuted . fontSizeScale 0.8) title
+                    labelWith (fontMono . fontTabular . fontMedium . fontSizeScale 0.86) (fmtY ptV <> " · " <> fmtSec ptT)
             when onClock $ do
               void (timeGestures env (axisOf (respRect resp)) resp ScrubDrag)
               canvasLinks env resp (momentAt (axisOf (respRect resp)) marks . v2X)
@@ -592,7 +595,7 @@ livePanes env st mdata logTl site = case mdata of
                   columnWith (tight . fillW . gap 3) $ do
                     labelWith (fontMedium . fontSizeScale 0.88) ("Live runtime alerts (" <> tshow (Seq.length (ldAlerts d)) <> ")")
                     forM_ recentAlerts $ \al ->
-                      rowWith (tight . gap 8 . fillW . alignMid) $ do
+                      rowWith (tight . gap 8 . fillW . itemsCenter) $ do
                         badge (if laKind al == "exc" then Danger else Warning) (laKind al)
                         labelWith (fontMono . fontSizeScale 0.84) ("tid " <> tshow (laTid al))
                         labelWith (fontMedium . fontSizeScale 0.86) (laTitle al)
@@ -604,7 +607,7 @@ livePanes env st mdata logTl site = case mdata of
                   focus <- readVar (lvFocus st)
                   let threads = sortOn ltId [t | t <- frThreads lastF, T.null filt || filt `T.isInfixOf` T.toLower (ltLabel t <> " " <> tshow (ltId t))]
                       palKey = colorToWord32 (pText pal)
-                  rowWith (padXY 8 0 . tight . gap 12 . fillW) $ do
+                  rowWith (padXY 8 0 . tight . gap 12 . itemsBaseline . fillW) $ do
                     colHeader (fixedW 56 . alignEnd) "id"
                     colHeader fillW "label"
                     colHeader (fixedW 36 . alignEnd) "cap"
@@ -615,7 +618,7 @@ livePanes env st mdata logTl site = case mdata of
                     numCell 56 fontMuted (tshow (ltId t))
                     cell (fillW . if T.null (ltLabel t) then fontMuted else id) (if T.null (ltLabel t) then "unlabelled" else ltLabel t)
                     numCell 36 fontMuted (maybe "" tshow (ltCap t))
-                    _ <- canvasKeyed (contentKeyOf [keyPart palKey, keyPart hist]) (fixedWH historyW 12 . alignMid) (\r -> drawHistory pal r hist)
+                    _ <- canvasKeyed (contentKeyOf [keyPart palKey, keyPart hist]) (fixedWH historyW 12) (\r -> drawHistory pal r hist)
                     cell (fixedW 220 . fontTone (groupTone (statusGroup (ltStatus t)))) (ltStatus t)
                 LiveStacksView -> liveStacksView env st rk (ldStacks d)
                 LiveFlameView -> liveFlameView st (ldFolded d)
@@ -685,12 +688,12 @@ groupColour pal = \case
 
 threadsHeader :: LiveState -> [(Text, Int)] -> NanoUI ()
 threadsHeader st counts = do
-  rowWith (alignMid . tight) $
+  rowWith (itemsCenter . tight) $
     boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} liveSubTabName (lvSubTab st)
   subTab <- readVar (lvSubTab st)
   scope $ when (subTab == LiveThreadsList) $
     searchInputConfigured
-      defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (alignMid . fixedW 180) defaultLayout}
+      defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (fixedW 180) defaultLayout}
       (lvThreadFilter st)
   flex
   forM_ counts $ \(g, n) -> withKey g $ badge (groupTone g) (g <> " " <> tshow n)
@@ -706,7 +709,7 @@ liveStacksView env st rk stacks = do
             Nothing -> M.elems stacks
       forM_ (take 32 ordered) $ \ts -> withKey ("stk" <> tshow (ltsTid ts)) $
         panelWith (padAll 8 . gap 3 . fillW) $ do
-          rowWith (tight . gap 8 . alignMid . fillW) $ do
+          rowWith (tight . gap 8 . itemsCenter . fillW) $ do
             linkText env (RThread rk (fromIntegral (ltsTid ts))) fontMedium ("Thread " <> tshow (ltsTid ts))
             badge (groupTone (statusGroup (ltsStatus ts))) (ltsStatus ts)
             flex
@@ -714,7 +717,7 @@ liveStacksView env st rk stacks = do
           if null (ltsFrames ts)
             then hint "No decoded frames (compile target with -finfo-table-map for Haskell source locations)."
             else forM_ (zip [0 :: Int ..] (take 24 (ltsFrames ts))) $ \(fi, f) -> withKey ("f" <> tshow fi) $
-              rowWith (tight . gap 8 . fillW . alignMid) $ do
+              rowWith (tight . gap 8 . fillW . itemsCenter) $ do
                 numCell 24 fontMuted (tshow fi)
                 cell (fontMono . fontSizeScale 0.86) (if T.null (lfeFunction f) then lfeClosureType f else lfeFunction f)
                 cell (fontMono . fontMuted . fontSizeScale 0.82) (lfeModule f)
@@ -729,12 +732,13 @@ liveFlameView st folded = do
   let filtBtn lbl val =
         whenM (styled (if statusFilt == val then primary else id) (buttonWith (padXY 8 2 . tight) lbl)) $
           writeVar (lvFlameStatus st) val
-  rowWith (tight . gap 6 . alignMid . fillW . wrap) $ do
+  rowWith (tight . gap 6 . itemsCenter . fillW . wrap) $ do
     labelWith (fontMuted . fontSizeScale 0.85) "Filter"
-    filtBtn "All" Nothing
-    filtBtn "On-CPU (running)" (Just "running")
-    filtBtn "Off-CPU (MVar)" (Just "BlockedOnMVar")
-    filtBtn "Off-CPU (BlackHole)" (Just "BlockedOnBlackHole")
+    buttonGroup $ do
+      filtBtn "All" Nothing
+      filtBtn "On-CPU (running)" (Just "running")
+      filtBtn "Off-CPU (MVar)" (Just "BlockedOnMVar")
+      filtBtn "Off-CPU (BlackHole)" (Just "BlockedOnBlackHole")
     flex
     labelWith (fontMuted . fontSizeScale 0.82) (tshow (sum (M.elems folded)) <> " total samples")
   flamegraphView (fromLiveFolded statusFilt folded) (lvFlameZoom st)
@@ -748,13 +752,13 @@ liveProbesView env probes =
         panelWith (padAll 8 . gap 3 . fillW) $ do
           let thunkCnt = length (filter lpnIsThunk nodes)
               totBytes = sum (map lpnBytes nodes)
-          rowWith (tight . gap 8 . alignMid . fillW) $ do
+          rowWith (tight . gap 8 . itemsCenter . fillW) $ do
             labelWith (fontMedium . fontMono) pName
             badge (if thunkCnt > 0 then Warning else Success) (tshow thunkCnt <> " thunks")
             flex
             labelWith (fontMono . fontMuted . fontSizeScale 0.84) (tshow (length nodes) <> " closures · " <> fmtBytes (fromIntegral totBytes))
           forM_ (take 80 nodes) $ \n -> withKey ("pn" <> tshow (lpnId n)) $
-            rowWith (tight . gap 8 . fillW . alignMid) $ do
+            rowWith (tight . gap 8 . fillW . itemsCenter) $ do
               let depth = max 0 (min 12 (if lpnParent n < 0 then 0 else 1 + min 11 (lpnParent n)))
               spacer (Fixed (fromIntegral depth * 10)) Fit
               cell (fontMono . fontSizeScale 0.86 . if lpnIsThunk n then fontTone Warning else id)

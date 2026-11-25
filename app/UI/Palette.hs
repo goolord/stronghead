@@ -82,7 +82,7 @@ paletteView env pl commands =
               HitRun act -> act
       when ((respSubmitted resp || enter) && n > 0) $
         for_ (take 1 (drop idx ranked)) run
-      rowWith (fillW . tight . gap 8 . alignMid) $ do
+      rowWith (fillW . tight . gap 8 . itemsCenter) $ do
         labelWith (fontMuted . fontSizeScale 0.8) $
           if T.null (T.strip query)
             then tshow totalMatches <> " available"
@@ -97,7 +97,7 @@ paletteView env pl commands =
           else do
             (scrollWid, ()) <- paneScrollArea (fixedH 380 . tight) $ columnWith (tight . fillW . gap 0 . padRight 6) $
               forM_ (zip [0 :: Int ..] ranked) $ \(i, h) -> withKey i $ do
-                picked <- selectableRow (i == idx) (padXY 8 4 . alignMid) $ do
+                picked <- selectableRow (i == idx) (padXY 8 4) $ do
                   cell (fixedW 92 . fontMuted . fontSizeScale 0.82) (hitKind h)
                   cell (fontSizeScale 0.94 . (if i == idx then fontMedium else id)) (T.take 64 (hitLabel h))
                   flex
@@ -107,6 +107,5 @@ paletteView env pl commands =
                 when picked (run h)
             when (idxMoved && (up || down)) $ do
               let rowH = 28 :: Float
-                  targetY = max 0 (fromIntegral idx * rowH - 150)
-              scrollToUi scrollWid (V2 0 targetY) ScrollInstant
+              scrollRectIntoViewUi scrollWid (Rect 0 (fromIntegral idx * rowH) 1 rowH) ScrollNearest ScrollInstant
       labelWith (fontMuted . fontSizeScale 0.8 . padTop 2) "Enter to open · ↑↓ to choose · Esc to close"

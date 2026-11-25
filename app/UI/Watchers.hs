@@ -196,16 +196,16 @@ firedList env evs =
     else forM_ (zip [0 :: Int ..] evs) $ \(i, ev) -> withKey i $
       columnWith (fillW . gap 2 . padTop 4 . tight) $ do
         let f = feFired ev
-        rowWith (fillW . tight . gap 8) $ do
-          linkText env (RInstant (feRun ev) (fiAt f)) (alignBaseline . fontMono . fontSizeScale 0.85) (fmtNs (fromIntegral (fiAt f)))
-          labelWith (alignBaseline . fillW . fontSizeScale 0.9) (fiText f)
-        rowWith (fillW . gap 8 . padLeft 12 . tight) $ do
-          labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (feTitle ev)
+        rowWith (fillW . itemsBaseline . tight . gap 8) $ do
+          linkText env (RInstant (feRun ev) (fiAt f)) (fontMono . fontSizeScale 0.85) (fmtNs (fromIntegral (fiAt f)))
+          labelWith (fillW . fontSizeScale 0.9) (fiText f)
+        rowWith (fillW . itemsBaseline . gap 8 . padLeft 12 . tight) $ do
+          labelWith (fontMuted . fontSizeScale 0.8) (feTitle ev)
           case fiSubject f of
             AboutRun -> pure ()
-            _ -> linkText env (subjectRef ev) (alignBaseline . fontSizeScale 0.85) (T.take 50 (refTitle env (subjectRef ev)))
+            _ -> linkText env (subjectRef ev) (fontSizeScale 0.85) (T.take 50 (refTitle env (subjectRef ev)))
           flex
-          labelWith (alignBaseline . fontMuted . fontSizeScale 0.8) (T.intercalate "; " (feDone ev))
+          labelWith (fontMuted . fontSizeScale 0.8) (T.intercalate "; " (feDone ev))
 
 -- | The Watchers pane: what has fired, newest first; then each built-in
 -- rule with its switch, its limits, its responses, its cooldown and
@@ -216,11 +216,11 @@ watchersPane env w watching ctx = do
   evs <- readVar (wrFired w)
   let header = do
         paneMetaWith fillW watching
-        disabledWhen (null evs) $ whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear fired") (writeVar (wrFired w) [] >> writeVar (wrUnseen w) 0)
+        disabledWhen (null evs) $ whenM (buttonWith (padXY 8 2 . tight) "Clear fired") (writeVar (wrFired w) [] >> writeVar (wrUnseen w) 0)
   paneWith tight ctx "Watchers" header $
     paneScroll (grow . tight) $
       columnWith (padAll 10 . fillW . tight . gap 8) $ do
-        rowWith (fillW . tight . gap 8) $ do
+        rowWith (fillW . itemsCenter . tight . gap 8) $ do
           labelWith (fontMedium . fontSizeScale 0.92) "Fired"
           paneMeta (tshow (length evs) <> if length evs > 30 then ", the newest 30 here" else "")
         firedList env (take 30 evs)
@@ -236,9 +236,9 @@ watchersPane env w watching ctx = do
 ruleEditor :: Var Rule -> Rule -> NanoUI ()
 ruleEditor v r =
   panelWith (padAll 8 . gap 4 . fillW) $ do
-    rowWith (fillW . tight . gap 8) $ do
-      checkboxWith alignMid (describeTrigger (ruTrigger r)) (zoomVar ruOn (\b x -> x {ruOn = b}) v)
-    rowWith (fillW . tight . gap 12 . wrap . lineGap 6) $ do
+    rowWith (fillW . itemsCenter . tight . gap 8) $ do
+      checkbox (describeTrigger (ruTrigger r)) (zoomVar ruOn (\b x -> x {ruOn = b}) v)
+    rowWith (fillW . itemsCenter . tight . gap 12 . wrap . lineGap 6) $ do
       case ruTrigger r of
         LiveUp n -> param "collections" (fromIntegral n) 2 20 (\x t -> case t of LiveUp _ -> LiveUp (round x); o -> o) (tshow n)
         BlockedOver ms -> param "ms" (realToFrac ms) 50 5000 (\x t -> case t of BlockedOver _ -> BlockedOver (fromIntegral (round (x / 10) :: Int) * 10); o -> o) (fmtFixed 0 ms <> " ms")
@@ -248,18 +248,18 @@ ruleEditor v r =
         BandGrowing n -> param "censuses" (fromIntegral n) 2 30 (\x t -> case t of BandGrowing _ -> BandGrowing (round x); o -> o) (tshow n)
       knob "cooldown" (realToFrac (ruCooldown r)) 0 300 (\x x' -> x' {ruCooldown = fromIntegral (round x :: Int)}) (fmtFixed 0 (ruCooldown r) <> " s")
       knob "hysteresis" (realToFrac (ruHysteresis r)) 0 1 (\x x' -> x' {ruHysteresis = fromIntegral (round (x * 100) :: Int) / 100}) (fmtFixed 0 (ruHysteresis r * 100) <> "%")
-    rowWith (fillW . tight . gap 10) $ do
-      labelWith (alignMid . fontMuted . fontSizeScale 0.85) "then"
+    rowWith (fillW . itemsCenter . tight . gap 10) $ do
+      labelWith (fontMuted . fontSizeScale 0.85) "then"
       forM_ [minBound .. maxBound] $ \resp -> withKey (responseName resp) $
-        checkboxWith alignMid (responseName resp) (zoomVar (elem resp . ruResponses) (\b x -> x {ruResponses = nubOrd (if b then resp : ruResponses x else filter (/= resp) (ruResponses x))}) v)
+        checkbox (responseName resp) (zoomVar (elem resp . ruResponses) (\b x -> x {ruResponses = nubOrd (if b then resp : ruResponses x else filter (/= resp) (ruResponses x))}) v)
   where
     param name cur lo hi set shown = knob name cur lo hi (\x x' -> x' {ruTrigger = set x (ruTrigger x')}) shown
     knob :: Text -> Float -> Float -> Float -> (Float -> Rule -> Rule) -> Text -> NanoUI ()
     knob name cur lo hi set shown =
-      rowWith (tight . gap 6) $ do
-        labelWith (alignMid . fontMuted . fontSizeScale 0.85) name
-        sliderWith (alignMid . fixedW 110) lo hi (zoomVar (const cur) set v)
-        labelWith (alignMid . fontMono . fontSizeScale 0.85 . fixedW 60) shown
+      rowWith (itemsCenter . tight . gap 6) $ do
+        labelWith (fontMuted . fontSizeScale 0.85) name
+        sliderWith (fixedW 110) lo hi (zoomVar (const cur) set v)
+        labelWith (fontMono . fontSizeScale 0.85 . fixedW 60) shown
 
 -- | The status bar's part: a badge when something has fired, opening the
 -- list, and the callout over it while it is new.
@@ -274,8 +274,8 @@ watchStatus env w = do
     mouse <- uiMousePos
     let under = maybe False (`rectContains` mouse) prev
         txt = if unseen > 0 then "Watchers: " <> tshow unseen <> " new" else "Watchers: " <> tshow (length evs) <> " fired"
-    (_, area) <- withCursorShape UiCursorPointer $ mouseArea (alignMid . tight) $
-      labelWith (alignMid . fontSizeScale 0.85 . (if unseen > 0 then fontTone Warning else fontMuted) . (if under then fontUnderline else id)) txt
+    (_, area) <- withCursorShape UiCursorPointer $ mouseArea (itemsCenter . tight) $
+      labelWith (fontSizeScale 0.85 . (if unseen > 0 then fontTone Warning else fontMuted) . (if under then fontUnderline else id)) txt
     tooltip area "Click for what the watchers saw"
     when (respClicked area) $ do
       modifyVar (wrListOpen w) not
@@ -294,11 +294,11 @@ watchStatus env w = do
       let warnCol = toneColor th Warning
       styled (popupStyle (background (lerpColor warnCol (styleBg (themePopup th)) 0.88) . borderColor warnCol)) $
         popupWith shown (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove, cfgDismissable = False} (fixedW 420 . padAll 10 . gap 4) $ do
-          rowWith (fillW . tight . gap 8) $ do
-            labelWith (alignMid . fontMedium . fontSizeScale 0.92 . fillW) (feTitle ev)
-            whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (wrToast w) Nothing)
+          rowWith (fillW . itemsCenter . tight . gap 8) $ do
+            labelWith (fontMedium . fontSizeScale 0.92 . fillW) (feTitle ev)
+            whenM (buttonWith (padXY 6 0 . tight) "Dismiss") (writeVar (wrToast w) Nothing)
           labelWith (fillW . fontSizeScale 0.9) (fiText (feFired ev))
-          rowWith (fillW . tight . gap 8) $ do
+          rowWith (fillW . itemsBaseline . tight . gap 8) $ do
             linkText env (subjectRef ev) (fontSizeScale 0.85) (T.take 60 (refTitle env (subjectRef ev)))
             flex
             labelWith (fontMuted . fontSizeScale 0.8) (T.intercalate "; " (feDone ev))

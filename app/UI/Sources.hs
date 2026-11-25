@@ -48,7 +48,7 @@ sourcesPopover env open anchor sources link unlink =
   popupWith open (defaultPopupConfig (AnchorRect anchor)) (fixedW 740 . maxH 660 . padAll 0) $
     void . bareScrollArea (fillW . maxH 660) $
       columnWith (fillW . padLRTB 14 14 14 20 . tight . gap 10) $ do
-        rowWith (fillW . tight . gap 8 . alignMid) $ do
+        rowWith (fillW . tight . gap 8 . itemsCenter) $ do
           labelWith (fontSemiBold . fontSizeScale 1.05) "Data sources"
           flex
           scope $ unless (null sources) $
@@ -66,18 +66,18 @@ sourcesPopover env open anchor sources link unlink =
               mine = nubOrd (concatMap srcData members)
               probable = ProbablySameRun `elem` ms
           panelWith (fillW . padAll 10 . gap 6 . tight) $ do
-            rowWith (fillW . tight . gap 8 . alignMid) $ do
-              labelWith (alignMid . fontSemiBold) (runTitle info)
+            rowWith (fillW . tight . gap 8 . itemsCenter) $ do
+              labelWith fontSemiBold (runTitle info)
               scope $ when probable $ badge Warning "matched by program name: no pid on one side, times approximate"
               flex
               scope $ when (ri > 0) $ for_ (listToMaybe runs) $ \firstRun ->
                 let target = foldMap srcRun firstRun
-                 in whenM (buttonWith (alignMid . padXY 8 2 . tight) ("Same run as " <> runTitle target)) (link members target)
+                 in whenM (buttonWith (padXY 8 2 . tight) ("Same run as " <> runTitle target)) (link members target)
             forM_ (zip [0 :: Int ..] members) $ \(si, s) -> withKey si (sourceRow env s unlink)
             missing (filter (`notElem` mine) [DTimeline, DHeapCensus, DHeapSource, DCostCentres, DLive, DLiveStats, DLiveGraph]) (riProgram info)
         scope $ unless (null codeOnly) $
           panelWith (fillW . padAll 10 . gap 6 . tight) $ do
-            labelWith (alignMid . fontSemiBold) "Not tied to a run (joined by code)"
+            labelWith fontSemiBold "Not tied to a run (joined by code)"
             forM_ (zip [0 :: Int ..] codeOnly) $ \(si, s) -> withKey si (sourceRow env s unlink)
         let missingCode = filter (`notElem` have) [DDumps, DDebugger]
         scope $ unless (null missingCode) $ missing missingCode Nothing
@@ -92,15 +92,15 @@ runTitle ri = fromMaybe "an unknown program" (riProgram ri) <> maybe "" (\p -> "
 
 sourceRow :: Env -> Source -> (RunKey -> NanoUI ()) -> NanoUI ()
 sourceRow env s unlink =
-  rowWith (fillW . gap 8 . padLeft 6 . tight . alignMid) $ do
+  rowWith (fillW . gap 8 . padLeft 6 . tight . itemsCenter) $ do
     (_, area) <- withCursorShape UiCursorPointer $ mouseArea tight $
-      labelWith (alignMid . fixedW 130 . fontMedium . fontSizeScale 0.9) (srcKind s)
+      labelWith (fixedW 130 . fontMedium . fontSizeScale 0.9) (srcKind s)
     when (respClicked area) (envSwitch env (srcPanel s))
     tooltip area ("Open " <> panelTitle (srcPanel s))
     columnWith (fillW . tight . gap 1) $ do
       labelWith (fillW . fontMono . fontSizeScale 0.85) (T.take 90 (srcDetail s))
       labelWith (fillW . fontMuted . fontSizeScale 0.82) (T.intercalate "; " (map datumAdds (srcData s)))
-    scope $ when (srcLinked s) $ whenM (buttonWith (alignMid . padXY 6 2 . tight) "Unlink") (unlink (srcOrigin s))
+    scope $ when (srcLinked s) $ whenM (buttonWith (padXY 6 2 . tight) "Unlink") (unlink (srcOrigin s))
 
 -- | What a run lacks, each with what it would add and how to get it.
 missing :: [Datum] -> Maybe Text -> NanoUI ()
@@ -118,7 +118,7 @@ missing ds prog = scope $ unless (null ds) $
 -- | A line to copy, after what it is for.
 recipe :: Text -> Text -> NanoUI ()
 recipe what t =
-  rowWith (fillW . gap 6 . padLeft 10 . tight . alignMid) $ do
-    labelWith (alignMid . fixedW 38 . fontMuted . fontSizeScale 0.8) what
-    columnWith (alignMid . fillW . tight) $ labelWith (fillW . fontMono . fontSizeScale 0.82) t
-    copyFeedbackButton (alignMid . padXY 6 2 . tight) "Copy" t
+  rowWith (fillW . gap 6 . padLeft 10 . tight . itemsCenter) $ do
+    labelWith (fixedW 38 . fontMuted . fontSizeScale 0.8) what
+    columnWith (fillW . tight) $ labelWith (fillW . fontMono . fontSizeScale 0.82) t
+    copyFeedbackButton (padXY 6 2 . tight) "Copy" t

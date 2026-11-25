@@ -115,6 +115,7 @@ module UI.Common
   , bareScrollArea
   , paneScroll
   , paneScrollArea
+  , paneFocusScrollArea
   , paneVirtualRows
   , canvasKeyed
   , codeBlock
@@ -398,23 +399,22 @@ axisTicks step lo hi = takeWhile (<= hi) [first, first + step ..]
 asRow :: Layout -> Layout
 asRow l = l {layoutDirection = Row}
 
--- | A label for a row of mixed text: children of a row are aligned one by
--- one, so every label sits on the row's shared baseline whatever its face
--- or size.
+-- | A label in a row, inheriting its enclosing container's 'ItemsAlign'
+-- ('itemsCenter' in list/control rows, 'itemsBaseline' in 'fact' / 'readout').
 cell :: (Layout -> Layout) -> Text -> NanoUI ()
 cell f txt = do
   notePaneState txt
-  labelWith (alignBaseline . f) txt
+  labelWith f txt
 
 -- | A number in a fixed-width, right-aligned monospace column with tabular figures.
 numCell :: Float -> (Layout -> Layout) -> Text -> NanoUI ()
 numCell w f txt = do
   notePaneState txt
-  labelWith (alignBaseline . fixedW w . alignEnd . fontMono . fontTabular . f) txt
+  labelWith (fixedW w . alignEnd . fontMono . fontTabular . f) txt
 
 -- | A table column header, sized like the column it heads.
 colHeader :: (Layout -> Layout) -> Text -> NanoUI ()
-colHeader f = labelWith (alignBaseline . fontMuted . fontSizeScale 0.85 . f)
+colHeader f = labelWith (fontMuted . fontSizeScale 0.85 . f)
 
 -- | A full-width clickable row with a selection background. The panel is
 -- always present (transparent when unselected) so widget ids stay stable.
@@ -425,7 +425,7 @@ selectableRow selected f body = do
       hover = if selected then themeSelection th else alpha 0.06 (inkText (ink th))
   (_, area) <- mouseArea (fillW . tight) $
     styled (panelStyle (hoverBackground hover . background bg . borderWidth 0 . cornerRadius 4)) $
-      panelWith (asRow . fillW . padXY 8 2 . gap 8 . f) body
+      panelWith (asRow . itemsCenter . fillW . padXY 8 2 . gap 8 . f) body
   pure (respClicked area)
 
 -- | A table's rows, stacked with no gap: each row's own padding is the
@@ -461,20 +461,19 @@ pathLabel = \case
     labelWith (alignMid . fontMono . fontSizeScale 0.92) name
 
 fillRow :: NanoUI a -> NanoUI a
-fillRow = rowWith (tight . gap 8 . alignMid . fillW)
+fillRow = rowWith (tight . gap 8 . itemsCenter . fillW)
 
 -- ---------------------------------------------------------------------------
 -- Frame
 
 -- | A panel's toolbar: one row on the pane surface, so the active folder tab
--- in the title bar opens onto it, ruled off from the panes below. Use
--- 'toolLabel', 'toolButton' and @alignMid@ controls in it so everything
--- shares one centre line.
+-- in the title bar opens onto it, ruled off from the panes below. Children
+-- share one centre line via 'itemsCenter'.
 toolStrip :: NanoUI a -> NanoUI a
 toolStrip body = do
   th <- uiTheme
   styled (panelStyle (background (inkPane (ink th)) . borderBottom 1 (inkRule (ink th)) . cornerRadius 0)) $
-    panelWith (asRow . fillW . padXY 10 7 . gap 8 . minH 46) (themed th body)
+    panelWith (asRow . itemsCenter . fillW . padXY 10 7 . gap 8 . minH 46) (themed th body)
 
 -- | A toolbar whose items wrap cleanly onto a second line on narrow viewports
 -- rather than clipping off the right edge.
@@ -482,17 +481,17 @@ toolStripWrap :: NanoUI a -> NanoUI a
 toolStripWrap body = do
   th <- uiTheme
   styled (panelStyle (background (inkPane (ink th)) . borderBottom 1 (inkRule (ink th)) . cornerRadius 0)) $
-    panelWith (asRow . fillW . padXY 10 7 . gap 8 . wrap . lineGap 6 . minH 46) (themed th body)
+    panelWith (asRow . itemsCenter . fillW . padXY 10 7 . gap 8 . wrap . lineGap 6 . minH 46) (themed th body)
 
 -- | A caption for the control after it.
 toolLabel :: Text -> NanoUI ()
-toolLabel = labelWith (alignMid . fontMuted . fontSizeScale 0.92)
+toolLabel = labelWith (fontMuted . fontSizeScale 0.92)
 
 toolButton :: Text -> NanoUI Bool
-toolButton = buttonWith alignMid
+toolButton = button
 
 toolIconButton :: Svg -> Text -> NanoUI Bool
-toolIconButton = iconButtonWith alignMid
+toolIconButton = iconButtonWith id
 
 -- | A button with a leading SVG icon and layout modifier.
 iconButtonWith :: (Layout -> Layout) -> Svg -> Text -> NanoUI Bool
@@ -500,15 +499,10 @@ iconButtonWith f ic label = respClicked <$> iconButtonWith' f ic label
 
 -- | 'iconButtonWith' returning its 'Response'.
 iconButtonWith' :: (Layout -> Layout) -> Svg -> Text -> NanoUI Response
-iconButtonWith' f ic label = do
-  let lay0 = f defaultLayout
-  base <- uiFontSize
-  let fs = if layoutFontSize lay0 > 0 then layoutFontSize lay0 else base
-  fm <- resolveFontUi fs (layoutFontWeight lay0) (layoutFontStyle lay0) (layoutFontVariant lay0)
-  spaceW <- lineWidthUi fm " "
+iconButtonWith' f ic label =
   buttonConfigured'
     defaultButtonConfig
-      { bcLayout = f (gap spaceW defaultLayout)
+      { bcLayout = f (gap 6 defaultLayout)
       , bcAdornments = A.leading (A.icon ic)
       }
     label
@@ -517,7 +511,7 @@ iconButtonWith' f ic label = do
 toolGroup :: NanoUI a -> NanoUI a
 toolGroup body = do
   vrule 22
-  rowWith (tight . gap 6 . alignMid) body
+  rowWith (tight . gap 6 . itemsCenter) body
 
 -- | Chrome that stays out of the way: a button with no surface until the
 -- pointer is on it, for the header's commands and the panes' menus.
@@ -527,22 +521,22 @@ quiet th =
    in buttonStyle (hoverBackground (alpha 0.08 t) . pressBackground (alpha 0.14 t) . background colorTransparent . borderWidth 0) th
 
 quietButton :: Text -> NanoUI Bool
-quietButton = styled quiet . buttonWith alignMid
+quietButton = styled quiet . button
 
 quietIconButton :: Svg -> Text -> NanoUI Bool
-quietIconButton ic = styled quiet . iconButtonWith alignMid ic
+quietIconButton ic = styled quiet . iconButtonWith id ic
 
 -- | A 'quietButton' with a tooltip, giving its response for a popover to
 -- anchor on.
 quietButton' :: Text -> Text -> NanoUI Response
 quietButton' label tip = do
-  resp <- styled quiet (buttonWith' alignMid label)
+  resp <- styled quiet (button' label)
   tooltip resp tip
   pure resp
 
 quietIconButton' :: Svg -> Text -> Text -> NanoUI Response
 quietIconButton' ic label tip = do
-  resp <- styled quiet (iconButtonWith' alignMid ic label)
+  resp <- styled quiet (iconButtonWith' id ic label)
   tooltip resp tip
   pure resp
 
@@ -809,13 +803,13 @@ paneWith bodyLayout ctx title trailing body = do
       borderWidthActive = if flashing && flashFactor > 0.05 then 2 else 1
 
   menuOpen <- useVar False
-  let headerRow = asRow . fillW . fixedH 36 . padXY 12 0 . gap 8
+  let headerRow = asRow . itemsCenter . fillW . fixedH 36 . padXY 12 0 . gap 8
       contents = do
-        rowWith (alignMid . fillW . tight . gap 8) $ do
-          labelWith (alignMid . fontSemiBold . fontSizeScale 0.92) title
+        rowWith (itemsCenter . fillW . tight . gap 8) $ do
+          labelWith (fontSemiBold . fontSizeScale 0.92) title
           themed th trailing
         scope $ for_ (pcGrid ctx) $ \g -> when (pgcMaximized g) $ do
-          resp <- themed th $ styled quiet $ iconButtonWith' (alignMid . padXY 6 2 . tight) iconMinimize "Restore"
+          resp <- themed th $ styled quiet $ iconButtonWith' (padXY 6 2 . tight) iconMinimize "Restore"
           tooltip resp "Restore split layout (or double-click header)"
           when (respClicked resp) (pgcRestore g)
         for_ (pcMenu ctx) (themed th . paneMenuWithVar menuOpen)
@@ -909,7 +903,7 @@ readoutToned items =
         columnWith (padLeft (if idx > 0 then 14 else 0) . padRight 14 . tight . gap 0) $ do
           let numTone = maybe id fontTone roTone
               (number, unit) = splitUnit roValue
-          rowWith (tight . gap 3) $ do
+          rowWith (tight . gap 3 . itemsBaseline) $ do
             cell (fontMono . fontTabular . fontSizeScale 1.3 . numTone) number
             scope $ unless (T.null unit) (cell (fontMuted . fontSizeScale 0.9) unit)
           labelWith (roSubLayout . fontMuted . fontSizeScale 0.8) roLabel
@@ -959,7 +953,7 @@ emptyStateWith title body commands actions =
         labelWith (fontSemiBold . fontSizeScale 1.15 . fillW) title
         forM_ body (labelWith (fontMuted . fontSizeScale 0.94 . fillW))
         scope $ unless (null commands) (codeBlock commands)
-        rowWith (tight . gap 8 . padTop 4 . wrap . lineGap 6 . fillW) actions
+        rowWith (tight . gap 8 . padTop 4 . itemsCenter . wrap . lineGap 6 . fillW) actions
       flex
     flex
     flex
@@ -1051,12 +1045,12 @@ drawLineChart pal font r@(Rect x y w h) (x0, x1) fmtY series = do
 -- | A compact "key value" pair for wrapping rows ('kv' spreads its value to
 -- the far edge, which only suits columns).
 fact :: Text -> Text -> NanoUI ()
-fact k v = rowWith (tight . gap 5 . alignBaseline) $ do
+fact k v = rowWith (tight . gap 5 . itemsBaseline) $ do
   cell fontMuted k
   cell id v
 
 factMono :: Text -> Text -> NanoUI ()
-factMono k v = rowWith (tight . gap 5 . alignBaseline) $ do
+factMono k v = rowWith (tight . gap 5 . itemsBaseline) $ do
   cell fontMuted k
   cell fontMono v
 
@@ -1075,7 +1069,7 @@ canvasKeyed k f draw = do
 -- | Chromeless vertical scroll area inside a pane, sharing height cleanly with siblings.
 bareScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
 bareScrollArea f =
-  scrollAreaConfigured (ScrollConfig ScrollNone ScrollAuto True) (f . minW 0 . minH 0)
+  scrollAreaConfigured (ScrollConfig ScrollNone ScrollAuto True False) (f . minW 0 . minH 0)
 
 -- | A chromeless scroll area inside a pane, using native @bareScrollArea@
 -- so it blends onto the pane surface and shares height cleanly with siblings.
@@ -1086,6 +1080,16 @@ paneScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
 paneScrollArea f body = do
   th <- uiTheme
   bareScrollArea (f . tight . fillW . fillH) (themed th body)
+
+-- | Focusable counterpart to 'paneScrollArea' ('scrollFocusable' enabled) for
+-- keyboard-navigated list panes ('useListNav').
+paneFocusScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
+paneFocusScrollArea f body = do
+  th <- uiTheme
+  scrollAreaConfigured
+    (ScrollConfig ScrollNone ScrollAuto True True)
+    (f . tight . fillW . fillH . minW 0 . minH 0)
+    (themed th body)
 
 -- | A vertically scrolled list of uniform-height rows inside a pane that
 -- virtualizes when there are many items, building only the rows near the

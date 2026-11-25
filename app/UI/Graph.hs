@@ -277,14 +277,14 @@ heapPanelUi pal mm hp topN panelTitle = do
   panelWith (padAll 10 . gap 6 . fillW . fillH) $ do
     -- Header block: Title row and Metric chips row closely stacked
     columnWith (tight . gap 4 . fillW) $ do
-      rowWith (tight . alignMid . gap 8 . fillW) $ do
+      rowWith (tight . itemsCenter . gap 8 . fillW) $ do
         labelWith (fontBold . fontSizeScale 1.05) panelTitle
         flex
         if suspects > 0
           then badge Danger (tshow suspects <> " LEAK SUSPECTS")
           else badge Success "0 LEAK SUSPECTS"
 
-      rowWith (tight . alignMid . gap 6 . fillW) $ do
+      rowWith (tight . itemsCenter . gap 6 . fillW) $ do
         cardWith (padXY 10 3) $
           labelWith (fontSizeScale 0.82 . fontBold) (tshow censuses <> " censuses")
         cardWith (padXY 10 3) $
@@ -313,11 +313,11 @@ heapPanelUi pal mm hp topN panelTitle = do
               bPeak = if VU.null (bandValues b) then 0 else VU.maximum (bandValues b)
               isLeak = S.member name leakNames
               dispName = if T.length name > 14 then T.take 13 name <> "…" else name
-          rowWith (alignMid . gap 6 . fillW) $ do
-            void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMid) (\r -> drawRoundedRect r 2 c)
+          rowWith (itemsCenter . gap 6 . fillW) $ do
+            void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8) (\r -> drawRoundedRect r 2 c)
             labelWith (fontMono . fontSizeScale 0.8 . fixedW 108) dispName
             numCell 62 (fontSizeScale 0.78 . fontMuted) (fmtBytesD bPeak)
-            rowWith (fixedW 58 . alignEnd . alignMid) $
+            rowWith (fixedW 58 . alignEnd . itemsCenter) $
               when isLeak $
                 badge Danger "LEAK"
 
@@ -366,11 +366,11 @@ heapDiffUi pal mm baseHp curHp topN = do
   columnWith (padAll 12 . gap 10 . fillW . fillH) $ do
     -- KPI header card
     cardWith (padAll 12 . gap 6 . fillW) $ do
-      rowWith (alignMid . gap 8) $
+      rowWith (itemsCenter . gap 8) $
         labelWith (fontBold . fontSizeScale 1.15) "Stronghead Memory Leak Verification & Proof of Fix"
-      rowWith (alignMid) $
+      rowWith itemsCenter $
         labelWith (fontSizeScale 0.85 . fontMuted) "Empirical GHC heap residency diff: unrolling intermediate thunk chains vs strict monadic sequencing"
-      rowWith (alignMid . gap 12) $ do
+      rowWith (itemsCenter . gap 12) $ do
         cardWith (padAll 8 . fixedW 200) $ do
           labelWith (fontSizeScale 0.75 . fontBold . fontMuted) "PEAK HEAP RESIDENCY"
           labelWith (fontMono . fontSizeScale 0.95 . fontBold) (fmtBytesD basePeak <> " -> " <> fmtBytesD curPeak)
@@ -429,7 +429,7 @@ renderFlamegraphSvg mTheme ft = do
   renderUiFrameToSvg 1100 540 theme $ do
     mm <- monoMetrics 0.82
     panelWith (padAll 12 . gap 8 . fillW . fillH) $ do
-      rowWith (tight . alignMid . gap 8 . fillW) $ do
+      rowWith (tight . itemsCenter . gap 8 . fillW) $ do
         labelWith (fontBold . fontSizeScale 1.05) (ftTitle ft)
         flex
         cardWith (padXY 10 3) $

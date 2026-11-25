@@ -168,11 +168,12 @@ diffPanes env st loaded now pid ctx
               if paths == noBaselinePaths
                 then paneMetaWith fillW "no baseline"
                 else paneMetaWith fillW ("against " <> baselineName paths <> if boLoading loaded then " (reading…)" else "")
-            markButton
-            scope $ unless (paths == noBaselinePaths) $
-              whenM (buttonWith (alignMid . padXY 8 2 . tight) "Clear") (clearBaseline st)
+            buttonGroup $ do
+              markButton
+              scope $ unless (paths == noBaselinePaths) $
+                whenM (buttonWith (padXY 8 2 . tight) "Clear") (clearBaseline st)
           markButton =
-            actionButton (alignMid . padXY 8 2 . tight) (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
+            actionButton (padXY 8 2 . tight) (if paths == noBaselinePaths then "Mark as baseline" else "Mark again")
               (Just "Keep what is loaded now as the baseline; what you open next is compared with it")
               (dnMark now)
       paneWith tight ctx title header $
@@ -194,16 +195,16 @@ heapDiff env st mbase mcur = case (mbase, mcur) of
         shown = if allBands then changes else filter ((/= BandSame) . bcStatus) changes
         peak hp = if VU.null (hpTotals hp) then 0 else VU.maximum (hpTotals hp)
     scope $ when same $ hint "The current heap profile is the baseline's: open the next run's eventlog or .hp file to compare."
-    rowWith (fillW . tight . gap 16 . wrap) $ do
+    rowWith (fillW . itemsCenter . tight . gap 16 . wrap) $ do
       fact "peak total" (fmtBytesD (peak base) <> " → " <> fmtBytesD (peak cur) <> "  " <> fmtChange (peak base) (peak cur))
       fact "gone" (tshow (length [() | c <- changes, bcStatus c == BandGone]))
       fact "new" (tshow (length [() | c <- changes, bcStatus c == BandNew]))
       fact "smaller" (tshow (length [() | c <- changes, bcStatus c == BandShrank]))
       fact "larger" (tshow (length [() | c <- changes, bcStatus c == BandGrew]))
       flex
-      checkboxWith alignMid "Show unchanged" (bvAllBands st)
+      checkbox "Show unchanged" (bvAllBands st)
     heapDiffChart base cur
-    rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+    rowWith (padXY 8 0 . tight . gap 8 . itemsBaseline . fillW) $ do
       colHeader fillW "band"
       colHeader (fixedW 90) "matched"
       colHeader (fixedW 90 . alignEnd) "peak before"
@@ -211,12 +212,12 @@ heapDiff env st mbase mcur = case (mbase, mcur) of
       colHeader (fixedW 70 . alignEnd) "change"
       colHeader (fixedW 160 . alignEnd) "growth before → now"
     forM_ (zip [0 :: Int ..] (take 300 shown)) $ \(i, c) -> withKey i $
-      rowWith (padXY 8 1 . tight . gap 8 . fillW) $ do
+      rowWith (padXY 8 1 . tight . gap 8 . itemsCenter . fillW) $ do
         let name = maybe "" bfName (maybe (bcBase c) Just (bcCur c))
             title = shortBand (maybe name figuresTitle (maybe (bcBase c) Just (bcCur c)))
         columnWith (fillW . tight) $ case (bcCur c, bcBase c >>= bandSite) of
           (Just _, _) -> linkText env (RBand name) (fontSizeScale 0.92) (clip 24 title)
-          (Nothing, Just sp) -> rowWith (tight . gap 6) $ do
+          (Nothing, Just sp) -> rowWith (tight . gap 6 . itemsBaseline) $ do
             labelWith (fontSizeScale 0.92) (clip 18 title)
             linkText env (RSource sp) (fontMuted . fontSizeScale 0.85) (renderSrcSpan sp)
           (Nothing, Nothing) -> labelWith (fontSizeScale 0.92) (clip 24 title)
@@ -255,7 +256,7 @@ heapDiffChart base cur = do
         ]
   unless (null basePts && null curPts) $
     columnWith (fillW . tight . gap 3 . padXY 4 4) $ do
-      rowWith (fillW . tight . gap 12 . alignMid) $ do
+      rowWith (fillW . tight . gap 12 . itemsCenter) $ do
         labelWith (fontMuted . fontSizeScale 0.82) "Total live residency over elapsed run time"
         flex
         labelWith (fontMuted . fontSizeScale 0.8) "— baseline"
@@ -275,14 +276,14 @@ costDiff env mbase mcur = case (mbase, mcur) of
         moved c = any (> 0.05) [abs (d ctInhTime c), abs (d ctInhAlloc c)] || isNothing (cgBase c) || isNothing (cgCur c)
         d f c = maybe 0 f (cgCur c) - maybe 0 f (cgBase c)
     scope $ when (base == cur) $ hint "The current .prof is the baseline's: open the next run's to compare."
-    rowWith (padXY 8 0 . tight . gap 8 . fillW) $ do
+    rowWith (padXY 8 0 . tight . gap 8 . itemsBaseline . fillW) $ do
       colHeader fillW "cost centre"
       colHeader (fixedW 120 . alignEnd) "time before → now"
       colHeader (fixedW 60 . alignEnd) "Δ time"
       colHeader (fixedW 120 . alignEnd) "alloc before → now"
       colHeader (fixedW 60 . alignEnd) "Δ alloc"
     forM_ (zip [0 :: Int ..] (take 300 changes)) $ \(i, c) -> withKey i $
-      rowWith (padXY 8 1 . tight . gap 8 . fillW) $ do
+      rowWith (padXY 8 1 . tight . gap 8 . itemsCenter . fillW) $ do
         columnWith (fillW . tight) $ linkText env (RCostCentre (cgModule c) (cgName c)) (fontSizeScale 0.92) (clip 48 (cgModule c <> "." <> cgName c))
         numCell 120 fontMuted (pct (cgBase c) ctInhTime <> " → " <> pct (cgCur c) ctInhTime)
         numCell 60 id (signed (d ctInhTime c))
@@ -304,7 +305,7 @@ bindingDiff env mbase mcur = case (mbase, mcur) of
     let changes = diffBindings base cur
     scope $ when (null changes) $ hint "No binding's badges or size changed."
     forM_ (zip [0 :: Int ..] (take 500 changes)) $ \(i, c) -> withKey i $
-      rowWith (padXY 8 1 . tight . gap 8 . fillW) $ do
+      rowWith (padXY 8 1 . tight . gap 8 . itemsBaseline . fillW) $ do
         columnWith (fixedW 260 . tight) $ linkText env (RBinding (bgModule c) (bgKey c)) (fontMono . fontSizeScale 0.88) (T.take 40 (bgModule c <> "." <> bgKey c))
         labelWith (fillW . fontSizeScale 0.88) (T.intercalate " · " (bgChanges c))
 
@@ -313,8 +314,8 @@ baselineStatus :: BaselineState -> BaselineLoaded -> NanoUI ()
 baselineStatus st loaded = do
   paths <- readVar (bvPaths st)
   scope $ unless (paths == noBaselinePaths) $ do
-    (_, area) <- mouseArea (alignMid . tight) $
-      labelWith (alignMid . fontMuted . fontSizeScale 0.85) ("Baseline: " <> baselineName paths <> if boLoading loaded then " (reading…)" else "")
+    (_, area) <- mouseArea (itemsCenter . tight) $
+      labelWith (fontMuted . fontSizeScale 0.85) ("Baseline: " <> baselineName paths <> if boLoading loaded then " (reading…)" else "")
     tooltip area (T.intercalate "\n" ([T.pack f | Just f <- [blEventlog paths, blHeapProfile paths, blCostCentres paths, blDumps paths]] ++ ["Right-click to clear"]))
     void . contextMenu area $ do
       menuHeader "Baseline"

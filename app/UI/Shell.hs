@@ -642,7 +642,7 @@ appView app = do
       compactHeader = winW < 1180
       headerBtn ic fullLabel tip =
         let lbl = if compactHeader then "" else fullLabel
-            btnMod = if compactHeader then alignMid . padXY 7 4 else alignMid . padXY 8 4
+            btnMod = if compactHeader then padXY 7 4 else padXY 8 4
          in do
               resp <- styled quiet (iconButtonWith' btnMod ic lbl)
               tooltip resp (if compactHeader then fullLabel <> " — " <> tip else tip)
@@ -652,14 +652,14 @@ appView app = do
       -- As tall as the tabs and a margin above them, so the wordmark, the
       -- tabs' labels and the commands share one centre line and the active
       -- folder tab joins the toolbar below without a seam.
-      panelWith (asRow . fillW . padLeft (if compactHeader then 12 else 20) . padRight 8 . padTop 8 . padBottom 0 . gap (if compactHeader then 10 else 18)) . themed th $ do
-        labelWith (alignMid . fontSemiBold . fontSizeScale 1.08) "Stronghead"
+      panelWith (asRow . itemsCenter . fillW . padLeft (if compactHeader then 12 else 20) . padRight 8 . padTop 8 . padBottom 0 . gap (if compactHeader then 10 else 18)) . themed th $ do
+        labelWith (fontSemiBold . fontSizeScale 1.08) "Stronghead"
         history env
         navBar (appTab app)
         flex
         -- The file on show, when there is room beside the buttons.
         scope $ when (winW >= 1560) (document app active)
-        rowWith (alignMid . tight . gap 3) $ do
+        rowWith (itemsCenter . tight . gap 3) $ do
           do
             resp <- headerBtn iconLayers "Sources" "What each run has, and how to add the rest"
             when (respClicked resp) (modifyVar (appSourcesOpen app) not)
@@ -671,7 +671,7 @@ appView app = do
             when (respClicked resp) (modifyVar (appPanesOpen app) not)
             panesPopover app active (respRect resp)
           do
-            resp <- styled quiet (iconButtonWith' (alignMid . padXY 8 4) iconSearch "Go to…")
+            resp <- styled quiet (iconButtonWith' (padXY 8 4) iconSearch "Go to…")
             tooltip resp "Find a thread, binding, cost centre, band or command (Ctrl+K)"
             when (respClicked resp) (openPalette (appPalette app))
           whenM (respClicked <$> headerBtn iconSettings "Settings" "Theme, scale, defaults and the editor command (Ctrl+,)") (writeVar (appSettingsOpen app) True)
@@ -709,10 +709,10 @@ askOpen app =
 -- naming where it leads.
 history :: Env -> NanoUI ()
 history env =
-  rowWith (alignMid . tight . gap 2) $ do
+  buttonGroup $ do
     let bus = envBus env
         step label fallback locs go = do
-          resp <- disabledWhen (null locs) (styled quiet (buttonWith' (alignMid . padXY 6 2 . tight) label))
+          resp <- disabledWhen (null locs) (styled quiet (buttonWith' (padXY 6 2 . tight) label))
           tooltip resp (maybe fallback describe (listToMaybe locs))
           when (respClicked resp) (go env)
         describe (Location p r) = panelTitle p <> maybe "" ((": " <>) . refTitle env) r
@@ -1168,12 +1168,12 @@ statusBar app env active winW timeline live heap hooks baseline = do
   msg <- readVar (appMessage app)
   path <- readVar (tsPath tl)
   styled (panelStyle (background (inkGround i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
-    panelWith (asRow . fillW . fixedH 30 . padXY 12 0 . gap 12) $ themed th $ do
+    panelWith (asRow . itemsCenter . fillW . fixedH 30 . padXY 12 0 . gap 12) $ themed th $ do
       -- Show active document name on the left when it isn't in the header and
       -- isn't already named by a live connection item right next to it.
       docName <- if winW < 1560 then activeDocumentName app active timeline live else pure Nothing
       scope $ for_ docName $ \nm ->
-        labelWith (alignMid . fontMono . fontMuted . fontSizeScale 0.82) (T.take 36 nm)
+        labelWith (fontMono . fontMuted . fontSizeScale 0.82) (T.take 36 nm)
       scope $ for_ timeline $ \p -> do
         let file = maybe "the eventlog" (T.pack . takeFileName) path
             toTimeline = writeVar (appTab app) PTimeline
@@ -1228,18 +1228,18 @@ statusBar app env active winW timeline live heap hooks baseline = do
       watchStatus env (appWatchers app)
       baselineStatus (appBaseline app) baseline
       scope $ unless (T.null msg) $ do
-        labelWith (alignMid . fontSizeScale 0.84 . fontTone Warning) (T.take 90 msg)
-        whenM (buttonWith (alignMid . padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")
+        labelWith (fontSizeScale 0.84 . fontTone Warning) (T.take 90 msg)
+        whenM (buttonWith (padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")
       flex
       cursor <- readVar (busCursor (envBus env))
       scope $ for_ cursor $ \(rk, t) -> do
-        labelWith (alignMid . fontMuted . fontSizeScale 0.82) "Cursor"
-        rowWith (alignMid . tight) $ linkText env (RInstant rk t) (fontSizeScale 0.82 . fontMono) (fmtNs (fromIntegral t))
+        labelWith (fontMuted . fontSizeScale 0.82) "Cursor"
+        linkText env (RInstant rk t) (fontSizeScale 0.82 . fontMono) (fmtNs (fromIntegral t))
       focus <- readVar (busFocus (envBus env))
       scope $ for_ focus $ \r -> do
-        labelWith (alignMid . fontMuted . fontSizeScale 0.82) "Focus"
-        rowWith (alignMid . tight) $ linkText env r (fontSizeScale 0.82) (T.take (if compactStatus then 32 else 52) (refTitle env r))
-        whenM (buttonWith (alignMid . padXY 5 0 . tight) "Clear") (setFocus env Nothing)
+        labelWith (fontMuted . fontSizeScale 0.82) "Focus"
+        linkText env r (fontSizeScale 0.82) (T.take (if compactStatus then 32 else 52) (refTitle env r))
+        whenM (buttonWith (padXY 5 0 . tight) "Clear") (setFocus env Nothing)
       let statusItems =
             length
               ( filter
@@ -1255,9 +1255,9 @@ statusBar app env active winW timeline live heap hooks baseline = do
               )
           crowdedStatus = compactStatus || statusItems >= 4
       scope $ when (winW >= 1060 && (winW >= 1560 || statusItems < 5)) $
-        labelWith (alignMid . fontMuted . fontSizeScale 0.82) (panelHint crowdedStatus active)
+        labelWith (fontMuted . fontSizeScale 0.82) (panelHint crowdedStatus active)
       do
-        resp <- styled quiet (iconButtonWith' (alignMid . padXY 5 1 . tight) iconKeyboard "")
+        resp <- styled quiet (iconButtonWith' (padXY 5 1 . tight) iconKeyboard "")
         tooltip resp "Keyboard shortcuts (? or F1)"
         when (respClicked resp) (modifyVar (appShortcutsOpen app) not)
 
@@ -1300,10 +1300,10 @@ connection tone txt open menu = do
   prev <- lastRect sid
   mouse <- uiMousePos
   let under = maybe False (`rectContains` mouse) prev
-  (_, area) <- withCursorShape UiCursorPointer $ mouseArea (alignMid . tight) $
-    rowWith (alignMid . tight . gap 5) $ do
+  (_, area) <- withCursorShape UiCursorPointer $ mouseArea tight $
+    rowWith (itemsCenter . tight . gap 5) $ do
       scope $ for_ tone statusDot
-      labelWith (alignMid . fontSizeScale 0.82 . (if tone == Just Danger then fontTone Danger else id) . (if under then fontUnderline else id)) txt
+      labelWith (fontSizeScale 0.82 . (if tone == Just Danger then fontTone Danger else id) . (if under then fontUnderline else id)) txt
   when (respClicked area) open
   tooltip area "Click to open, right-click for more"
   void (contextMenu area menu)
@@ -1438,7 +1438,7 @@ sourcesOf app timeline heap core live links = do
 -- | The panels, as folder tabs along the bottom of the title bar.
 navBar :: Var Panel -> NanoUI ()
 navBar v =
-  rowWith (alignMid . tight) $
+  rowWith (alignBottom . tight) $
     boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v
 
 -- ---------------------------------------------------------------------------
@@ -1448,8 +1448,8 @@ shortcutsModal :: App -> NanoUI ()
 shortcutsModal app =
   modalWith (fixedW 820) (appShortcutsOpen app) "Keyboard shortcuts" $ do
     let item keys desc =
-          rowWith (fillW . tight . gap 8 . alignMid) $ do
-            rowWith (fixedW 136 . tight . gap 4 . alignMid) $
+          rowWith (fillW . tight . gap 8 . itemsCenter) $ do
+            rowWith (fixedW 136 . tight . gap 4 . itemsCenter) $
               forM_ keys $ \k -> kbdBadge k
             labelWith (fillW . fontSizeScale 0.88) desc
         group title rows =
@@ -1527,8 +1527,8 @@ settingsModal app =
     let auto = if scale == ScaleAuto then Just zoom else Nothing
         chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
         headOr = \case k : _ -> k; [] -> mempty
-        input f v = textInputConfigured defaultTextInputConfig {ticLayout = (alignMid . f) defaultLayout} v
-        inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = (alignMid . f) defaultLayout} v
+        input f v = textInputConfigured defaultTextInputConfig {ticLayout = f defaultLayout} v
+        inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = f defaultLayout} v
         core = appCore app
         lastPath = takeDirectory (appSettingsPath app) </> ("last" <> sessionExtension)
     columnWith (fillW . tight . gap 8) $ do
@@ -1537,17 +1537,17 @@ settingsModal app =
           sectionTitle "Appearance"
           settingRow "Theme" $
             boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} themeChoiceName (appTheme app)
-          settingRow "Interface scale" $ enumSelectWith (alignMid . fixedW 230) (uiScaleLabel auto) (appScale app)
+          settingRow "Interface scale" $ enumSelectWith (fixedW 230) (uiScaleLabel auto) (appScale app)
           settingNote $
             chords [zoomIn, zoomOut] <> " step the scale; " <> chords [zoomReset] <> " follows the display again."
           sectionTitle "Startup"
           settingRow "Open on" $
             selectWith
-              (alignMid . fixedW 230)
+              (fixedW 230)
               ("The panel last used" : map panelTitle [minBound .. maxBound])
               (zoomVar (maybe 0 ((+ 1) . fromEnum)) (\i _ -> if i <= 0 then Nothing else Just (toEnum (i - 1))) (appStartPanel app))
-          settingRow "" $ checkboxWith alignMid "Reopen the window where it was, at the size it was" (appRestoreWindow app)
-          settingRow "" $ checkboxWith alignMid "Reopen the last session on start" (appReopenLast app)
+          settingRow "" $ checkbox "Reopen the window where it was, at the size it was" (appRestoreWindow app)
+          settingRow "" $ checkbox "Reopen the last session on start" (appReopenLast app)
           settingNote ("The session is saved on quit to " <> T.pack lastPath <> ". Files on the command line open instead.")
           sectionTitle "Live"
           settingRow "Agent address" $ do
@@ -1560,8 +1560,8 @@ settingsModal app =
           settingRow "Colouring" $
             boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring core)
           settingRow "" $ do
-            checkboxWith alignMid "Hide uniques" (csHideUniques core)
-            checkboxWith alignMid "Hide Typeable bindings" (csHideTypeable core)
+            checkbox "Hide uniques" (csHideUniques core)
+            checkbox "Hide Typeable bindings" (csHideTypeable core)
           settingNote "The Core & STG toolbar changes these too; the last choice is kept."
           sectionTitle "Source"
           settingRow "Project root" $ inputHint "folder whose sources the panels link to" fillW (csProjectRoot core)
@@ -1599,9 +1599,9 @@ resetSettings app = do
 -- | A setting: its name in a column of names, then its controls.
 settingRow :: T.Text -> NanoUI () -> NanoUI ()
 settingRow name controls =
-  rowWith (fillW . tight . gap 12) $ do
-    labelWith (alignMid . fixedW 130 . fontSizeScale 0.92) name
-    rowWith (alignMid . fillW . tight . gap 8) controls
+  rowWith (fillW . tight . gap 12 . itemsCenter) $ do
+    labelWith (fixedW 130 . fontSizeScale 0.92) name
+    rowWith (itemsCenter . fillW . tight . gap 8) controls
 
 -- | A line of explanation under a setting, indented to its controls.
 -- Uses a column container so nano-ui wraps long paths and prose cleanly.

@@ -1415,5 +1415,33 @@ main = do
   check "Runner & lab pane renders target recipes, Pareto sweep controls, and live budget badge"
     (hasText "Target runner & capture recipes" labSpans && hasText "Space-Leak Provenance (-hi)" labSpans && hasText "RTS flag Pareto tuning lab" labSpans)
 
+  putStrLn "nano-ui ergonomics: ItemsAlign centering, buttonGroup, and useListNav"
+  let midY lbl spans = [ry + rh / 2 | (Rect _ ry _ rh, t, _, _, _) <- spans, t == lbl]
+  case (midY "CRITICAL" triSpans, midY "94.0% conf" triSpans) of
+    (y1 : _, y2 : _) -> check "itemsCenter vertically centers badge and label in Triage card" (abs (y1 - y2) <= 1.5)
+    _ -> check "itemsCenter vertically centers badge and label in Triage card" False
+  case (midY "Mark again" diffSpans, midY "Clear" diffSpans) of
+    (y1 : _, y2 : _) -> check "buttonGroup aligns connected header buttons on identical midline" (abs (y1 - y2) <= 1.0)
+    _ -> check "buttonGroup aligns connected header buttons on identical midline" False
+
+  navCtx <- newContext
+  navCst <- newCoreState
+  navPopped <- newVar []
+  let navBench = csPanes navCst
+      navScene = void $ columnWith (fixedWH 1300 1000) $ do
+        need <- maybe [] treeKinds <$> readVar (wbTree navBench)
+        draw <- corePanes (worldEnv w PCore) navCst cloaded need
+        workspace [BenchPlace "Core & STG" navBench] navPopped navBench draw
+      navFrame i = evalUi navCtx i navScene
+  warmup2 navCtx cinp navScene >>= \_ -> pure ()
+  navSpans0 <- collectTextSpans navCtx
+  navGoPos <- findSpan "go" navSpans0
+  let (npPress, npRel) = clickPair cinp navGoPos
+  mapM_ navFrame [npPress, npRel, cinp]
+  check "clicking binding selects 'go' and focuses Bindings scroller" . (== Just "go") =<< readVarIO (csSelected navCst)
+  _ <- navFrame (keyInp KeyDown cinp)
+  _ <- navFrame cinp
+  check "useListNav KeyDown advances focused Bindings list from 'go' to 'main'" . (== Just "main") =<< readVarIO (csSelected navCst)
+
   n <- readIORef failures
   if n == 0 then putStrLn "all passed" else putStrLn (show n <> " failed") >> exitFailure
