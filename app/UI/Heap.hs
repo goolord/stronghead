@@ -1278,6 +1278,13 @@ dbgTabName = \case
   DbgBiggest -> "Biggest retainers"
   DbgAnatomy -> "Anatomy & What-If"
 
+dbgTabShortName :: DbgTab -> Text
+dbgTabShortName = \case
+  DbgSurvivors -> "Survivors"
+  DbgGraph -> "Graph"
+  DbgBiggest -> "Retainers"
+  DbgAnatomy -> "Anatomy"
+
 ghcDebugView :: Env -> Bench -> HeapState -> HeapLoaded -> Maybe Timeline -> NanoUI ()
 ghcDebugView env bench st loaded logTl = do
   History _ history0 <- readVar (hsDbgHistory st)
@@ -1395,18 +1402,20 @@ graphPanes env st = do
       pure $ \pid ctx ->
         if pid /= paneHeapGraph
           then Nothing
-          else Just $ do
-            let actions = do
-                  paneMeta (dbgTabName tab)
-                  scope $ when (snapTruncated latest) $ badge Warning "stopped at the closure limit"
-                  flex
-                  rowWith (itemsCenter . tight) $
-                    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} dbgTabName (hsDbgTab st)
-            pane ctx (snapLabel latest) actions $ case tab of
-              DbgSurvivors -> dbgSurvivors env st history latest survivors marked
-              DbgGraph -> dbgGraph env st sn latest marked
-              DbgBiggest -> dbgBiggest env st sn latest marked
-              DbgAnatomy -> dbgAnatomy env st latest
+          else Just $
+            withContainerWidth (grow . minW 0 . minH 0) $ \paneW -> do
+              let compact = paneW < 620
+                  tabLabel = if compact then dbgTabShortName else dbgTabName
+                  actions = do
+                    scope $ when (snapTruncated latest) $ badge Warning (if compact then "truncated" else "stopped at the closure limit")
+                    flex
+                    rowWith (itemsCenter . tight) $
+                      boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabLabel (hsDbgTab st)
+              pane ctx (snapLabel latest) actions $ case tab of
+                DbgSurvivors -> dbgSurvivors env st history latest survivors marked
+                DbgGraph -> dbgGraph env st sn latest marked
+                DbgBiggest -> dbgBiggest env st sn latest marked
+                DbgAnatomy -> dbgAnatomy env st latest
 
 -- | Where a snapshot would be taken from, as the live graph's toolbar has
 -- it.

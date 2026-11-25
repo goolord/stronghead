@@ -326,14 +326,14 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
     toolLabel "in"
     rowWith (tight . gap 4 . itemsCenter . minW 180 . fillW) $ do
       input "working directory" fillW (dsDir st)
-      dirBrowse <- iconButton' iconFolderOpen "Browse working directory"
+      dirBrowse <- iconButton' iconFolderOpen ""
       tooltip dirBrowse "Browse working directory…"
       when (respClicked dirBrowse) $
         writeVar (dsDirDialog st) . Just =<< askOpenFolderDialog defaultFileDialogOptions
     toolLabel "and load"
     rowWith (tight . gap 4 . itemsCenter) $ do
       input "src/Main.hs" (fixedW 180) (dsFile st)
-      fileBrowse <- iconButton' iconFile "Browse Haskell source file"
+      fileBrowse <- iconButton' iconFile ""
       tooltip fileBrowse "Browse Haskell source file…"
       when (respClicked fileBrowse) $
         writeVar (dsFileDialog st) . Just
