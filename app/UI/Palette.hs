@@ -83,7 +83,7 @@ paletteView env pl commands =
       when ((respSubmitted resp || enter) && n > 0) $
         for_ (take 1 (drop idx ranked)) run
       rowWith (fillW . tight . gap 8 . itemsCenter) $ do
-        labelWith (fontMuted . fontSizeScale 0.8) $
+        labelWith (fontMuted . fontTabular . fontSizeScale 0.8) $
           if T.null (T.strip query)
             then tshow totalMatches <> " available"
             else tshow totalMatches <> (if totalMatches == 1 then " match" else " matches") <> (if totalMatches > shown then " (showing top " <> tshow shown <> ")" else "")
@@ -97,13 +97,12 @@ paletteView env pl commands =
           else do
             (scrollWid, ()) <- paneScrollArea (fixedH 380 . tight) $ columnWith (tight . fillW . gap 0 . padRight 6) $
               forM_ (zip [0 :: Int ..] ranked) $ \(i, h) -> withKey i $ do
-                picked <- selectableRow (i == idx) (padXY 8 4) $ do
+                picked <- selectableRow (i == idx) (padXY 8 4 . gap 10) $ do
                   cell (fixedW 92 . fontMuted . fontSizeScale 0.82) (hitKind h)
-                  cell (fontSizeScale 0.94 . (if i == idx then fontMedium else id)) (T.take 64 (hitLabel h))
-                  flex
+                  cell (fillW . minW 0 . singleLine . ellipsisEnd . fontSizeScale 0.94 . (if i == idx then fontMedium else id)) (hitLabel h)
                   let det = hitDetail h
                   scope $ unless (T.null det) $
-                    cell (fontMono . fontMuted . fontSizeScale 0.82) (T.take 56 det)
+                    cell (maxW 240 . singleLine . ellipsisMiddle . fontMono . fontMuted . fontSizeScale 0.82) det
                 when picked (run h)
             when (idxMoved && (up || down)) $ do
               let rowH = 28 :: Float

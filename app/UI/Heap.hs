@@ -987,8 +987,7 @@ leakView env st hp = do
       wereSuspects = [(c, bf) | c <- changes, Just bf <- [bcBase c], isJust (bfScore bf)]
   paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
     scope $ for_ (biographyBreakdown hp) $ \bio -> do
-      th <- uiTheme
-      callout (if bioDominant bio == "use" then themeSuccess th else themeWarning th) $
+      calloutTone (if bioDominant bio == "use" then Success else Warning) $
         columnWith (tight . fillW . gap 4) $ do
           rowWith (tight . gap 8 . itemsCenter . fillW) $ do
             labelWith fontMedium ("LDV Biography breakdown (+RTS -hb) — dominant: " <> T.toUpper (bioDominant bio))
@@ -1176,7 +1175,7 @@ retentionView env st hp i
         let ref = if hpBreakdown hp == "cost centre" then Just (RCostCentre "" (rtName node)) else Nothing
             share = realToFrac (rtBytes node / max 1 (rtBytes tree)) :: Float
         picked <- maybe (selectableRow False id) (\r -> linkRow env r False id) ref $ do
-          spacer (Fixed (fromIntegral depth * 16)) Fit
+          spacerW (fromIntegral depth * 16)
           cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
           labelWith fillW (rtName node)
           _ <- canvasKeyed (contentKey [share]) (fixedWH 120 8) $ \r@(Rect x y w h) -> do
@@ -1238,7 +1237,7 @@ costCentreTree env st = \case
           let it = realToFrac (ccInhTime cc / 100) :: Float
               ia = realToFrac (ccInhAlloc cc / 100) :: Float
           picked <- linkRow env (RCostCentre (ccModule cc) (ccName cc)) (sel == Just (ccNo cc)) id $ do
-            spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
+            spacerW (fromIntegral (min 30 depth) * 14)
             cell (fixedW 14 . fontMuted) (if hasKids then (if isOpen then "▾" else "▸") else " ")
             cell id (ccName cc)
             cell (fillW . fontMuted . fontSizeScale 0.85) (ccModule cc)
@@ -1556,7 +1555,7 @@ dbgGraph env st sn snap marked = do
       hint "GC roots (threads, stable pointers), biggest first. Expand to follow pointers. Held: bytes a closure keeps alive, each closure charged to its first retainer on a shortest path. Thunks are amber, surviving thunks red."
       paneVirtualRows (grow . tight) id rows $ \(path, depth, n, expandable, isOpen, cyclic) -> withKey path $ do
         picked <- linkRow env (RClosure sn (cnId n)) (sel == Just (cnId n)) id $ do
-          spacer (Fixed (fromIntegral (min 40 depth) * 14)) Fit
+          spacerW (fromIntegral (min 40 depth) * 14)
           cell (fixedW 14 . fontMuted) (if cyclic then "↺" else if expandable then (if isOpen then "▾" else "▸") else " ")
           cell (fillW . ellipsisMiddle . nodeTone marked n) (cnName n)
           scope $ for_ (M.lookup (cnId n) marked) $ \k -> badge Danger ("×" <> tshow k)
@@ -1585,7 +1584,7 @@ dbgDetail env st sn snap marked sel selPath = case sel >>= (`M.lookup` snapNodes
     hint (describePath selPath)
     forM_ (zip [0 :: Int ..] selPath) $ \(d, p) -> withKey ("p:" <> fmtClosureId (cnId p)) $ do
       picked <- linkRow env (RClosure sn (cnId p)) (cnId p == cnId n) id $ do
-        spacer (Fixed (fromIntegral (min 12 d) * 8)) Fit
+        spacerW (fromIntegral (min 12 d) * 8)
         cell (fixedW 14 . fontMuted) (if d == 0 then "●" else "↳")
         cell (fillW . fontSizeScale 0.9 . nodeTone marked p) (nodeTitle p)
         cell (fontMuted . fontSizeScale 0.8) (cnType p)
@@ -1681,11 +1680,10 @@ dbgAnatomy env st snap = do
   (dt, skel, dups) <- liftIO (cachedAnatomy st snap)
   severRes <- readVar (hsDbgSever st)
   sn <- readVar (hsDbgStored st)
-  th <- uiTheme
   paneScroll (grow . tight . minH 160) $ columnWith (tight . fillW . gap 8) $ do
     hint "Topological heap anatomy: exact dominator retained bytes, automatically folded thunk/list spines, counterfactual what-if severing, and Merkle duplicate waste."
     scope $ for_ severRes $ \sr ->
-      callout (themeSuccess th) $
+      calloutTone Success $
         columnWith (tight . fillW . gap 4) $ do
           rowWith (tight . gap 8 . itemsCenter . fillW) $ do
             labelWith fontMedium

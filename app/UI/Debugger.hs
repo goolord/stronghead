@@ -533,7 +533,7 @@ bindingsPane env st stop send = do
           mxr = M.lookup name xrays
       rowWith (tight . gap 6 . itemsCenter . fillW) $ do
         cell (fontMono . fontMedium) name
-        cell (fontMono . fontMuted . fillW . fontSizeScale 0.9) (":: " <> gbType b)
+        cell (fontMono . fontMuted . fillW . minW 0 . singleLine . ellipsisEnd . fontSizeScale 0.9) (":: " <> gbType b)
         scope $ case mxr of
           Just xr -> case vxTransition xr of
             ThunkCollapsed -> badge Success "collapsed"
@@ -560,12 +560,12 @@ valueTree st toggled busy force root v0 = columnWith (tight . fillW . gap 0) $
   forM_ (take 400 (flattenValue toggled root v0)) $ \(path, depth, label', v, open, expandable) -> withKey path $
     rowWith (tight . itemsCenter . fillW . gap 4) $ do
       clicked <- selectableRow False fillW $ do
-        spacer (Fixed (fromIntegral (min 30 depth) * 14)) Fit
+        spacerW (fromIntegral (min 30 depth) * 14)
         cell (fixedW 14 . fontMuted) (if expandable then (if open then "▾" else "▸") else " ")
         scope $ unless (T.null label') $ cell (fontMono . fontMuted . fontSizeScale 0.9) label'
-        cell (fillW . fontMono . fontSizeScale 0.9 . (case v of VThunk _ _ -> fontTone Warning; _ -> id)) (T.take 160 (nodeText open v))
+        cell (fillW . minW 0 . singleLine . ellipsisEnd . fontMono . fontSizeScale 0.9 . (case v of VThunk _ _ -> fontTone Warning; _ -> id)) (nodeText open v)
         scope $ case v of
-          VThunk _ (Just ty) -> cell (fontMono . fontMuted . fontSizeScale 0.85) (":: " <> T.take 60 ty)
+          VThunk _ (Just ty) -> cell (maxW 240 . singleLine . ellipsisEnd . fontMono . fontMuted . fontSizeScale 0.85) (":: " <> ty)
           _ -> pure ()
       when (clicked && expandable) $ modifyVar (dsToggled st) (\s -> if S.member path s then S.delete path s else S.insert path s)
       scope $ case v of

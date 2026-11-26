@@ -866,11 +866,11 @@ panesPopover app active anchor = do
         rowWith (fillW . tight . gap 6 . wrap . lineGap 6) $
           forM_ presets $ \pr -> withKey (prName pr) $ do
             whenM (buttonWith (padXY 8 2 . tight) (prName pr)) (useArrangement app active (prTree pr) >> close)
-        rowWith (fillW . gap 8 . padTop 4 . tight) $ do
-          textInputConfigured defaultTextInputConfig {ticPlaceholder = "name for this arrangement", ticLayout = alignMiddle . fillW} (appPresetName app)
+        rowWith (fillW . gap 8 . padTop 4 . itemsCenter . tight) $ do
+          textInputConfigured defaultTextInputConfig {ticPlaceholder = "name for this arrangement", ticLayout = fillW} (appPresetName app)
           name <- T.strip <$> readVar (appPresetName app)
           disabledWhen (T.null name || isNothing tree) $
-            whenM (buttonWith (alignMiddle . padXY 8 2 . tight) "Save as a preset") $ for_ tree $ \t -> do
+            whenM (buttonWith (padXY 8 2 . tight) "Save as a preset") $ for_ tree $ \t -> do
               modifyVar (appPresets app) (\ps -> filter ((/= name) . prName) ps ++ [Preset name t])
               writeVar (appPresetName app) ""
         hint "Presets are saved with the session."
@@ -1174,7 +1174,7 @@ statusBar app env active winW timeline live heap hooks baseline = do
       -- isn't already named by a live connection item right next to it.
       docName <- if winW < 1560 then activeDocumentName app active timeline live else pure Nothing
       scope $ for_ docName $ \nm ->
-        labelWith (fontMono . fontMuted . fontSizeScale 0.82) (T.take 36 nm)
+        labelWith (maxW 260 . singleLine . ellipsisMiddle . fontMono . fontMuted . fontSizeScale 0.82) nm
       scope $ for_ timeline $ \p -> do
         let file = maybe "the eventlog" (T.pack . takeFileName) path
             toTimeline = writeVar (appTab app) PTimeline
@@ -1186,7 +1186,7 @@ statusBar app env active winW timeline live heap hooks baseline = do
               whenM (menuItem "Show in Timeline") toTimeline
         unless (lpDone p) $ do
           let frac = if lpTotal p > 0 then fromIntegral (lpBytes p) / fromIntegral (lpTotal p) else 0 :: Double
-          progressBarWith (fixedW 100 . alignMiddle) 6 (realToFrac frac)
+          progressBarWith (fixedW 100) 6 (realToFrac frac)
           connection (Just Warning) ("Reading " <> file <> ", " <> fmtBytes (fromIntegral (lpBytes p))) toTimeline menu
         when (lpFollowing p && lpDone p) $ connection (Just Success) ("Following " <> file) toTimeline menu
         for_ (lpError p) $ \e -> connection (Just Danger) ("Eventlog decoding stopped: " <> T.take 80 e) toTimeline menu
@@ -1229,13 +1229,13 @@ statusBar app env active winW timeline live heap hooks baseline = do
       watchStatus env (appWatchers app)
       baselineStatus (appBaseline app) baseline
       scope $ unless (T.null msg) $ do
-        labelWith (fontSizeScale 0.84 . fontTone Warning) (T.take 90 msg)
+        labelWith (maxW 360 . singleLine . ellipsisEnd . fontSizeScale 0.84 . fontTone Warning) msg
         whenM (buttonWith (padXY 6 0 . tight) "Dismiss") (writeVar (appMessage app) "")
       flex
       cursor <- readVar (busCursor (envBus env))
       scope $ for_ cursor $ \(rk, t) -> do
         labelWith (fontMuted . fontSizeScale 0.82) "Cursor"
-        linkText env (RInstant rk t) (fontSizeScale 0.82 . fontMono) (fmtNs (fromIntegral t))
+        linkText env (RInstant rk t) (fontSizeScale 0.82 . fontMono . fontTabular) (fmtNs (fromIntegral t))
       focus <- readVar (busFocus (envBus env))
       scope $ for_ focus $ \r -> do
         labelWith (fontMuted . fontSizeScale 0.82) "Focus"

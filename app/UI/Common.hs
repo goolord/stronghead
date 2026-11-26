@@ -1123,10 +1123,10 @@ paneVirtualRows scrollLayout colLayout items drawItem
       void . bareScrollArea (scrollLayout . tight . fillW . fillH) . themed th $
         columnWith (colLayout . tight . fillW . gap 0) $ do
           when (firstRow > 0) $
-            spacer Fit (Fixed (fromIntegral firstRow * rowH))
+            spacerH (fromIntegral firstRow * rowH)
           forM_ [firstRow .. lastRow] $ \i ->
             drawItem (vec V.! i)
           when (lastRow < n - 1) $
-            spacer Fit (Fixed (fromIntegral (n - 1 - lastRow) * rowH))
+            spacerH (fromIntegral (n - 1 - lastRow) * rowH)
   where
     n = length items

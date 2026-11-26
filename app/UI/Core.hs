@@ -1088,10 +1088,10 @@ corePanes env st loaded sitePanes = do
                   -- the numbers keep their place.
                   if multiLine
                     then columnWith (fillW . minW 72 . tight . gap 2) $ do
-                      labelWith (fillW . fontMono . fontSizeScale 0.9) (T.take 24 (enKey e))
+                      labelWith (fillW . minW 0 . singleLine . ellipsisEnd . fontMono . fontSizeScale 0.9) (enKey e)
                       rowWith (tight . gap 4 . wrap . fillW) (entryBadges e (isJust core))
                     else do
-                      cell (fillW . minW 72 . fontMono . fontSizeScale 0.9) (T.take (if null lanes then 34 else 24) (enKey e))
+                      cell (fillW . minW 72 . singleLine . ellipsisEnd . fontMono . fontSizeScale 0.9) (enKey e)
                       entryBadges e (isJust core)
                   forM_ lanes $ \l -> withKey (laneName l) $ case l of
                     LaneTime -> numCell 38 (costTone (rtTime r)) (pct (rtTime r))

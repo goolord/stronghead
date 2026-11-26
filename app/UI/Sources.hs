@@ -98,7 +98,7 @@ sourceRow env s unlink =
     when (respClicked area) (envSwitch env (srcPanel s))
     tooltip area ("Open " <> panelTitle (srcPanel s))
     columnWith (fillW . tight . gap 1) $ do
-      labelWith (fillW . fontMono . fontSizeScale 0.85) (T.take 90 (srcDetail s))
+      labelWith (fillW . minW 0 . singleLine . ellipsisMiddle . fontMono . fontSizeScale 0.85) (srcDetail s)
       labelWith (fillW . fontMuted . fontSizeScale 0.82) (T.intercalate "; " (map datumAdds (srcData s)))
     scope $ when (srcLinked s) $ whenM (buttonWith (padXY 6 2 . tight) "Unlink") (unlink (srcOrigin s))
 

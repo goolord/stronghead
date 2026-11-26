@@ -236,14 +236,14 @@ queryPane env st qctx ctx = do
                       Just r -> do
                         _ <- linkRow env r False id $ do
                           badge Muted qrKindBadge
-                          labelWith (fontMono . fontSizeScale 0.88 . fillW) (T.take 56 qrTitle)
-                          labelWith (fontMono . fontMedium . fontSizeScale 0.86 . alignEnd) qrPrimaryMetric
+                          labelWith (fontMono . fontSizeScale 0.88 . fillW . minW 0 . singleLine . ellipsisEnd) qrTitle
+                          labelWith (fontMono . fontTabular . fontMedium . fontSizeScale 0.86 . alignEnd) qrPrimaryMetric
                         labelWith (padLeft 14 . fontMuted . fontSizeScale 0.8 . fillW) (qrSecondary <> maybe "" (\s -> " · " <> s) qrSource)
                       Nothing ->
                         rowWith (padXY 8 2 . gap 8 . itemsCenter . fillW) $ do
                           badge Muted qrKindBadge
-                          labelWith (fontMono . fontSizeScale 0.88 . fillW) qrTitle
-                          labelWith (fontMono . fontSizeScale 0.86) qrPrimaryMetric
+                          labelWith (fontMono . fontSizeScale 0.88 . fillW . minW 0 . singleLine . ellipsisEnd) qrTitle
+                          labelWith (fontMono . fontTabular . fontSizeScale 0.86) qrPrimaryMetric
 
 -- ---------------------------------------------------------------------------
 -- 3. Project Target Runner, RTS Pareto Scatter Lab & Benchmark Explorer
@@ -307,7 +307,7 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
                       writeVar (wlStatus st) ("Launched " <> ctName curTarget <> " (" <> recipeTitle recipe <> ")")
                       onLaunched evOut bdir
                 copyFeedbackButton (padXY 8 3 . tight) "Copy cabal command" cmdPreview
-              labelWith (fontMono . fontMuted . fontSizeScale 0.78 . fillW) (T.take 120 cmdPreview)
+              labelWith (fontMono . fontMuted . fontSizeScale 0.78 . fillW . minW 0 . singleLine . ellipsisEnd) cmdPreview
 
         separator
 

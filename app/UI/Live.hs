@@ -410,13 +410,12 @@ actionStrip st remote = do
 -- | What Connect found, or how to upgrade an old agent.
 attachReport :: LiveState -> LiveData -> NanoUI ()
 attachReport st d = do
-  th <- uiTheme
   attached <- readVar (lvAttached st)
   let oldAgent = isNothing (ldInfo d) && not (Seq.null (ldFrames d))
   if
     | oldAgent ->
         columnWith (padTop 8 . padXY 8 0 . tight . fillW) $
-          callout (themeWarning th) $
+          calloutTone Warning $
             columnWith (fillW . tight . gap 4) $ do
               labelWith (fontMedium . fillW) "This program's agent is an old one (protocol v1)"
               labelWith (fillW . fontSizeScale 0.92) "It streams statistics and threads, but doesn't say where the program runs or take commands, so Connect can't follow its eventlog or send marks. Rebuild the program against the current stronghead:agent; nothing else changes."
@@ -436,7 +435,6 @@ attachReport st d = do
 
 dashboard :: Env -> Bench -> LiveState -> LiveData -> Maybe Timeline -> NanoUI ()
 dashboard env bench st d logTl = do
-  th <- uiTheme
   let frames = ldFrames d
       lastF = Seq.index frames (Seq.length frames - 1)
       latest = case frames of
@@ -445,7 +443,7 @@ dashboard env bench st d logTl = do
       statsOn = stat "rts_stats" lastF > 0
   scope $ when (not statsOn) $
     columnWith (padBottom 8 . padXY 8 0 . tight . fillW) $
-      callout (themeWarning th) (label "The program was not run with +RTS -T, so only the thread list is available.")
+      calloutTone Warning (label "The program was not run with +RTS -T, so only the thread list is available.")
   let lastPauseNs = stat "gc_elapsed_ns" lastF
       gcCpuShare = stat "gc_cpu_ns" lastF / max 1 (stat "cpu_ns" lastF)
       prodTone p
@@ -592,15 +590,15 @@ livePanes env st mdata logTl site = case mdata of
             pane ctx "Threads" (threadsHeader st counts) $ do
               scope $ unless (Seq.null (ldAlerts d)) $ do
                 let recentAlerts = take 4 (reverse (toList (ldAlerts d)))
-                callout (themeWarning th) $
+                calloutTone Warning $
                   columnWith (tight . fillW . gap 3) $ do
                     labelWith (fontMedium . fontSizeScale 0.88) ("Live runtime alerts (" <> tshow (Seq.length (ldAlerts d)) <> ")")
                     forM_ recentAlerts $ \al ->
                       rowWith (tight . gap 8 . fillW . itemsCenter) $ do
                         badge (if laKind al == "exc" then Danger else Warning) (laKind al)
-                        labelWith (fontMono . fontSizeScale 0.84) ("tid " <> tshow (laTid al))
+                        labelWith (fontMono . fontTabular . fontSizeScale 0.84) ("tid " <> tshow (laTid al))
                         labelWith (fontMedium . fontSizeScale 0.86) (laTitle al)
-                        labelWith (fillW . fontMono . fontMuted . fontSizeScale 0.8) (T.take 120 (laDetail al))
+                        labelWith (fillW . minW 0 . singleLine . ellipsisEnd . fontMono . fontMuted . fontSizeScale 0.8) (laDetail al)
               subTab <- readVar (lvSubTab st)
               case subTab of
                 LiveThreadsList -> do
@@ -761,12 +759,12 @@ liveProbesView env probes =
           forM_ (take 80 nodes) $ \n -> withKey ("pn" <> tshow (lpnId n)) $
             rowWith (tight . gap 8 . fillW . itemsCenter) $ do
               let depth = max 0 (min 12 (if lpnParent n < 0 then 0 else 1 + min 11 (lpnParent n)))
-              spacer (Fixed (fromIntegral depth * 10)) Fit
+              spacerW (fromIntegral depth * 10)
               cell (fontMono . fontSizeScale 0.86 . if lpnIsThunk n then fontTone Warning else id)
                 (if T.null (lpnName n) then lpnType n else lpnName n)
               badge (if lpnIsThunk n then Warning else Muted) (lpnType n)
               scope $ unless (T.null (lpnDetail n)) $
-                labelWith (fontMono . fontMuted . fontSizeScale 0.8) (T.take 48 (lpnDetail n))
+                labelWith (maxW 240 . singleLine . ellipsisEnd . fontMono . fontMuted . fontSizeScale 0.8) (lpnDetail n)
               flex
               case srcLocSpan (parseSrcLoc (lpnSource n)) of
                 Just sp -> linkText env (RSource sp) (fontMono . fontMuted . fontSizeScale 0.8) (lpnSource n)
