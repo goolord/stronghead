@@ -39,7 +39,7 @@ import System.FilePath (isAbsolute, makeRelative, normalise, takeDirectory, take
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import NanoUI
+import NanoUI hiding (selectableRow)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Shortcut qualified as K
 
@@ -308,7 +308,7 @@ debugView env bench st ix source = columnWith (tight . gap 0 . grow) $ do
   busy <- readVar (dsBusy st)
   stop <- readVar (dsStop st)
   let send cmds = liftIO (runCommands st wake cmds)
-      input placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = f defaultLayout} v
+      input placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = f} v
       tipBtn ic lbl tip = do
         r <- iconButtonWith' id ic lbl
         tooltip r tip
@@ -633,12 +633,12 @@ consolePane env st ctx send = do
     n <- readVar seen
     when (n /= length ls) $ do
       writeVar seen (length ls)
-      scrollToEndUi scrollWid ScrollInstant
+      scrollToEnd scrollWid ScrollInstant
     running <- readVar (dsRunning st)
     styled (panelStyle (background (inkSunken i) . borderTop 1 (inkRule i) . cornerRadius 0)) $
       panelWith (asRow . itemsCenter . fillW . padXY 12 6 . gap 8) $ themed th $ do
         labelWith (fontMono . fontTone Accent) "λ>"
-        resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "Any GHCi command, e.g. :show breaks, :history, :sprint xs", ticLayout = fillW defaultLayout} (dsInput st)
+        resp <- textInputConfigured' defaultTextInputConfig {ticPlaceholder = "Any GHCi command, e.g. :show breaks, :history, :sprint xs", ticLayout = fillW} (dsInput st)
         go <- disabledWhen (not running) (toolIconButton iconSend "Send")
         when (respSubmitted resp || go) $ do
           cmd <- readVar (dsInput st)

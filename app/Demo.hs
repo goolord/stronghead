@@ -78,7 +78,7 @@ import System.Process
 import Numeric (showFFloat)
 
 import NanoUI
-import NanoUI.Backend (applyMouseButton, emptyInput)
+import NanoUI.Backend (applyMouseButton, buttonsFromList, emptyInput, withTheme)
 import NanoUI.Backend.Sdl
   ( NanoUIFont (..)
   , SdlEnv

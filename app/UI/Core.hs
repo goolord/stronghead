@@ -36,7 +36,8 @@ import System.Process (spawnCommand)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
-import NanoUI hiding (Binding)
+import NanoUI
+import NanoUI.Widgets.PaneGrid (PaneDropLocation (..), PaneGridCtx (..), paneDragHandle)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askOpenFolderDialog, defaultFileDialogOptions, useFileDialog)
 
 import Stronghead.Dump
@@ -562,7 +563,7 @@ coreView env bench st loaded = columnWith (tight . gap 0 . grow) $ do
     toolGroup $ do
       toolLabel "Colour"
       rowWith (itemsCenter . tight) $
-        boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring st)
+        enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring st)
       colNow <- readVar (csColouring st)
       scope $ when (colNow == BoxingColours) $ do
         labelWith (fontTone Warning . fontSizeScale 0.8) "■ box"
@@ -1054,7 +1055,7 @@ corePanes env st loaded sitePanes = do
     if
       | pid == paneCoreBindings -> Just $
           pane ctx "Bindings" (paneMeta (if length shown == length es then tshow (length shown) else tshow (length shown) <> " / " <> tshow (length es))) $ do
-            searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter bindings", sicLayout = fillW defaultLayout} (csFilter st)
+            searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter bindings", sicLayout = fillW} (csFilter st)
             scope $ when hasLifted $
               checkboxWith (fillW . fontSizeScale 0.86) "Hide compiler lifted" (csHideLifted st)
             scope $ unless (null lanes) $ do
@@ -1070,16 +1071,15 @@ corePanes env st loaded sitePanes = do
             let shownVec = V.fromList shown
                 nShown = V.length shownVec
                 multiLine = length lanes >= 3 || LaneTicky `elem` lanes
-                curIdx = fromMaybe (-1) (selected >>= \k -> findIndex ((== k) . enKey) shown)
+                curIdx = selected >>= \k -> findIndex ((== k) . enKey) shown
             sid <- currentId
             nav <- useListNav sid nShown curIdx (if multiLine then 38 else 24)
-            selectedNow <-
-              if lnChanged nav && lnIndex nav >= 0 && lnIndex nav < nShown
-                then do
-                  let pickedKey = enKey (shownVec V.! lnIndex nav)
-                  select pickedKey
-                  pure (Just pickedKey)
-                else pure selected
+            selectedNow <- case (lnChanged nav, lnIndex nav) of
+              (True, Just i) | i >= 0 && i < nShown -> do
+                let pickedKey = enKey (shownVec V.! i)
+                select pickedKey
+                pure (Just pickedKey)
+              _ -> pure selected
             void $ paneFocusScrollArea (grow . tight) $ columnWith (tight . fillW . gap 0) $
               forM_ shown $ \e -> withKey (enKey e) $ do
                 let r = rt e

@@ -177,7 +177,7 @@ library ui
         mtl >=2.2 && <2.4,
         nano-ui ^>=0.2,
         nano-ui-sdl ^>=0.2,
-        nano-ui-svg ^>=0.1,
+        nano-ui-svg ^>=0.2,
         optparse-applicative >=0.18 && <0.20,
         primitive ^>=0.9,
         process ^>=1.6,

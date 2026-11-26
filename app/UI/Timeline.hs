@@ -38,7 +38,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
-import NanoUI
+import NanoUI hiding (selectableRow)
+import NanoUI.Backend (colorToWord32)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
 
@@ -491,7 +492,7 @@ mainCanvas env st pal mm tl v sel marks = do
   resp <-
     canvasConfigured
       defaultCanvasConfig
-        { canvasLayout = (fillW . fillH . minH (mainHeight nCaps code)) defaultLayout
+        { canvasLayout = fillW . fillH . minH (mainHeight nCaps code)
         , canvasTrackPointer = True
         , canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)
         }
@@ -994,10 +995,10 @@ threadsHeader st pal tl = do
   winW <- windowWidth
   paneMeta (fmtInt (M.size (tlThreads tl)))
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (fixedW (if winW < 1200 then 160 else 200) . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = fixedW (if winW < 1200 then 160 else 200) . padXY 0 0}
     (tsThreadFilter st)
   scope $ when (winW >= 1220) $
-    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} threadSortName (tsThreadSort st)
+    enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabSegmented} threadSortName (tsThreadSort st)
   flex
   legendDot (pRun pal) "running"
   legendDot (pBlocked pal) "blocked"
@@ -1075,7 +1076,7 @@ threadsSection env st pal mm tl v sel marks = do
     resp <-
       canvasConfigured
         defaultCanvasConfig
-          { canvasLayout = (fillW . fillH . minH 80) defaultLayout
+          { canvasLayout = fillW . fillH . minH 80
           , canvasTrackPointer = True
           }
         $ \r@(Rect x y w h) -> do
@@ -1673,7 +1674,7 @@ markersHeader st tl = do
       compact = winW < 1220
   paneMetaWith (fixedW (if compact then 24 else 32)) (fmtInt nMarkers)
   searchInputConfigured
-    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = (minW 52 . fillW . padXY 0 0) defaultLayout}
+    defaultSearchInputConfig {sicPlaceholder = "Filter", sicLayout = minW 52 . fillW . padXY 0 0}
     (tsMarkerFilter st)
   (_, evArea) <- mouseArea tight $ checkbox (if compact then "All" else "Events") (tsMarkerEvents st)
   when compact (tooltip evArea "Include all runtime events (markers and RTS events)")

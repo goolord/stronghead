@@ -208,7 +208,7 @@ queryPane env st qctx ctx = do
         textInputConfigured
           defaultTextInputConfig
             { ticPlaceholder = "closures | path (MutVar ~> Thunk{3,}) | sort dom | top 25"
-            , ticLayout = (fillW . fontMono) defaultLayout
+            , ticLayout = fillW . fontMono
             }
           (wlQueryText st)
       -- Bidirectional removable stage pills
@@ -293,7 +293,7 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
                 labelWith (fontTone Warning . fontSizeScale 0.84 . fillW) cav
               rowWith (fillW . tight . gap 6 . itemsCenter) $ do
                 labelWith (fontMuted . fontSizeScale 0.85) "Args:"
-                textInputConfigured defaultTextInputConfig {ticPlaceholder = "program arguments before +RTS", ticLayout = fillW defaultLayout} (wlTargetArgs st)
+                textInputConfigured defaultTextInputConfig {ticPlaceholder = "program arguments before +RTS", ticLayout = fillW} (wlTargetArgs st)
               root <- readVar (wlProjectRoot st)
               argsRaw <- readVar (wlTargetArgs st)
               let evOut = root </> (T.unpack (ctName curTarget) <> ".eventlog")
@@ -315,10 +315,10 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
         sectionTitle "RTS flag Pareto tuning lab"
         hint "Sweep nursery sizes, idle GC, and concurrent non-moving GC (+RTS -xn) across a compiled binary to plot the Throughput vs Tail-Latency Pareto frontier."
         rowWith (fillW . tight . gap 6 . itemsCenter) $ do
-          textInputConfigured defaultTextInputConfig {ticPlaceholder = "path/to/executable", ticLayout = fillW defaultLayout} (wlSweepExe st)
-          textInputConfigured defaultTextInputConfig {ticPlaceholder = "args", ticLayout = fixedW 120 defaultLayout} (wlSweepArgs st)
+          textInputConfigured defaultTextInputConfig {ticPlaceholder = "path/to/executable", ticLayout = fillW} (wlSweepExe st)
+          textInputConfigured defaultTextInputConfig {ticPlaceholder = "args", ticLayout = fixedW 120} (wlSweepArgs st)
         rowWith (fillW . tight . gap 6 . itemsCenter) $ do
-          textInputConfigured defaultTextInputConfig {ticPlaceholder = "-A16m, -A64m, -A64m -xn", ticLayout = (fillW . fontMono) defaultLayout} (wlSweepGrid st)
+          textInputConfigured defaultTextInputConfig {ticPlaceholder = "-A16m, -A64m, -A64m -xn", ticLayout = fillW . fontMono} (wlSweepGrid st)
           exeTxt <- T.strip <$> readVar (wlSweepExe st)
           sArgs <- readVar (wlSweepArgs st)
           gridTxt <- readVar (wlSweepGrid st)
@@ -342,7 +342,7 @@ labPane env st targets mTl mHp mDumps onLaunched ctx = do
 
         -- Section C: Live .stronghead-spec Budget Gate & Benchmark CSV
         sectionTitle "Performance budget (.stronghead-spec) & benchmarks"
-        textInputConfigured defaultTextInputConfig {ticPlaceholder = "max-leak-score = 0.5\nmax-gc-p99-ms = 15", ticLayout = (fillW . fontMono) defaultLayout} (wlBudgetSpec st)
+        textInputConfigured defaultTextInputConfig {ticPlaceholder = "max-leak-score = 0.5\nmax-gc-p99-ms = 15", ticLayout = fillW . fontMono} (wlBudgetSpec st)
         specTxt <- readVar (wlBudgetSpec st)
         bRes <- liftIO (evaluateBudget (parseBudgetSpec specTxt) mTl mHp (envBaseline env >>= baHeap) mDumps)
         rowWith (fillW . tight . gap 8 . itemsCenter . wrap) $ do
@@ -379,7 +379,7 @@ paretoScatterView ParetoSummary {..} = do
       maxY = max 1 (maximum (1 : p99s) * 1.15)
   unless (null pts) $ do
     void $
-      canvasConfigured defaultCanvasConfig {canvasLayout = (fillW . fixedH 150) defaultLayout} $ \r@(Rect x y w h) -> do
+      canvasConfigured defaultCanvasConfig {canvasLayout = fillW . fixedH 150} $ \r@(Rect x y w h) -> do
         drawRoundedRect r 4 (pTrackBg pal)
         let padL = 46
             padR = 16

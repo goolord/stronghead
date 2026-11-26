@@ -262,7 +262,7 @@ heapDiffChart base cur = do
         labelWith (fontMuted . fontSizeScale 0.8) "— baseline"
         labelWith (fontTone Accent . fontSizeScale 0.8) "■ current"
       void $
-        canvasConfigured defaultCanvasConfig {canvasLayout = (fillW . fixedH 116) defaultLayout} $ \r ->
+        canvasConfigured defaultCanvasConfig {canvasLayout = fillW . fixedH 116} $ \r ->
           drawLineChart pal (mmFont mm) r (0, maxT) (\v -> "peak " <> fmtBytesD v) series
 
 

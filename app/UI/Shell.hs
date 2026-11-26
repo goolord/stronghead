@@ -40,6 +40,7 @@ import Data.Vector.Unboxed qualified as VU
 import NanoUI
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, askSaveFileDialog, askSdlEnv, defaultFileDialogOptions, setSdlUiScale, useFileDialog, windowZoom)
 import NanoUI.Shortcut qualified as K
+import NanoUI.Widgets.PaneGrid (GridNode)
 
 import Stronghead.Attach (AttachKind (..), AttachStep (..))
 import Stronghead.Debug (DebugTarget (..), ghcDebugEnabled)
@@ -351,8 +352,8 @@ trackWindow app = do
   for_ place $ \sw -> do
     writeVar (appPlaceWindow app) Nothing
     -- Opening at a zoom other than 1 centres the window, so move it after.
-    for_ (swPosition sw) (uncurry moveWindowUi)
-    when (swMaximized sw) maximizeWindowUi
+    for_ (swPosition sw) (uncurry moveWindow)
+    when (swMaximized sw) maximizeWindow
   w <- askWindow
   let Size ww wh = winSize w
   liftIO $ unless (winMinimized w || winFullscreen w || ww <= 0 || wh <= 0) $
@@ -383,7 +384,7 @@ appView :: App -> NanoUI ()
 appView app = do
   -- Settings first, so the whole frame is drawn in the chosen theme.
   choice <- readVar (appTheme app)
-  setUiTheme . strongheadTheme . choiceAppearance choice =<< systemAppearance
+  setTheme . strongheadTheme . choiceAppearance choice =<< systemAppearance
   setSdlUiScale . uiScaleFactor =<< readVar (appScale app)
   trackWindow app
   settingsShortcuts app
@@ -866,10 +867,10 @@ panesPopover app active anchor = do
           forM_ presets $ \pr -> withKey (prName pr) $ do
             whenM (buttonWith (padXY 8 2 . tight) (prName pr)) (useArrangement app active (prTree pr) >> close)
         rowWith (fillW . gap 8 . padTop 4 . tight) $ do
-          textInputConfigured defaultTextInputConfig {ticPlaceholder = "name for this arrangement", ticLayout = (alignMid . fillW) defaultLayout} (appPresetName app)
+          textInputConfigured defaultTextInputConfig {ticPlaceholder = "name for this arrangement", ticLayout = alignMiddle . fillW} (appPresetName app)
           name <- T.strip <$> readVar (appPresetName app)
           disabledWhen (T.null name || isNothing tree) $
-            whenM (buttonWith (alignMid . padXY 8 2 . tight) "Save as a preset") $ for_ tree $ \t -> do
+            whenM (buttonWith (alignMiddle . padXY 8 2 . tight) "Save as a preset") $ for_ tree $ \t -> do
               modifyVar (appPresets app) (\ps -> filter ((/= name) . prName) ps ++ [Preset name t])
               writeVar (appPresetName app) ""
         hint "Presets are saved with the session."
@@ -891,7 +892,7 @@ poppedWindows app shellPanes providers = do
     draw <- case paneKind k >>= pkPanel of
       Just p -> providers p [k]
       Nothing -> pure shellPanes
-    (resp, _) <- window' always (paneTitle k) $
+    (resp, _) <- floatingWindow' always (paneTitle k) $
       columnWith (fixedWH 720 460 . tight) $
         fromMaybe (hint "Nothing draws this pane.") (draw k floatingPane)
     when (respClicked resp) $ do
@@ -1140,7 +1141,7 @@ document app active = scope $ case active of
     case source of
       FromHpFile -> pathLabel =<< readVar (hsHpPath (appHeap app))
       FromEventlog -> pathLabel =<< readVar (tsPath (appTimeline app))
-      FromGhcDebug -> labelWith (alignMid . fontMuted . fontSizeScale 0.92) "ghc-debug live graph"
+      FromGhcDebug -> labelWith (alignMiddle . fontMuted . fontSizeScale 0.92) "ghc-debug live graph"
   PCore -> do
     (s, c, g) <- readVar (csPaths (appCore app))
     pathLabel (c <|> g <|> s)
@@ -1148,7 +1149,7 @@ document app active = scope $ case active of
   PLive -> do
     host <- readVar (lvHost (appLive app))
     port <- readVar (lvPort (appLive app))
-    labelWith (alignMid . fontMono . fontSizeScale 0.92) (host <> ":" <> port)
+    labelWith (alignMiddle . fontMono . fontSizeScale 0.92) (host <> ":" <> port)
 
 -- | The connection centre on the left: every live source (the followed
 -- eventlog, the agent, the ghc-debug target, GHCi) opens its panel on a
@@ -1185,7 +1186,7 @@ statusBar app env active winW timeline live heap hooks baseline = do
               whenM (menuItem "Show in Timeline") toTimeline
         unless (lpDone p) $ do
           let frac = if lpTotal p > 0 then fromIntegral (lpBytes p) / fromIntegral (lpTotal p) else 0 :: Double
-          progressBarWith (fixedW 100 . alignMid) 6 (realToFrac frac)
+          progressBarWith (fixedW 100 . alignMiddle) 6 (realToFrac frac)
           connection (Just Warning) ("Reading " <> file <> ", " <> fmtBytes (fromIntegral (lpBytes p))) toTimeline menu
         when (lpFollowing p && lpDone p) $ connection (Just Success) ("Following " <> file) toTimeline menu
         for_ (lpError p) $ \e -> connection (Just Danger) ("Eventlog decoding stopped: " <> T.take 80 e) toTimeline menu
@@ -1439,7 +1440,7 @@ sourcesOf app timeline heap core live links = do
 navBar :: Var Panel -> NanoUI ()
 navBar v =
   rowWith (alignBottom . tight) $
-    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v
+    enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabContained} panelTitle v
 
 -- ---------------------------------------------------------------------------
 -- Keyboard shortcuts modal
@@ -1527,8 +1528,8 @@ settingsModal app =
     let auto = if scale == ScaleAuto then Just zoom else Nothing
         chords = T.intercalate ", " . map (K.shortcutLabel . headOr)
         headOr = \case k : _ -> k; [] -> mempty
-        input f v = textInputConfigured defaultTextInputConfig {ticLayout = f defaultLayout} v
-        inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = f defaultLayout} v
+        input f v = textInputConfigured defaultTextInputConfig {ticLayout = f} v
+        inputHint placeholder f v = textInputConfigured defaultTextInputConfig {ticPlaceholder = placeholder, ticLayout = f} v
         core = appCore app
         lastPath = takeDirectory (appSettingsPath app) </> ("last" <> sessionExtension)
     columnWith (fillW . tight . gap 8) $ do
@@ -1536,7 +1537,7 @@ settingsModal app =
         columnWith (fillW . tight . gap 8 . padRight 8) $ do
           sectionTitle "Appearance"
           settingRow "Theme" $
-            boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} themeChoiceName (appTheme app)
+            enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabSegmented} themeChoiceName (appTheme app)
           settingRow "Interface scale" $ enumSelectWith (fixedW 230) (uiScaleLabel auto) (appScale app)
           settingNote $
             chords [zoomIn, zoomOut] <> " step the scale; " <> chords [zoomReset] <> " follows the display again."
@@ -1558,7 +1559,7 @@ settingsModal app =
           settingRow "GHCi command" $ input (fixedW 260) (dsCommand (appDebug app))
           sectionTitle "Core & STG"
           settingRow "Colouring" $
-            boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring core)
+            enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabSegmented} colouringName (csColouring core)
           settingRow "" $ do
             checkbox "Hide uniques" (csHideUniques core)
             checkbox "Hide Typeable bindings" (csHideTypeable core)

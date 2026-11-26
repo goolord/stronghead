@@ -66,7 +66,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Vector qualified as V
 import Data.Vector.Unboxed qualified as VU
-import NanoUI
+import NanoUI hiding (selectableRow)
+import NanoUI.Backend (colorToWord32)
 import NanoUI.Backend.Sdl (FileDialogId, FileDialogOptions (..), FileFilter (..), askOpenFileDialog, defaultFileDialogOptions, useFileDialog)
 import NanoUI.Path qualified as P
 
@@ -360,7 +361,7 @@ heapView env bench st loaded logTl = columnWith (tight . gap 0 . grow) $ do
   toolStripWrap $ do
     toolLabel "Source"
     rowWith (itemsCenter . tight) $
-      boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} (\case FromEventlog -> "Eventlog samples"; FromHpFile -> ".hp file"; FromGhcDebug -> "Live graph (ghc-debug)") (hsSource st)
+      enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabSegmented} (\case FromEventlog -> "Eventlog samples"; FromHpFile -> ".hp file"; FromGhcDebug -> "Live graph (ghc-debug)") (hsSource st)
     scope $ unless (source == FromGhcDebug) $ toolGroup $ do
       whenM (toolIconButton iconFolderOpen "Open heap profile…") askOpenHp
       whenM (toolIconButton iconFolderOpen "Open cost-centre profile…") askOpenProf
@@ -693,7 +694,7 @@ profilePanes env st loaded logTl hp site = do
                   hoverX = if rectContains plot0 mouse then Just (v2X mouse) else Nothing
               resp <-
                 canvasConfigured
-                  defaultCanvasConfig {canvasLayout = (fillW . fillH) defaultLayout, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
+                  defaultCanvasConfig {canvasLayout = fillW . fillH, canvasTrackPointer = True, canvasCursor = Just (\_ _ _ -> UiCursorCrosshair)}
                   (\r -> drawChart pal mm hp ls ymax v cursorIx (chartAxis rk clock v (chartPlot r)) marks {tmCursor = Nothing} r hoverX)
               let plot@(Rect px py pw ph) = chartPlot (respRect resp)
                   onAxis = v2Y mouse >= py + ph && v2X mouse >= px && v2X mouse <= px + pw
@@ -737,7 +738,7 @@ profilePanes env st loaded logTl hp site = do
             let actions = do
                   flex
                   rowWith (itemsCenter . tight) $
-                    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabName (hsTab st)
+                    enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabContained} tabName (hsTab st)
             pane ctx (analysisTitle (paneW < 680) tab) actions $ case tab of
               AtCursor -> atCursor env st hp cursorIx
               Leaks -> leakView env st hp
@@ -843,23 +844,22 @@ legend :: Env -> HeapState -> HeapProfile -> Set Text -> Maybe Text -> NanoUI ()
 legend env st hp hidden solo = do
   let bandsVec = hpBands hp
       nBands = V.length bandsVec
-      curIdx = fromMaybe (-1) $ do
+      curIdx = do
         s <- solo
         V.findIndex (\b -> bandName b == s) bandsVec
   sid <- currentId
   nav <- useListNav sid nBands curIdx 26
-  soloNow <-
-    if lnChanged nav && lnIndex nav >= 0 && lnIndex nav < nBands
-      then do
-        let pickedName = bandName (bandsVec V.! lnIndex nav)
-        writeVar (hsSolo st) (Just pickedName)
-        pure (Just pickedName)
-      else
-        if lnActivated nav && curIdx >= 0 && curIdx < nBands
-          then do
-            writeVar (hsSolo st) Nothing
-            pure Nothing
-          else pure solo
+  soloNow <- case (lnChanged nav, lnIndex nav) of
+    (True, Just i) | i >= 0 && i < nBands -> do
+      let pickedName = bandName (bandsVec V.! i)
+      writeVar (hsSolo st) (Just pickedName)
+      pure (Just pickedName)
+    _ ->
+      if lnActivated nav && isJust curIdx
+        then do
+          writeVar (hsSolo st) Nothing
+          pure Nothing
+        else pure solo
   void $ paneFocusScrollArea (grow . tight) $ columnWith (tight . fillW . gap 1) $
     forM_ (zip [0 :: Int ..] (V.toList bandsVec)) $ \(i, b) -> withKey (bandName b) $ do
       let name = bandName b
@@ -922,7 +922,7 @@ atCursor env st hp i = do
           [ headed "closure or band" $ \(k, b) ->
               let c = bandColor k (bandName b)
                   title = bandTitle b
-              in cellSort title . withText (shorten 20 title) $ cellWidget $
+              in cellSort title . cellWidthText (shorten 20 title) $ cellWidget $
                    rowWith (padXY 8 0 . gap 8 . tight . fillW . fillH . itemsCenter) $ do
                      _ <- canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 10 10) (\r -> drawRoundedRect r 2 c)
                      picked <- linkText' env (RBand (bandName b)) (fillW . ellipsisMiddle . fontSizeScale 0.92) title
@@ -935,7 +935,7 @@ atCursor env st hp i = do
           , headed "residency" $ \(_, b) ->
               let val = bandValues b VU.! i
               in cellSortNum val
-                   . withText (tshow (round val :: Integer))
+                   . cellWidthText (tshow (round val :: Integer))
                    $ cellWidget
                    $ withCellBar (realToFrac (val / maxRes)) barTint
                    $ rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
@@ -945,7 +945,7 @@ atCursor env st hp i = do
                   stTone = if d > 0 then fontTone Warning else if d < 0 then fontTone Success else fontMuted
                   txt = (if d > 0 then "+" else "") <> fmtBytesD d
               in cellSortNum d
-                   . withText (tshow (round (abs d) :: Integer))
+                   . cellWidthText (tshow (round (abs d) :: Integer))
                    $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
                        labelWith (fontMono . fontTabular . stTone . alignEnd . fillW) txt
@@ -953,7 +953,7 @@ atCursor env st hp i = do
               let val = bandValues b VU.! i
                   sh = val / max 1 total
               in cellSortNum sh
-                   . withText (tshow (round (sh * 10000) :: Integer))
+                   . cellWidthText (tshow (round (sh * 10000) :: Integer))
                    $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
                        labelWith (fontMono . fontTabular . fontMuted . alignEnd . fillW) (fmtPct sh)
@@ -1014,21 +1014,21 @@ leakView env st hp = do
             [ headed "leak suspect" $ \(c, bf) ->
                 let title = figuresTitle bf
                     name = maybe (bfName bf) bfName (bcCur c)
-                in cellSort title . withText (shorten 20 title) $ cellWidget $
+                in cellSort title . cellWidthText (shorten 20 title) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $ do
                        picked <- linkText' env (RBand name) (fillW . ellipsisMiddle . fontSizeScale 0.92) title
                        when picked $ writeVar (hsSolo st) (Just name)
             , headed "peak before" $ \(_, bf) ->
                 let peak = bfPeak bf
                     txt = fmtBytesD peak
-                in cellSortNum peak . withText (tshow (round peak :: Integer)) $ cellWidget $
+                in cellSortNum peak . cellWidthText (tshow (round peak :: Integer)) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
                        labelWith (fontMono . fontTabular . fontMuted . alignEnd . fillW) txt
             , headed "peak now" $ \(c, _) ->
                 let mPeak = bcCur c >>= (Just . bfPeak)
                     txt = maybe "—" fmtBytesD mPeak
                     sortKey = maybe (-1) bfPeak (bcCur c)
-                in cellSortNum sortKey . withText (tshow (round (max 0 sortKey) :: Integer)) $ cellWidget $
+                in cellSortNum sortKey . cellWidthText (tshow (round (max 0 sortKey) :: Integer)) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
                        labelWith (fontMono . fontTabular . alignEnd . fillW) txt
             , headed "status" $ \(c, bf) ->
@@ -1036,7 +1036,7 @@ leakView env st hp = do
                       BandGone -> (Success, "gone")
                       BandShrank -> (Success, "much smaller (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")")
                       _ -> (Warning, "still there (" <> fmtChange (bfPeak bf) (maybe 0 bfPeak (bcCur c)) <> ")" <> maybe "" (const ", still a suspect") (bcCur c >>= bfScore))
-                in cellSort stText . withText (shorten 20 stText) $ cellWidget $
+                in cellSort stText . cellWidthText (shorten 20 stText) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
                        labelWith (fontTone stTone . fillW) stText
             ]
@@ -1094,7 +1094,7 @@ leakView env st hp = do
       let thunkCols = mconcat
             [ headed "thunk band" $ \b ->
                 let name = bandName b
-                in cellSort name . withText (shorten 20 name) $ cellWidget $
+                in cellSort name . cellWidthText (shorten 20 name) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $ do
                        picked <- linkText' env (RBand name) (fillW . ellipsisMiddle . fontSizeScale 0.92) name
                        when picked $ writeVar (hsSolo st) (Just name)
@@ -1102,7 +1102,7 @@ leakView env st hp = do
                 let vs = VU.take nAnalysed (bandValues b)
                     val = maybe 0 snd (VU.unsnoc vs)
                 in cellSortNum val
-                     . withText (tshow (round val :: Integer))
+                     . cellWidthText (tshow (round val :: Integer))
                      $ cellWidget
                      $ withCellBar (realToFrac (val / thunkMax)) (alpha 0.16 (pGC pal))
                      $ rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
@@ -1113,7 +1113,7 @@ leakView env st hp = do
                       | VU.null vs = 0
                       | otherwise = fst (VU.foldl' (\(!tr, !prev) v -> if v >= prev then (tr + 1, v) else (0, v)) (0 :: Int, vs VU.! 0) (VU.drop 1 vs))
                     sText = tshow streak <> " censuses growing"
-                in cellSortInt streak . withText (tshow streak) $ cellWidget $
+                in cellSortInt streak . cellWidthText (tshow streak) $ cellWidget $
                      rowWith (padXY 8 0 . tight . fillW . fillH . itemsCenter) $
                        labelWith ((if streak >= 5 then fontTone Danger else fontMuted) . fillW) sText
             ]
@@ -1207,7 +1207,7 @@ costCentreTree env st = \case
     showFlame <- readVar (hsCCFlame st)
     forM_ (take 4 (drop 1 (pfHeader pf))) (labelWith (fontMuted . fontSizeScale 0.9) . T.strip)
     rowWith (tight . gap 8 . itemsCenter . fillW) $ do
-      searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter cost centres", sicLayout = (fixedW 280) defaultLayout} (hsCCFilter st)
+      searchInputConfigured defaultSearchInputConfig {sicPlaceholder = "Filter cost centres", sicLayout = fixedW 280} (hsCCFilter st)
       flex
       whenM (buttonWith tight (if showFlame then "Show tree" else "Flamegraph")) (writeVar (hsCCFlame st) (not showFlame))
     if showFlame
@@ -1321,13 +1321,13 @@ ghcDebugView env bench st loaded logTl = do
         toolStrip $ do
           toolLabel "Target"
           rowWith (itemsCenter . tight) $
-            boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabSegmented} connName (hsDbgConn st)
+            enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabSegmented} connName (hsDbgConn st)
           scope $ case conn of
             ConnSocket -> do
-              textInputConfigured defaultTextInputConfig {ticPlaceholder = "socket path, printed by withGhcDebug", ticLayout = (minW 260 . fillW) defaultLayout} (hsDbgSocket st)
+              textInputConfigured defaultTextInputConfig {ticPlaceholder = "socket path, printed by withGhcDebug", ticLayout = minW 260 . fillW} (hsDbgSocket st)
               whenM (toolIconButton iconSearch "Find sockets") (writeVar (hsDbgSockets st) =<< liftIO listSockets)
             ConnTcp ->
-              textInputConfigured defaultTextInputConfig {ticPlaceholder = "host:port, as given to withGhcDebugTCP", ticLayout = (minW 200 . fillW) defaultLayout} (hsDbgHostPort st)
+              textInputConfigured defaultTextInputConfig {ticPlaceholder = "host:port, as given to withGhcDebugTCP", ticLayout = minW 200 . fillW} (hsDbgHostPort st)
             ConnFile -> do
               whenM (toolIconButton iconFolderOpen "Open snapshot…") $
                 writeVar (hsDbgFileDialog st) . Just =<< askOpenFileDialog defaultFileDialogOptions
@@ -1410,7 +1410,7 @@ graphPanes env st = do
                     scope $ when (snapTruncated latest) $ badge Warning (if compact then "truncated" else "stopped at the closure limit")
                     flex
                     rowWith (itemsCenter . tight) $
-                      boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} tabLabel (hsDbgTab st)
+                      enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabContained} tabLabel (hsDbgTab st)
               pane ctx (snapLabel latest) actions $ case tab of
                 DbgSurvivors -> dbgSurvivors env st history latest survivors marked
                 DbgGraph -> dbgGraph env st sn latest marked

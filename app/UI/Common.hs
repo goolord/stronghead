@@ -161,10 +161,12 @@ import Data.Word (Word64)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef
 
-import NanoUI
+import NanoUI hiding (selectableRow)
 import NanoUI.Adornment qualified as A
+import NanoUI.Backend (colorToWord32)
 import NanoUI.Monad (askFrameInput)
 import NanoUI.Path qualified as P
+import NanoUI.Widgets.PaneGrid (GridNode, PaneDropLocation, PaneGridCtx (..), paneDragHandle)
 
 -- ---------------------------------------------------------------------------
 -- Theme
@@ -397,7 +399,7 @@ axisTicks step lo hi = takeWhile (<= hi) [first, first + step ..]
 -- Widgets
 
 asRow :: Layout -> Layout
-asRow l = l {layoutDirection = Row}
+asRow = direction Row
 
 -- | A label in a row, inheriting its enclosing container's 'ItemsAlign'
 -- ('itemsCenter' in list/control rows, 'itemsBaseline' in 'fact' / 'readout').
@@ -450,15 +452,15 @@ badge t txt = do
   th <- uiTheme
   let c = toneColor th t
   styled (panelStyle (background (alpha 0.16 c) . borderWidth 0 . cornerRadius 4)) $
-    panelWith (alignMid . padXY 10 4) (labelWith (fontColor c . fontSizeScale 0.8) txt)
+    panelWith (alignMiddle . padXY 10 4) (labelWith (fontColor c . fontSizeScale 0.8) txt)
 
 pathLabel :: Maybe FilePath -> NanoUI ()
 pathLabel = \case
-  Nothing -> notePaneState "No file open" >> labelWith (alignMid . fontMuted) "No file open"
+  Nothing -> notePaneState "No file open" >> labelWith (alignMiddle . fontMuted) "No file open"
   Just p -> do
     let name = T.pack (takeFileName p)
     notePaneState name
-    labelWith (alignMid . fontMono . fontSizeScale 0.92) name
+    labelWith (alignMiddle . fontMono . fontSizeScale 0.92) name
 
 fillRow :: NanoUI a -> NanoUI a
 fillRow = rowWith (tight . gap 8 . itemsCenter . fillW)
@@ -502,7 +504,7 @@ iconButtonWith' :: (Layout -> Layout) -> Svg -> Text -> NanoUI Response
 iconButtonWith' f ic label =
   buttonConfigured'
     defaultButtonConfig
-      { bcLayout = f (gap 6 defaultLayout)
+      { bcLayout = f . gap 6
       , bcAdornments = A.leading (A.icon ic)
       }
     label
@@ -584,7 +586,7 @@ kbdBadge txt = do
   th <- uiTheme
   let i = ink th
   styled (panelStyle (background (inkSunken i) . borderColor (inkRule i) . borderWidth 1 . cornerRadius 4)) $
-    panelWith (alignMid . padXY 6 2 . tight) $
+    panelWith (alignMiddle . padXY 6 2 . tight) $
       labelWith (fontMono . fontMuted . fontSizeScale 0.78) txt
 
 -- | A crisp 7px status dot in a semantic tone.
@@ -592,7 +594,7 @@ statusDot :: Tone -> NanoUI ()
 statusDot t = do
   th <- uiTheme
   let c = toneColor th t
-  void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMid) $ \(Rect x y w h) ->
+  void $ canvasKeyed (fromIntegral (colorToWord32 c)) (fixedWH 8 8 . alignMiddle) $ \(Rect x y w h) ->
     drawCircle (V2 (x + w / 2) (y + h / 2)) 3.5 c
 
 -- ---------------------------------------------------------------------------
@@ -861,7 +863,7 @@ paneMenu items = do
 paneMenuWithVar :: Var Bool -> NanoUI Bool -> NanoUI ()
 paneMenuWithVar open items = do
   th <- uiTheme
-  resp <- styled (quiet . buttonStyle (foreground (inkMuted (ink th)))) (buttonWith' (alignMid . padXY 6 0 . tight) "⋯")
+  resp <- styled (quiet . buttonStyle (foreground (inkMuted (ink th)))) (buttonWith' (alignMiddle . padXY 6 0 . tight) "⋯")
   tooltip resp "Move, pop out or close this pane; drag the header to rearrange"
   when (respClicked resp) (modifyVar open not)
   _ <- popupWith open (defaultPopupConfig (AnchorRect (respRect resp))) (minW 200 . padXY 0 4) $
@@ -878,7 +880,7 @@ paneMeta = paneMetaWith id
 paneMetaWith :: (Layout -> Layout) -> Text -> NanoUI ()
 paneMetaWith f txt = do
   notePaneState txt
-  labelWith (alignMid . fontMuted . fontSizeScale 0.85 . f) txt
+  labelWith (alignMiddle . fontMuted . fontSizeScale 0.85 . f) txt
 
 -- | A single metric item in a 'readoutToned' strip.
 data ReadoutItem = ReadoutItem
@@ -1058,18 +1060,19 @@ factMono k v = rowWith (tight . gap 5 . itemsBaseline) $ do
 vrule :: Float -> NanoUI ()
 vrule h = do
   th <- uiTheme
-  box (fixedWH 1 h . alignMid) (inkRule (ink th))
+  box (fixedWH 1 h . alignMiddle) (inkRule (ink th))
 
 -- | 'canvas' with a content key, so unchanged frames skip rebuilding its ops.
 canvasKeyed :: Int -> (Layout -> Layout) -> (Rect -> CanvasM ()) -> NanoUI Response
 canvasKeyed k f draw = do
   when (k /= 0) (notePaneKey (fromIntegral k))
-  canvasConfigured defaultCanvasConfig {canvasLayout = f defaultLayout, canvasContent = k} draw
+  canvasConfigured defaultCanvasConfig {canvasLayout = f, canvasContent = k} draw
 
 -- | Chromeless vertical scroll area inside a pane, sharing height cleanly with siblings.
 bareScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
-bareScrollArea f =
-  scrollAreaConfigured (ScrollConfig ScrollNone ScrollAuto True False) (f . minW 0 . minH 0)
+bareScrollArea f body =
+  (\(a, resp) -> (respId resp, a))
+    <$> scrollConfigured' (ScrollConfig ScrollNone ScrollAuto True False) (f . minW 0 . minH 0) body
 
 -- | A chromeless scroll area inside a pane, using native @bareScrollArea@
 -- so it blends onto the pane surface and shares height cleanly with siblings.
@@ -1086,10 +1089,11 @@ paneScrollArea f body = do
 paneFocusScrollArea :: (Layout -> Layout) -> NanoUI a -> NanoUI (WidgetId, a)
 paneFocusScrollArea f body = do
   th <- uiTheme
-  scrollAreaConfigured
-    (ScrollConfig ScrollNone ScrollAuto True True)
-    (f . tight . fillW . fillH . minW 0 . minH 0)
-    (themed th body)
+  (\(a, resp) -> (respId resp, a))
+    <$> scrollConfigured'
+      (ScrollConfig ScrollNone ScrollAuto True True)
+      (f . tight . fillW . fillH . minW 0 . minH 0)
+      (themed th body)
 
 -- | A vertically scrolled list of uniform-height rows inside a pane that
 -- virtualizes when there are many items, building only the rows near the
@@ -1107,7 +1111,7 @@ paneVirtualRows scrollLayout colLayout items drawItem
       let !rowH = max 18 (fmLineHeight fm + 4)
           !vec = V.fromListN n items
       sid <- currentId
-      metrics <- getScrollMetricsUi sid
+      metrics <- getScrollMetrics sid
       let (!firstRow, !lastRow) = case metrics of
             Nothing -> (0, min (n - 1) 59)
             Just m ->

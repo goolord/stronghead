@@ -79,6 +79,7 @@ import Numeric (showFFloat)
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
+import NanoUI.Widgets.PaneGrid
 import Text.Megaparsec (Parsec, between, choice, eof, errorBundlePretty, parse, takeWhile1P)
 import Text.Megaparsec.Char (char, hspace)
 

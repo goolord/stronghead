@@ -12,7 +12,7 @@ module UI.Palette
 import Control.Monad (forM_, unless, when)
 import Data.Foldable (for_)
 import Data.Text qualified as T
-import NanoUI
+import NanoUI hiding (selectableRow)
 import NanoUI.Adornment qualified as A
 import Stronghead.Format (tshow)
 import Stronghead.Fuzzy (fuzzyRank)
@@ -50,7 +50,7 @@ paletteView env pl commands =
         textInputConfigured'
           defaultTextInputConfig
             { ticPlaceholder = "Threads, bindings, cost centres, bands, closures, markers, commands…"
-            , ticLayout = (fillW . gap 6) defaultLayout
+            , ticLayout = fillW . gap 6
             , ticAdornments = A.leading (A.icon iconSearch)
             }
           (plQuery pl)
@@ -107,5 +107,5 @@ paletteView env pl commands =
                 when picked (run h)
             when (idxMoved && (up || down)) $ do
               let rowH = 28 :: Float
-              scrollRectIntoViewUi scrollWid (Rect 0 (fromIntegral idx * rowH) 1 rowH) ScrollNearest ScrollInstant
+              scrollRectIntoView scrollWid (Rect 0 (fromIntegral idx * rowH) 1 rowH) ScrollNearest ScrollInstant
       labelWith (fontMuted . fontSizeScale 0.8 . padTop 2) "Enter to open · ↑↓ to choose · Esc to close"

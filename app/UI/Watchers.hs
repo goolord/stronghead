@@ -282,7 +282,7 @@ watchStatus env w = do
       writeVar (wrUnseen w) 0
       writeVar (wrToast w) Nothing
     let anchor = AnchorRect (respRect area)
-    popupWith (wrListOpen w) (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove} (fixedW 560 . maxH 480 . padAll 0) $
+    popupWith (wrListOpen w) (defaultPopupConfig anchor) {popupPlacement = PlacementAbove} (fixedW 560 . maxH 480 . padAll 0) $
       void . bareScrollArea fillW $
         columnWith (fillW . padAll 12 . tight . gap 4) $ do
           labelWith (fontMedium . fontSizeScale 1.05) "What the watchers saw"
@@ -293,7 +293,7 @@ watchStatus env w = do
       writeVar shown True
       let warnCol = toneColor th Warning
       styled (popupStyle (background (lerpColor warnCol (styleBg (themePopup th)) 0.88) . borderColor warnCol)) $
-        popupWith shown (defaultPopupConfig anchor) {cfgPlacement = PlacementAbove, cfgDismissable = False} (fixedW 420 . padAll 10 . gap 4) $ do
+        popupWith shown (defaultPopupConfig anchor) {popupPlacement = PlacementAbove, popupDismissable = False} (fixedW 420 . padAll 10 . gap 4) $ do
           rowWith (fillW . itemsCenter . tight . gap 8) $ do
             labelWith (fontMedium . fontSizeScale 0.92 . fillW) (feTitle ev)
             whenM (buttonWith (padXY 6 0 . tight) "Dismiss") (writeVar (wrToast w) Nothing)

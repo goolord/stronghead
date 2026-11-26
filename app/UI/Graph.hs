@@ -27,9 +27,11 @@ import Numeric (showFFloat)
 import NanoUI
 import NanoUI.Backend
   ( FontMetrics (..)
+  , colorToWord32
   , damageFullNow
   , emptyInput
   , runFrame
+  , setThemeIO
   , withFontMetrics
   , withMonoFontMetrics
   )
@@ -114,7 +116,7 @@ renderUiFrameToSvg :: Float -> Float -> Theme -> NanoUI () -> IO Text
 renderUiFrameToSvg width height theme ui = do
   ctx0 <- newPixelContext
   let ctx = withMonoFontMetrics (withFontMetrics ctx0 (sansFm 16)) (monoFm 16)
-  setTheme ctx theme
+  setThemeIO ctx theme
   enableSvgExport ctx
   let baseInp = emptyInput { inputWindowSize = Size width height, inputMousePos = V2 (-10) (-10) }
   -- Warm up frames so layout, stores, and variables settle
@@ -297,7 +299,7 @@ heapPanelUi pal mm hp topN panelTitle = do
     let sep = themeWindow th
     rowWith (fillW . grow . gap 8) $ do
       void $ canvasConfigured
-        defaultCanvasConfig { canvasLayout = (fillW . fillH) defaultLayout }
+        defaultCanvasConfig { canvasLayout = fillW . fillH }
         (\r -> do
             drawChart pal mm hp ls ymax v (-1) (axis r) marks r Nothing
             proofOverlay pal sep hp ls ymax v r)
@@ -435,5 +437,5 @@ renderFlamegraphSvg mTheme ft = do
         cardWith (padXY 10 3) $
           labelWith (fontSizeScale 0.82 . fontBold) (tshow (round (ftTotal ft) :: Int) <> " " <> ftUnit ft)
       void $ canvasConfigured
-        defaultCanvasConfig { canvasLayout = (fillW . grow) defaultLayout }
+        defaultCanvasConfig { canvasLayout = fillW . grow }
         (\r -> drawFlameTree pal mm r ft)

@@ -40,6 +40,7 @@ import System.FilePath (takeFileName)
 import Data.Text (Text)
 import Data.Text qualified as T
 import NanoUI
+import NanoUI.Backend (colorToWord32)
 
 import Stronghead.Attach (AttachStep (..), attachKindName, probeAttach)
 import Stronghead.Debug (DebugTarget, ghcDebugEnabled, listSockets, pauseTarget)
@@ -312,8 +313,8 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
   toolStripWrap $ do
     scope $ for_ mDotTone statusDot
     toolLabel "Agent"
-    textInputConfigured defaultTextInputConfig {ticLayout = (fixedW 140) defaultLayout} (lvHost st)
-    textInputConfigured defaultTextInputConfig {ticLayout = (fixedW 68) defaultLayout} (lvPort st)
+    textInputConfigured defaultTextInputConfig {ticLayout = fixedW 140} (lvHost st)
+    textInputConfigured defaultTextInputConfig {ticLayout = fixedW 68} (lvPort st)
     if want
       then whenM (toolIconButton iconUnlink "Disconnect") (writeVar (lvWant st) False)
       else whenM (styled primary (toolIconButton iconLink "Connect")) (connect st)
@@ -324,7 +325,7 @@ liveView env bench st mdata logTl remote followEventlog = columnWith (tight . ga
     flex
     toolGroup $ do
       toolLabel "Eventlog"
-      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = (minW 180 . fixedW 220) defaultLayout} (lvEventlog st)
+      textInputConfigured defaultTextInputConfig {ticPlaceholder = "the program's .eventlog", ticLayout = minW 180 . fixedW 220} (lvEventlog st)
       path <- readVar (lvEventlog st)
       disabledWhen (T.null (T.strip path)) $
         whenM (toolIconButton iconTrace "Follow in Timeline") (followEventlog (T.unpack (T.strip path)))
@@ -546,7 +547,7 @@ livePanes env st mdata logTl site = case mdata of
             resp <-
               canvasConfigured
                 defaultCanvasConfig
-                  { canvasLayout = (fillW . fillH . minH 60) defaultLayout
+                  { canvasLayout = fillW . fillH . minH 60
                   , canvasTrackPointer = True
                   , canvasCursor = if onClock then Just (\_ _ _ -> UiCursorCrosshair) else Nothing
                   }
@@ -689,11 +690,11 @@ groupColour pal = \case
 threadsHeader :: LiveState -> [(Text, Int)] -> NanoUI ()
 threadsHeader st counts = do
   rowWith (itemsCenter . tight) $
-    boundedTabBarConfigured defaultTabsConfig {tabsStyle = TabContained} liveSubTabName (lvSubTab st)
+    enumTabBarByConfigured defaultTabsConfig {tabsStyle = TabContained} liveSubTabName (lvSubTab st)
   subTab <- readVar (lvSubTab st)
   scope $ when (subTab == LiveThreadsList) $
     searchInputConfigured
-      defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = (fixedW 180) defaultLayout}
+      defaultSearchInputConfig {sicPlaceholder = "Filter by label or id", sicLayout = fixedW 180}
       (lvThreadFilter st)
   flex
   forM_ counts $ \(g, n) -> withKey g $ badge (groupTone g) (g <> " " <> tshow n)
@@ -991,7 +992,7 @@ markPrompt bus st mdata =
   modalWith (fixedW 440) (lvMarkOpen st) "Mark the program's timeline" $
     columnWith (fillW . tight . gap 10) $ do
       labelWith (fillW . fontMuted . fontSizeScale 0.9) "The agent posts it as an eventlog marker, so it shows on every time view of the run."
-      resp <- textInputConfigured' defaultTextInputConfig {ticLayout = fillW defaultLayout} (lvMarkText st)
+      resp <- textInputConfigured' defaultTextInputConfig {ticLayout = fillW} (lvMarkText st)
       focus <- readVar (lvMarkFocus st)
       when focus $ do
         writeVar (lvMarkFocus st) False

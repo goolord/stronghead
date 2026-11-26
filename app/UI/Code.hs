@@ -347,7 +347,7 @@ codeView cv mm cfg = do
   resp <-
     canvasConfigured
       defaultCanvasConfig
-        { canvasLayout = ccLayout cfg defaultLayout
+        { canvasLayout = ccLayout cfg
         , canvasTrackPointer = True
         , canvasContent = contentKeyVal
         , canvasCursor = Just $ \_ (Rect x _ _ _) (V2 px _) ->

@@ -16,6 +16,7 @@ import Data.Text qualified as T
 import Data.Vector qualified as V
 import NanoUI
 import NanoUI.Backend (FontMetrics (fmAdvance))
+import NanoUI.Widgets.PaneGrid (GridAxis (..), GridNode (..), validateGridTree)
 import NanoUI.Testing
 import NanoUI.Testing.Assert (evalUi, withInput)
 import NanoUI.Testing.Harness
@@ -149,7 +150,7 @@ clockView c = do
       env = Env (cBus c) [timeline] PHeap (\_ -> pure ()) haveNothing Nothing
   go <- liftIO (atomicModifyIORef' (cGo c) (Nothing,))
   for_ go (goTo env)
-  resp <- canvasConfigured defaultCanvasConfig {canvasLayout = fixedWH 400 100 defaultLayout, canvasTrackPointer = True} (\_ -> pure ())
+  resp <- canvasConfigured defaultCanvasConfig {canvasLayout = fixedWH 400 100, canvasTrackPointer = True} (\_ -> pure ())
   let r = respRect resp
   liftIO (writeIORef (cRect c) r)
   _ <- timeGestures env (linearAxis run (TimeView 0 1e9) (rectX r) (rectW r)) resp ScrubDrag
@@ -1032,7 +1033,7 @@ main = do
   _ <- renderLane
   laneScrolls <- nodesOfType NodeScrollContainer lsCtx
   laneChecks <- forM laneScrolls $ \(wid, _) -> do
-    mMetrics <- getScrollMetrics lsCtx wid
+    mMetrics <- getScrollMetricsIO lsCtx wid
     pure $ case mMetrics of
       Just sm | scrollAxes sm == ScrollAxisXY -> v2X (scrollRange sm) == 0
       _ -> True
@@ -1055,7 +1056,7 @@ main = do
     _ <- sqRender
     sqScrolls <- nodesOfType NodeScrollContainer sqCtx
     overs <- forM sqScrolls $ \(wid, _) -> do
-      mMetrics <- getScrollMetrics sqCtx wid
+      mMetrics <- getScrollMetricsIO sqCtx wid
       pure $ case mMetrics of
         Just sm | scrollAxes sm == ScrollAxisXY -> v2X (scrollRange sm) > 0
         _ -> False
@@ -1077,7 +1078,7 @@ main = do
     _ <- fvRender
     fvScrolls <- nodesOfType NodeScrollContainer fvCtx
     vOvers <- forM fvScrolls $ \(wid, _) -> do
-      mMetrics <- getScrollMetrics fvCtx wid
+      mMetrics <- getScrollMetricsIO fvCtx wid
       pure $ case mMetrics of
         Just sm | scrollAxes sm == ScrollAxisXY -> v2Y (scrollRange sm) > 0
         _ -> False
@@ -1103,7 +1104,7 @@ main = do
             _ <- stRender
             scrolls <- nodesOfType NodeScrollContainer stCtx
             state <- forM scrolls $ \(wid, r) -> do
-              m <- getScrollMetrics stCtx wid
+              m <- getScrollMetricsIO stCtx wid
               pure (r, fmap scrollRange m)
             if Just state == prev
               then pure (Just (k :: Int))
@@ -1160,7 +1161,7 @@ main = do
   _ <- renderAtCursor 500 600 fit500Ctx fit500State
   fit500Scrolls <- nodesOfType NodeScrollContainer fit500Ctx
   horz500Overflows <- forM fit500Scrolls $ \(wid, _) -> do
-    mMetrics <- getScrollMetrics fit500Ctx wid
+    mMetrics <- getScrollMetricsIO fit500Ctx wid
     pure $ case mMetrics of
       Just sm -> v2X (scrollRange sm) > 0
       Nothing -> False
@@ -1213,7 +1214,7 @@ main = do
     _ <- renderFive testW 400 tCtx tState
     scrolls <- nodesOfType NodeScrollContainer tCtx
     hasAnyOverflow <- forM scrolls $ \(wid, _) -> do
-      mMetrics <- getScrollMetrics tCtx wid
+      mMetrics <- getScrollMetricsIO tCtx wid
       pure $ case mMetrics of
         Just sm -> v2X (scrollRange sm) > 0 || v2Y (scrollRange sm) > 0
         Nothing -> False
@@ -1345,7 +1346,7 @@ main = do
       diffLoaded = BaselineLoaded (Just diffBase) False Nothing
       diffNow = DiffNow (Just diffHp) Nothing (Right (pure ()))
       diffUi = do
-        setUiTheme (strongheadTheme (Just AppearanceDark))
+        setTheme (strongheadTheme (Just AppearanceDark))
         writeVar (bvPaths diffSt) diffPaths
         columnWith (fillW . fillH . tight) $
           for_ (diffPanes diffEnv diffSt diffLoaded diffNow paneDiffHeap (PaneCtx Nothing (Just (menuItem "Close")) (Just paneDiffHeap) Nothing)) id

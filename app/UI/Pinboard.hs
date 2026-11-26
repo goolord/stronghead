@@ -53,7 +53,7 @@ pinboardPane env export ctx = do
                 small "↓" "Move down" (i < length pins - 1) (modifyVar (busPins bus) (pinMove i 1))
                 small "×" "Unpin" True (modifyVar (busPins bus) (filter ((/= pinRef p) . pinRef)))
             textInputConfigured
-              defaultTextInputConfig {ticPlaceholder = "Note", ticLayout = fillW defaultLayout}
+              defaultTextInputConfig {ticPlaceholder = "Note", ticLayout = fillW}
               (zoomVar (noteOf (pinRef p)) (setNote (pinRef p)) (busPins bus))
   where
     noteOf r = maybe "" pinNote . find ((== r) . pinRef)

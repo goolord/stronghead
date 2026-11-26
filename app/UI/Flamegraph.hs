@@ -163,7 +163,7 @@ canvasRegions layoutMod mkRegions draw = do
   resp <-
     canvasConfigured
       defaultCanvasConfig
-        { canvasLayout = layoutMod defaultLayout
+        { canvasLayout = layoutMod
         , canvasTrackPointer = True
         , canvasCursor = Just cursorAt
         }
@@ -289,7 +289,7 @@ latencyHeatmapView hm = do
         resp <-
           canvasConfigured
             defaultCanvasConfig
-              { canvasLayout = (fillW . fixedH 132) defaultLayout
+              { canvasLayout = fillW . fixedH 132
               , canvasTrackPointer = True
               }
             (\r -> drawLatencyHeatmap pal mm r hm)
@@ -372,7 +372,7 @@ eraCohortHeatmapView hp = do
         resp <-
           canvasConfigured
             defaultCanvasConfig
-              { canvasLayout = (fillW . grow . minH 180) defaultLayout
+              { canvasLayout = fillW . grow . minH 180
               , canvasTrackPointer = True
               }
             $ \r@(Rect rx ry rw rh) -> withClip r $ do
